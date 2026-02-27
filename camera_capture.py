@@ -35,6 +35,13 @@ import queue
 from pathlib import Path
 from datetime import datetime
 
+# --- Hard-disable OpenCL (common macOS crash workaround) ---
+try:
+    cv2.ocl.setUseOpenCL(False)
+    print("[INFO] OpenCL disabled:", cv2.ocl.useOpenCL())
+except Exception as e:
+    print("[INFO] Could not disable OpenCL:", e)
+
 # -----------------------
 # User settings
 # -----------------------
@@ -71,7 +78,7 @@ DELETE_RAW_AFTER_TRANSCODE = False
 CHESSBOARD_INNER_CORNERS = (11, 7)
 SQUARE_SIZE_M = 0.020
 MIN_CALIB_FRAMES = 12
-USE_SB_DETECTOR = True
+USE_SB_DETECTOR = False
 
 # ---- Choose backend ----
 cap = cv2.VideoCapture(PORT, cv2.CAP_AVFOUNDATION)

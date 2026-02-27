@@ -416,7 +416,448 @@ class CTR_Shadow_Calibration:
         }
         self.analysis_crop = dict(self.default_analysis_crop)
 
+        # Optional camera/board calibration state (CTR shadow calibration workflow)
+        self.camera_calib_path = None
+        self.camera_K = None
+        self.camera_dist = None
+        self.camera_calib_meta = None
+        self.board_pose = None
+        self.true_vertical_img_unit = None
+        self.board_homography_px_from_mm = None
+        self.board_homography_mm_from_px = None
+        self.board_px_per_mm_local = None
+        self.board_mm_per_px_local = None
+        self.board_reference_image_path = None
+
         print("Calibration object initialized successfully!")
+
+    # Usage example:
+    # sc.load_camera_calibration("/path/to/webcam_calibration.npz")
+    # sc.estimate_board_reference_from_image("/path/to/checkerboard_reference.png", draw_debug=True)
+    # u_mm, z_mm = sc.pixel_point_to_calibrated_axes(x_px=1800, y_px=900)
+    def load_camera_calibration(self, calibration_npz_path):
+        """
+        Load camera intrinsics/distortion and checkerboard metadata from a saved .npz file.
+
+        Expected keys: K, dist, rms, inner_corners, square_size_m.
+        """
+        if calibration_npz_path is None:
+            raise ValueError("Calibration file path cannot be None.")
+
+        calib_path = os.path.abspath(os.path.expanduser(str(calibration_npz_path)))
+        if not os.path.isfile(calib_path):
+            raise FileNotFoundError(f"Camera calibration file not found: {calib_path}")
+
+        with np.load(calib_path, allow_pickle=False) as data:
+            required_keys = ("K", "dist", "rms", "inner_corners", "square_size_m")
+            missing = [k for k in required_keys if k not in data]
+            if missing:
+                raise KeyError(
+                    f"Calibration file is missing required keys: {missing}. "
+                    f"Found keys: {list(data.keys())}"
+                )
+
+            K = np.asarray(data["K"], dtype=np.float64)
+            dist = np.asarray(data["dist"], dtype=np.float64)
+            rms = float(np.asarray(data["rms"]).reshape(-1)[0])
+            inner_corners_arr = np.asarray(data["inner_corners"]).reshape(-1)
+            if inner_corners_arr.size < 2:
+                raise ValueError(
+                    f"inner_corners must have at least 2 values, got {inner_corners_arr}"
+                )
+            inner_corners = (int(inner_corners_arr[0]), int(inner_corners_arr[1]))
+            square_size_m = float(np.asarray(data["square_size_m"]).reshape(-1)[0])
+
+        if K.shape != (3, 3):
+            raise ValueError(f"K must be shape (3,3), got {K.shape}")
+
+        square_size_mm = square_size_m * 1000.0
+
+        self.camera_K = K
+        self.camera_dist = dist
+        self.camera_calib_path = calib_path
+        self.camera_calib_meta = {
+            "rms": rms,
+            "inner_corners": inner_corners,
+            "square_size_m": square_size_m,
+            "square_size_mm": square_size_mm,
+        }
+
+        print(
+            "Loaded camera calibration: "
+            f"RMS={rms:.6f}, inner_corners={inner_corners}, square_size={square_size_mm:.3f} mm"
+        )
+        return dict(self.camera_calib_meta)
+
+    def _detect_checkerboard_corners(self, gray, inner_corners=None, use_sb=True):
+        """
+        Detect checkerboard inner corners in a grayscale image.
+
+        Returns:
+            found (bool), corners (N,1,2 float32) or None.
+        """
+        if gray is None or gray.ndim != 2:
+            raise ValueError("gray must be a valid grayscale image.")
+
+        if inner_corners is None:
+            if self.camera_calib_meta is None or "inner_corners" not in self.camera_calib_meta:
+                raise ValueError(
+                    "inner_corners was not provided and no camera calibration metadata is loaded."
+                )
+            inner_corners = self.camera_calib_meta["inner_corners"]
+
+        pattern_size = (int(inner_corners[0]), int(inner_corners[1]))
+        found = False
+        corners = None
+
+        if use_sb and hasattr(cv2, "findChessboardCornersSB"):
+            try:
+                flags_sb = cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY
+                found, corners = cv2.findChessboardCornersSB(gray, pattern_size, flags=flags_sb)
+            except Exception:
+                found = False
+                corners = None
+
+        if not found:
+            flags = (
+                cv2.CALIB_CB_ADAPTIVE_THRESH
+                + cv2.CALIB_CB_NORMALIZE_IMAGE
+                + cv2.CALIB_CB_FAST_CHECK
+            )
+            found, corners = cv2.findChessboardCorners(gray, pattern_size, flags)
+            if found:
+                criteria = (
+                    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    40,
+                    1e-4,
+                )
+                corners = cv2.cornerSubPix(
+                    gray,
+                    corners,
+                    winSize=(11, 11),
+                    zeroZone=(-1, -1),
+                    criteria=criteria,
+                )
+
+        if not found or corners is None:
+            return False, None
+
+        corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+        return True, corners
+
+    def estimate_board_reference_from_image(
+        self,
+        image_or_path,
+        inner_corners=None,
+        square_size_mm=None,
+        use_undistort=True,
+        draw_debug=False,
+        save_debug_path=None,
+    ):
+        """
+        Estimate checkerboard pose and calibrated board reference from a single image.
+
+        Convention:
+        - Image coordinates are (x, y) = (column, row) in pixels.
+        - Board coordinates are (x_mm, y_mm) in the checkerboard plane.
+        - "True vertical" in image is defined as projection of board +Y axis.
+          Therefore +z_mm returned by pixel_point_to_calibrated_axes corresponds to +Y_board.
+        """
+        if self.camera_K is None or self.camera_dist is None:
+            raise RuntimeError(
+                "Camera calibration is not loaded. Call load_camera_calibration(...) first."
+            )
+
+        if isinstance(image_or_path, str):
+            image_path = os.path.abspath(os.path.expanduser(image_or_path))
+            image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if image_bgr is None:
+                raise FileNotFoundError(
+                    f"Could not read checkerboard reference image: {image_path}"
+                )
+            self.board_reference_image_path = image_path
+        elif isinstance(image_or_path, np.ndarray):
+            image_bgr = image_or_path.copy()
+            self.board_reference_image_path = None
+        else:
+            raise TypeError("image_or_path must be an image path or a BGR numpy array.")
+
+        if inner_corners is None:
+            if self.camera_calib_meta is None or "inner_corners" not in self.camera_calib_meta:
+                raise ValueError("inner_corners is required when calibration metadata is unavailable.")
+            inner_corners = self.camera_calib_meta["inner_corners"]
+        inner_corners = (int(inner_corners[0]), int(inner_corners[1]))
+
+        if square_size_mm is None:
+            if self.camera_calib_meta is None or "square_size_mm" not in self.camera_calib_meta:
+                raise ValueError("square_size_mm is required when calibration metadata is unavailable.")
+            square_size_mm = float(self.camera_calib_meta["square_size_mm"])
+        else:
+            square_size_mm = float(square_size_mm)
+
+        if square_size_mm <= 0:
+            raise ValueError(f"square_size_mm must be positive, got {square_size_mm}")
+
+        if use_undistort:
+            image_for_detection = cv2.undistort(image_bgr, self.camera_K, self.camera_dist)
+            dist_for_pnp = np.zeros((1, 5), dtype=np.float64)
+        else:
+            image_for_detection = image_bgr
+            dist_for_pnp = self.camera_dist
+
+        gray = cv2.cvtColor(image_for_detection, cv2.COLOR_BGR2GRAY)
+        found, corners = self._detect_checkerboard_corners(gray, inner_corners=inner_corners, use_sb=True)
+        if not found:
+            raise RuntimeError(
+                f"Checkerboard not found in reference image using inner_corners={inner_corners}."
+            )
+
+        nx, ny = int(inner_corners[0]), int(inner_corners[1])
+        board_xy = np.mgrid[0:nx, 0:ny].T.reshape(-1, 2).astype(np.float64) * square_size_mm
+        obj_points = np.zeros((board_xy.shape[0], 3), dtype=np.float64)
+        obj_points[:, :2] = board_xy
+        img_points = corners.reshape(-1, 2).astype(np.float64)
+
+        pnp_ok, rvec, tvec = cv2.solvePnP(
+            obj_points,
+            img_points,
+            self.camera_K,
+            dist_for_pnp,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not pnp_ok:
+            pnp_ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                obj_points,
+                img_points,
+                self.camera_K,
+                dist_for_pnp,
+            )
+        if not pnp_ok:
+            raise RuntimeError("Failed to estimate checkerboard pose (solvePnP failed).")
+
+        R, _ = cv2.Rodrigues(rvec)
+        board_normal_cam = R[:, 2].copy()
+
+        axis_len = float(square_size_mm * 3.0)
+        axis_points_3d = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [axis_len, 0.0, 0.0],
+                [0.0, axis_len, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        proj_axes, _ = cv2.projectPoints(
+            axis_points_3d,
+            rvec,
+            tvec,
+            self.camera_K,
+            dist_for_pnp,
+        )
+        proj_axes = proj_axes.reshape(-1, 2)
+        origin_px = proj_axes[0].astype(np.float64)
+        x_axis_px = proj_axes[1].astype(np.float64)
+        y_axis_px = proj_axes[2].astype(np.float64)
+
+        vertical_vec = y_axis_px - origin_px
+        v_norm = float(np.linalg.norm(vertical_vec))
+        if v_norm < 1e-9:
+            raise RuntimeError("Projected board +Y axis is degenerate; cannot define true vertical.")
+        true_vertical_img_unit = vertical_vec / v_norm
+
+        H_px_from_mm, _ = cv2.findHomography(board_xy, img_points, method=0)
+        if H_px_from_mm is None:
+            raise RuntimeError("Failed to compute board-plane homography (mm -> px).")
+        H_mm_from_px = np.linalg.inv(H_px_from_mm)
+
+        corners_grid = img_points.reshape(ny, nx, 2)
+        d_h = np.linalg.norm(corners_grid[:, 1:, :] - corners_grid[:, :-1, :], axis=2).reshape(-1)
+        d_v = np.linalg.norm(corners_grid[1:, :, :] - corners_grid[:-1, :, :], axis=2).reshape(-1)
+        d_all = np.concatenate([d_h, d_v])
+        d_all = d_all[np.isfinite(d_all) & (d_all > 0)]
+        if d_all.size == 0:
+            raise RuntimeError("Could not compute local checkerboard px/mm scale from detected corners.")
+
+        board_px_per_mm_local = float(np.mean(d_all) / square_size_mm)
+        board_mm_per_px_local = 1.0 / board_px_per_mm_local
+
+        self.true_vertical_img_unit = true_vertical_img_unit.astype(np.float64)
+        self.board_homography_px_from_mm = H_px_from_mm.astype(np.float64)
+        self.board_homography_mm_from_px = H_mm_from_px.astype(np.float64)
+        self.board_px_per_mm_local = float(board_px_per_mm_local)
+        self.board_mm_per_px_local = float(board_mm_per_px_local)
+        self.board_pose = {
+            "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+            "R": np.asarray(R, dtype=np.float64),
+            "normal_cam": np.asarray(board_normal_cam, dtype=np.float64).reshape(3),
+            "origin_px": origin_px.astype(np.float64),
+            "x_axis_px": x_axis_px.astype(np.float64),
+            "y_axis_px": y_axis_px.astype(np.float64),
+            "image_shape": tuple(image_for_detection.shape),
+            "inner_corners": inner_corners,
+            "square_size_mm": float(square_size_mm),
+            "use_undistort": bool(use_undistort),
+        }
+
+        result = {
+            "camera_calib_path": self.camera_calib_path,
+            "board_reference_image_path": self.board_reference_image_path,
+            "rvec": self.board_pose["rvec"],
+            "tvec": self.board_pose["tvec"],
+            "R": self.board_pose["R"],
+            "normal_cam": self.board_pose["normal_cam"],
+            "origin_px": self.board_pose["origin_px"],
+            "x_axis_px": self.board_pose["x_axis_px"],
+            "y_axis_px": self.board_pose["y_axis_px"],
+            "true_vertical_img_unit": self.true_vertical_img_unit,
+            "board_homography_px_from_mm": self.board_homography_px_from_mm,
+            "board_homography_mm_from_px": self.board_homography_mm_from_px,
+            "board_px_per_mm_local": self.board_px_per_mm_local,
+            "board_mm_per_px_local": self.board_mm_per_px_local,
+            "inner_corners": inner_corners,
+            "square_size_mm": float(square_size_mm),
+            "image_shape": tuple(image_for_detection.shape),
+        }
+
+        if draw_debug:
+            debug_img = image_for_detection.copy()
+            cv2.drawChessboardCorners(debug_img, (nx, ny), corners, True)
+
+            o = tuple(np.round(origin_px).astype(int))
+            x_end = tuple(np.round(x_axis_px).astype(int))
+            y_end = tuple(np.round(y_axis_px).astype(int))
+            cv2.circle(debug_img, o, 7, (255, 255, 0), -1)
+            cv2.arrowedLine(debug_img, o, x_end, (0, 0, 255), 3, tipLength=0.15)  # X axis
+            cv2.arrowedLine(debug_img, o, y_end, (0, 255, 0), 3, tipLength=0.15)  # Y axis / true vertical
+
+            txt1 = f"px/mm(local): {self.board_px_per_mm_local:.4f}"
+            txt2 = f"mm/px(local): {self.board_mm_per_px_local:.6f}"
+            cv2.putText(debug_img, txt1, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 255, 40), 2)
+            cv2.putText(debug_img, txt2, (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 255, 40), 2)
+
+            if save_debug_path is not None:
+                save_debug_path = os.path.abspath(os.path.expanduser(str(save_debug_path)))
+                cv2.imwrite(save_debug_path, debug_img)
+                print(f"Saved board reference debug image: {save_debug_path}")
+
+            result["debug_image"] = debug_img
+
+        print(
+            "Estimated checkerboard reference: "
+            f"inner_corners={inner_corners}, square={square_size_mm:.3f} mm, "
+            f"local scale={self.board_px_per_mm_local:.4f} px/mm"
+        )
+        print("True vertical convention: +Z image-axis is projection of checkerboard +Y.")
+        return result
+
+    def board_mm_to_px(self, x_mm, y_mm):
+        """Map board-plane mm coordinates -> image px using homography."""
+        if self.board_homography_px_from_mm is None:
+            raise RuntimeError(
+                "Board homography is unavailable. Call estimate_board_reference_from_image(...) first."
+            )
+
+        pts_mm = np.array([[[float(x_mm), float(y_mm)]]], dtype=np.float64)
+        pts_px = cv2.perspectiveTransform(pts_mm, self.board_homography_px_from_mm)
+        return pts_px.reshape(2)
+
+    def board_px_to_mm(self, x_px, y_px):
+        """Map image px coordinates -> board-plane mm using inverse homography."""
+        if self.board_homography_mm_from_px is None:
+            raise RuntimeError(
+                "Board inverse homography is unavailable. Call estimate_board_reference_from_image(...) first."
+            )
+
+        pts_px = np.array([[[float(x_px), float(y_px)]]], dtype=np.float64)
+        pts_mm = cv2.perspectiveTransform(pts_px, self.board_homography_mm_from_px)
+        return pts_mm.reshape(2)
+
+    def mm_to_px_local(self, mm_val):
+        """Convert millimeters to pixels using local checkerboard scale near board center."""
+        if self.board_px_per_mm_local is None:
+            raise RuntimeError("Local px/mm scale unavailable. Estimate board reference first.")
+        return float(mm_val) * float(self.board_px_per_mm_local)
+
+    def px_to_mm_local(self, px_val):
+        """Convert pixels to millimeters using local checkerboard scale near board center."""
+        if self.board_mm_per_px_local is None:
+            raise RuntimeError("Local mm/px scale unavailable. Estimate board reference first.")
+        return float(px_val) * float(self.board_mm_per_px_local)
+
+    def project_pixel_delta_onto_true_vertical(self, dx_px, dy_px):
+        """
+        Return signed component in pixels along estimated true vertical image direction.
+        """
+        if self.true_vertical_img_unit is None:
+            raise RuntimeError(
+                "True vertical image direction is unavailable. Estimate board reference first."
+            )
+        delta = np.array([float(dx_px), float(dy_px)], dtype=np.float64)
+        return float(np.dot(delta, self.true_vertical_img_unit))
+
+    def project_points_onto_true_vertical(self, pts_xy_px, origin_xy_px=None):
+        """
+        Project points onto true vertical image direction.
+
+        Returns signed pixel distances along true vertical from origin.
+        """
+        if self.true_vertical_img_unit is None:
+            raise RuntimeError(
+                "True vertical image direction is unavailable. Estimate board reference first."
+            )
+
+        pts = np.asarray(pts_xy_px, dtype=np.float64).reshape(-1, 2)
+        if origin_xy_px is None:
+            if self.board_pose is not None and "origin_px" in self.board_pose:
+                origin = np.asarray(self.board_pose["origin_px"], dtype=np.float64).reshape(1, 2)
+            else:
+                origin = np.zeros((1, 2), dtype=np.float64)
+        else:
+            origin = np.asarray(origin_xy_px, dtype=np.float64).reshape(1, 2)
+
+        deltas = pts - origin
+        return (deltas @ self.true_vertical_img_unit.reshape(2, 1)).reshape(-1)
+
+    def pixel_point_to_calibrated_axes(self, x_px, y_px, origin_px=None):
+        """
+        Convert a pixel point to board-referenced calibrated axes (u_mm, z_mm).
+
+        - u_mm: transverse coordinate in board-plane X direction
+        - z_mm: coordinate along "true vertical", defined as checkerboard +Y direction
+
+        Uses full homography when available. Falls back to local projection + local scale.
+        """
+        pt_px = np.array([float(x_px), float(y_px)], dtype=np.float64)
+
+        if origin_px is None:
+            if self.board_pose is not None and "origin_px" in self.board_pose:
+                origin_px_vec = np.asarray(self.board_pose["origin_px"], dtype=np.float64).reshape(2)
+            else:
+                origin_px_vec = np.array([0.0, 0.0], dtype=np.float64)
+        else:
+            origin_px_vec = np.asarray(origin_px, dtype=np.float64).reshape(2)
+
+        if self.board_homography_mm_from_px is not None:
+            pt_mm = self.board_px_to_mm(pt_px[0], pt_px[1])
+            origin_mm = self.board_px_to_mm(origin_px_vec[0], origin_px_vec[1])
+            delta_mm = pt_mm - origin_mm
+            u_mm = float(delta_mm[0])
+            z_mm = float(delta_mm[1])
+            return u_mm, z_mm
+
+        if self.true_vertical_img_unit is None or self.board_mm_per_px_local is None:
+            raise RuntimeError(
+                "Calibrated conversion unavailable: need board homography or (true_vertical + local mm/px)."
+            )
+
+        delta_px = pt_px - origin_px_vec
+        v_hat = self.true_vertical_img_unit.astype(np.float64).reshape(2)
+        u_hat = np.array([v_hat[1], -v_hat[0]], dtype=np.float64)
+
+        u_mm = float(np.dot(delta_px, u_hat) * self.board_mm_per_px_local)
+        z_mm = float(np.dot(delta_px, v_hat) * self.board_mm_per_px_local)
+        return u_mm, z_mm
 
     def setup_analysis_crop(self, enable_manual_adjustment=False, cam_port=None):
         """
@@ -1298,8 +1739,6 @@ class CTR_Shadow_Calibration:
         else:
             axs[1, 1].legend(["skeleton", "coarse tip"])
 
-        axs[1, 1].set_title(f'Identified coarse tip (angle={tip_angle_deg:.2f} deg)')
-
         tip_locations_array_fine[i, :] = np.array(
             [tip_location[1] + crop_y_min_img + crop_y_min,
              tip_location[0] + crop_x_min_img + crop_x_min,
@@ -1308,6 +1747,31 @@ class CTR_Shadow_Calibration:
              float(ntnl_pos),
              float(tip_angle_deg)]
         )
+
+        calibrated_tip_axes = None
+        if (
+            self.board_homography_mm_from_px is not None
+            or (
+                self.true_vertical_img_unit is not None
+                and self.board_mm_per_px_local is not None
+            )
+        ):
+            try:
+                calibrated_tip_axes = self.pixel_point_to_calibrated_axes(
+                    x_px=float(tip_locations_array_coarse[i, 1]),
+                    y_px=float(tip_locations_array_coarse[i, 0]),
+                )
+            except Exception:
+                calibrated_tip_axes = None
+
+        if calibrated_tip_axes is not None:
+            u_mm, z_mm = calibrated_tip_axes
+            axs[1, 1].set_title(
+                f'Identified coarse tip (angle={tip_angle_deg:.2f} deg)\n'
+                f'Calibrated: u={u_mm:.2f} mm, z={z_mm:.2f} mm'
+            )
+        else:
+            axs[1, 1].set_title(f'Identified coarse tip (angle={tip_angle_deg:.2f} deg)')
 
         return fig, axs, tip_locations_array_coarse[i, :], tip_locations_array_fine[i, :]
 
@@ -1550,21 +2014,68 @@ class CTR_Shadow_Calibration:
                 print("Warning: Tip-angle data not found. Re-run analyze_data_batch() to enable angle fitting.")
 
             # ---------- Step 3: Convert to physical coordinates + canonicalize axes ----------
-            print(f"Converting to physical coordinates (scale: {width_in_pixels} px = {width_in_mm} mm)")
-
+            conversion_mode = "legacy_linear_scale"
+            pixel_to_mm_scale = float(width_in_mm) / float(width_in_pixels)
             tip_locations_array_fine_mm = self.tip_locations_array_coarse.copy()
-            tip_locations_array_fine_mm[:, 0:2] = self.tip_locations_array_coarse[:, 0:2] / width_in_pixels * width_in_mm
+            has_calibrated_axes = (
+                self.board_homography_mm_from_px is not None
+                or (
+                    self.true_vertical_img_unit is not None
+                    and self.board_mm_per_px_local is not None
+                )
+            )
 
-            # Canonical camera frame (matches your desired Plot 03):
-            # X = image column (mm) = original col1
-            # Z = -image row (mm)   = -original col0  (flip Z negative ONCE here)
-            x_mm = tip_locations_array_fine_mm[:, 1].copy()
-            z_mm = -tip_locations_array_fine_mm[:, 0].copy()
+            if has_calibrated_axes:
+                conversion_mode = "board_reference_calibrated"
+                if self.board_mm_per_px_local is not None:
+                    pixel_to_mm_scale = float(self.board_mm_per_px_local)
+                print(
+                    "Converting to physical coordinates using board-reference calibration "
+                    "(homography/true-vertical)."
+                )
+
+                if self.board_pose is not None and "origin_px" in self.board_pose:
+                    origin_px = np.asarray(self.board_pose["origin_px"], dtype=float).reshape(2)
+                else:
+                    origin_px = None
+
+                u_mm = np.zeros((tip_locations_array_fine_mm.shape[0],), dtype=float)
+                z_mm = np.zeros((tip_locations_array_fine_mm.shape[0],), dtype=float)
+
+                for idx, row in enumerate(self.tip_locations_array_coarse):
+                    row_px = float(row[0])
+                    col_px = float(row[1])
+                    uu, zz = self.pixel_point_to_calibrated_axes(
+                        x_px=col_px,
+                        y_px=row_px,
+                        origin_px=origin_px,
+                    )
+                    u_mm[idx] = uu
+                    z_mm[idx] = zz
+            else:
+                print(
+                    f"Converting to physical coordinates using legacy scale "
+                    f"({width_in_pixels} px = {width_in_mm} mm)"
+                )
+                tip_locations_array_fine_mm[:, 0:2] = (
+                    self.tip_locations_array_coarse[:, 0:2] / width_in_pixels * width_in_mm
+                )
+
+                # Canonical camera frame (legacy):
+                # X = image column (mm) = original col1
+                # Z = -image row (mm)   = -original col0
+                u_mm = tip_locations_array_fine_mm[:, 1].copy()
+                z_mm = -tip_locations_array_fine_mm[:, 0].copy()
 
             # Overwrite first two columns so the rest of the pipeline is consistent:
-            # col0 := X, col1 := Z
-            tip_locations_array_fine_mm[:, 0] = x_mm
+            # col0 := transverse coordinate (u), col1 := vertical coordinate (z)
+            tip_locations_array_fine_mm[:, 0] = u_mm
             tip_locations_array_fine_mm[:, 1] = z_mm
+
+            print(
+                f"Physical conversion mode: {conversion_mode} | "
+                f"representative mm/px={pixel_to_mm_scale:.6f}"
+            )
 
             # Optional: save mm data
             df_mm = pd.DataFrame(tip_locations_array_fine_mm)
@@ -2437,7 +2948,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                     {'Parameter': 'Tip_Angle_Equation_R_Squared', 'Value': tip_angle_r2},
                     {'Parameter': 'B_Motor_Min', 'Value': float(np.min(delta_motor))},
                     {'Parameter': 'B_Motor_Max', 'Value': float(np.max(delta_motor))},
-                    {'Parameter': 'Pixel_to_MM_Scale', 'Value': width_in_mm/width_in_pixels},
+                    {'Parameter': 'Pixel_to_MM_Scale', 'Value': pixel_to_mm_scale},
                 ]),
                 'Cubic_Coefficients': pd.DataFrame([
                     {'Coordinate': 'R (signed planar X deflection, r=x)', 'Power': 3, 'Coefficient': r_coefficients[0]},

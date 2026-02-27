@@ -15,7 +15,7 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-02-27_00',
+    project_name='Test_Calibration_2026-02-27_01',
     allow_existing= True,
     add_date=False
 )
@@ -26,8 +26,12 @@ print("Calibration object created!")
 MANUAL_CROP_ADJUSTMENT = True
 THRESHOLD = 200
 PULL_B_START = 0.0
-PULL_B_STEPS = 25
+PULL_B_STEPS = 26
 PULL_B_STEP_SIZE = -0.2
+CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures", "calibration_webcam_20260227_120334.npz")
+# Optional checkerboard image from the same setup to define true vertical + mm/px reference.
+# Set to None to skip board-reference estimation.
+BOARD_REFERENCE_IMAGE = None  # e.g. os.path.join(SCRIPT_DIR, "captures", "checkerboard_reference.png")
 
 
 PROBE_MODE = "middle"  # "middle" | "five"
@@ -44,6 +48,18 @@ elif PROBE_MODE == "five":
     ]
 else:
     raise ValueError(f"Unknown PROBE_MODE: {PROBE_MODE}")
+
+# Optional camera/board calibration load for calibrated vertical/mm conversion.
+if os.path.isfile(CAMERA_CALIBRATION_FILE):
+    cal.load_camera_calibration(CAMERA_CALIBRATION_FILE)
+    if BOARD_REFERENCE_IMAGE is not None:
+        cal.estimate_board_reference_from_image(
+            BOARD_REFERENCE_IMAGE,
+            draw_debug=True,
+            save_debug_path=os.path.join(SCRIPT_DIR, "captures", "checkerboard_reference_debug.png"),
+        )
+else:
+    print(f"[WARN] Camera calibration file not found, continuing without it: {CAMERA_CALIBRATION_FILE}")
 
 # Example usage:
 cal.connect_to_camera(cam_port=0, show_preview=False)

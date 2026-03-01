@@ -1176,10 +1176,10 @@ class CTR_Shadow_Calibration:
                   enable_manual_focus=True):
         """
         Probes at 5 XYZ locations and for each location:
-        - Capture orientation 0 pull (B axis microsteps)
-        - Rotate C by robot_rotation_axis_180_deg
-        - Capture orientation 1 pull
-        - Rotate C back by robot_rotation_axis_180_deg (legacy-style two-orientation capture)
+        - Capture orientation 0 pull at C=0 deg
+        - Capture orientation 1 pull at C=180 deg
+        - Capture orientation 2 pull at C=+90 deg
+        - Capture orientation 3 pull at C=-90 deg
 
         Filenames begin with: "{orientation}_{X}_{B}_..." so downstream processing can parse orientation/X/B,
         while extra suffix tokens avoid overwriting between different Z points.
@@ -1324,6 +1324,25 @@ class CTR_Shadow_Calibration:
 
             self.rrf.send_code("G90")
 
+        def run_pull_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float, probe_idx: int):
+            nonlocal pos, total_images
+            # Baseline at B start
+            print(f" Baseline capture: {robot_rear_axis_name}={b_start:.2f}")
+            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            capture_and_save(orientation_id, x, y, z, b_start, probe_idx, 0)
+            total_images += 1
+
+            # Pull sequence
+            for step_idx in range(1, b_steps + 1):
+                b_val = b_start + step_idx * b_step_size
+                print(f" Step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
+                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
+                capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx)
+                total_images += 1
+
+            # Return B to start
+            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+
         # Track current robot position on relevant axes
         pos = {
             robot_front_axis_name: 0.0,
@@ -1332,7 +1351,7 @@ class CTR_Shadow_Calibration:
             robot_rear_axis_name: 0.0,
         }
 
-        print("Starting probe sequence (legacy rotate behavior)...")
+        print("Starting probe sequence (4-orientation capture: 0/180/+90/-90)...")
         print(f"Probe points (X,Y,Z): {probe_points}")
         print(f"Pull axis: {robot_rear_axis_name} | steps={b_steps} | step_size={b_step_size}mm | start={b_start}mm")
         print(f"Rotation axis: {robot_rotation_axis_name} | 180deg={robot_rotation_axis_180_deg} axis units")
@@ -1363,51 +1382,37 @@ class CTR_Shadow_Calibration:
             print(f" Setting {robot_rear_axis_name} to start ({b_start:.2f})...")
             pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-            # --- Phase 1: orientation 0 ---
-            print(" Phase 1: orientation 0 (no rotation)")
-            # Baseline capture at B start (typically B=0.0)
-            print(f" Baseline capture: {robot_rear_axis_name}={b_start:.2f}")
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-            capture_and_save(0, x, y, z, b_start, probe_idx, 0)
-            total_images += 1
+            # ---- Orientation 0: C = 0 deg ----
+            print(" Phase 1: orientation 0 (C = 0 deg)")
+            run_pull_sequence_for_orientation(0, x, y, z, probe_idx)
 
-            # Pull sequence
-            for step_idx in range(1, b_steps + 1):
-                b_val = b_start + step_idx * b_step_size
-                print(f" Step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
-                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
-                capture_and_save(0, x, y, z, b_val, probe_idx, step_idx)
-                total_images += 1
-
-            # Return B to start
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-
-            # Rotate to orientation 1
-            print(" Rotating to orientation 1...")
+            # ---- Orientation 1: C = +180 deg ----
+            print(" Rotating to orientation 1 (C = 180 deg)...")
             rotate_rel(robot_rotation_axis_name, robot_rotation_axis_180_deg)
+            print(" Phase 2: orientation 1 (C = 180 deg)")
+            run_pull_sequence_for_orientation(1, x, y, z, probe_idx)
 
-            # --- Phase 2: orientation 1 ---
-            print(" Phase 2: orientation 1 (after rotation)")
-            # Baseline capture at B start (typically B=0.0)
-            print(f" Baseline capture: {robot_rear_axis_name}={b_start:.2f}")
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-            capture_and_save(1, x, y, z, b_start, probe_idx, 0)
-            total_images += 1
-
-            # Pull sequence
-            for step_idx in range(1, b_steps + 1):
-                b_val = b_start + step_idx * b_step_size
-                print(f" Step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
-                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
-                capture_and_save(1, x, y, z, b_val, probe_idx, step_idx)
-                total_images += 1
-
-            # Return B to start
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-
-            # Rotate back to orientation 0 (so every probe starts consistent)
-            print(" Rotating back to orientation 0...")
+            # Return to C = 0 before going to +90/-90 for deterministic pathing
+            print(" Rotating back to C = 0 deg...")
             rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
+
+            # ---- Orientation 2: C = +90 deg ----
+            c_quarter = robot_rotation_axis_180_deg / 2.0
+            print(" Rotating to orientation 2 (C = +90 deg)...")
+            rotate_rel(robot_rotation_axis_name, +c_quarter)
+            print(" Phase 3: orientation 2 (C = +90 deg)")
+            run_pull_sequence_for_orientation(2, x, y, z, probe_idx)
+
+            # ---- Orientation 3: C = -90 deg ----
+            # from +90 to -90 is a -180 move
+            print(" Rotating to orientation 3 (C = -90 deg)...")
+            rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
+            print(" Phase 4: orientation 3 (C = -90 deg)")
+            run_pull_sequence_for_orientation(3, x, y, z, probe_idx)
+
+            # Return to C = 0 (from -90 to 0 is +90)
+            print(" Rotating back to C = 0 deg...")
+            rotate_rel(robot_rotation_axis_name, +c_quarter)
 
         print("\n" + "=" * 70)
         print("ALL PROBES FINISHED!")
@@ -1513,6 +1518,7 @@ class CTR_Shadow_Calibration:
         def get_pos_from_file_name(file_name):
             base = os.path.splitext(os.path.basename(file_name))[0]
             parts = base.split("_")
+            # Orientation IDs are numeric and may be 0/1/2/3 (C=0/180/+90/-90 deg).
             orientation = int(parts[0])
             ntnl_pos = float(parts[1])
             ss_pos = float(parts[2])
@@ -2149,6 +2155,11 @@ class CTR_Shadow_Calibration:
             B_PULL_COL = 3
             ANGLE_COL = 5
 
+            unique_oris = np.unique(arr_rot[:, ORI_COL][np.isfinite(arr_rot[:, ORI_COL])]).astype(int)
+            unexpected_oris = [o for o in unique_oris if o not in (0, 1, 2, 3)]
+            if unexpected_oris:
+                print(f"Warning: Unexpected orientation IDs found: {unexpected_oris}")
+
             arr_valid_rows = arr_rot[np.isfinite(arr_rot[:, 0])].copy()
             if arr_valid_rows.size == 0:
                 raise ValueError("No valid X values found in arr_rot to compute planar mirror-line reference.")
@@ -2167,8 +2178,15 @@ class CTR_Shadow_Calibration:
 
             o0 = arr_rot[arr_rot[:, ORI_COL] == 0].copy()
             o1 = arr_rot[arr_rot[:, ORI_COL] == 1].copy()
+            o2 = arr_rot[arr_rot[:, ORI_COL] == 2].copy()  # +90 deg
+            o3 = arr_rot[arr_rot[:, ORI_COL] == 3].copy()  # -90 deg
             if o0.size == 0 or o1.size == 0:
                 raise ValueError("Missing orientation 0 or 1 data; cannot mirror/average X between orientations.")
+            has_offplane_pair = (o2.size > 0 and o3.size > 0)
+            if has_offplane_pair:
+                print("Off-plane ±90 orientation data detected (orientations 2 and 3).")
+            else:
+                print("Off-plane ±90 orientation data not found; skipping off-plane cubic fitting.")
 
             def circular_mean_deg(a):
                 a = np.asarray(a, dtype=float)
@@ -2230,6 +2248,74 @@ class CTR_Shadow_Calibration:
 
             # [X_mm, Z_mm, b_pull, tip_angle_deg]
             tip_locations_final = np.column_stack([avg_x, avg_z, common_b, avg_ang])
+
+            # ---------- Step 6b: Off-plane processing using orientations 2 (+90) and 3 (-90) ----------
+            offplane_tip_locations_final = None  # [Y_offplane_mm, b_pull]
+            y_off_coefficients = None
+            y_off_predicted = None
+            y_off_r2 = float("nan")
+            y_off_equation = None
+
+            # Raw pre-mirroring points for plotting (YZ before mirroring)
+            o2p_raw_plot = None
+            o3p_raw_plot = None
+            y_ref_offplane_mirror_line = None
+            b_ref_offplane_mirror_line_mean = float("nan")
+            b_ref_offplane_mirror_line_min = float("nan")
+            b_ref_offplane_mirror_line_max = float("nan")
+            o2p = None
+            o3p = None
+
+            if has_offplane_pair:
+                o2c = collapse_by_bpull(o2)
+                o3c = collapse_by_bpull(o3)
+
+                b2 = o2c[:, B_PULL_COL]
+                b3 = o3c[:, B_PULL_COL]
+                common_b_off = np.intersect1d(b2, b3)
+
+                if common_b_off.size == 0:
+                    print("Warning: No matching b_pull values between orientations 2 and 3; skipping off-plane fit.")
+                else:
+                    idx2 = np.searchsorted(b2, common_b_off)
+                    idx3 = np.searchsorted(b3, common_b_off)
+                    o2p = o2c[idx2].copy()
+                    o3p = o3c[idx3].copy()
+
+                    # Save raw paired points for plotting before mirroring
+                    o2p_raw_plot = o2p.copy()
+                    o3p_raw_plot = o3p.copy()
+
+                    if common_b_off.shape != common_b.shape or not np.allclose(common_b_off, common_b):
+                        print("Warning: common_b for off-plane pair differs from planar common_b (non-fatal).")
+
+                    # Off-plane mirror line from unmirrored ±90 data.
+                    arr_off_valid = np.vstack([o2, o3])
+                    arr_off_valid = arr_off_valid[np.isfinite(arr_off_valid[:, 0])]
+                    if arr_off_valid.size > 0:
+                        y_ref_offplane_mirror_line = float(np.mean(arr_off_valid[:, 0]))
+                        b_ref_offplane_mirror_line_mean = float(np.mean(arr_off_valid[:, B_PULL_COL]))
+                        b_ref_offplane_mirror_line_min = float(np.min(arr_off_valid[:, B_PULL_COL]))
+                        b_ref_offplane_mirror_line_max = float(np.max(arr_off_valid[:, B_PULL_COL]))
+                    else:
+                        y_ref_offplane_mirror_line = 0.0
+
+                    # Mirror orientation 3 around off-plane mirror line
+                    o3_y_mirrored = (2.0 * y_ref_offplane_mirror_line) - o3p[:, 0]
+                    avg_y_off_raw = (o2p[:, 0] + o3_y_mirrored) / 2.0
+
+                    # Neglect ±90 Z values by design for off-plane fitting.
+                    offplane_tip_locations_final = np.column_stack([avg_y_off_raw, common_b_off])
+
+                    print("After off-plane orientation mirroring/averaging (±90 pair):")
+                    print(f"  Y_off raw range: {offplane_tip_locations_final[:,0].min():.3f} to {offplane_tip_locations_final[:,0].max():.3f} mm")
+                    print(f"  b_pull range: {offplane_tip_locations_final[:,1].min():.3f} to {offplane_tip_locations_final[:,1].max():.3f}")
+                    print(
+                        "  Off-plane mirror line from unmirrored ±90 data: "
+                        f"Y_ref={y_ref_offplane_mirror_line:.6f} mm, "
+                        f"B range=[{b_ref_offplane_mirror_line_min:.6f}, {b_ref_offplane_mirror_line_max:.6f}], "
+                        f"B mean={b_ref_offplane_mirror_line_mean:.6f}"
+                    )
 
             print("After orientation X mirroring/averaging (current frame):")
             print(f"X range: {tip_locations_final[:, 0].min():.3f} to {tip_locations_final[:, 0].max():.3f} mm")
@@ -2308,6 +2394,23 @@ class CTR_Shadow_Calibration:
             # Axial coordinate for fitting/plots (re-referenced)
             z_coords = z_avg.copy()
 
+            # Off-plane coordinate (from ±90 mirrored pair), referenced to the ±90 mirror line.
+            y_off_coords = None
+            delta_motor_off = None
+            y0_off_ref = None  # deprecated: off-plane is no longer B=0 referenced
+
+            if offplane_tip_locations_final is not None:
+                # columns: [Y_off_raw_mm, b_pull]
+                y_off_raw = offplane_tip_locations_final[:, 0].copy()
+                delta_motor_off = offplane_tip_locations_final[:, 1].copy()
+
+                y_off_coords = y_off_raw - float(y_ref_offplane_mirror_line)
+
+                print("Off-plane coordinate reference:")
+                print(f"  y_ref_offplane_mirror_line = {float(y_ref_offplane_mirror_line):.6f} mm")
+                print("  Off-plane Y is referenced to the ±90 Y-proxy mirror line (not B=0).")
+                print(f"  Y_off referenced range: {y_off_coords.min():.3f} to {y_off_coords.max():.3f} mm")
+
             if save_plots:
                 # Referenced X/Z plot for simplified trajectory
                 plt.figure(figsize=(10, 8))
@@ -2340,15 +2443,30 @@ class CTR_Shadow_Calibration:
             print("r = f(B_motor) - signed planar transverse deflection (r = x) as function of B-axis translation")
             print("z = f(B_motor) - axial position as function of B-axis translation")
 
+            def fit_cubic_or_none(x_vals, y_vals, label):
+                x_vals = np.asarray(x_vals, dtype=float).ravel()
+                y_vals = np.asarray(y_vals, dtype=float).ravel()
+                valid = np.isfinite(x_vals) & np.isfinite(y_vals)
+                x_use = x_vals[valid]
+                y_use = y_vals[valid]
+                if x_use.size < 4:
+                    print(f"Warning: Need at least 4 valid points for {label} cubic fit. Found {x_use.size}; skipping.")
+                    return None, None
+                coeffs = np.polyfit(x_use, y_use, 3)
+                pred = np.polyval(coeffs, x_use)
+                return coeffs, pred
+
             # Fit cubic polynomial for r-coordinate
-            r_coefficients = np.polyfit(delta_motor, r_coords, 3)
-            r_polynomial = np.poly1d(r_coefficients)
-            r_predicted = r_polynomial(delta_motor)
+            r_coefficients, r_predicted_valid = fit_cubic_or_none(delta_motor, r_coords, "R-coordinate")
+            if r_coefficients is None:
+                raise ValueError("Insufficient points for planar R cubic fit.")
+            r_predicted = np.polyval(r_coefficients, delta_motor)
 
             # Fit cubic polynomial for z-coordinate
-            z_coefficients = np.polyfit(delta_motor, z_coords, 3)
-            z_polynomial = np.poly1d(z_coefficients)
-            z_predicted = z_polynomial(delta_motor)
+            z_coefficients, z_predicted_valid = fit_cubic_or_none(delta_motor, z_coords, "Z-coordinate")
+            if z_coefficients is None:
+                raise ValueError("Insufficient points for axial Z cubic fit.")
+            z_predicted = np.polyval(z_coefficients, delta_motor)
 
             tip_angle_coefficients = None
             tip_angle_predicted = None
@@ -2356,9 +2474,15 @@ class CTR_Shadow_Calibration:
             tip_angle_equation = None
 
             if has_tip_angle and np.all(np.isfinite(tip_angle_avg)):
-                tip_angle_coefficients = np.polyfit(delta_motor, tip_angle_avg, 3)
-                tip_angle_polynomial = np.poly1d(tip_angle_coefficients)
-                tip_angle_predicted = tip_angle_polynomial(delta_motor)
+                tip_angle_coefficients, _ = fit_cubic_or_none(delta_motor, tip_angle_avg, "tip-angle")
+                if tip_angle_coefficients is not None:
+                    tip_angle_predicted = np.polyval(tip_angle_coefficients, delta_motor)
+
+            # Fit cubic polynomial for off-plane coordinate (if available)
+            if y_off_coords is not None and delta_motor_off is not None:
+                y_off_coefficients, _ = fit_cubic_or_none(delta_motor_off, y_off_coords, "off-plane Y")
+                if y_off_coefficients is not None:
+                    y_off_predicted = np.polyval(y_off_coefficients, delta_motor_off)
 
             # Calculate R² scores
             def r2_score_safe(y_true, y_pred):
@@ -2374,12 +2498,16 @@ class CTR_Shadow_Calibration:
 
             if tip_angle_predicted is not None:
                 tip_angle_r2 = r2_score_safe(tip_angle_avg, tip_angle_predicted)
+            if y_off_predicted is not None:
+                y_off_r2 = r2_score_safe(y_off_coords, y_off_predicted)
 
             print(f"\nCubic polynomial fit results:")
             print(f"R-coordinate (signed planar X deflection) R² score: {r_r2:.6f}")
             print(f"Z-coordinate R² score: {z_r2:.6f}")
             if tip_angle_predicted is not None:
                 print(f"Tip-angle R² score: {tip_angle_r2:.6f}")
+            if y_off_predicted is not None:
+                print(f"Off-plane coordinate R² score: {y_off_r2:.6f}")
 
             # Create polynomial equation strings
             def format_cubic_equation(coeffs, var_name):
@@ -2404,12 +2532,16 @@ class CTR_Shadow_Calibration:
             z_equation = format_cubic_equation(z_coefficients, "z")
             if tip_angle_coefficients is not None:
                 tip_angle_equation = format_cubic_equation(tip_angle_coefficients, "tip_angle_deg")
+            if y_off_coefficients is not None:
+                y_off_equation = format_cubic_equation(y_off_coefficients, "y_offplane_mm")
 
             print(f"\nCubic equations:")
             print(f"R: {r_equation}")
             print(f"Z: {z_equation}")
             if tip_angle_equation is not None:
                 print(f"Tip angle: {tip_angle_equation}")
+            if y_off_equation is not None:
+                print(f"Off-plane Y: {y_off_equation}")
 
             # Create comprehensive results DataFrame
             coefficients_data = []
@@ -2440,6 +2572,14 @@ class CTR_Shadow_Calibration:
                         'Coefficient': coef,
                         'Description': f'Coefficient for {power} term in tip-angle equation'
                     })
+            if y_off_coefficients is not None:
+                for power, coef in zip(['b^3', 'b^2', 'b^1', 'b^0'], y_off_coefficients):
+                    coefficients_data.append({
+                        'Coordinate': 'Off-plane Y (from ±90 mirrored pair)',
+                        'Term': power,
+                        'Coefficient': coef,
+                        'Description': f'Coefficient for {power} term in off-plane transverse displacement equation (±90 views, mirrored/averaged, mirror-line referenced)'
+                    })
 
             df_coefficients = pd.DataFrame(coefficients_data)
 
@@ -2458,6 +2598,12 @@ class CTR_Shadow_Calibration:
                     {'Metric': 'Max_Tip_Angle_Error_deg', 'Value': np.max(np.abs(tip_angle_predicted - tip_angle_avg)), 'Description': 'Maximum absolute tip-angle prediction error'},
                     {'Metric': 'Mean_Tip_Angle_Error_deg', 'Value': np.mean(np.abs(tip_angle_predicted - tip_angle_avg)), 'Description': 'Mean absolute tip-angle prediction error'},
                 ])
+            if y_off_predicted is not None:
+                fit_info_data.extend([
+                    {'Metric': 'Offplane_Y_R_squared', 'Value': y_off_r2, 'Description': 'R² score for off-plane displacement fit from ±90 mirrored pair (mirror-line referenced)'},
+                    {'Metric': 'Max_Offplane_Y_Error', 'Value': np.max(np.abs(y_off_predicted - y_off_coords)), 'Description': 'Maximum absolute error in off-plane displacement prediction'},
+                    {'Metric': 'Mean_Offplane_Y_Error', 'Value': np.mean(np.abs(y_off_predicted - y_off_coords)), 'Description': 'Mean absolute error in off-plane displacement prediction'},
+                ])
             df_fit_info = pd.DataFrame(fit_info_data)
 
             # Create equations DataFrame
@@ -2467,14 +2613,16 @@ class CTR_Shadow_Calibration:
             ]
             if tip_angle_equation is not None:
                 equations_data.append({'Coordinate': 'Tip angle (deg vs vertical)', 'Cubic_Equation': tip_angle_equation})
+            if y_off_equation is not None:
+                equations_data.append({'Coordinate': 'Off-plane Y (from ±90 mirrored pair)', 'Cubic_Equation': y_off_equation})
             df_equations = pd.DataFrame(equations_data)
 
             # Plotting
             if save_plots:
-                plt.figure(figsize=(15, 10))
+                plt.figure(figsize=(18, 14))
 
                 # Plot 1: Referenced X,Z trajectory
-                plt.subplot(2, 3, 1)
+                plt.subplot(3, 3, 1)
                 plt.plot(x_avg, z_avg, 'o-', linewidth=2, markersize=6)
                 plt.xlabel('X transverse deflection (mm, ref. B=0)')
                 plt.ylabel('Z axial position (mm, ref. B=0)')
@@ -2483,7 +2631,7 @@ class CTR_Shadow_Calibration:
                 plt.grid(True, alpha=0.3)
 
                 # Plot 2: Planar bending coordinates (r = x, z)
-                plt.subplot(2, 3, 2)
+                plt.subplot(3, 3, 2)
                 plt.plot(r_coords, z_coords, 'o-', linewidth=2, markersize=6, color='green')
                 plt.xlabel('R = X (signed transverse deflection, mm)')
                 plt.ylabel('Z (axial) Position (mm)')
@@ -2491,7 +2639,7 @@ class CTR_Shadow_Calibration:
                 plt.grid(True, alpha=0.3)
 
                 # Plot 3: R vs B Motor
-                plt.subplot(2, 3, 3)
+                plt.subplot(3, 3, 3)
                 plt.plot(delta_motor, r_coords, 'o', linewidth=2, markersize=6, label='Measured')
                 plt.plot(delta_motor, r_predicted, 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
                 plt.xlabel('B Motor Position')
@@ -2501,7 +2649,7 @@ class CTR_Shadow_Calibration:
                 plt.legend()
 
                 # Plot 4: Z vs B Motor
-                plt.subplot(2, 3, 4)
+                plt.subplot(3, 3, 4)
                 plt.plot(delta_motor, z_coords, 'o', linewidth=2, markersize=6, label='Measured')
                 plt.plot(delta_motor, z_predicted, 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
                 plt.xlabel('B Motor Position')
@@ -2511,7 +2659,7 @@ class CTR_Shadow_Calibration:
                 plt.legend()
 
                 # Plot 5: Residuals for R (planar X deflection)
-                plt.subplot(2, 3, 5)
+                plt.subplot(3, 3, 5)
                 r_residuals = r_coords - r_predicted
                 plt.plot(delta_motor, r_residuals, 'o-', linewidth=2, markersize=6, color='purple')
                 plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
@@ -2521,7 +2669,7 @@ class CTR_Shadow_Calibration:
                 plt.grid(True, alpha=0.3)
 
                 # Plot 6: Residuals for Z
-                plt.subplot(2, 3, 6)
+                plt.subplot(3, 3, 6)
                 z_residuals = z_coords - z_predicted
                 plt.plot(delta_motor, z_residuals, 'o-', linewidth=2, markersize=6, color='orange')
                 plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
@@ -2529,6 +2677,73 @@ class CTR_Shadow_Calibration:
                 plt.ylabel('Z Residuals (mm)')
                 plt.title('Axial Fit Residuals')
                 plt.grid(True, alpha=0.3)
+
+                # Plot 7: Tip angle vs B (cubic fit)
+                plt.subplot(3, 3, 7)
+                if tip_angle_predicted is not None:
+                    sort_idx_ang = np.argsort(delta_motor)
+                    plt.plot(delta_motor[sort_idx_ang], tip_angle_avg[sort_idx_ang], 'o', markersize=6, label='Measured')
+                    plt.plot(delta_motor[sort_idx_ang], tip_angle_predicted[sort_idx_ang], 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
+                    plt.xlabel('B Motor Position')
+                    plt.ylabel('Tip Angle vs Vertical (deg)')
+                    plt.title(f'Tip Angle Cubic Fit (R² = {tip_angle_r2:.4f})')
+                    plt.grid(True, alpha=0.3)
+                    plt.legend()
+                else:
+                    plt.text(0.5, 0.5, 'Tip angle fit unavailable', ha='center', va='center', transform=plt.gca().transAxes)
+                    plt.title('Tip Angle Cubic Fit')
+                    plt.grid(True, alpha=0.3)
+
+                # Plot 8: Off-plane Y vs B (from ±90 pair)
+                plt.subplot(3, 3, 8)
+                if y_off_predicted is not None and y_off_coords is not None and delta_motor_off is not None:
+                    sort_idx_off = np.argsort(delta_motor_off)
+                    plt.plot(delta_motor_off[sort_idx_off], y_off_coords[sort_idx_off], 'o', markersize=6, label='Measured')
+                    plt.plot(delta_motor_off[sort_idx_off], y_off_predicted[sort_idx_off], 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
+                    plt.xlabel('B Motor Position')
+                    plt.ylabel('Off-plane Y (mm, ref.)')
+                    plt.title(f'Off-plane Cubic Fit (R² = {y_off_r2:.4f})')
+                    plt.grid(True, alpha=0.3)
+                    plt.legend()
+                else:
+                    plt.text(0.5, 0.5, 'Off-plane ±90 fit unavailable', ha='center', va='center', transform=plt.gca().transAxes)
+                    plt.title('Off-plane Cubic Fit')
+                    plt.grid(True, alpha=0.3)
+
+                # Plot 9: Raw pre-mirroring points in XZ and YZ with mirror lines
+                ax9 = plt.subplot(3, 3, 9)
+                ax9.axis('off')
+                ax9.set_title('Raw Pre-mirroring Trajectories (XZ / YZ)')
+
+                # Left mini-axis: XZ before mirroring (orientations 0 and 1)
+                left = ax9.inset_axes([0.02, 0.08, 0.46, 0.82])
+                if o0p is not None and o1p is not None:
+                    left.plot(o0p[:, 0], o0p[:, 1], 'o-', markersize=4, label='Ori 0 (C=0°)')
+                    left.plot(o1p[:, 0], o1p[:, 1], 'o-', markersize=4, label='Ori 1 (C=180°)')
+                    left.axvline(x=x_ref_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
+                    left.set_xlabel('X (mm)')
+                    left.set_ylabel('Z (mm)')
+                    left.set_title('XZ before mirroring', fontsize=9)
+                    left.grid(True, alpha=0.3)
+                    left.legend(fontsize=7)
+                else:
+                    left.text(0.5, 0.5, 'XZ data unavailable', ha='center', va='center', transform=left.transAxes)
+                    left.set_title('XZ before mirroring', fontsize=9)
+
+                # Right mini-axis: YZ before mirroring from ±90 pair.
+                right = ax9.inset_axes([0.52, 0.08, 0.46, 0.82])
+                if o2p_raw_plot is not None and o3p_raw_plot is not None and y_ref_offplane_mirror_line is not None:
+                    right.plot(o2p_raw_plot[:, 0], o2p_raw_plot[:, 1], 'o-', markersize=4, label='Ori 2 (C=+90°)')
+                    right.plot(o3p_raw_plot[:, 0], o3p_raw_plot[:, 1], 'o-', markersize=4, label='Ori 3 (C=-90°)')
+                    right.axvline(x=y_ref_offplane_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
+                    right.set_xlabel('Y proxy (mm)')
+                    right.set_ylabel('Z (mm)')
+                    right.set_title('YZ before mirroring (±90)', fontsize=9)
+                    right.grid(True, alpha=0.3)
+                    right.legend(fontsize=7)
+                else:
+                    right.text(0.5, 0.5, 'YZ ±90 data unavailable', ha='center', va='center', transform=right.transAxes)
+                    right.set_title('YZ before mirroring (±90)', fontsize=9)
 
                 plt.tight_layout()
                 plt.savefig("10_polar_cubic_fits.png", dpi=150, bbox_inches='tight')
@@ -2585,8 +2800,27 @@ class CTR_Shadow_Calibration:
                 })
                 df_validation.to_excel(writer, sheet_name='Validation', index=False)
 
+                if y_off_coords is not None and delta_motor_off is not None:
+                    df_offplane_raw = pd.DataFrame({
+                        'B_Pull': delta_motor_off,
+                        'Offplane_Y_mm_ref_mirrorline': y_off_coords,
+                        'Offplane_Y_mm_raw_avg': offplane_tip_locations_final[:, 0] if offplane_tip_locations_final is not None else np.nan,
+                        'Y_ref_offplane_mirror_line_mm': np.full_like(delta_motor_off, y_ref_offplane_mirror_line, dtype=float),
+                    })
+                    df_offplane_raw.to_excel(writer, sheet_name='Offplane_Raw', index=False)
+
+                    df_offplane_validation = pd.DataFrame({
+                        'B_Pull': delta_motor_off,
+                        'Actual_Offplane_Y_mm_ref_mirrorline': y_off_coords,
+                        'Predicted_Offplane_Y_mm_ref_mirrorline': y_off_predicted if y_off_predicted is not None else np.full_like(delta_motor_off, np.nan, dtype=float),
+                        'Offplane_Y_Error': (y_off_predicted - y_off_coords) if y_off_predicted is not None else np.full_like(delta_motor_off, np.nan, dtype=float),
+                    })
+                    df_offplane_validation.to_excel(writer, sheet_name='Offplane_Validation', index=False)
+
             print(f"\nCubic polar coefficients saved to: {excel_filename}")
-            print(f"Excel file contains 5 sheets: Cubic_Coefficients, Fit_Quality, Equations, Raw_Data, and Validation")
+            print("Excel file contains base sheets: Cubic_Coefficients, Fit_Quality, Equations, Raw_Data, Validation")
+            if y_off_coords is not None and delta_motor_off is not None:
+                print("Additional sheets added: Offplane_Raw, Offplane_Validation")
 
             # Save coefficients as numpy arrays
             np.save(f"{robot_name}_r_cubic_coefficients.npy", r_coefficients)
@@ -2597,6 +2831,9 @@ class CTR_Shadow_Calibration:
             if tip_angle_coefficients is not None:
                 np.save(f"{robot_name}_tip_angle_cubic_coefficients.npy", tip_angle_coefficients)
                 print(f"Tip-angle cubic coefficients saved to: {robot_name}_tip_angle_cubic_coefficients.npy")
+            if y_off_coefficients is not None:
+                np.save(f"{robot_name}_offplane_y_cubic_coefficients.npy", y_off_coefficients)
+                print(f"Off-plane Y cubic coefficients saved to: {robot_name}_offplane_y_cubic_coefficients.npy")
 
             # Save the cubic model data
             cubic_model_data = {
@@ -2606,11 +2843,14 @@ class CTR_Shadow_Calibration:
                 'z_r2': z_r2,
                 'b_motor_range': [float(np.min(delta_motor)), float(np.max(delta_motor))],
                 'r_equation': r_equation,
-                'r_definition': 'signed planar transverse deflection in strict planar bending calibration (r = x in the B0-referenced frame)',
+                'r_definition': 'signed planar transverse deflection in strict planar bending calibration (r = x referenced to the planar X mirror line)',
                 'z_equation': z_equation,
                 'tip_angle_coefficients': tip_angle_coefficients,
                 'tip_angle_r2': tip_angle_r2,
                 'tip_angle_equation': tip_angle_equation,
+                'offplane_y_coefficients': y_off_coefficients,
+                'offplane_y_r2': y_off_r2,
+                'offplane_y_equation': y_off_equation,
                 'reference_point': {
                     'b_ref': float(delta_motor[zero_idx]),
                     'x0_ref_mm': x0_ref,
@@ -2619,7 +2859,12 @@ class CTR_Shadow_Calibration:
                     'radial_reference_b_min_mm': b_ref_mirror_line_min,
                     'radial_reference_b_max_mm': b_ref_mirror_line_max,
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored X across all measured B values and both orientations in the current frame'
+                    'offplane_reference_b_mean_mm': b_ref_offplane_mirror_line_mean if np.isfinite(b_ref_offplane_mirror_line_mean) else None,
+                    'offplane_reference_b_min_mm': b_ref_offplane_mirror_line_min if np.isfinite(b_ref_offplane_mirror_line_min) else None,
+                    'offplane_reference_b_max_mm': b_ref_offplane_mirror_line_max if np.isfinite(b_ref_offplane_mirror_line_max) else None,
+                    'y_ref_offplane_mirror_line_mm': y_ref_offplane_mirror_line if y_ref_offplane_mirror_line is not None else None,
+                    'offplane_zero_point_offset_mm': None,
+                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); planar radial r is signed planar transverse deflection (r=x) referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations); off-plane y is referenced to the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate).'
                 }
             }
             with open(f"{robot_name}_cubic_polar_calibration.pkl", "wb") as f:
@@ -2627,6 +2872,7 @@ class CTR_Shadow_Calibration:
             print(f"Complete cubic model saved to: {robot_name}_cubic_polar_calibration.pkl")
 
             tip_angle_coeffs_list = tip_angle_coefficients.tolist() if tip_angle_coefficients is not None else None
+            y_off_coeffs_list = y_off_coefficients.tolist() if y_off_coefficients is not None else None
 
             # Create prediction functions
             def predict_tip_position(b_motor_pos):
@@ -2650,6 +2896,13 @@ class CTR_Shadow_Calibration:
                 b_motor = np.atleast_1d(b_motor_pos)
                 return np.polyval(tip_angle_coefficients, b_motor)
 
+            def predict_offplane_y(b_motor_pos):
+                """Predict off-plane transverse displacement from ±90 mirrored-pair calibration."""
+                if y_off_coefficients is None:
+                    return None
+                b_motor = np.atleast_1d(b_motor_pos)
+                return np.polyval(y_off_coefficients, b_motor)
+
             def predict_tip_position_cartesian(b_motor_pos):
                 """
                 Predict tip position in Cartesian coordinates given B motor position.
@@ -2671,6 +2924,7 @@ class CTR_Shadow_Calibration:
 r_coefficients = {r_coefficients.tolist()}
 z_coefficients = {z_coefficients.tolist()}
 tip_angle_coefficients = {tip_angle_coeffs_list}
+offplane_y_coefficients = {y_off_coeffs_list}
 
 def predict_tip_position(b_motor_pos):
     """
@@ -2702,6 +2956,16 @@ def predict_tip_angle(b_motor_pos):
     b_motor = np.atleast_1d(b_motor_pos)
     return np.polyval(tip_angle_coefficients, b_motor)
 
+def predict_offplane_y(b_motor_pos):
+    """
+    Predict off-plane transverse displacement (from ±90 mirrored-pair calibration) vs B motor position.
+    Returns None if off-plane calibration is unavailable.
+    """
+    if offplane_y_coefficients is None:
+        return None
+    b_motor = np.atleast_1d(b_motor_pos)
+    return np.polyval(offplane_y_coefficients, b_motor)
+
 def predict_tip_position_cartesian(b_motor_pos):
     """
     Predict tip position in Cartesian coordinates given B motor position.
@@ -2722,6 +2986,7 @@ def predict_tip_position_cartesian(b_motor_pos):
 # r, z = predict_tip_position(-1.2)           # Predict planar coordinates (r=x, z)
 # x, y = predict_tip_position_cartesian(-1.2) # Predict Cartesian coordinates
 # angle_deg = predict_tip_angle(-1.2)
+# y_off = predict_offplane_y(-1.2)
 '''
             with open(f"{robot_name}_cubic_prediction_functions.py", "w") as f:
                 f.write(function_code)
@@ -2734,6 +2999,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             print(f"Axial equation R² score: {z_r2:.6f}")
             if tip_angle_equation is not None:
                 print(f"Tip-angle equation R² score: {tip_angle_r2:.6f}")
+            if y_off_equation is not None:
+                print(f"Off-plane equation R² score: {y_off_r2:.6f}")
             print(f"B motor fit range: {float(np.min(delta_motor)):.6f} to {float(np.max(delta_motor)):.6f}")
 
             print(f"\nCubic equations fitted:")
@@ -2741,6 +3008,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             print(f"Z: {z_equation}")
             if tip_angle_equation is not None:
                 print(f"Tip angle: {tip_angle_equation}")
+            if y_off_equation is not None:
+                print(f"Off-plane Y: {y_off_equation}")
 
             print(f"\nSaved files:")
             print(f" - {robot_name}_cubic_polar_calibration.pkl (complete model)")
@@ -2751,6 +3020,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             if tip_angle_equation is not None:
                 print(f" - {robot_name}_tip_angle_cubic_coefficients.npy")
                 print(f" - 11_tip_angle_vs_b_pull.png")
+            if y_off_equation is not None:
+                print(f" - {robot_name}_offplane_y_cubic_coefficients.npy")
 
             # Step 9: Save final results
             print("Saving final calibration results...")
@@ -2763,11 +3034,14 @@ def predict_tip_position_cartesian(b_motor_pos):
                 'z_r2': z_r2,
                 'b_motor_range': [float(np.min(delta_motor)), float(np.max(delta_motor))],
                 'r_equation': r_equation,
-                'r_definition': 'signed planar transverse deflection in strict planar bending calibration (r = x in the B0-referenced frame)',
+                'r_definition': 'signed planar transverse deflection in strict planar bending calibration (r = x referenced to the planar X mirror line)',
                 'z_equation': z_equation,
                 'tip_angle_coefficients': tip_angle_coefficients,
                 'tip_angle_r2': tip_angle_r2,
                 'tip_angle_equation': tip_angle_equation,
+                'offplane_y_coefficients': y_off_coefficients,
+                'offplane_y_r2': y_off_r2,
+                'offplane_y_equation': y_off_equation,
                 'reference_point': {
                     'b_ref': float(delta_motor[zero_idx]),
                     'x0_ref_mm': x0_ref,
@@ -2776,7 +3050,12 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'radial_reference_b_min_mm': b_ref_mirror_line_min,
                     'radial_reference_b_max_mm': b_ref_mirror_line_max,
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored X across all measured B values and both orientations in the current frame'
+                    'offplane_reference_b_mean_mm': b_ref_offplane_mirror_line_mean if np.isfinite(b_ref_offplane_mirror_line_mean) else None,
+                    'offplane_reference_b_min_mm': b_ref_offplane_mirror_line_min if np.isfinite(b_ref_offplane_mirror_line_min) else None,
+                    'offplane_reference_b_max_mm': b_ref_offplane_mirror_line_max if np.isfinite(b_ref_offplane_mirror_line_max) else None,
+                    'y_ref_offplane_mirror_line_mm': y_ref_offplane_mirror_line if y_ref_offplane_mirror_line is not None else None,
+                    'offplane_zero_point_offset_mm': None,
+                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); planar radial r is signed planar transverse deflection (r=x) referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations); off-plane y is referenced to the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate).'
                 }
             }
             with open(f"{robot_name}_cubic_calibration.pkl", "wb") as f:
@@ -2805,6 +3084,12 @@ def predict_tip_position_cartesian(b_motor_pos):
                 b_motor = np.atleast_1d(b_motor_pos)
                 return np.polyval(tip_angle_coefficients, b_motor)
 
+            def predict_offplane_y_from_b(b_motor_pos):
+                if y_off_coefficients is None:
+                    return None
+                b_motor = np.atleast_1d(b_motor_pos)
+                return np.polyval(y_off_coefficients, b_motor)
+
             def predict_cartesian_from_b(b_motor_pos):
                 """
                 Predict tip position in Cartesian coordinates given B motor position.
@@ -2826,11 +3111,13 @@ def predict_tip_position_cartesian(b_motor_pos):
             r_coefficients = {r_coefficients.tolist()}
             z_coefficients = {z_coefficients.tolist()}
             tip_angle_coefficients = {tip_angle_coeffs_list}
+            offplane_y_coefficients = {y_off_coeffs_list}
 
             # Cubic equations:
             # R: {r_equation}
             # Z: {z_equation}
             # Tip Angle: {tip_angle_equation if tip_angle_equation is not None else "N/A"}
+            # Off-plane Y: {y_off_equation if y_off_equation is not None else "N/A"}
 
             def predict_tip_position_from_b(b_motor_pos):
                 """
@@ -2858,6 +3145,16 @@ def predict_tip_position_cartesian(b_motor_pos):
                 b_motor = np.atleast_1d(b_motor_pos)
                 return np.polyval(tip_angle_coefficients, b_motor)
 
+            def predict_offplane_y_from_b(b_motor_pos):
+                """
+                Predict off-plane transverse displacement (from ±90 mirrored-pair calibration) vs B motor position.
+                Returns None if off-plane calibration is unavailable.
+                """
+                if offplane_y_coefficients is None:
+                    return None
+                b_motor = np.atleast_1d(b_motor_pos)
+                return np.polyval(offplane_y_coefficients, b_motor)
+
             def predict_cartesian_from_b(b_motor_pos):
                 """
                 Predict tip position in Cartesian coordinates given B motor position.
@@ -2884,10 +3181,14 @@ def predict_tip_position_cartesian(b_motor_pos):
             def predict_tip_angle_from_delta(delta_motor_pos):
                 return predict_tip_angle_from_b(delta_motor_pos)
 
+            def predict_offplane_y_from_delta(delta_motor_pos):
+                return predict_offplane_y_from_b(delta_motor_pos)
+
             # Example usage:
             # r, z = predict_tip_position_from_b(-1.2)
             # x, y = predict_cartesian_from_b(-1.2)
             # angle_deg = predict_tip_angle_from_b(-1.2)
+            # y_off = predict_offplane_y_from_b(-1.2)
             '''
             with open(f"{robot_name}_cubic_prediction_functions.py", "w") as f:
                 f.write(function_code)
@@ -2898,6 +3199,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             np.save(f"{robot_name}_z_cubic_coefficients.npy", z_coefficients)
             if tip_angle_coefficients is not None:
                 np.save(f"{robot_name}_tip_angle_cubic_coefficients.npy", tip_angle_coefficients)
+            if y_off_coefficients is not None:
+                np.save(f"{robot_name}_offplane_y_cubic_coefficients.npy", y_off_coefficients)
 
             print(f"Cubic coefficients saved to {robot_name}_r_cubic_coefficients.npy and {robot_name}_z_cubic_coefficients.npy")
 
@@ -2909,6 +3212,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             print(f"Axial fit R² score: {z_r2:.6f}")
             if tip_angle_equation is not None:
                 print(f"Tip-angle fit R² score: {tip_angle_r2:.6f}")
+            if y_off_equation is not None:
+                print(f"Off-plane fit R² score: {y_off_r2:.6f}")
             print(f"B motor fit range: {float(np.min(delta_motor)):.6f} to {float(np.max(delta_motor)):.6f}")
 
             print(f"\nSaved files:")
@@ -2920,6 +3225,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             if tip_angle_equation is not None:
                 print(f" - {robot_name}_tip_angle_cubic_coefficients.npy")
                 print(f" - 11_tip_angle_vs_b_pull.png")
+            if y_off_equation is not None:
+                print(f" - {robot_name}_offplane_y_cubic_coefficients.npy")
 
             # Print the cubic equations for reference
             print(f"\nCubic equations fitted:")
@@ -2927,6 +3234,8 @@ def predict_tip_position_cartesian(b_motor_pos):
             print(f"Axial: {z_equation}")
             if tip_angle_equation is not None:
                 print(f"Tip angle: {tip_angle_equation}")
+            if y_off_equation is not None:
+                print(f"Off-plane Y: {y_off_equation}")
 
             # Print ready-to-use function example
             print(f"\nReady-to-use functions:")
@@ -2939,6 +3248,7 @@ def predict_tip_position_cartesian(b_motor_pos):
             print("# r, z = predict_tip_position_from_b(-1.2)")
             print("# x, y = predict_cartesian_from_b(-1.2)")
             print("# angle_deg = predict_tip_angle_from_b(-1.2)")
+            print("# y_off = predict_offplane_y_from_b(-1.2)")
 
             # Step 10: Export calibration data for G-code generation
             print("Exporting calibration data for G-code generation...")
@@ -2951,6 +3261,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                     {'Parameter': 'R_Equation_R_Squared', 'Value': r_r2},
                     {'Parameter': 'Z_Equation_R_Squared', 'Value': z_r2},
                     {'Parameter': 'Tip_Angle_Equation_R_Squared', 'Value': tip_angle_r2},
+                    {'Parameter': 'Offplane_Y_Equation_R_Squared', 'Value': y_off_r2},
                     {'Parameter': 'B_Motor_Min', 'Value': float(np.min(delta_motor))},
                     {'Parameter': 'B_Motor_Max', 'Value': float(np.max(delta_motor))},
                     {'Parameter': 'Pixel_to_MM_Scale', 'Value': pixel_to_mm_scale},
@@ -2968,6 +3279,10 @@ def predict_tip_position_cartesian(b_motor_pos):
                     {'Coordinate': 'Tip_Angle_deg', 'Power': 2, 'Coefficient': tip_angle_coefficients[1] if tip_angle_coefficients is not None else np.nan},
                     {'Coordinate': 'Tip_Angle_deg', 'Power': 1, 'Coefficient': tip_angle_coefficients[2] if tip_angle_coefficients is not None else np.nan},
                     {'Coordinate': 'Tip_Angle_deg', 'Power': 0, 'Coefficient': tip_angle_coefficients[3] if tip_angle_coefficients is not None else np.nan},
+                    {'Coordinate': 'Offplane_Y_mm', 'Power': 3, 'Coefficient': y_off_coefficients[0] if y_off_coefficients is not None else np.nan},
+                    {'Coordinate': 'Offplane_Y_mm', 'Power': 2, 'Coefficient': y_off_coefficients[1] if y_off_coefficients is not None else np.nan},
+                    {'Coordinate': 'Offplane_Y_mm', 'Power': 1, 'Coefficient': y_off_coefficients[2] if y_off_coefficients is not None else np.nan},
+                    {'Coordinate': 'Offplane_Y_mm', 'Power': 0, 'Coefficient': y_off_coefficients[3] if y_off_coefficients is not None else np.nan},
                 ]),
                 'Working_Ranges': pd.DataFrame([
                     {'Parameter': 'B_Motor_Min', 'Value': delta_motor.min()},
@@ -2978,6 +3293,8 @@ def predict_tip_position_cartesian(b_motor_pos):
                     {'Parameter': 'Z_Max_mm', 'Value': z_coords.max()},
                     {'Parameter': 'Tip_Angle_Min_deg', 'Value': tip_angle_avg.min() if tip_angle_avg is not None else np.nan},
                     {'Parameter': 'Tip_Angle_Max_deg', 'Value': tip_angle_avg.max() if tip_angle_avg is not None else np.nan},
+                    {'Parameter': 'Offplane_Y_Min_mm', 'Value': y_off_coords.min() if y_off_coords is not None else np.nan},
+                    {'Parameter': 'Offplane_Y_Max_mm', 'Value': y_off_coords.max() if y_off_coords is not None else np.nan},
                 ])
             }
 
@@ -2996,6 +3313,12 @@ def predict_tip_position_cartesian(b_motor_pos):
             gcode_calibration_data = {
                 'robot_name': robot_name,
                 'calibration_date': pd.Timestamp.now().isoformat(),
+                'orientation_map': {
+                    '0': 'C=0 deg',
+                    '1': 'C=180 deg',
+                    '2': 'C=+90 deg',
+                    '3': 'C=-90 deg'
+                },
                 'reference_frame': {
                     'type': 'B0_tip_referenced',
                     'b_reference': float(delta_motor[zero_idx]),
@@ -3005,20 +3328,30 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'radial_reference_b_min_mm': b_ref_mirror_line_min,
                     'radial_reference_b_max_mm': b_ref_mirror_line_max,
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
+                    'offplane_reference_b_mean_mm': b_ref_offplane_mirror_line_mean if np.isfinite(b_ref_offplane_mirror_line_mean) else None,
+                    'offplane_reference_b_min_mm': b_ref_offplane_mirror_line_min if np.isfinite(b_ref_offplane_mirror_line_min) else None,
+                    'offplane_reference_b_max_mm': b_ref_offplane_mirror_line_max if np.isfinite(b_ref_offplane_mirror_line_max) else None,
+                    'y_ref_offplane_mirror_line_mm': y_ref_offplane_mirror_line if y_ref_offplane_mirror_line is not None else None,
+                    'offplane_zero_point_offset_mm': None,
                     'r_definition': 'signed planar transverse deflection (r = x) in strict planar bending calibration',
-                    'notes': 'Z is shifted so the first averaged B=0.0 tip is z=0 (or nearest B fallback). Radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored X across all measured B values and both orientations in the current frame, so r=0 at that radial reference.'
+                    'notes': 'Z is shifted so the first averaged B=0.0 tip is z=0 (or nearest B fallback). Planar radial r is defined as signed planar transverse deflection (r=x) and referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations).',
+                    'offplane_notes': 'Off-plane displacement is derived from ±90° rotations using mirrored/averaged transverse coordinate only; tip Z from ±90° orientations is intentionally neglected. Off-plane Y zero is the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate), not B=0.'
                 },
                 'cubic_coefficients': {
                     'r_coeffs': r_coefficients.tolist(),  # [u³, u², u¹, u⁰]
                     'z_coeffs': z_coefficients.tolist(),
                     'tip_angle_coeffs': tip_angle_coefficients.tolist() if tip_angle_coefficients is not None else None,
+                    'offplane_y_coeffs': y_off_coefficients.tolist() if y_off_coefficients is not None else None,
                     'r_equation': r_equation,
-                    'r_definition': 'signed planar transverse deflection (r = x), referenced to the mirror line = mean unmirrored X across all measured B values and both orientations in the current frame',
+                    'r_definition': 'signed planar transverse deflection (r = x), referenced to the planar X mirror line = mean unmirrored X across all measured B values and both orientations in the current frame',
                     'z_equation': z_equation,
                     'tip_angle_equation': tip_angle_equation,
+                    'offplane_y_equation': y_off_equation,
+                    'offplane_y_definition': 'off-plane transverse displacement from ±90 mirrored pair, referenced to ±90 Y-proxy mirror line = mean unmirrored ±90 transverse coordinate',
                     'r_r_squared': float(r_r2),
                     'z_r_squared': float(z_r2),
-                    'tip_angle_r_squared': float(tip_angle_r2) if np.isfinite(tip_angle_r2) else None
+                    'tip_angle_r_squared': float(tip_angle_r2) if np.isfinite(tip_angle_r2) else None,
+                    'offplane_y_r_squared': float(y_off_r2) if np.isfinite(y_off_r2) else None
                 },
                 'motor_setup': {
                     # Current machine setup: single pull motor on B axis, homed at 0.
@@ -3036,6 +3369,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'radius_range_definition': 'signed planar transverse deflection range (r = x), not Euclidean radius',
                     'z_range_mm': [float(z_coords.min()), float(z_coords.max())],
                     'tip_angle_range_deg': [float(tip_angle_avg.min()), float(tip_angle_avg.max())] if tip_angle_avg is not None else None,
+                    'offplane_y_range_mm': [float(y_off_coords.min()), float(y_off_coords.max())] if y_off_coords is not None else None,
                     'max_radius_mm': float(r_coords.max())
                 },
                 'duet_axis_mapping': {

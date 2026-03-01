@@ -36,7 +36,7 @@ DEFAULT_OUT = "gcode_generation/probe_point_c_motion_fixed_tip.gcode"
 # Fixed tip point in world/cartesian space
 DEFAULT_POINT_X = 65.0
 DEFAULT_POINT_Y = 40.0
-DEFAULT_POINT_Z = -85.0
+DEFAULT_POINT_Z = -88.0
 
 # Motion
 DEFAULT_TRAVEL_FEED = 1200.0

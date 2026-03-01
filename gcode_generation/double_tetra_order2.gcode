@@ -12,21 +12,21 @@
 ;   a(B) = (+1.000) * tip_angle_poly(B) + +0.000 deg
 ; axes: X->X, Y->Y, Z->Z, B->B, C->C, U->U
 ; edges planned = 39 (all edges extruded exactly once)
-; total print length ~ 546.000 mm
-; total tip travel  ~ 358.191 mm
-; tangent angle error [min/mean/max] = 0.007 / 0.056 / 0.087 deg
-; head-lead [min/mean/max] mm = -8.185 / -6.243 / -3.135
+; total print length ~ 585.000 mm
+; total tip travel  ~ 403.543 mm
+; tangent angle error [min/mean/max] = 0.044 / 0.049 / 0.057 deg
+; head-lead [min/mean/max] mm = -4.464 / -3.220 / -1.229
 ; head-front ok / violations = 0 / 39
-; B used range = [-2.727, -1.360]
-; C used range = [-1590.000, 270.000]
-; X gantry range used = [40.818, 87.182]
-; Y gantry range used = [43.439, 84.851]
-; Z gantry range used = [-115.390, -69.666]
+; B used range = [-2.521, -1.054]
+; C used range = [-1950.000, 270.000]
+; X gantry range used = [44.706, 85.294]
+; Y gantry range used = [46.943, 82.094]
+; Z gantry range used = [-115.640, -66.650]
 ; virtual bbox (enforced during print/travel): X[10.000, 110.000] Y[10.000, 110.000] Z[-120.000, -20.000]
 ; startup safe approach Z = 0.000
 ; start pose (stage) = [60.000, 40.000, -30.000, 0.000, 0.000]
 ; end pose (stage)   = [60.000, 40.000, -30.000, 0.000, 0.000]
-; bottom-center start (tip-space heuristic origin) = [64.000, 58.083, -112.862]
+; bottom-center start (tip-space heuristic origin) = [65.000, 58.660, -114.495]
 ; extrusion_per_mm = 0.020000 U/mm-path (coordinated with print feed)
 ; pressure_offset_mm = 3.000 U mm
 ; pressure advance/retract feeds = 120.0/240.0 mm/min on U
@@ -39,710 +39,713 @@ G1 Z0.000 B0.000 C0.000 F1200
 G1 X60.000 Y40.000 B0.000 C0.000 F1200
 G1 Z-30.000 B0.000 C0.000 F1200
 ; --- edge 1/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=270.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=270.000, head_lead=-4.464 mm, head_front_ok=0
 ; startup move to first strut start (bottom-center-first ordering)
-G1 X64.000 Y47.481 Z-115.390 B-1.360 C270.000 F1200
+G1 X65.000 Y52.547 Z-115.640 B-1.054 C270.000 F1200
 ; pressure preload before print pass
 G1 U3.000 F120
 G4 P700
-G1 X64.000 Y48.491 Z-113.961 B-1.360 C270.000 U3.035 F300
-G1 X64.000 Y49.501 Z-112.532 B-1.360 C270.000 U3.070 F300
-G1 X64.000 Y50.512 Z-111.104 B-1.360 C270.000 U3.105 F300
-G1 X64.000 Y51.522 Z-109.675 B-1.360 C270.000 U3.140 F300
-G1 X64.000 Y52.533 Z-108.246 B-1.360 C270.000 U3.175 F300
-G1 X64.000 Y53.543 Z-106.817 B-1.360 C270.000 U3.210 F300
-G1 X64.000 Y54.553 Z-105.388 B-1.360 C270.000 U3.245 F300
-G1 X64.000 Y55.564 Z-103.959 B-1.360 C270.000 U3.280 F300
+G1 X65.000 Y53.629 Z-114.109 B-1.054 C270.000 U3.038 F300
+G1 X65.000 Y54.712 Z-112.578 B-1.054 C270.000 U3.075 F300
+G1 X65.000 Y55.794 Z-111.047 B-1.054 C270.000 U3.113 F300
+G1 X65.000 Y56.877 Z-109.516 B-1.054 C270.000 U3.150 F300
+G1 X65.000 Y57.959 Z-107.985 B-1.054 C270.000 U3.188 F300
+G1 X65.000 Y59.042 Z-106.454 B-1.054 C270.000 U3.225 F300
+G1 X65.000 Y60.125 Z-104.923 B-1.054 C270.000 U3.262 F300
+G1 X65.000 Y61.207 Z-103.392 B-1.054 C270.000 U3.300 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U0.280 F240
+G1 U0.300 F240
 ; --- edge 2/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=120.000, head_lead=-3.135 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=150.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X62.432 Y68.881 Z-114.024 B-2.727 C120.000 F1200
+G1 X59.706 Y61.717 Z-115.640 B-1.054 C150.000 F1200
 ; pressure preload before print pass
-G1 U3.280 F120
+G1 U3.300 F120
 G4 P700
-G1 X63.307 Y67.365 Z-114.024 B-2.727 C120.000 U3.315 F300
-G1 X64.182 Y65.850 Z-114.024 B-2.727 C120.000 U3.350 F300
-G1 X65.057 Y64.334 Z-114.024 B-2.727 C120.000 U3.385 F300
-G1 X65.932 Y62.819 Z-114.024 B-2.727 C120.000 U3.420 F300
-G1 X66.807 Y61.303 Z-114.024 B-2.727 C120.000 U3.455 F300
-G1 X67.682 Y59.788 Z-114.024 B-2.727 C120.000 U3.490 F300
-G1 X68.557 Y58.272 Z-114.024 B-2.727 C120.000 U3.525 F300
-G1 X69.432 Y56.757 Z-114.024 B-2.727 C120.000 U3.560 F300
+G1 X60.643 Y61.176 Z-114.109 B-1.054 C150.000 U3.337 F300
+G1 X61.581 Y60.634 Z-112.578 B-1.054 C150.000 U3.375 F300
+G1 X62.518 Y60.093 Z-111.047 B-1.054 C150.000 U3.413 F300
+G1 X63.456 Y59.552 Z-109.516 B-1.054 C150.000 U3.450 F300
+G1 X64.393 Y59.011 Z-107.985 B-1.054 C150.000 U3.487 F300
+G1 X65.331 Y58.469 Z-106.454 B-1.054 C150.000 U3.525 F300
+G1 X66.268 Y57.928 Z-104.923 B-1.054 C150.000 U3.562 F300
+G1 X67.206 Y57.387 Z-103.392 B-1.054 C150.000 U3.600 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U0.600 F240
 ; --- edge 3/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=0.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X74.135 Y54.041 Z-114.024 B-2.727 C0.000 F1200
-G1 X72.385 Y54.041 Z-114.024 B-2.727 C0.000 U3.595 F300
-G1 X70.635 Y54.041 Z-114.024 B-2.727 C0.000 U3.630 F300
-G1 X68.885 Y54.041 Z-114.024 B-2.727 C0.000 U3.665 F300
-G1 X67.135 Y54.041 Z-114.024 B-2.727 C0.000 U3.700 F300
-G1 X65.385 Y54.041 Z-114.024 B-2.727 C0.000 U3.735 F300
-G1 X63.635 Y54.041 Z-114.024 B-2.727 C0.000 U3.770 F300
-G1 X61.885 Y54.041 Z-114.024 B-2.727 C0.000 U3.805 F300
-G1 X60.135 Y54.041 Z-114.024 B-2.727 C0.000 U3.840 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=30.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X70.294 Y61.717 Z-115.640 B-1.054 C30.000 F1200
+; pressure preload before print pass
+G1 U3.600 F120
+G4 P700
+G1 X69.357 Y61.176 Z-114.109 B-1.054 C30.000 U3.638 F300
+G1 X68.419 Y60.634 Z-112.578 B-1.054 C30.000 U3.675 F300
+G1 X67.482 Y60.093 Z-111.047 B-1.054 C30.000 U3.712 F300
+G1 X66.544 Y59.552 Z-109.516 B-1.054 C30.000 U3.750 F300
+G1 X65.607 Y59.011 Z-107.985 B-1.054 C30.000 U3.787 F300
+G1 X64.669 Y58.469 Z-106.454 B-1.054 C30.000 U3.825 F300
+G1 X63.732 Y57.928 Z-104.923 B-1.054 C30.000 U3.862 F300
+G1 X62.794 Y57.387 Z-103.392 B-1.054 C30.000 U3.900 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U0.900 F240
 ; --- edge 4/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-120.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X55.432 Y51.326 Z-114.024 B-2.727 C-120.000 F1200
-G1 X56.307 Y52.842 Z-114.024 B-2.727 C-120.000 U3.875 F300
-G1 X57.182 Y54.357 Z-114.024 B-2.727 C-120.000 U3.910 F300
-G1 X58.057 Y55.873 Z-114.024 B-2.727 C-120.000 U3.945 F300
-G1 X58.932 Y57.388 Z-114.024 B-2.727 C-120.000 U3.980 F300
-G1 X59.807 Y58.904 Z-114.024 B-2.727 C-120.000 U4.015 F300
-G1 X60.682 Y60.420 Z-114.024 B-2.727 C-120.000 U4.050 F300
-G1 X61.557 Y61.935 Z-114.024 B-2.727 C-120.000 U4.085 F300
-G1 X62.432 Y63.451 Z-114.024 B-2.727 C-120.000 U4.120 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-120.000, head_lead=-1.229 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X56.885 Y53.265 Z-109.697 B-2.521 C-120.000 F1200
+; pressure preload before print pass
+G1 U3.900 F120
+G4 P700
+G1 X57.823 Y54.889 Z-109.697 B-2.521 C-120.000 U3.937 F300
+G1 X58.760 Y56.513 Z-109.697 B-2.521 C-120.000 U3.975 F300
+G1 X59.698 Y58.137 Z-109.697 B-2.521 C-120.000 U4.012 F300
+G1 X60.635 Y59.761 Z-109.697 B-2.521 C-120.000 U4.050 F300
+G1 X61.573 Y61.384 Z-109.697 B-2.521 C-120.000 U4.087 F300
+G1 X62.510 Y63.008 Z-109.697 B-2.521 C-120.000 U4.125 F300
+G1 X63.448 Y64.632 Z-109.697 B-2.521 C-120.000 U4.162 F300
+G1 X64.385 Y66.256 Z-109.697 B-2.521 C-120.000 U4.200 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U1.120 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 5/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-210.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X54.818 Y63.384 Z-115.390 B-1.360 C-210.000 F1200
-; pressure preload before print pass
-G1 U4.120 F120
-G4 P700
-G1 X55.693 Y62.879 Z-113.961 B-1.360 C-210.000 U4.155 F300
-G1 X56.568 Y62.374 Z-112.532 B-1.360 C-210.000 U4.190 F300
-G1 X57.443 Y61.868 Z-111.104 B-1.360 C-210.000 U4.225 F300
-G1 X58.318 Y61.363 Z-109.675 B-1.360 C-210.000 U4.260 F300
-G1 X59.193 Y60.858 Z-108.246 B-1.360 C-210.000 U4.295 F300
-G1 X60.068 Y60.353 Z-106.817 B-1.360 C-210.000 U4.330 F300
-G1 X60.943 Y59.848 Z-105.388 B-1.360 C-210.000 U4.365 F300
-G1 X61.818 Y59.343 Z-103.959 B-1.360 C-210.000 U4.400 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-240.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X64.385 Y68.385 Z-109.697 B-2.521 C-240.000 F1200
+G1 X65.323 Y66.761 Z-109.697 B-2.521 C-240.000 U4.237 F300
+G1 X66.260 Y65.138 Z-109.697 B-2.521 C-240.000 U4.275 F300
+G1 X67.198 Y63.514 Z-109.697 B-2.521 C-240.000 U4.312 F300
+G1 X68.135 Y61.890 Z-109.697 B-2.521 C-240.000 U4.350 F300
+G1 X69.073 Y60.266 Z-109.697 B-2.521 C-240.000 U4.387 F300
+G1 X70.010 Y58.642 Z-109.697 B-2.521 C-240.000 U4.425 F300
+G1 X70.948 Y57.019 Z-109.697 B-2.521 C-240.000 U4.462 F300
+G1 X71.885 Y55.395 Z-109.697 B-2.521 C-240.000 U4.500 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U1.400 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 6/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-330.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X73.182 Y63.384 Z-115.390 B-1.360 C-330.000 F1200
-; pressure preload before print pass
-G1 U4.400 F120
-G4 P700
-G1 X72.307 Y62.879 Z-113.961 B-1.360 C-330.000 U4.435 F300
-G1 X71.432 Y62.374 Z-112.532 B-1.360 C-330.000 U4.470 F300
-G1 X70.557 Y61.868 Z-111.104 B-1.360 C-330.000 U4.505 F300
-G1 X69.682 Y61.363 Z-109.675 B-1.360 C-330.000 U4.540 F300
-G1 X68.807 Y60.858 Z-108.246 B-1.360 C-330.000 U4.575 F300
-G1 X67.932 Y60.353 Z-106.817 B-1.360 C-330.000 U4.610 F300
-G1 X67.057 Y59.848 Z-105.388 B-1.360 C-330.000 U4.645 F300
-G1 X66.182 Y59.343 Z-103.959 B-1.360 C-330.000 U4.680 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-360.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X73.729 Y54.330 Z-109.697 B-2.521 C-360.000 F1200
+G1 X71.854 Y54.330 Z-109.697 B-2.521 C-360.000 U4.537 F300
+G1 X69.979 Y54.330 Z-109.697 B-2.521 C-360.000 U4.575 F300
+G1 X68.104 Y54.330 Z-109.697 B-2.521 C-360.000 U4.612 F300
+G1 X66.229 Y54.330 Z-109.697 B-2.521 C-360.000 U4.650 F300
+G1 X64.354 Y54.330 Z-109.697 B-2.521 C-360.000 U4.688 F300
+G1 X62.479 Y54.330 Z-109.697 B-2.521 C-360.000 U4.725 F300
+G1 X60.604 Y54.330 Z-109.697 B-2.521 C-360.000 U4.763 F300
+G1 X58.729 Y54.330 Z-109.697 B-2.521 C-360.000 U4.800 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U1.680 F240
+G1 U1.800 F240
 ; --- edge 7/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-210.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-210.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X47.818 Y59.343 Z-103.959 B-1.360 C-210.000 F1200
+G1 X59.706 Y70.377 Z-103.392 B-1.054 C-210.000 F1200
 ; pressure preload before print pass
-G1 U4.680 F120
+G1 U4.800 F120
 G4 P700
-G1 X48.693 Y58.837 Z-102.530 B-1.360 C-210.000 U4.715 F300
-G1 X49.568 Y58.332 Z-101.101 B-1.360 C-210.000 U4.750 F300
-G1 X50.443 Y57.827 Z-99.673 B-1.360 C-210.000 U4.785 F300
-G1 X51.318 Y57.322 Z-98.244 B-1.360 C-210.000 U4.820 F300
-G1 X52.193 Y56.817 Z-96.815 B-1.360 C-210.000 U4.855 F300
-G1 X53.068 Y56.311 Z-95.386 B-1.360 C-210.000 U4.890 F300
-G1 X53.943 Y55.806 Z-93.957 B-1.360 C-210.000 U4.925 F300
-G1 X54.818 Y55.301 Z-92.528 B-1.360 C-210.000 U4.960 F300
+G1 X60.643 Y69.836 Z-101.861 B-1.054 C-210.000 U4.838 F300
+G1 X61.581 Y69.295 Z-100.330 B-1.054 C-210.000 U4.875 F300
+G1 X62.518 Y68.753 Z-98.799 B-1.054 C-210.000 U4.913 F300
+G1 X63.456 Y68.212 Z-97.268 B-1.054 C-210.000 U4.950 F300
+G1 X64.393 Y67.671 Z-95.737 B-1.054 C-210.000 U4.988 F300
+G1 X65.331 Y67.130 Z-94.207 B-1.054 C-210.000 U5.025 F300
+G1 X66.268 Y66.588 Z-92.676 B-1.054 C-210.000 U5.062 F300
+G1 X67.206 Y66.047 Z-91.145 B-1.054 C-210.000 U5.100 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U1.960 F240
+G1 U2.100 F240
 ; --- edge 8/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-120.000, head_lead=-3.135 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-330.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X62.432 Y47.285 Z-102.593 B-2.727 C-120.000 F1200
+G1 X70.294 Y70.377 Z-103.392 B-1.054 C-330.000 F1200
 ; pressure preload before print pass
-G1 U4.960 F120
+G1 U5.100 F120
 G4 P700
-G1 X63.307 Y48.800 Z-102.593 B-2.727 C-120.000 U4.995 F300
-G1 X64.182 Y50.316 Z-102.593 B-2.727 C-120.000 U5.030 F300
-G1 X65.057 Y51.832 Z-102.593 B-2.727 C-120.000 U5.065 F300
-G1 X65.932 Y53.347 Z-102.593 B-2.727 C-120.000 U5.100 F300
-G1 X66.807 Y54.863 Z-102.593 B-2.727 C-120.000 U5.135 F300
-G1 X67.682 Y56.378 Z-102.593 B-2.727 C-120.000 U5.170 F300
-G1 X68.557 Y57.894 Z-102.593 B-2.727 C-120.000 U5.205 F300
-G1 X69.432 Y59.409 Z-102.593 B-2.727 C-120.000 U5.240 F300
+G1 X69.357 Y69.836 Z-101.861 B-1.054 C-330.000 U5.138 F300
+G1 X68.419 Y69.295 Z-100.330 B-1.054 C-330.000 U5.175 F300
+G1 X67.482 Y68.753 Z-98.799 B-1.054 C-330.000 U5.213 F300
+G1 X66.544 Y68.212 Z-97.268 B-1.054 C-330.000 U5.250 F300
+G1 X65.607 Y67.671 Z-95.737 B-1.054 C-330.000 U5.288 F300
+G1 X64.669 Y67.130 Z-94.207 B-1.054 C-330.000 U5.325 F300
+G1 X63.732 Y66.588 Z-92.676 B-1.054 C-330.000 U5.363 F300
+G1 X62.794 Y66.047 Z-91.145 B-1.054 C-330.000 U5.400 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U2.400 F240
 ; --- edge 9/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-240.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X69.432 Y64.839 Z-102.593 B-2.727 C-240.000 F1200
-G1 X70.307 Y63.324 Z-102.593 B-2.727 C-240.000 U5.275 F300
-G1 X71.182 Y61.808 Z-102.593 B-2.727 C-240.000 U5.310 F300
-G1 X72.057 Y60.293 Z-102.593 B-2.727 C-240.000 U5.345 F300
-G1 X72.932 Y58.777 Z-102.593 B-2.727 C-240.000 U5.380 F300
-G1 X73.807 Y57.262 Z-102.593 B-2.727 C-240.000 U5.415 F300
-G1 X74.682 Y55.746 Z-102.593 B-2.727 C-240.000 U5.450 F300
-G1 X75.557 Y54.231 Z-102.593 B-2.727 C-240.000 U5.485 F300
-G1 X76.432 Y52.715 Z-102.593 B-2.727 C-240.000 U5.520 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-210.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X52.206 Y57.387 Z-103.392 B-1.054 C-210.000 F1200
+; pressure preload before print pass
+G1 U5.400 F120
+G4 P700
+G1 X53.143 Y56.846 Z-101.861 B-1.054 C-210.000 U5.438 F300
+G1 X54.081 Y56.304 Z-100.330 B-1.054 C-210.000 U5.475 F300
+G1 X55.018 Y55.763 Z-98.799 B-1.054 C-210.000 U5.513 F300
+G1 X55.956 Y55.222 Z-97.268 B-1.054 C-210.000 U5.550 F300
+G1 X56.893 Y54.681 Z-95.737 B-1.054 C-210.000 U5.588 F300
+G1 X57.831 Y54.139 Z-94.207 B-1.054 C-210.000 U5.625 F300
+G1 X58.768 Y53.598 Z-92.676 B-1.054 C-210.000 U5.663 F300
+G1 X59.706 Y53.057 Z-91.145 B-1.054 C-210.000 U5.700 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U2.700 F240
 ; --- edge 10/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-360.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X81.135 Y50.000 Z-102.593 B-2.727 C-360.000 F1200
-G1 X79.385 Y50.000 Z-102.593 B-2.727 C-360.000 U5.555 F300
-G1 X77.635 Y50.000 Z-102.593 B-2.727 C-360.000 U5.590 F300
-G1 X75.885 Y50.000 Z-102.593 B-2.727 C-360.000 U5.625 F300
-G1 X74.135 Y50.000 Z-102.593 B-2.727 C-360.000 U5.660 F300
-G1 X72.385 Y50.000 Z-102.593 B-2.727 C-360.000 U5.695 F300
-G1 X70.635 Y50.000 Z-102.593 B-2.727 C-360.000 U5.730 F300
-G1 X68.885 Y50.000 Z-102.593 B-2.727 C-360.000 U5.765 F300
-G1 X67.135 Y50.000 Z-102.593 B-2.727 C-360.000 U5.800 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-330.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X77.794 Y57.387 Z-103.392 B-1.054 C-330.000 F1200
+; pressure preload before print pass
+G1 U5.700 F120
+G4 P700
+G1 X76.857 Y56.846 Z-101.861 B-1.054 C-330.000 U5.738 F300
+G1 X75.919 Y56.304 Z-100.330 B-1.054 C-330.000 U5.775 F300
+G1 X74.982 Y55.763 Z-98.799 B-1.054 C-330.000 U5.813 F300
+G1 X74.044 Y55.222 Z-97.268 B-1.054 C-330.000 U5.850 F300
+G1 X73.107 Y54.681 Z-95.737 B-1.054 C-330.000 U5.888 F300
+G1 X72.169 Y54.139 Z-94.207 B-1.054 C-330.000 U5.925 F300
+G1 X71.232 Y53.598 Z-92.676 B-1.054 C-330.000 U5.963 F300
+G1 X70.294 Y53.057 Z-91.145 B-1.054 C-330.000 U6.000 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U3.000 F240
 ; --- edge 11/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-420.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X65.568 Y47.285 Z-102.593 B-2.727 C-420.000 F1200
-G1 X64.693 Y48.800 Z-102.593 B-2.727 C-420.000 U5.835 F300
-G1 X63.818 Y50.316 Z-102.593 B-2.727 C-420.000 U5.870 F300
-G1 X62.943 Y51.832 Z-102.593 B-2.727 C-420.000 U5.905 F300
-G1 X62.068 Y53.347 Z-102.593 B-2.727 C-420.000 U5.940 F300
-G1 X61.193 Y54.863 Z-102.593 B-2.727 C-420.000 U5.975 F300
-G1 X60.318 Y56.378 Z-102.593 B-2.727 C-420.000 U6.010 F300
-G1 X59.443 Y57.894 Z-102.593 B-2.727 C-420.000 U6.045 F300
-G1 X58.568 Y59.409 Z-102.593 B-2.727 C-420.000 U6.080 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-450.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X72.500 Y48.217 Z-103.392 B-1.054 C-450.000 F1200
+; pressure preload before print pass
+G1 U6.000 F120
+G4 P700
+G1 X72.500 Y49.299 Z-101.861 B-1.054 C-450.000 U6.038 F300
+G1 X72.500 Y50.382 Z-100.330 B-1.054 C-450.000 U6.075 F300
+G1 X72.500 Y51.464 Z-98.799 B-1.054 C-450.000 U6.113 F300
+G1 X72.500 Y52.547 Z-97.268 B-1.054 C-450.000 U6.150 F300
+G1 X72.500 Y53.629 Z-95.737 B-1.054 C-450.000 U6.188 F300
+G1 X72.500 Y54.712 Z-94.207 B-1.054 C-450.000 U6.225 F300
+G1 X72.500 Y55.794 Z-92.676 B-1.054 C-450.000 U6.263 F300
+G1 X72.500 Y56.877 Z-91.145 B-1.054 C-450.000 U6.300 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U3.300 F240
 ; --- edge 12/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-480.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X55.432 Y59.409 Z-102.593 B-2.727 C-480.000 F1200
-G1 X56.307 Y60.925 Z-102.593 B-2.727 C-480.000 U6.115 F300
-G1 X57.182 Y62.440 Z-102.593 B-2.727 C-480.000 U6.150 F300
-G1 X58.057 Y63.956 Z-102.593 B-2.727 C-480.000 U6.185 F300
-G1 X58.932 Y65.471 Z-102.593 B-2.727 C-480.000 U6.220 F300
-G1 X59.807 Y66.987 Z-102.593 B-2.727 C-480.000 U6.255 F300
-G1 X60.682 Y68.502 Z-102.593 B-2.727 C-480.000 U6.290 F300
-G1 X61.557 Y70.018 Z-102.593 B-2.727 C-480.000 U6.325 F300
-G1 X62.432 Y71.534 Z-102.593 B-2.727 C-480.000 U6.360 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-450.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X57.500 Y48.217 Z-103.392 B-1.054 C-450.000 F1200
+; pressure preload before print pass
+G1 U6.300 F120
+G4 P700
+G1 X57.500 Y49.299 Z-101.861 B-1.054 C-450.000 U6.338 F300
+G1 X57.500 Y50.382 Z-100.330 B-1.054 C-450.000 U6.375 F300
+G1 X57.500 Y51.464 Z-98.799 B-1.054 C-450.000 U6.413 F300
+G1 X57.500 Y52.547 Z-97.268 B-1.054 C-450.000 U6.450 F300
+G1 X57.500 Y53.629 Z-95.737 B-1.054 C-450.000 U6.488 F300
+G1 X57.500 Y54.712 Z-94.207 B-1.054 C-450.000 U6.525 F300
+G1 X57.500 Y55.794 Z-92.676 B-1.054 C-450.000 U6.563 F300
+G1 X57.500 Y56.877 Z-91.145 B-1.054 C-450.000 U6.600 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U3.600 F240
 ; --- edge 13/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-600.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X62.432 Y76.964 Z-102.593 B-2.727 C-600.000 F1200
-G1 X63.307 Y75.448 Z-102.593 B-2.727 C-600.000 U6.395 F300
-G1 X64.182 Y73.933 Z-102.593 B-2.727 C-600.000 U6.430 F300
-G1 X65.057 Y72.417 Z-102.593 B-2.727 C-600.000 U6.465 F300
-G1 X65.932 Y70.902 Z-102.593 B-2.727 C-600.000 U6.500 F300
-G1 X66.807 Y69.386 Z-102.593 B-2.727 C-600.000 U6.535 F300
-G1 X67.682 Y67.871 Z-102.593 B-2.727 C-600.000 U6.570 F300
-G1 X68.557 Y66.355 Z-102.593 B-2.727 C-600.000 U6.605 F300
-G1 X69.432 Y64.839 Z-102.593 B-2.727 C-600.000 U6.640 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-330.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X62.794 Y57.387 Z-103.392 B-1.054 C-330.000 F1200
+; pressure preload before print pass
+G1 U6.600 F120
+G4 P700
+G1 X61.857 Y56.846 Z-101.861 B-1.054 C-330.000 U6.638 F300
+G1 X60.919 Y56.304 Z-100.330 B-1.054 C-330.000 U6.675 F300
+G1 X59.982 Y55.763 Z-98.799 B-1.054 C-330.000 U6.713 F300
+G1 X59.044 Y55.222 Z-97.268 B-1.054 C-330.000 U6.750 F300
+G1 X58.107 Y54.681 Z-95.737 B-1.054 C-330.000 U6.788 F300
+G1 X57.169 Y54.139 Z-94.207 B-1.054 C-330.000 U6.825 F300
+G1 X56.232 Y53.598 Z-92.676 B-1.054 C-330.000 U6.863 F300
+G1 X55.294 Y53.057 Z-91.145 B-1.054 C-330.000 U6.900 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U3.900 F240
 ; --- edge 14/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-720.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X74.135 Y62.124 Z-102.593 B-2.727 C-720.000 F1200
-G1 X72.385 Y62.124 Z-102.593 B-2.727 C-720.000 U6.675 F300
-G1 X70.635 Y62.124 Z-102.593 B-2.727 C-720.000 U6.710 F300
-G1 X68.885 Y62.124 Z-102.593 B-2.727 C-720.000 U6.745 F300
-G1 X67.135 Y62.124 Z-102.593 B-2.727 C-720.000 U6.780 F300
-G1 X65.385 Y62.124 Z-102.593 B-2.727 C-720.000 U6.815 F300
-G1 X63.635 Y62.124 Z-102.593 B-2.727 C-720.000 U6.850 F300
-G1 X61.885 Y62.124 Z-102.593 B-2.727 C-720.000 U6.885 F300
-G1 X60.135 Y62.124 Z-102.593 B-2.727 C-720.000 U6.920 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-210.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X67.206 Y57.387 Z-103.392 B-1.054 C-210.000 F1200
+; pressure preload before print pass
+G1 U6.900 F120
+G4 P700
+G1 X68.143 Y56.846 Z-101.861 B-1.054 C-210.000 U6.938 F300
+G1 X69.081 Y56.304 Z-100.330 B-1.054 C-210.000 U6.975 F300
+G1 X70.018 Y55.763 Z-98.799 B-1.054 C-210.000 U7.013 F300
+G1 X70.956 Y55.222 Z-97.268 B-1.054 C-210.000 U7.050 F300
+G1 X71.893 Y54.681 Z-95.737 B-1.054 C-210.000 U7.088 F300
+G1 X72.831 Y54.139 Z-94.207 B-1.054 C-210.000 U7.125 F300
+G1 X73.768 Y53.598 Z-92.676 B-1.054 C-210.000 U7.163 F300
+G1 X74.706 Y53.057 Z-91.145 B-1.054 C-210.000 U7.200 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U4.200 F240
 ; --- edge 15/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-660.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X58.568 Y64.839 Z-102.593 B-2.727 C-660.000 F1200
-G1 X57.693 Y63.324 Z-102.593 B-2.727 C-660.000 U6.955 F300
-G1 X56.818 Y61.808 Z-102.593 B-2.727 C-660.000 U6.990 F300
-G1 X55.943 Y60.293 Z-102.593 B-2.727 C-660.000 U7.025 F300
-G1 X55.068 Y58.777 Z-102.593 B-2.727 C-660.000 U7.060 F300
-G1 X54.193 Y57.262 Z-102.593 B-2.727 C-660.000 U7.095 F300
-G1 X53.318 Y55.746 Z-102.593 B-2.727 C-660.000 U7.130 F300
-G1 X52.443 Y54.231 Z-102.593 B-2.727 C-660.000 U7.165 F300
-G1 X51.568 Y52.715 Z-102.593 B-2.727 C-660.000 U7.200 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-90.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X65.000 Y61.207 Z-103.392 B-1.054 C-90.000 F1200
+; pressure preload before print pass
+G1 U7.200 F120
+G4 P700
+G1 X65.000 Y62.290 Z-101.861 B-1.054 C-90.000 U7.237 F300
+G1 X65.000 Y63.372 Z-100.330 B-1.054 C-90.000 U7.275 F300
+G1 X65.000 Y64.455 Z-98.799 B-1.054 C-90.000 U7.312 F300
+G1 X65.000 Y65.537 Z-97.268 B-1.054 C-90.000 U7.350 F300
+G1 X65.000 Y66.620 Z-95.737 B-1.054 C-90.000 U7.387 F300
+G1 X65.000 Y67.702 Z-94.207 B-1.054 C-90.000 U7.425 F300
+G1 X65.000 Y68.785 Z-92.676 B-1.054 C-90.000 U7.462 F300
+G1 X65.000 Y69.867 Z-91.145 B-1.054 C-90.000 U7.500 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U4.500 F240
 ; --- edge 16/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-540.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X46.865 Y50.000 Z-102.593 B-2.727 C-540.000 F1200
-G1 X48.615 Y50.000 Z-102.593 B-2.727 C-540.000 U7.235 F300
-G1 X50.365 Y50.000 Z-102.593 B-2.727 C-540.000 U7.270 F300
-G1 X52.115 Y50.000 Z-102.593 B-2.727 C-540.000 U7.305 F300
-G1 X53.865 Y50.000 Z-102.593 B-2.727 C-540.000 U7.340 F300
-G1 X55.615 Y50.000 Z-102.593 B-2.727 C-540.000 U7.375 F300
-G1 X57.365 Y50.000 Z-102.593 B-2.727 C-540.000 U7.410 F300
-G1 X59.115 Y50.000 Z-102.593 B-2.727 C-540.000 U7.445 F300
-G1 X60.865 Y50.000 Z-102.593 B-2.727 C-540.000 U7.480 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-240.000, head_lead=-1.229 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X64.385 Y77.045 Z-97.449 B-2.521 C-240.000 F1200
+; pressure preload before print pass
+G1 U7.500 F120
+G4 P700
+G1 X65.323 Y75.422 Z-97.449 B-2.521 C-240.000 U7.537 F300
+G1 X66.260 Y73.798 Z-97.449 B-2.521 C-240.000 U7.575 F300
+G1 X67.198 Y72.174 Z-97.449 B-2.521 C-240.000 U7.612 F300
+G1 X68.135 Y70.550 Z-97.449 B-2.521 C-240.000 U7.650 F300
+G1 X69.073 Y68.926 Z-97.449 B-2.521 C-240.000 U7.687 F300
+G1 X70.010 Y67.303 Z-97.449 B-2.521 C-240.000 U7.725 F300
+G1 X70.948 Y65.679 Z-97.449 B-2.521 C-240.000 U7.762 F300
+G1 X71.885 Y64.055 Z-97.449 B-2.521 C-240.000 U7.800 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U4.480 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 17/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-690.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X80.182 Y59.343 Z-103.959 B-1.360 C-690.000 F1200
-; pressure preload before print pass
-G1 U7.480 F120
-G4 P700
-G1 X79.307 Y58.837 Z-102.530 B-1.360 C-690.000 U7.515 F300
-G1 X78.432 Y58.332 Z-101.101 B-1.360 C-690.000 U7.550 F300
-G1 X77.557 Y57.827 Z-99.673 B-1.360 C-690.000 U7.585 F300
-G1 X76.682 Y57.322 Z-98.244 B-1.360 C-690.000 U7.620 F300
-G1 X75.807 Y56.817 Z-96.815 B-1.360 C-690.000 U7.655 F300
-G1 X74.932 Y56.311 Z-95.386 B-1.360 C-690.000 U7.690 F300
-G1 X74.057 Y55.806 Z-93.957 B-1.360 C-690.000 U7.725 F300
-G1 X73.182 Y55.301 Z-92.528 B-1.360 C-690.000 U7.760 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-240.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X71.885 Y64.055 Z-97.449 B-2.521 C-240.000 F1200
+G1 X72.823 Y62.431 Z-97.449 B-2.521 C-240.000 U7.837 F300
+G1 X73.760 Y60.807 Z-97.449 B-2.521 C-240.000 U7.875 F300
+G1 X74.698 Y59.184 Z-97.449 B-2.521 C-240.000 U7.912 F300
+G1 X75.635 Y57.560 Z-97.449 B-2.521 C-240.000 U7.950 F300
+G1 X76.573 Y55.936 Z-97.449 B-2.521 C-240.000 U7.987 F300
+G1 X77.510 Y54.312 Z-97.449 B-2.521 C-240.000 U8.025 F300
+G1 X78.448 Y52.688 Z-97.449 B-2.521 C-240.000 U8.062 F300
+G1 X79.385 Y51.065 Z-97.449 B-2.521 C-240.000 U8.100 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U4.760 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 18/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-570.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X54.818 Y71.467 Z-103.959 B-1.360 C-570.000 F1200
-; pressure preload before print pass
-G1 U7.760 F120
-G4 P700
-G1 X55.693 Y70.962 Z-102.530 B-1.360 C-570.000 U7.795 F300
-G1 X56.568 Y70.457 Z-101.101 B-1.360 C-570.000 U7.830 F300
-G1 X57.443 Y69.951 Z-99.673 B-1.360 C-570.000 U7.865 F300
-G1 X58.318 Y69.446 Z-98.244 B-1.360 C-570.000 U7.900 F300
-G1 X59.193 Y68.941 Z-96.815 B-1.360 C-570.000 U7.935 F300
-G1 X60.068 Y68.436 Z-95.386 B-1.360 C-570.000 U7.970 F300
-G1 X60.943 Y67.931 Z-93.957 B-1.360 C-570.000 U8.005 F300
-G1 X61.818 Y67.425 Z-92.528 B-1.360 C-570.000 U8.040 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-360.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X81.229 Y50.000 Z-97.449 B-2.521 C-360.000 F1200
+G1 X79.354 Y50.000 Z-97.449 B-2.521 C-360.000 U8.137 F300
+G1 X77.479 Y50.000 Z-97.449 B-2.521 C-360.000 U8.175 F300
+G1 X75.604 Y50.000 Z-97.449 B-2.521 C-360.000 U8.212 F300
+G1 X73.729 Y50.000 Z-97.449 B-2.521 C-360.000 U8.250 F300
+G1 X71.854 Y50.000 Z-97.449 B-2.521 C-360.000 U8.287 F300
+G1 X69.979 Y50.000 Z-97.449 B-2.521 C-360.000 U8.325 F300
+G1 X68.104 Y50.000 Z-97.449 B-2.521 C-360.000 U8.362 F300
+G1 X66.229 Y50.000 Z-97.449 B-2.521 C-360.000 U8.400 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U5.040 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 19/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-690.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X73.182 Y71.467 Z-103.959 B-1.360 C-690.000 F1200
-; pressure preload before print pass
-G1 U8.040 F120
-G4 P700
-G1 X72.307 Y70.962 Z-102.530 B-1.360 C-690.000 U8.075 F300
-G1 X71.432 Y70.457 Z-101.101 B-1.360 C-690.000 U8.110 F300
-G1 X70.557 Y69.951 Z-99.673 B-1.360 C-690.000 U8.145 F300
-G1 X69.682 Y69.446 Z-98.244 B-1.360 C-690.000 U8.180 F300
-G1 X68.807 Y68.941 Z-96.815 B-1.360 C-690.000 U8.215 F300
-G1 X67.932 Y68.436 Z-95.386 B-1.360 C-690.000 U8.250 F300
-G1 X67.057 Y67.931 Z-93.957 B-1.360 C-690.000 U8.285 F300
-G1 X66.182 Y67.425 Z-92.528 B-1.360 C-690.000 U8.320 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-480.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X64.385 Y48.935 Z-97.449 B-2.521 C-480.000 F1200
+G1 X65.323 Y50.559 Z-97.449 B-2.521 C-480.000 U8.437 F300
+G1 X66.260 Y52.183 Z-97.449 B-2.521 C-480.000 U8.475 F300
+G1 X67.198 Y53.807 Z-97.449 B-2.521 C-480.000 U8.512 F300
+G1 X68.135 Y55.431 Z-97.449 B-2.521 C-480.000 U8.550 F300
+G1 X69.073 Y57.054 Z-97.449 B-2.521 C-480.000 U8.587 F300
+G1 X70.010 Y58.678 Z-97.449 B-2.521 C-480.000 U8.625 F300
+G1 X70.948 Y60.302 Z-97.449 B-2.521 C-480.000 U8.662 F300
+G1 X71.885 Y61.926 Z-97.449 B-2.521 C-480.000 U8.700 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U5.320 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 20/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-810.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X57.000 Y43.439 Z-103.959 B-1.360 C-810.000 F1200
-; pressure preload before print pass
-G1 U8.320 F120
-G4 P700
-G1 X57.000 Y44.450 Z-102.530 B-1.360 C-810.000 U8.355 F300
-G1 X57.000 Y45.460 Z-101.101 B-1.360 C-810.000 U8.390 F300
-G1 X57.000 Y46.470 Z-99.673 B-1.360 C-810.000 U8.425 F300
-G1 X57.000 Y47.481 Z-98.244 B-1.360 C-810.000 U8.460 F300
-G1 X57.000 Y48.491 Z-96.815 B-1.360 C-810.000 U8.495 F300
-G1 X57.000 Y49.501 Z-95.386 B-1.360 C-810.000 U8.530 F300
-G1 X57.000 Y50.512 Z-93.957 B-1.360 C-810.000 U8.565 F300
-G1 X57.000 Y51.522 Z-92.528 B-1.360 C-810.000 U8.600 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-360.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X73.729 Y62.990 Z-97.449 B-2.521 C-360.000 F1200
+G1 X71.854 Y62.990 Z-97.449 B-2.521 C-360.000 U8.737 F300
+G1 X69.979 Y62.990 Z-97.449 B-2.521 C-360.000 U8.775 F300
+G1 X68.104 Y62.990 Z-97.449 B-2.521 C-360.000 U8.812 F300
+G1 X66.229 Y62.990 Z-97.449 B-2.521 C-360.000 U8.850 F300
+G1 X64.354 Y62.990 Z-97.449 B-2.521 C-360.000 U8.887 F300
+G1 X62.479 Y62.990 Z-97.449 B-2.521 C-360.000 U8.925 F300
+G1 X60.604 Y62.990 Z-97.449 B-2.521 C-360.000 U8.962 F300
+G1 X58.729 Y62.990 Z-97.449 B-2.521 C-360.000 U9.000 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U5.600 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 21/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-810.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X71.000 Y43.439 Z-103.959 B-1.360 C-810.000 F1200
-; pressure preload before print pass
-G1 U8.600 F120
-G4 P700
-G1 X71.000 Y44.450 Z-102.530 B-1.360 C-810.000 U8.635 F300
-G1 X71.000 Y45.460 Z-101.101 B-1.360 C-810.000 U8.670 F300
-G1 X71.000 Y46.470 Z-99.673 B-1.360 C-810.000 U8.705 F300
-G1 X71.000 Y47.481 Z-98.244 B-1.360 C-810.000 U8.740 F300
-G1 X71.000 Y48.491 Z-96.815 B-1.360 C-810.000 U8.775 F300
-G1 X71.000 Y49.501 Z-95.386 B-1.360 C-810.000 U8.810 F300
-G1 X71.000 Y50.512 Z-93.957 B-1.360 C-810.000 U8.845 F300
-G1 X71.000 Y51.522 Z-92.528 B-1.360 C-810.000 U8.880 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-480.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X56.885 Y61.926 Z-97.449 B-2.521 C-480.000 F1200
+G1 X57.823 Y63.550 Z-97.449 B-2.521 C-480.000 U9.037 F300
+G1 X58.760 Y65.173 Z-97.449 B-2.521 C-480.000 U9.075 F300
+G1 X59.698 Y66.797 Z-97.449 B-2.521 C-480.000 U9.112 F300
+G1 X60.635 Y68.421 Z-97.449 B-2.521 C-480.000 U9.150 F300
+G1 X61.573 Y70.045 Z-97.449 B-2.521 C-480.000 U9.187 F300
+G1 X62.510 Y71.669 Z-97.449 B-2.521 C-480.000 U9.225 F300
+G1 X63.448 Y73.292 Z-97.449 B-2.521 C-480.000 U9.262 F300
+G1 X64.385 Y74.916 Z-97.449 B-2.521 C-480.000 U9.300 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U5.880 F240
+G1 U6.300 F240
 ; --- edge 22/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-930.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-600.000, head_lead=-1.229 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X61.818 Y59.343 Z-103.959 B-1.360 C-930.000 F1200
+G1 X56.885 Y64.055 Z-97.449 B-2.521 C-600.000 F1200
 ; pressure preload before print pass
-G1 U8.880 F120
+G1 U9.300 F120
 G4 P700
-G1 X62.693 Y58.837 Z-102.530 B-1.360 C-930.000 U8.915 F300
-G1 X63.568 Y58.332 Z-101.101 B-1.360 C-930.000 U8.950 F300
-G1 X64.443 Y57.827 Z-99.673 B-1.360 C-930.000 U8.985 F300
-G1 X65.318 Y57.322 Z-98.244 B-1.360 C-930.000 U9.020 F300
-G1 X66.193 Y56.817 Z-96.815 B-1.360 C-930.000 U9.055 F300
-G1 X67.068 Y56.311 Z-95.386 B-1.360 C-930.000 U9.090 F300
-G1 X67.943 Y55.806 Z-93.957 B-1.360 C-930.000 U9.125 F300
-G1 X68.818 Y55.301 Z-92.528 B-1.360 C-930.000 U9.160 F300
+G1 X57.823 Y62.431 Z-97.449 B-2.521 C-600.000 U9.337 F300
+G1 X58.760 Y60.807 Z-97.449 B-2.521 C-600.000 U9.375 F300
+G1 X59.698 Y59.184 Z-97.449 B-2.521 C-600.000 U9.412 F300
+G1 X60.635 Y57.560 Z-97.449 B-2.521 C-600.000 U9.450 F300
+G1 X61.573 Y55.936 Z-97.449 B-2.521 C-600.000 U9.487 F300
+G1 X62.510 Y54.312 Z-97.449 B-2.521 C-600.000 U9.525 F300
+G1 X63.448 Y52.688 Z-97.449 B-2.521 C-600.000 U9.562 F300
+G1 X64.385 Y51.065 Z-97.449 B-2.521 C-600.000 U9.600 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U6.160 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 23/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1050.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X66.182 Y59.343 Z-103.959 B-1.360 C-1050.000 F1200
-; pressure preload before print pass
-G1 U9.160 F120
-G4 P700
-G1 X65.307 Y58.837 Z-102.530 B-1.360 C-1050.000 U9.195 F300
-G1 X64.432 Y58.332 Z-101.101 B-1.360 C-1050.000 U9.230 F300
-G1 X63.557 Y57.827 Z-99.673 B-1.360 C-1050.000 U9.265 F300
-G1 X62.682 Y57.322 Z-98.244 B-1.360 C-1050.000 U9.300 F300
-G1 X61.807 Y56.817 Z-96.815 B-1.360 C-1050.000 U9.335 F300
-G1 X60.932 Y56.311 Z-95.386 B-1.360 C-1050.000 U9.370 F300
-G1 X60.057 Y55.806 Z-93.957 B-1.360 C-1050.000 U9.405 F300
-G1 X59.182 Y55.301 Z-92.528 B-1.360 C-1050.000 U9.440 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-720.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X66.229 Y50.000 Z-97.449 B-2.521 C-720.000 F1200
+G1 X64.354 Y50.000 Z-97.449 B-2.521 C-720.000 U9.637 F300
+G1 X62.479 Y50.000 Z-97.449 B-2.521 C-720.000 U9.675 F300
+G1 X60.604 Y50.000 Z-97.449 B-2.521 C-720.000 U9.712 F300
+G1 X58.729 Y50.000 Z-97.449 B-2.521 C-720.000 U9.750 F300
+G1 X56.854 Y50.000 Z-97.449 B-2.521 C-720.000 U9.787 F300
+G1 X54.979 Y50.000 Z-97.449 B-2.521 C-720.000 U9.825 F300
+G1 X53.104 Y50.000 Z-97.449 B-2.521 C-720.000 U9.862 F300
+G1 X51.229 Y50.000 Z-97.449 B-2.521 C-720.000 U9.900 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U6.440 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 24/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1170.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X64.000 Y55.564 Z-103.959 B-1.360 C-1170.000 F1200
-; pressure preload before print pass
-G1 U9.440 F120
-G4 P700
-G1 X64.000 Y56.574 Z-102.530 B-1.360 C-1170.000 U9.475 F300
-G1 X64.000 Y57.584 Z-101.101 B-1.360 C-1170.000 U9.510 F300
-G1 X64.000 Y58.595 Z-99.673 B-1.360 C-1170.000 U9.545 F300
-G1 X64.000 Y59.605 Z-98.244 B-1.360 C-1170.000 U9.580 F300
-G1 X64.000 Y60.615 Z-96.815 B-1.360 C-1170.000 U9.615 F300
-G1 X64.000 Y61.626 Z-95.386 B-1.360 C-1170.000 U9.650 F300
-G1 X64.000 Y62.636 Z-93.957 B-1.360 C-1170.000 U9.685 F300
-G1 X64.000 Y63.647 Z-92.528 B-1.360 C-1170.000 U9.720 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-840.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X49.385 Y48.935 Z-97.449 B-2.521 C-840.000 F1200
+G1 X50.323 Y50.559 Z-97.449 B-2.521 C-840.000 U9.937 F300
+G1 X51.260 Y52.183 Z-97.449 B-2.521 C-840.000 U9.975 F300
+G1 X52.198 Y53.807 Z-97.449 B-2.521 C-840.000 U10.012 F300
+G1 X53.135 Y55.431 Z-97.449 B-2.521 C-840.000 U10.050 F300
+G1 X54.073 Y57.054 Z-97.449 B-2.521 C-840.000 U10.087 F300
+G1 X55.010 Y58.678 Z-97.449 B-2.521 C-840.000 U10.125 F300
+G1 X55.948 Y60.302 Z-97.449 B-2.521 C-840.000 U10.162 F300
+G1 X56.885 Y61.926 Z-97.449 B-2.521 C-840.000 U10.200 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U6.720 F240
+G1 U7.200 F240
 ; --- edge 25/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1110.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-870.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X80.182 Y56.823 Z-92.528 B-1.360 C-1110.000 F1200
+G1 X52.206 Y59.934 Z-91.145 B-1.054 C-870.000 F1200
 ; pressure preload before print pass
-G1 U9.720 F120
+G1 U10.200 F120
 G4 P700
-G1 X79.307 Y57.328 Z-91.099 B-1.360 C-1110.000 U9.755 F300
-G1 X78.432 Y57.834 Z-89.671 B-1.360 C-1110.000 U9.790 F300
-G1 X77.557 Y58.339 Z-88.242 B-1.360 C-1110.000 U9.825 F300
-G1 X76.682 Y58.844 Z-86.813 B-1.360 C-1110.000 U9.860 F300
-G1 X75.807 Y59.349 Z-85.384 B-1.360 C-1110.000 U9.895 F300
-G1 X74.932 Y59.854 Z-83.955 B-1.360 C-1110.000 U9.930 F300
-G1 X74.057 Y60.360 Z-82.526 B-1.360 C-1110.000 U9.965 F300
-G1 X73.182 Y60.865 Z-81.097 B-1.360 C-1110.000 U10.000 F300
+G1 X53.143 Y60.475 Z-89.614 B-1.054 C-870.000 U10.237 F300
+G1 X54.081 Y61.016 Z-88.083 B-1.054 C-870.000 U10.275 F300
+G1 X55.018 Y61.557 Z-86.552 B-1.054 C-870.000 U10.312 F300
+G1 X55.956 Y62.099 Z-85.021 B-1.054 C-870.000 U10.350 F300
+G1 X56.893 Y62.640 Z-83.490 B-1.054 C-870.000 U10.387 F300
+G1 X57.831 Y63.181 Z-81.959 B-1.054 C-870.000 U10.425 F300
+G1 X58.768 Y63.723 Z-80.428 B-1.054 C-870.000 U10.462 F300
+G1 X59.706 Y64.264 Z-78.897 B-1.054 C-870.000 U10.500 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U7.000 F240
+G1 U7.500 F240
 ; --- edge 26/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-960.000, head_lead=-3.135 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-750.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X62.432 Y68.881 Z-91.162 B-2.727 C-960.000 F1200
+G1 X77.794 Y59.934 Z-91.145 B-1.054 C-750.000 F1200
 ; pressure preload before print pass
-G1 U10.000 F120
+G1 U10.500 F120
 G4 P700
-G1 X63.307 Y67.365 Z-91.162 B-2.727 C-960.000 U10.035 F300
-G1 X64.182 Y65.850 Z-91.162 B-2.727 C-960.000 U10.070 F300
-G1 X65.057 Y64.334 Z-91.162 B-2.727 C-960.000 U10.105 F300
-G1 X65.932 Y62.819 Z-91.162 B-2.727 C-960.000 U10.140 F300
-G1 X66.807 Y61.303 Z-91.162 B-2.727 C-960.000 U10.175 F300
-G1 X67.682 Y59.788 Z-91.162 B-2.727 C-960.000 U10.210 F300
-G1 X68.557 Y58.272 Z-91.162 B-2.727 C-960.000 U10.245 F300
-G1 X69.432 Y56.757 Z-91.162 B-2.727 C-960.000 U10.280 F300
+G1 X76.857 Y60.475 Z-89.614 B-1.054 C-750.000 U10.537 F300
+G1 X75.919 Y61.016 Z-88.083 B-1.054 C-750.000 U10.575 F300
+G1 X74.982 Y61.557 Z-86.552 B-1.054 C-750.000 U10.612 F300
+G1 X74.044 Y62.099 Z-85.021 B-1.054 C-750.000 U10.650 F300
+G1 X73.107 Y62.640 Z-83.490 B-1.054 C-750.000 U10.687 F300
+G1 X72.169 Y63.181 Z-81.959 B-1.054 C-750.000 U10.725 F300
+G1 X71.232 Y63.723 Z-80.428 B-1.054 C-750.000 U10.762 F300
+G1 X70.294 Y64.264 Z-78.897 B-1.054 C-750.000 U10.800 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U7.800 F240
 ; --- edge 27/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-1080.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X74.135 Y54.041 Z-91.162 B-2.727 C-1080.000 F1200
-G1 X72.385 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.315 F300
-G1 X70.635 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.350 F300
-G1 X68.885 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.385 F300
-G1 X67.135 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.420 F300
-G1 X65.385 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.455 F300
-G1 X63.635 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.490 F300
-G1 X61.885 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.525 F300
-G1 X60.135 Y54.041 Z-91.162 B-2.727 C-1080.000 U10.560 F300
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-750.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X70.294 Y46.943 Z-91.145 B-1.054 C-750.000 F1200
+; pressure preload before print pass
+G1 U10.800 F120
+G4 P700
+G1 X69.357 Y47.485 Z-89.614 B-1.054 C-750.000 U10.837 F300
+G1 X68.419 Y48.026 Z-88.083 B-1.054 C-750.000 U10.875 F300
+G1 X67.482 Y48.567 Z-86.552 B-1.054 C-750.000 U10.912 F300
+G1 X66.544 Y49.108 Z-85.021 B-1.054 C-750.000 U10.950 F300
+G1 X65.607 Y49.650 Z-83.490 B-1.054 C-750.000 U10.987 F300
+G1 X64.669 Y50.191 Z-81.959 B-1.054 C-750.000 U11.025 F300
+G1 X63.732 Y50.732 Z-80.428 B-1.054 C-750.000 U11.062 F300
+G1 X62.794 Y51.273 Z-78.897 B-1.054 C-750.000 U11.100 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; keep pressure charged for continuous horizontal tip-pivot into next edge
+; pressure release before travel
+G1 U8.100 F240
 ; --- edge 28/39 ---
-; len=14.000 mm, angle_error=0.007 deg, B=-2.727, C=-1200.000, head_lead=-3.135 mm, head_front_ok=0
-; continuous horizontal transition: tip-fixed pivot to next line direction
-; (same tip vertex, new B/C and corresponding stage XYZ)
-G1 X55.432 Y51.326 Z-91.162 B-2.727 C-1200.000 F1200
-G1 X56.307 Y52.842 Z-91.162 B-2.727 C-1200.000 U10.595 F300
-G1 X57.182 Y54.357 Z-91.162 B-2.727 C-1200.000 U10.630 F300
-G1 X58.057 Y55.873 Z-91.162 B-2.727 C-1200.000 U10.665 F300
-G1 X58.932 Y57.388 Z-91.162 B-2.727 C-1200.000 U10.700 F300
-G1 X59.807 Y58.904 Z-91.162 B-2.727 C-1200.000 U10.735 F300
-G1 X60.682 Y60.420 Z-91.162 B-2.727 C-1200.000 U10.770 F300
-G1 X61.557 Y61.935 Z-91.162 B-2.727 C-1200.000 U10.805 F300
-G1 X62.432 Y63.451 Z-91.162 B-2.727 C-1200.000 U10.840 F300
-; end-of-pass dwell for node formation / liquid flow
-G4 P700
-; pressure release before travel
-G1 U7.840 F240
-; --- edge 29/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1230.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-870.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X47.818 Y56.823 Z-92.528 B-1.360 C-1230.000 F1200
+G1 X59.706 Y46.943 Z-91.145 B-1.054 C-870.000 F1200
 ; pressure preload before print pass
-G1 U10.840 F120
+G1 U11.100 F120
 G4 P700
-G1 X48.693 Y57.328 Z-91.099 B-1.360 C-1230.000 U10.875 F300
-G1 X49.568 Y57.834 Z-89.671 B-1.360 C-1230.000 U10.910 F300
-G1 X50.443 Y58.339 Z-88.242 B-1.360 C-1230.000 U10.945 F300
-G1 X51.318 Y58.844 Z-86.813 B-1.360 C-1230.000 U10.980 F300
-G1 X52.193 Y59.349 Z-85.384 B-1.360 C-1230.000 U11.015 F300
-G1 X53.068 Y59.854 Z-83.955 B-1.360 C-1230.000 U11.050 F300
-G1 X53.943 Y60.360 Z-82.526 B-1.360 C-1230.000 U11.085 F300
-G1 X54.818 Y60.865 Z-81.097 B-1.360 C-1230.000 U11.120 F300
-; end-of-pass dwell for node formation / liquid flow
-G4 P700
-; pressure release before travel
-G1 U8.120 F240
-; --- edge 30/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1230.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X54.818 Y44.699 Z-92.528 B-1.360 C-1230.000 F1200
-; pressure preload before print pass
-G1 U11.120 F120
-G4 P700
-G1 X55.693 Y45.204 Z-91.099 B-1.360 C-1230.000 U11.155 F300
-G1 X56.568 Y45.709 Z-89.671 B-1.360 C-1230.000 U11.190 F300
-G1 X57.443 Y46.214 Z-88.242 B-1.360 C-1230.000 U11.225 F300
-G1 X58.318 Y46.720 Z-86.813 B-1.360 C-1230.000 U11.260 F300
-G1 X59.193 Y47.225 Z-85.384 B-1.360 C-1230.000 U11.295 F300
-G1 X60.068 Y47.730 Z-83.955 B-1.360 C-1230.000 U11.330 F300
-G1 X60.943 Y48.235 Z-82.526 B-1.360 C-1230.000 U11.365 F300
-G1 X61.818 Y48.740 Z-81.097 B-1.360 C-1230.000 U11.400 F300
+G1 X60.643 Y47.485 Z-89.614 B-1.054 C-870.000 U11.137 F300
+G1 X61.581 Y48.026 Z-88.083 B-1.054 C-870.000 U11.175 F300
+G1 X62.518 Y48.567 Z-86.552 B-1.054 C-870.000 U11.212 F300
+G1 X63.456 Y49.108 Z-85.021 B-1.054 C-870.000 U11.250 F300
+G1 X64.393 Y49.650 Z-83.490 B-1.054 C-870.000 U11.287 F300
+G1 X65.331 Y50.191 Z-81.959 B-1.054 C-870.000 U11.325 F300
+G1 X66.268 Y50.732 Z-80.428 B-1.054 C-870.000 U11.362 F300
+G1 X67.206 Y51.273 Z-78.897 B-1.054 C-870.000 U11.400 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
 G1 U8.400 F240
-; --- edge 31/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1110.000, head_lead=-8.185 mm, head_front_ok=0
+; --- edge 29/39 ---
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-990.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X73.182 Y44.699 Z-92.528 B-1.360 C-1110.000 F1200
+G1 X72.500 Y69.104 Z-91.145 B-1.054 C-990.000 F1200
 ; pressure preload before print pass
 G1 U11.400 F120
 G4 P700
-G1 X72.307 Y45.204 Z-91.099 B-1.360 C-1110.000 U11.435 F300
-G1 X71.432 Y45.709 Z-89.671 B-1.360 C-1110.000 U11.470 F300
-G1 X70.557 Y46.214 Z-88.242 B-1.360 C-1110.000 U11.505 F300
-G1 X69.682 Y46.720 Z-86.813 B-1.360 C-1110.000 U11.540 F300
-G1 X68.807 Y47.225 Z-85.384 B-1.360 C-1110.000 U11.575 F300
-G1 X67.932 Y47.730 Z-83.955 B-1.360 C-1110.000 U11.610 F300
-G1 X67.057 Y48.235 Z-82.526 B-1.360 C-1110.000 U11.645 F300
-G1 X66.182 Y48.740 Z-81.097 B-1.360 C-1110.000 U11.680 F300
+G1 X72.500 Y68.021 Z-89.614 B-1.054 C-990.000 U11.437 F300
+G1 X72.500 Y66.939 Z-88.083 B-1.054 C-990.000 U11.475 F300
+G1 X72.500 Y65.856 Z-86.552 B-1.054 C-990.000 U11.512 F300
+G1 X72.500 Y64.774 Z-85.021 B-1.054 C-990.000 U11.550 F300
+G1 X72.500 Y63.691 Z-83.490 B-1.054 C-990.000 U11.587 F300
+G1 X72.500 Y62.609 Z-81.959 B-1.054 C-990.000 U11.625 F300
+G1 X72.500 Y61.526 Z-80.428 B-1.054 C-990.000 U11.662 F300
+G1 X72.500 Y60.444 Z-78.897 B-1.054 C-990.000 U11.700 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U8.680 F240
+G1 U8.700 F240
+; --- edge 30/39 ---
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-990.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X57.500 Y69.104 Z-91.145 B-1.054 C-990.000 F1200
+; pressure preload before print pass
+G1 U11.700 F120
+G4 P700
+G1 X57.500 Y68.021 Z-89.614 B-1.054 C-990.000 U11.737 F300
+G1 X57.500 Y66.939 Z-88.083 B-1.054 C-990.000 U11.775 F300
+G1 X57.500 Y65.856 Z-86.552 B-1.054 C-990.000 U11.812 F300
+G1 X57.500 Y64.774 Z-85.021 B-1.054 C-990.000 U11.850 F300
+G1 X57.500 Y63.691 Z-83.490 B-1.054 C-990.000 U11.887 F300
+G1 X57.500 Y62.609 Z-81.959 B-1.054 C-990.000 U11.925 F300
+G1 X57.500 Y61.526 Z-80.428 B-1.054 C-990.000 U11.962 F300
+G1 X57.500 Y60.444 Z-78.897 B-1.054 C-990.000 U12.000 F300
+; end-of-pass dwell for node formation / liquid flow
+G4 P700
+; pressure release before travel
+G1 U9.000 F240
+; --- edge 31/39 ---
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-1110.000, head_lead=-4.464 mm, head_front_ok=0
+; non-print travel to next strut start (tip exact)
+G1 X85.294 Y46.943 Z-91.145 B-1.054 C-1110.000 F1200
+; pressure preload before print pass
+G1 U12.000 F120
+G4 P700
+G1 X84.357 Y47.485 Z-89.614 B-1.054 C-1110.000 U12.037 F300
+G1 X83.419 Y48.026 Z-88.083 B-1.054 C-1110.000 U12.075 F300
+G1 X82.482 Y48.567 Z-86.552 B-1.054 C-1110.000 U12.112 F300
+G1 X81.544 Y49.108 Z-85.021 B-1.054 C-1110.000 U12.150 F300
+G1 X80.607 Y49.650 Z-83.490 B-1.054 C-1110.000 U12.187 F300
+G1 X79.669 Y50.191 Z-81.959 B-1.054 C-1110.000 U12.225 F300
+G1 X78.732 Y50.732 Z-80.428 B-1.054 C-1110.000 U12.262 F300
+G1 X77.794 Y51.273 Z-78.897 B-1.054 C-1110.000 U12.300 F300
+; end-of-pass dwell for node formation / liquid flow
+G4 P700
+; pressure release before travel
+G1 U9.300 F240
 ; --- edge 32/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-990.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-1230.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X57.000 Y72.727 Z-92.528 B-1.360 C-990.000 F1200
+G1 X44.706 Y46.943 Z-91.145 B-1.054 C-1230.000 F1200
 ; pressure preload before print pass
-G1 U11.680 F120
+G1 U12.300 F120
 G4 P700
-G1 X57.000 Y71.716 Z-91.099 B-1.360 C-990.000 U11.715 F300
-G1 X57.000 Y70.706 Z-89.671 B-1.360 C-990.000 U11.750 F300
-G1 X57.000 Y69.695 Z-88.242 B-1.360 C-990.000 U11.785 F300
-G1 X57.000 Y68.685 Z-86.813 B-1.360 C-990.000 U11.820 F300
-G1 X57.000 Y67.675 Z-85.384 B-1.360 C-990.000 U11.855 F300
-G1 X57.000 Y66.664 Z-83.955 B-1.360 C-990.000 U11.890 F300
-G1 X57.000 Y65.654 Z-82.526 B-1.360 C-990.000 U11.925 F300
-G1 X57.000 Y64.644 Z-81.097 B-1.360 C-990.000 U11.960 F300
+G1 X45.643 Y47.485 Z-89.614 B-1.054 C-1230.000 U12.337 F300
+G1 X46.581 Y48.026 Z-88.083 B-1.054 C-1230.000 U12.375 F300
+G1 X47.518 Y48.567 Z-86.552 B-1.054 C-1230.000 U12.412 F300
+G1 X48.456 Y49.108 Z-85.021 B-1.054 C-1230.000 U12.450 F300
+G1 X49.393 Y49.650 Z-83.490 B-1.054 C-1230.000 U12.487 F300
+G1 X50.331 Y50.191 Z-81.959 B-1.054 C-1230.000 U12.525 F300
+G1 X51.268 Y50.732 Z-80.428 B-1.054 C-1230.000 U12.562 F300
+G1 X52.206 Y51.273 Z-78.897 B-1.054 C-1230.000 U12.600 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U8.960 F240
+G1 U9.600 F240
 ; --- edge 33/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-990.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-1350.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X71.000 Y72.727 Z-92.528 B-1.360 C-990.000 F1200
+G1 X65.000 Y82.094 Z-91.145 B-1.054 C-1350.000 F1200
 ; pressure preload before print pass
-G1 U11.960 F120
+G1 U12.600 F120
 G4 P700
-G1 X71.000 Y71.716 Z-91.099 B-1.360 C-990.000 U11.995 F300
-G1 X71.000 Y70.706 Z-89.671 B-1.360 C-990.000 U12.030 F300
-G1 X71.000 Y69.695 Z-88.242 B-1.360 C-990.000 U12.065 F300
-G1 X71.000 Y68.685 Z-86.813 B-1.360 C-990.000 U12.100 F300
-G1 X71.000 Y67.675 Z-85.384 B-1.360 C-990.000 U12.135 F300
-G1 X71.000 Y66.664 Z-83.955 B-1.360 C-990.000 U12.170 F300
-G1 X71.000 Y65.654 Z-82.526 B-1.360 C-990.000 U12.205 F300
-G1 X71.000 Y64.644 Z-81.097 B-1.360 C-990.000 U12.240 F300
+G1 X65.000 Y81.012 Z-89.614 B-1.054 C-1350.000 U12.637 F300
+G1 X65.000 Y79.929 Z-88.083 B-1.054 C-1350.000 U12.675 F300
+G1 X65.000 Y78.847 Z-86.552 B-1.054 C-1350.000 U12.712 F300
+G1 X65.000 Y77.764 Z-85.021 B-1.054 C-1350.000 U12.750 F300
+G1 X65.000 Y76.682 Z-83.490 B-1.054 C-1350.000 U12.787 F300
+G1 X65.000 Y75.599 Z-81.959 B-1.054 C-1350.000 U12.825 F300
+G1 X65.000 Y74.516 Z-80.428 B-1.054 C-1350.000 U12.862 F300
+G1 X65.000 Y73.434 Z-78.897 B-1.054 C-1350.000 U12.900 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U9.240 F240
+G1 U9.900 F240
 ; --- edge 34/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1110.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-1320.000, head_lead=-1.229 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X87.182 Y44.699 Z-92.528 B-1.360 C-1110.000 F1200
+G1 X64.385 Y68.385 Z-85.202 B-2.521 C-1320.000 F1200
 ; pressure preload before print pass
-G1 U12.240 F120
+G1 U12.900 F120
 G4 P700
-G1 X86.307 Y45.204 Z-91.099 B-1.360 C-1110.000 U12.275 F300
-G1 X85.432 Y45.709 Z-89.671 B-1.360 C-1110.000 U12.310 F300
-G1 X84.557 Y46.214 Z-88.242 B-1.360 C-1110.000 U12.345 F300
-G1 X83.682 Y46.720 Z-86.813 B-1.360 C-1110.000 U12.380 F300
-G1 X82.807 Y47.225 Z-85.384 B-1.360 C-1110.000 U12.415 F300
-G1 X81.932 Y47.730 Z-83.955 B-1.360 C-1110.000 U12.450 F300
-G1 X81.057 Y48.235 Z-82.526 B-1.360 C-1110.000 U12.485 F300
-G1 X80.182 Y48.740 Z-81.097 B-1.360 C-1110.000 U12.520 F300
+G1 X65.323 Y66.761 Z-85.202 B-2.521 C-1320.000 U12.937 F300
+G1 X66.260 Y65.138 Z-85.202 B-2.521 C-1320.000 U12.975 F300
+G1 X67.198 Y63.514 Z-85.202 B-2.521 C-1320.000 U13.012 F300
+G1 X68.135 Y61.890 Z-85.202 B-2.521 C-1320.000 U13.050 F300
+G1 X69.073 Y60.266 Z-85.202 B-2.521 C-1320.000 U13.087 F300
+G1 X70.010 Y58.642 Z-85.202 B-2.521 C-1320.000 U13.125 F300
+G1 X70.948 Y57.019 Z-85.202 B-2.521 C-1320.000 U13.162 F300
+G1 X71.885 Y55.395 Z-85.202 B-2.521 C-1320.000 U13.200 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U9.520 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 35/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1230.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X40.818 Y44.699 Z-92.528 B-1.360 C-1230.000 F1200
-; pressure preload before print pass
-G1 U12.520 F120
-G4 P700
-G1 X41.693 Y45.204 Z-91.099 B-1.360 C-1230.000 U12.555 F300
-G1 X42.568 Y45.709 Z-89.671 B-1.360 C-1230.000 U12.590 F300
-G1 X43.443 Y46.214 Z-88.242 B-1.360 C-1230.000 U12.625 F300
-G1 X44.318 Y46.720 Z-86.813 B-1.360 C-1230.000 U12.660 F300
-G1 X45.193 Y47.225 Z-85.384 B-1.360 C-1230.000 U12.695 F300
-G1 X46.068 Y47.730 Z-83.955 B-1.360 C-1230.000 U12.730 F300
-G1 X46.943 Y48.235 Z-82.526 B-1.360 C-1230.000 U12.765 F300
-G1 X47.818 Y48.740 Z-81.097 B-1.360 C-1230.000 U12.800 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-1440.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X73.729 Y54.330 Z-85.202 B-2.521 C-1440.000 F1200
+G1 X71.854 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.237 F300
+G1 X69.979 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.275 F300
+G1 X68.104 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.312 F300
+G1 X66.229 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.350 F300
+G1 X64.354 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.387 F300
+G1 X62.479 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.425 F300
+G1 X60.604 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.462 F300
+G1 X58.729 Y54.330 Z-85.202 B-2.521 C-1440.000 U13.500 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
-; pressure release before travel
-G1 U9.800 F240
+; keep pressure charged for continuous horizontal tip-pivot into next edge
 ; --- edge 36/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1350.000, head_lead=-8.185 mm, head_front_ok=0
-; non-print travel to next strut start (tip exact)
-G1 X64.000 Y84.851 Z-92.528 B-1.360 C-1350.000 F1200
-; pressure preload before print pass
-G1 U12.800 F120
-G4 P700
-G1 X64.000 Y83.841 Z-91.099 B-1.360 C-1350.000 U12.835 F300
-G1 X64.000 Y82.830 Z-89.671 B-1.360 C-1350.000 U12.870 F300
-G1 X64.000 Y81.820 Z-88.242 B-1.360 C-1350.000 U12.905 F300
-G1 X64.000 Y80.809 Z-86.813 B-1.360 C-1350.000 U12.940 F300
-G1 X64.000 Y79.799 Z-85.384 B-1.360 C-1350.000 U12.975 F300
-G1 X64.000 Y78.789 Z-83.955 B-1.360 C-1350.000 U13.010 F300
-G1 X64.000 Y77.778 Z-82.526 B-1.360 C-1350.000 U13.045 F300
-G1 X64.000 Y76.768 Z-81.097 B-1.360 C-1350.000 U13.080 F300
+; len=15.000 mm, angle_error=0.057 deg, B=-2.521, C=-1560.000, head_lead=-1.229 mm, head_front_ok=0
+; continuous horizontal transition: tip-fixed pivot to next line direction
+; (same tip vertex, new B/C and corresponding stage XYZ)
+G1 X56.885 Y53.265 Z-85.202 B-2.521 C-1560.000 F1200
+G1 X57.823 Y54.889 Z-85.202 B-2.521 C-1560.000 U13.537 F300
+G1 X58.760 Y56.513 Z-85.202 B-2.521 C-1560.000 U13.575 F300
+G1 X59.698 Y58.137 Z-85.202 B-2.521 C-1560.000 U13.612 F300
+G1 X60.635 Y59.761 Z-85.202 B-2.521 C-1560.000 U13.650 F300
+G1 X61.573 Y61.384 Z-85.202 B-2.521 C-1560.000 U13.687 F300
+G1 X62.510 Y63.008 Z-85.202 B-2.521 C-1560.000 U13.725 F300
+G1 X63.448 Y64.632 Z-85.202 B-2.521 C-1560.000 U13.762 F300
+G1 X64.385 Y66.256 Z-85.202 B-2.521 C-1560.000 U13.800 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U10.080 F240
+G1 U10.800 F240
 ; --- edge 37/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1350.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-1710.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X64.000 Y76.768 Z-81.097 B-1.360 C-1350.000 F1200
+G1 X65.000 Y73.434 Z-78.897 B-1.054 C-1710.000 F1200
 ; pressure preload before print pass
-G1 U13.080 F120
+G1 U13.800 F120
 G4 P700
-G1 X64.000 Y75.758 Z-79.668 B-1.360 C-1350.000 U13.115 F300
-G1 X64.000 Y74.747 Z-78.240 B-1.360 C-1350.000 U13.150 F300
-G1 X64.000 Y73.737 Z-76.811 B-1.360 C-1350.000 U13.185 F300
-G1 X64.000 Y72.727 Z-75.382 B-1.360 C-1350.000 U13.220 F300
-G1 X64.000 Y71.716 Z-73.953 B-1.360 C-1350.000 U13.255 F300
-G1 X64.000 Y70.706 Z-72.524 B-1.360 C-1350.000 U13.290 F300
-G1 X64.000 Y69.695 Z-71.095 B-1.360 C-1350.000 U13.325 F300
-G1 X64.000 Y68.685 Z-69.666 B-1.360 C-1350.000 U13.360 F300
+G1 X65.000 Y72.351 Z-77.366 B-1.054 C-1710.000 U13.837 F300
+G1 X65.000 Y71.269 Z-75.835 B-1.054 C-1710.000 U13.875 F300
+G1 X65.000 Y70.186 Z-74.304 B-1.054 C-1710.000 U13.912 F300
+G1 X65.000 Y69.104 Z-72.773 B-1.054 C-1710.000 U13.950 F300
+G1 X65.000 Y68.021 Z-71.243 B-1.054 C-1710.000 U13.987 F300
+G1 X65.000 Y66.939 Z-69.712 B-1.054 C-1710.000 U14.025 F300
+G1 X65.000 Y65.856 Z-68.181 B-1.054 C-1710.000 U14.062 F300
+G1 X65.000 Y64.774 Z-66.650 B-1.054 C-1710.000 U14.100 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U10.360 F240
+G1 U11.100 F240
 ; --- edge 38/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1470.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-1830.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X80.182 Y48.740 Z-81.097 B-1.360 C-1470.000 F1200
+G1 X77.794 Y51.273 Z-78.897 B-1.054 C-1830.000 F1200
 ; pressure preload before print pass
-G1 U13.360 F120
+G1 U14.100 F120
 G4 P700
-G1 X79.307 Y49.246 Z-79.668 B-1.360 C-1470.000 U13.395 F300
-G1 X78.432 Y49.751 Z-78.240 B-1.360 C-1470.000 U13.430 F300
-G1 X77.557 Y50.256 Z-76.811 B-1.360 C-1470.000 U13.465 F300
-G1 X76.682 Y50.761 Z-75.382 B-1.360 C-1470.000 U13.500 F300
-G1 X75.807 Y51.266 Z-73.953 B-1.360 C-1470.000 U13.535 F300
-G1 X74.932 Y51.771 Z-72.524 B-1.360 C-1470.000 U13.570 F300
-G1 X74.057 Y52.277 Z-71.095 B-1.360 C-1470.000 U13.605 F300
-G1 X73.182 Y52.782 Z-69.666 B-1.360 C-1470.000 U13.640 F300
+G1 X76.857 Y51.815 Z-77.366 B-1.054 C-1830.000 U14.137 F300
+G1 X75.919 Y52.356 Z-75.835 B-1.054 C-1830.000 U14.175 F300
+G1 X74.982 Y52.897 Z-74.304 B-1.054 C-1830.000 U14.212 F300
+G1 X74.044 Y53.438 Z-72.773 B-1.054 C-1830.000 U14.250 F300
+G1 X73.107 Y53.980 Z-71.243 B-1.054 C-1830.000 U14.287 F300
+G1 X72.169 Y54.521 Z-69.712 B-1.054 C-1830.000 U14.325 F300
+G1 X71.232 Y55.062 Z-68.181 B-1.054 C-1830.000 U14.362 F300
+G1 X70.294 Y55.604 Z-66.650 B-1.054 C-1830.000 U14.400 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U10.640 F240
+G1 U11.400 F240
 ; --- edge 39/39 ---
-; len=14.000 mm, angle_error=0.087 deg, B=-1.360, C=-1590.000, head_lead=-8.185 mm, head_front_ok=0
+; len=15.000 mm, angle_error=0.044 deg, B=-1.054, C=-1950.000, head_lead=-4.464 mm, head_front_ok=0
 ; non-print travel to next strut start (tip exact)
-G1 X47.818 Y48.740 Z-81.097 B-1.360 C-1590.000 F1200
+G1 X52.206 Y51.273 Z-78.897 B-1.054 C-1950.000 F1200
 ; pressure preload before print pass
-G1 U13.640 F120
+G1 U14.400 F120
 G4 P700
-G1 X48.693 Y49.246 Z-79.668 B-1.360 C-1590.000 U13.675 F300
-G1 X49.568 Y49.751 Z-78.240 B-1.360 C-1590.000 U13.710 F300
-G1 X50.443 Y50.256 Z-76.811 B-1.360 C-1590.000 U13.745 F300
-G1 X51.318 Y50.761 Z-75.382 B-1.360 C-1590.000 U13.780 F300
-G1 X52.193 Y51.266 Z-73.953 B-1.360 C-1590.000 U13.815 F300
-G1 X53.068 Y51.771 Z-72.524 B-1.360 C-1590.000 U13.850 F300
-G1 X53.943 Y52.277 Z-71.095 B-1.360 C-1590.000 U13.885 F300
-G1 X54.818 Y52.782 Z-69.666 B-1.360 C-1590.000 U13.920 F300
+G1 X53.143 Y51.815 Z-77.366 B-1.054 C-1950.000 U14.437 F300
+G1 X54.081 Y52.356 Z-75.835 B-1.054 C-1950.000 U14.475 F300
+G1 X55.018 Y52.897 Z-74.304 B-1.054 C-1950.000 U14.512 F300
+G1 X55.956 Y53.438 Z-72.773 B-1.054 C-1950.000 U14.550 F300
+G1 X56.893 Y53.980 Z-71.243 B-1.054 C-1950.000 U14.587 F300
+G1 X57.831 Y54.521 Z-69.712 B-1.054 C-1950.000 U14.625 F300
+G1 X58.768 Y55.062 Z-68.181 B-1.054 C-1950.000 U14.662 F300
+G1 X59.706 Y55.604 Z-66.650 B-1.054 C-1950.000 U14.700 F300
 ; end-of-pass dwell for node formation / liquid flow
 G4 P700
 ; pressure release before travel
-G1 U10.920 F240
+G1 U11.700 F240
 ; safe end move: raise to safe Z, move XY, then dive to end Z
 G1 Z0.000 B0.000 C0.000 F1200
 G1 X60.000 Y40.000 B0.000 C0.000 F1200

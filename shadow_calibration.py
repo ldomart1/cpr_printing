@@ -2081,58 +2081,62 @@ class CTR_Shadow_Calibration:
             df_mm = pd.DataFrame(tip_locations_array_fine_mm)
             df_mm.to_excel('tip_locations_coarse_mm.xlsx', index=False, header=False)
 
-            # ---------- Step 4: Fit line and plot (in canonical Z-X) ----------
-            print("Fitting alignment line (X as a function of Z)...")
-            # Fit X = mZ + b so the reference alignment line is vertical (along Z axis).
-            coefficients = np.polyfit(tip_locations_array_fine_mm[:, 1], tip_locations_array_fine_mm[:, 0], 1)  # X = mZ + b
-            p = np.poly1d(coefficients)
+            # ---------- Step 4/5: X-Z alignment (disabled) ----------
+            print("Skipping X-Z alignment (line fitting + rotation disabled).")
+            arr_rot = tip_locations_array_fine_mm.copy()
 
-            if save_plots:
-                z_sorted = np.sort(tip_locations_array_fine_mm[:, 1])
-                plt.figure(figsize=(10, 8))
-                plt.scatter(tip_locations_array_fine_mm[:, 0], tip_locations_array_fine_mm[:, 1], alpha=0.7)
-                plt.plot(p(z_sorted), z_sorted, 'r-', linewidth=2)
-                plt.axis("equal")
-                plt.title(f"Tip Locations with Fitted Vertical Alignment Line (dX/dZ slope: {coefficients[0]:.4f})")
-                plt.xlabel("X (mm)")
-                plt.ylabel("Z (mm) [flipped]")
-                plt.savefig("02_tip_locations_with_line_fitted.png", dpi=150, bbox_inches='tight')
-                plt.close()
-
-            # ---------- Step 5: Change of basis (rotate to align) ----------
-            print("Performing coordinate alignment (rotate to align with Z axis)...")
-
-            arr0 = tip_locations_array_fine_mm.copy()
-            arr0[:, 0] -= np.mean(arr0[:, 0])  # X
-            arr0[:, 1] -= np.mean(arr0[:, 1])  # Z
-
-            # If slope = dX/dZ, rotate by +atan(slope) to align fitted line with Z axis.
-            theta = math.atan(coefficients[0])
-            print(f"Rotation angle: {theta:.4f} rad ({theta * 180 / math.pi:.2f} deg)")
-
-            R = np.array([[math.cos(theta), -math.sin(theta)],
-                        [math.sin(theta),  math.cos(theta)]])
-
-            arr_rot = arr0.copy()
-            arr_rot[:, 0:2] = (R @ arr0[:, 0:2].T).T
-
-            if save_plots:
-                plt.figure(figsize=(12, 6))
-                plt.subplot(1, 2, 1)
-                plt.scatter(arr0[:, 0], arr0[:, 1], alpha=0.7)
-                plt.title("03: Before Alignment (Canonical X-Z)")
-                plt.axis("equal")
-                plt.xlabel("X (mm)")
-                plt.ylabel("Z (mm) [flipped]")
-                plt.subplot(1, 2, 2)
-                plt.scatter(arr_rot[:, 0], arr_rot[:, 1], alpha=0.7)
-                plt.title("03: After Alignment (Aligned X-Z)")
-                plt.axis("equal")
-                plt.xlabel("X (mm)")
-                plt.ylabel("Z (mm) [flipped]")
-                plt.tight_layout()
-                plt.savefig("03_tip_locations_alignment.png", dpi=150, bbox_inches='tight')
-                plt.close()
+            # # ---------- Step 4: Fit line and plot (in canonical Z-X) ----------
+            # print("Fitting alignment line (X as a function of Z)...")
+            # # Fit X = mZ + b so the reference alignment line is vertical (along Z axis).
+            # coefficients = np.polyfit(tip_locations_array_fine_mm[:, 1], tip_locations_array_fine_mm[:, 0], 1)  # X = mZ + b
+            # p = np.poly1d(coefficients)
+            #
+            # if save_plots:
+            #     z_sorted = np.sort(tip_locations_array_fine_mm[:, 1])
+            #     plt.figure(figsize=(10, 8))
+            #     plt.scatter(tip_locations_array_fine_mm[:, 0], tip_locations_array_fine_mm[:, 1], alpha=0.7)
+            #     plt.plot(p(z_sorted), z_sorted, 'r-', linewidth=2)
+            #     plt.axis("equal")
+            #     plt.title(f"Tip Locations with Fitted Vertical Alignment Line (dX/dZ slope: {coefficients[0]:.4f})")
+            #     plt.xlabel("X (mm)")
+            #     plt.ylabel("Z (mm) [flipped]")
+            #     plt.savefig("02_tip_locations_with_line_fitted.png", dpi=150, bbox_inches='tight')
+            #     plt.close()
+            #
+            # # ---------- Step 5: Change of basis (rotate to align) ----------
+            # print("Performing coordinate alignment (rotate to align with Z axis)...")
+            #
+            # arr0 = tip_locations_array_fine_mm.copy()
+            # arr0[:, 0] -= np.mean(arr0[:, 0])  # X
+            # arr0[:, 1] -= np.mean(arr0[:, 1])  # Z
+            #
+            # # If slope = dX/dZ, rotate by +atan(slope) to align fitted line with Z axis.
+            # theta = math.atan(coefficients[0])
+            # print(f"Rotation angle: {theta:.4f} rad ({theta * 180 / math.pi:.2f} deg)")
+            #
+            # R = np.array([[math.cos(theta), -math.sin(theta)],
+            #             [math.sin(theta),  math.cos(theta)]])
+            #
+            # arr_rot = arr0.copy()
+            # arr_rot[:, 0:2] = (R @ arr0[:, 0:2].T).T
+            #
+            # if save_plots:
+            #     plt.figure(figsize=(12, 6))
+            #     plt.subplot(1, 2, 1)
+            #     plt.scatter(arr0[:, 0], arr0[:, 1], alpha=0.7)
+            #     plt.title("03: Before Alignment (Canonical X-Z)")
+            #     plt.axis("equal")
+            #     plt.xlabel("X (mm)")
+            #     plt.ylabel("Z (mm) [flipped]")
+            #     plt.subplot(1, 2, 2)
+            #     plt.scatter(arr_rot[:, 0], arr_rot[:, 1], alpha=0.7)
+            #     plt.title("03: After Alignment (Aligned X-Z)")
+            #     plt.axis("equal")
+            #     plt.xlabel("X (mm)")
+            #     plt.ylabel("Z (mm) [flipped]")
+            #     plt.tight_layout()
+            #     plt.savefig("03_tip_locations_alignment.png", dpi=150, bbox_inches='tight')
+            #     plt.close()
 
             # ---------- Step 6: Orientation processing ----------
             # Mirror + average the X component between orientations 0/1, paired by b_pull.
@@ -2147,7 +2151,7 @@ class CTR_Shadow_Calibration:
 
             arr_valid_rows = arr_rot[np.isfinite(arr_rot[:, 0])].copy()
             if arr_valid_rows.size == 0:
-                raise ValueError("No valid aligned X values found in arr_rot to compute planar mirror-line reference.")
+                raise ValueError("No valid X values found in arr_rot to compute planar mirror-line reference.")
 
             x_ref_mirror_line = float(np.mean(arr_valid_rows[:, 0]))
             b_ref_mirror_line_mean = float(np.mean(arr_valid_rows[:, B_PULL_COL]))
@@ -2155,7 +2159,7 @@ class CTR_Shadow_Calibration:
             b_ref_mirror_line_max = float(np.max(arr_valid_rows[:, B_PULL_COL]))
 
             print(
-                "Planar radial zero (mirror line) from aligned unmirrored data (all B, all orientations): "
+                "Planar radial zero (mirror line) from unmirrored data (all B, all orientations): "
                 f"samples={arr_valid_rows.shape[0]}, X_ref_mirror_line={x_ref_mirror_line:.6f} mm, "
                 f"B range=[{b_ref_mirror_line_min:.6f}, {b_ref_mirror_line_max:.6f}], "
                 f"B mean={b_ref_mirror_line_mean:.6f}"
@@ -2207,8 +2211,9 @@ class CTR_Shadow_Calibration:
             o0p = o0c[idx0].copy()
             o1p = o1c[idx1].copy()
 
-            # Requested behavior: mirror and average X between orientations.
-            o1_x_mirrored = -o1p[:, 0]
+            # Mirror orientation-1 around the computed mirror line, not around x=0.
+            # This keeps the radial zero reference tied to x_ref_mirror_line.
+            o1_x_mirrored = (2.0 * x_ref_mirror_line) - o1p[:, 0]
             avg_x = (o0p[:, 0] + o1_x_mirrored) / 2.0
 
             # Keep a single paired trajectory for fitting.
@@ -2226,7 +2231,7 @@ class CTR_Shadow_Calibration:
             # [X_mm, Z_mm, b_pull, tip_angle_deg]
             tip_locations_final = np.column_stack([avg_x, avg_z, common_b, avg_ang])
 
-            print("After orientation X mirroring/averaging (aligned frame):")
+            print("After orientation X mirroring/averaging (current frame):")
             print(f"X range: {tip_locations_final[:, 0].min():.3f} to {tip_locations_final[:, 0].max():.3f} mm")
             print(f"Z range: {tip_locations_final[:, 1].min():.3f} to {tip_locations_final[:, 1].max():.3f} mm")
             print(f"b_pull range: {tip_locations_final[:, 2].min():.3f} to {tip_locations_final[:, 2].max():.3f}")
@@ -2286,7 +2291,7 @@ class CTR_Shadow_Calibration:
                 zero_idx = int(np.argmin(np.abs(delta_motor - b_zero_target)))
                 print(f"Warning: No exact B=0.0 found; using nearest point at B={delta_motor[zero_idx]:.6f} as zero reference.")
 
-            # X/r reference uses mirror-line X from aligned unmirrored data at B=0 (or nearest B)
+            # Keep mirror-line X as the radial zero reference (even with alignment disabled).
             x0_ref = float(x_ref_mirror_line)
             z0_ref = float(z_avg_raw[zero_idx])
 
@@ -2296,7 +2301,7 @@ class CTR_Shadow_Calibration:
 
             # Strict planar bending definition:
             # r is the signed transverse/radial deflection, i.e. r = x (not Euclidean radius).
-            # Radial zero is defined by the mirror line (mean unmirrored aligned X across all B and both orientations).
+            # Radial zero is defined by the mirror line (mean unmirrored X across all B and both orientations).
             r_coords_raw = x_avg_raw.copy()
             r_coords = x_avg.copy()
 
@@ -2319,7 +2324,7 @@ class CTR_Shadow_Calibration:
             print(f"Zero reference index: {zero_idx} | B_ref = {delta_motor[zero_idx]:.6f}")
             print(f"Reference tip (raw): x_ref_mirror_line = {x0_ref:.6f} mm, z0 = {z0_ref:.6f} mm")
             print(
-                "Radial reference source: mirror line = mean unmirrored aligned X across all measured B values "
+                "Radial reference source: mirror line = mean unmirrored X across all measured B values "
                 f"and both orientations (B range {b_ref_mirror_line_min:.6f} to {b_ref_mirror_line_max:.6f}, "
                 f"B mean {b_ref_mirror_line_mean:.6f})"
             )
@@ -2614,7 +2619,7 @@ class CTR_Shadow_Calibration:
                     'radial_reference_b_min_mm': b_ref_mirror_line_min,
                     'radial_reference_b_max_mm': b_ref_mirror_line_max,
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored aligned X across all measured B values and both orientations in the aligned frame'
+                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored X across all measured B values and both orientations in the current frame'
                 }
             }
             with open(f"{robot_name}_cubic_polar_calibration.pkl", "wb") as f:
@@ -2771,7 +2776,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'radial_reference_b_min_mm': b_ref_mirror_line_min,
                     'radial_reference_b_max_mm': b_ref_mirror_line_max,
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored aligned X across all measured B values and both orientations in the aligned frame'
+                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored X across all measured B values and both orientations in the current frame'
                 }
             }
             with open(f"{robot_name}_cubic_calibration.pkl", "wb") as f:
@@ -3001,14 +3006,14 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'radial_reference_b_max_mm': b_ref_mirror_line_max,
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
                     'r_definition': 'signed planar transverse deflection (r = x) in strict planar bending calibration',
-                    'notes': 'Z is shifted so the first averaged B=0.0 tip is z=0 (or nearest B fallback). Radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored aligned X across all measured B values and both orientations in the aligned frame, so r=0 at that radial reference.'
+                    'notes': 'Z is shifted so the first averaged B=0.0 tip is z=0 (or nearest B fallback). Radial r is defined as signed planar transverse deflection (r=x) and referenced to the mirror line, computed as the mean unmirrored X across all measured B values and both orientations in the current frame, so r=0 at that radial reference.'
                 },
                 'cubic_coefficients': {
                     'r_coeffs': r_coefficients.tolist(),  # [u³, u², u¹, u⁰]
                     'z_coeffs': z_coefficients.tolist(),
                     'tip_angle_coeffs': tip_angle_coefficients.tolist() if tip_angle_coefficients is not None else None,
                     'r_equation': r_equation,
-                    'r_definition': 'signed planar transverse deflection (r = x), referenced to the mirror line = mean unmirrored aligned X across all measured B values and both orientations in the aligned frame',
+                    'r_definition': 'signed planar transverse deflection (r = x), referenced to the mirror line = mean unmirrored X across all measured B values and both orientations in the current frame',
                     'z_equation': z_equation,
                     'tip_angle_equation': tip_angle_equation,
                     'r_r_squared': float(r_r2),

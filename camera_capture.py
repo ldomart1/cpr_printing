@@ -1,37 +1,27 @@
 # -*- coding: utf-8 -*-
 """
-Long-run webcam monitor w/ segmented recording + post-convert to 720p30.
+Long-run webcam monitor w/ raw video recording.
 
 What it does:
   - Captures frames from your webcam (OpenCV decoded frames).
-  - Records "raw" segments at the camera's *captured* resolution/FPS (no resizing on record).
-  - After each segment closes, it transcodes that segment to 720p 30fps into an output directory.
-  - Uses a background worker thread so transcoding won't pause recording.
-  - Keeps raw segments if conversion fails (failsafe).
-  - Optional disk-space guard to stop starting new segments if low on space.
+  - Records "raw" video at the camera's *captured* resolution/FPS (no resizing on record).
+  - Saves one file per start/stop recording session.
+  - Optional disk-space guard to stop starting new recordings if low on space.
 
 Keys:
   p → photo
-  v → start/stop monitoring recording (segmented)
+  v → start/stop monitoring recording
   c/SPACE/k/u/r/f/←/→ → same as your calibration/focus controls
   q → quit
 
 Notes:
-  - This uses ffmpeg for conversion. Install it:
-      macOS: brew install ffmpeg
-      Windows: install ffmpeg and add to PATH
   - "Native camera format" isn’t directly available via OpenCV; OpenCV gives decoded frames.
-    This records “as captured” (resolution unchanged), then converts after.
+    This records “as captured” (resolution unchanged).
 """
 
 import cv2
-import os
 import numpy as np
-import time
 import shutil
-import subprocess
-import threading
-import queue
 from pathlib import Path
 from datetime import datetime
 
@@ -51,26 +41,12 @@ PORT = 0
 BASE_DIR = Path("captures")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Segment folders
-RAW_DIR = BASE_DIR / "segments_raw"
-OUT_DIR = BASE_DIR / "segments_out"
+# Video folder
+RAW_DIR = BASE_DIR / "videos_raw"
 RAW_DIR.mkdir(exist_ok=True)
-OUT_DIR.mkdir(exist_ok=True)
 
-# Segment length (recommended 1–5 minutes for robustness)
-SEGMENT_SECONDS = 5 * 60  # 5 minutes
-
-# Output transcode settings
-OUT_HEIGHT = 720
-OUT_FPS = 30
-OUT_CRF = 23          # lower = higher quality/larger file (18–28 typical)
-OUT_PRESET = "veryfast"
-
-# Disk guard (stop starting new segments if free space below this)
+# Disk guard (stop starting new recordings if free space below this)
 MIN_FREE_GB = 5.0
-
-# Whether to delete raw segment after successful transcode
-DELETE_RAW_AFTER_TRANSCODE = False
 
 # -----------------------
 # Calibration configuration (unchanged)
@@ -92,7 +68,7 @@ if not cap.isOpened():
 print("""
 Controls:
   p → take photo
-  v → start/stop video (segmented)
+  v → start/stop video
   c → toggle calibration mode (and capture if board found)
   SPACE → capture calibration frame (only in calibration mode, only if board found)
   k → compute calibration (requires enough captured calibration frames)
@@ -129,94 +105,26 @@ def free_gb(path: Path) -> float:
     usage = shutil.disk_usage(str(path))
     return usage.free / (1024 ** 3)
 
-def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-def transcode_to_720p30(raw_path: Path) -> Path:
-    """
-    Convert finished segment to 720p 30fps in OUT_DIR.
-    Keeps aspect ratio; height=720; width auto (-2) with even dimensions.
-    """
-    out_path = OUT_DIR / (raw_path.stem + f"_720p{OUT_FPS}.mp4")
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(raw_path),
-        "-vf", f"scale=-2:{OUT_HEIGHT}",
-        "-r", str(OUT_FPS),
-        "-c:v", "libx264",
-        "-preset", OUT_PRESET,
-        "-crf", str(OUT_CRF),
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-an",
-        str(out_path),
-    ]
-
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip()[:3000])
-
-    return out_path
-
 # -----------------------
-# Background transcode worker
-# -----------------------
-transcode_q: "queue.Queue[Path]" = queue.Queue()
-stop_worker = threading.Event()
-
-def transcode_worker():
-    has_ffmpeg = ffmpeg_available()
-    if not has_ffmpeg:
-        print("[WARN] ffmpeg not found on PATH. Will NOT transcode; raw segments will be kept only.")
-    while not stop_worker.is_set() or not transcode_q.empty():
-        try:
-            raw_path = transcode_q.get(timeout=0.2)
-        except queue.Empty:
-            continue
-
-        try:
-            if has_ffmpeg:
-                out_path = transcode_to_720p30(raw_path)
-                print(f"Transcoded → {out_path}")
-                if DELETE_RAW_AFTER_TRANSCODE:
-                    try:
-                        raw_path.unlink()
-                        print(f"🧹 Deleted raw → {raw_path}")
-                    except Exception as e:
-                        print(f"[WARN] Could not delete raw {raw_path}: {e}")
-            else:
-                print(f"[SKIP] No ffmpeg; keeping raw → {raw_path}")
-        except Exception as e:
-            print(f"Transcode failed; keeping raw → {raw_path}")
-            print(f"    {e}")
-        finally:
-            transcode_q.task_done()
-
-worker_thread = threading.Thread(target=transcode_worker, daemon=True)
-worker_thread.start()
-
-# -----------------------
-# Video recording state (segmented)
+# Video recording state
 # -----------------------
 recording = False
 video_writer = None
-fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # raw segments container/codec
-segment_start_t = None
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 current_raw_path: Path | None = None
 
-def start_new_segment(frame_shape_hw):
+def start_recording(frame_shape_hw):
     """
-    Start a new raw segment file.
+    Start a new raw video file.
     Records frames at captured resolution (no resizing).
     Writer FPS: we attempt to use camera FPS readback; fallback to 30.
     """
-    global video_writer, segment_start_t, current_raw_path
+    global video_writer, current_raw_path
 
-    # Disk guard before starting a segment
+    # Disk guard before starting a recording
     gb = free_gb(BASE_DIR)
     if gb < MIN_FREE_GB:
-        raise RuntimeError(f"Low disk space: {gb:.2f} GB free (< {MIN_FREE_GB} GB). Not starting new segment.")
+        raise RuntimeError(f"Low disk space: {gb:.2f} GB free (< {MIN_FREE_GB} GB). Not starting recording.")
 
     h, w = frame_shape_hw
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -227,28 +135,23 @@ def start_new_segment(frame_shape_hw):
     video_writer = cv2.VideoWriter(str(current_raw_path), fourcc, float(fps), (w, h))
     if not video_writer.isOpened():
         video_writer = None
-        raise RuntimeError("Could not open VideoWriter for raw segment.")
+        raise RuntimeError("Could not open VideoWriter for raw recording.")
+    print(f"🎥 Recording started → {current_raw_path}  (writer_fps≈{fps:.2f}, size={w}x{h})")
 
-    segment_start_t = time.time()
-    print(f"🎥 Segment started → {current_raw_path}  (writer_fps≈{fps:.2f}, size={w}x{h})")
-
-def close_segment_enqueue_transcode():
+def stop_recording():
     """
-    Close current writer and enqueue for background transcode.
+    Close current writer.
     """
-    global video_writer, segment_start_t, current_raw_path
+    global video_writer, current_raw_path
     if video_writer is not None:
         try:
             video_writer.release()
         except Exception:
             pass
         video_writer = None
-
-    segment_start_t = None
-
-    if current_raw_path is not None and current_raw_path.exists():
-        transcode_q.put(current_raw_path)
-    current_raw_path = None
+    if current_raw_path is not None:
+        print(f"💾 Saved video → {current_raw_path}")
+        current_raw_path = None
 
 # -----------------------
 # Calibration state (unchanged)
@@ -350,21 +253,16 @@ try:
         if undistort_preview and K is not None and dist is not None:
             display = cv2.undistort(display, K, dist)
 
-        # Recording behavior (segmented)
+        # Recording behavior
         if recording:
-            # Start segment if needed
+            # Start recording if needed
             if video_writer is None:
                 try:
                     h, w = frame.shape[:2]
-                    start_new_segment((h, w))
+                    start_recording((h, w))
                 except Exception as e:
-                    print(f"Could not start segment: {e}")
+                    print(f"Could not start recording: {e}")
                     recording = False  # stop trying
-            else:
-                # Rotate segment if time elapsed
-                if segment_start_t is not None and (time.time() - segment_start_t) >= SEGMENT_SECONDS:
-                    close_segment_enqueue_transcode()
-                    # Next loop iteration will start a new segment
 
             # Write frame if writer exists
             if video_writer is not None:
@@ -373,8 +271,9 @@ try:
                 try:
                     video_writer.write(frame)
                 except Exception as e:
-                    print(f"Write failed; closing segment. {e}")
-                    close_segment_enqueue_transcode()
+                    print(f"Write failed; stopping recording. {e}")
+                    recording = False
+                    stop_recording()
 
         # Focus overlay
         if focus_mode:
@@ -410,18 +309,16 @@ try:
             cv2.imwrite(str(path), frame)
             print(f"📸 Saved {path}")
 
-        # Toggle segmented recording
+        # Toggle recording
         elif key == ord('v'):
             if not recording:
                 recording = True
-                print(f"Monitoring recording ON (segments every {SEGMENT_SECONDS//60} min).")
+                print("Monitoring recording ON")
                 print(f"    Raw → {RAW_DIR}")
-                print(f"    Out → {OUT_DIR} (720p {OUT_FPS}fps via ffmpeg)")
             else:
                 recording = False
                 print("Monitoring recording OFF")
-                # Close current segment safely (and enqueue for transcode)
-                close_segment_enqueue_transcode()
+                stop_recording()
 
         # Toggle calibration mode (also captures if board found)
         elif key == ord('c'):
@@ -503,7 +400,7 @@ finally:
     # Stop recording cleanly
     try:
         recording = False
-        close_segment_enqueue_transcode()
+        stop_recording()
     except Exception:
         pass
 
@@ -514,17 +411,6 @@ finally:
         pass
     try:
         cv2.destroyAllWindows()
-    except Exception:
-        pass
-
-    # Shut down worker after it drains queue
-    stop_worker.set()
-    try:
-        transcode_q.join()  # wait for pending transcodes
-    except Exception:
-        pass
-    try:
-        worker_thread.join(timeout=2.0)
     except Exception:
         pass
 

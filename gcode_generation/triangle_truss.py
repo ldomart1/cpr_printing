@@ -6,14 +6,16 @@ kinematics with exact tip-position tracking and soft tangent alignment.
 
 IMPORTANT CORRECTION
 --------------------
-The physical tip-position kinematics are LEFT UNCHANGED.
+Physical tip-position kinematics now support an optional off-plane transverse term from calibration.
 
 We only apply an azimuth flip to the *attack/nozzle direction* model used for tangency:
     theta_attack = C + attack_azimuth_flip_deg   (default +180 deg)
 
 This means:
-- Tip compensation / stage solve still uses the robot's physical kinematics:
-    offset_tip(B,C) = [r(B) cos(C), r(B) sin(C), z(B)]
+- Tip compensation / stage solve uses physical kinematics:
+    local transverse v(B) = [r(B), y_off(B)]
+    [x,y] = Rot(C) @ v(B), z = z(B)
+    offset_tip(B,C) = [x(B,C), y(B,C), z(B)]
 - Tangency / nozzle attack direction uses corrected azimuth:
     nozzle_dir(B,C) = [sin(a(B)) cos(theta_attack), sin(a(B)) sin(theta_attack), cos(a(B))]
 
@@ -153,6 +155,7 @@ DEFAULT_TUBE_ID_INCH = 0.02
 class Calibration:
     pr: np.ndarray            # r(B) coeffs
     pz: np.ndarray            # z(B) coeffs
+    py_off: Optional[np.ndarray]  # off-plane y(B) coeffs (None => planar fallback)
     pa: np.ndarray            # tip_angle(B) coeffs (deg; calibration convention)
 
     b_min: float
@@ -210,9 +213,12 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r") as f:
         data = json.load(f)
 
-    pr = np.array(data["cubic_coefficients"]["r_coeffs"], dtype=float)
-    pz = np.array(data["cubic_coefficients"]["z_coeffs"], dtype=float)
-    pa = np.array(data["cubic_coefficients"]["tip_angle_coeffs"], dtype=float)
+    cubic = data["cubic_coefficients"]
+    pr = np.array(cubic["r_coeffs"], dtype=float)
+    pz = np.array(cubic["z_coeffs"], dtype=float)
+    pa = np.array(cubic["tip_angle_coeffs"], dtype=float)
+    py_off_raw = cubic.get("offplane_y_coeffs", None)
+    py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -231,7 +237,7 @@ def load_calibration(json_path: str) -> Calibration:
     c_180 = float(motor_setup.get("rotation_axis_180_deg", 180.0))
 
     return Calibration(
-        pr=pr, pz=pz, pa=pa,
+        pr=pr, pz=pz, py_off=py_off, pa=pa,
         b_min=b_min, b_max=b_max,
         x_axis=x_axis, y_axis=y_axis, z_axis=z_axis,
         b_axis=b_axis, c_axis=c_axis, u_axis=u_axis,
@@ -245,6 +251,43 @@ def eval_r(cal: Calibration, b: ArrayLike) -> np.ndarray:
 
 def eval_z(cal: Calibration, b: ArrayLike) -> np.ndarray:
     return _polyval4(cal.pz, b)
+
+
+def eval_offplane_y(cal: Calibration, b: ArrayLike) -> np.ndarray:
+    if cal.py_off is None:
+        return np.zeros_like(np.asarray(b, dtype=float), dtype=float)
+    return _polyval4(cal.py_off, b)
+
+
+def predict_r_z_offplane(cal: Calibration, b: float) -> Tuple[float, float, float]:
+    r = float(eval_r(cal, b))
+    z = float(eval_z(cal, b))
+    y_off = float(eval_offplane_y(cal, b))
+    return r, z, y_off
+
+
+def transverse_radius_from_b(cal: Calibration, b: float) -> float:
+    r, _, y_off = predict_r_z_offplane(cal, b)
+    return float(math.hypot(r, y_off))
+
+
+def transverse_phase_from_b(cal: Calibration, b: float) -> float:
+    return float(math.atan2(predict_r_z_offplane(cal, b)[2], predict_r_z_offplane(cal, b)[0]))
+
+
+def predict_tip_xyz_from_bc(cal: Calibration, b: float, c_deg: float) -> np.ndarray:
+    # Convention: [x,y] = Rot(+C) @ [r(B), y_off(B)].
+    r, z, y_off = predict_r_z_offplane(cal, b)
+    c = math.radians(c_deg)
+    x = r * math.cos(c) - y_off * math.sin(c)
+    y = r * math.sin(c) + y_off * math.cos(c)
+    return np.array([x, y, z], dtype=float)
+
+
+def solve_c_from_b_and_xy(cal: Calibration, b: float, x: float, y: float) -> float:
+    phi = math.atan2(float(y), float(x))
+    alpha = transverse_phase_from_b(cal, b)
+    return float(math.degrees(phi - alpha))
 
 
 def eval_tip_angle_pitch_from_vertical_deg(
@@ -264,18 +307,13 @@ def eval_tip_angle_pitch_from_vertical_deg(
     return angle_sign * raw + angle_offset_deg
 
 
-# ---- PHYSICAL tip kinematics (unchanged) ----
+# ---- PHYSICAL tip kinematics ----
 def tip_offset_xyz_physical(cal: Calibration, b: float, c_deg: float) -> np.ndarray:
     """
-    Physical tip offset from stage origin for a given B/C:
-        [r(B) cos(C), r(B) sin(C), z(B)]
-
-    This remains unchanged to preserve correct tip positioning on the robot.
+    Physical tip offset from stage origin for a given B/C.
+    Uses local transverse [r(B), y_off(B)] rotated by C into world XY.
     """
-    r = float(eval_r(cal, b))
-    z = float(eval_z(cal, b))
-    c = math.radians(c_deg)
-    return np.array([r * math.cos(c), r * math.sin(c), z], dtype=float)
+    return predict_tip_xyz_from_bc(cal, b, c_deg)
 
 
 # ---- ATTACK / tangency model (can be remapped) ----
@@ -325,6 +363,7 @@ def sampled_ranges(
 ) -> dict:
     bb = np.linspace(b_lo, b_hi, n)
     rr = eval_r(cal, bb)
+    yy = eval_offplane_y(cal, bb)
     zz = eval_z(cal, bb)
     aa_raw = _polyval4(cal.pa, bb)
     aa_eff = eval_tip_angle_pitch_from_vertical_deg(cal, bb, angle_sign=angle_sign, angle_offset_deg=angle_offset_deg)
@@ -333,6 +372,12 @@ def sampled_ranges(
         "r_max": float(np.max(rr)),
         "abs_r_min": float(np.min(np.abs(rr))),
         "abs_r_max": float(np.max(np.abs(rr))),
+        "yoff_min": float(np.min(yy)),
+        "yoff_max": float(np.max(yy)),
+        "rho_min": float(np.min(np.hypot(rr, yy))),
+        "rho_max": float(np.max(np.hypot(rr, yy))),
+        "alpha_min_deg": float(np.min(np.rad2deg(np.arctan2(yy, rr)))),
+        "alpha_max_deg": float(np.max(np.rad2deg(np.arctan2(yy, rr)))),
         "z_min": float(np.min(zz)),
         "z_max": float(np.max(zz)),
         "a_raw_min": float(np.min(aa_raw)),
@@ -612,7 +657,7 @@ def solve_directed_edge_tangent_soft(
 
     IMPORTANT:
     - attack azimuth flip affects ONLY the nozzle/tangency model
-    - physical tip offset remains unchanged
+    - physical tip offset uses rotated local transverse vector [r(B), y_off(B)]
     """
     v = p1_tip - p0_tip
     L = float(np.linalg.norm(v))
@@ -677,7 +722,7 @@ def solve_directed_edge_tangent_soft(
     nozzle_dir = np.array([float(nx[i]), float(ny[i]), float(nz[i])], dtype=float)
     nozzle_dir /= np.linalg.norm(nozzle_dir)
 
-    # PHYSICAL tip offset and head lead (unchanged kinematics)
+    # PHYSICAL tip offset and head lead (using [r(B), y_off(B)] rotated by C)
     offset_vec = tip_offset_xyz_physical(cal, b_star, c_star)
     head_lead = float(np.dot(-offset_vec, t))  # >0 means stage/head is ahead along writing direction
     head_front_ok = bool(head_lead >= float(min_head_lead_mm))
@@ -1174,9 +1219,9 @@ def write_gcode_tetrahedral_truss(
         f.write("; head-front preference: choose edge direction so head/stage leads deposition point when possible\n")
         f.write("; build order heuristic: bottom-center-first, bottom-up, center-out\n")
         f.write(f"; geometry: {'double tetrahedron (mirrored along base plane)' if double_tetra else 'single tetrahedron / tetrahedral lattice'}\n")
-        f.write("; PHYSICAL tip kinematics unchanged; attack azimuth remap used only for tangency\n")
+        f.write("; PHYSICAL tip kinematics uses local [r(B), y_off(B)] rotated by C; attack azimuth remap is tangency-only\n")
         f.write("; model assumptions:\n")
-        f.write(";   physical tip_offset(B,C) = [r(B) cos(C), r(B) sin(C), z(B)]\n")
+        f.write(";   physical tip_offset(B,C): [x,y]=Rot(C)@[r(B), y_off(B)], z=z(B)\n")
         f.write(";   nozzle attack dir(B,C) = [sin(a(B)) cos(theta_attack), sin(a(B)) sin(theta_attack), cos(a(B))]\n")
         f.write(f";   theta_attack = C + {float(attack_azimuth_flip_deg):+.3f} deg\n")
         f.write(f";   a(B) = ({angle_sign:+.3f}) * tip_angle_poly(B) + {angle_offset_deg:+.3f} deg\n")
@@ -1506,13 +1551,16 @@ def main(args):
     print(f"Calibration B range: [{cal.b_min:.3f}, {cal.b_max:.3f}]")
     print(f"Commanded B range:  [{b_lo:.3f}, {b_hi:.3f}]")
     print(f"Sampled r(B):       [{ranges['r_min']:.3f}, {ranges['r_max']:.3f}] mm   |r| max={ranges['abs_r_max']:.3f}")
+    print(f"Sampled y_off(B):   [{ranges['yoff_min']:.3f}, {ranges['yoff_max']:.3f}] mm")
+    print(f"Sampled rho(B):     [{ranges['rho_min']:.3f}, {ranges['rho_max']:.3f}] mm")
+    print(f"Sampled alpha(B):   [{ranges['alpha_min_deg']:.3f}, {ranges['alpha_max_deg']:.3f}] deg")
     print(f"Sampled z(B):       [{ranges['z_min']:.3f}, {ranges['z_max']:.3f}] mm")
     print(f"Raw tip_angle poly(B) range:   [{ranges['a_raw_min']:.3f}, {ranges['a_raw_max']:.3f}] deg")
     print(f"Effective pitch (from vertical) range used for solve: "
           f"[{ranges['a_eff_min']:.3f}, {ranges['a_eff_max']:.3f}] deg")
 
     print(f"Attack azimuth flip applied (tangency only): {float(args.attack_azimuth_flip_deg):+.3f} deg")
-    print("Physical tip kinematics: unchanged (offset uses C directly)")
+    print("Physical tip kinematics: [x,y]=Rot(C)@[r(B), y_off(B)], z=z(B)")
 
     print(f"B used range:       [{plan_meta['b_min_used']:.3f}, {plan_meta['b_max_used']:.3f}]")
     print(f"C used range:       [{plan_meta['c_min_used']:.3f}, {plan_meta['c_max_used']:.3f}]")

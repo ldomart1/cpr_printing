@@ -428,6 +428,14 @@ class CTR_Shadow_Calibration:
         self.board_px_per_mm_local = None
         self.board_mm_per_px_local = None
         self.board_reference_image_path = None
+        self.ruler_ref_p1_px = None
+        self.ruler_ref_p2_px = None
+        self.ruler_ref_distance_mm = None
+        self.ruler_mm_per_px = None
+        self.ruler_px_per_mm = None
+        self.ruler_axis_unit = None
+        self.ruler_axis_perp_unit = None
+        self.ruler_calib_meta = None
 
         print("Calibration object initialized successfully!")
 
@@ -785,6 +793,46 @@ class CTR_Shadow_Calibration:
             raise RuntimeError("Local mm/px scale unavailable. Estimate board reference first.")
         return float(px_val) * float(self.board_mm_per_px_local)
 
+    def mm_to_px_ruler(self, mm_val):
+        """Convert millimeters to pixels using manual ruler-reference scale."""
+        if self.ruler_px_per_mm is None:
+            raise RuntimeError("Ruler calibration unavailable. Run setup_analysis_crop(enable_manual_adjustment=True) and complete ruler picking.")
+        return float(mm_val) * float(self.ruler_px_per_mm)
+
+    def px_to_mm_ruler(self, px_val):
+        """Convert pixels to millimeters using manual ruler-reference scale."""
+        if self.ruler_mm_per_px is None:
+            raise RuntimeError("Ruler calibration unavailable. Run setup_analysis_crop(enable_manual_adjustment=True) and complete ruler picking.")
+        return float(px_val) * float(self.ruler_mm_per_px)
+
+    def project_pixel_delta_onto_ruler_axis(self, dx_px, dy_px):
+        """Project a pixel delta onto the ruler axis unit vector."""
+        if self.ruler_axis_unit is None:
+            raise RuntimeError("Ruler axis unavailable. Run setup_analysis_crop(enable_manual_adjustment=True) and complete ruler picking.")
+        delta = np.array([float(dx_px), float(dy_px)], dtype=np.float64)
+        return float(np.dot(delta, self.ruler_axis_unit))
+
+    def project_pixel_delta_onto_ruler_perp(self, dx_px, dy_px):
+        """Project a pixel delta onto the ruler-axis perpendicular unit vector."""
+        if self.ruler_axis_perp_unit is None:
+            raise RuntimeError("Ruler perpendicular axis unavailable. Run setup_analysis_crop(enable_manual_adjustment=True) and complete ruler picking.")
+        delta = np.array([float(dx_px), float(dy_px)], dtype=np.float64)
+        return float(np.dot(delta, self.ruler_axis_perp_unit))
+
+    def get_analysis_reference_info(self):
+        """Return analysis crop + optional ruler-reference state."""
+        return {
+            "analysis_crop": dict(self.analysis_crop) if self.analysis_crop is not None else None,
+            "ruler_ref_p1_px": None if self.ruler_ref_p1_px is None else tuple(self.ruler_ref_p1_px),
+            "ruler_ref_p2_px": None if self.ruler_ref_p2_px is None else tuple(self.ruler_ref_p2_px),
+            "ruler_ref_distance_mm": self.ruler_ref_distance_mm,
+            "ruler_mm_per_px": self.ruler_mm_per_px,
+            "ruler_px_per_mm": self.ruler_px_per_mm,
+            "ruler_axis_unit": None if self.ruler_axis_unit is None else np.asarray(self.ruler_axis_unit, dtype=float).copy(),
+            "ruler_axis_perp_unit": None if self.ruler_axis_perp_unit is None else np.asarray(self.ruler_axis_perp_unit, dtype=float).copy(),
+            "ruler_calib_meta": None if self.ruler_calib_meta is None else dict(self.ruler_calib_meta),
+        }
+
     def project_pixel_delta_onto_true_vertical(self, dx_px, dy_px):
         """
         Return signed component in pixels along estimated true vertical image direction.
@@ -1034,6 +1082,166 @@ class CTR_Shadow_Calibration:
             }
             self.analysis_crop = selected_crop
             print(f"Selected analysis crop: {self.analysis_crop}")
+
+            # Reset prior ruler state; this session may repick or skip.
+            self.ruler_ref_p1_px = None
+            self.ruler_ref_p2_px = None
+            self.ruler_ref_distance_mm = None
+            self.ruler_mm_per_px = None
+            self.ruler_px_per_mm = None
+            self.ruler_axis_unit = None
+            self.ruler_axis_perp_unit = None
+            self.ruler_calib_meta = None
+
+            # Step B: ruler reference picking (100 mm known distance).
+            ruler_window_name = "Ruler Reference Setup"
+            ruler_points = []
+            ruler_known_mm = 150.0
+            ruler_confirmed = False
+            ruler_skipped = False
+            min_valid_dist_px = 5.0
+
+            def on_ruler_mouse(event, mx, my, flags, param):
+                if event != cv2.EVENT_LBUTTONDOWN:
+                    return
+                mx = int(np.clip(mx, 0, img_w - 1))
+                my = int(np.clip(my, 0, img_h - 1))
+                if len(ruler_points) >= 2:
+                    return
+                ruler_points.append((mx, my))
+
+            print("Ruler reference setup:")
+            print("- Click two points on the physical ruler (known distance = 100.0 mm).")
+            print("- Press ENTER or SPACE to confirm once two points are selected.")
+            print("- Press R to reset ruler points.")
+            print("- Press Q or ESC to skip ruler calibration (crop remains accepted).")
+
+            cv2.namedWindow(ruler_window_name, cv2.WINDOW_NORMAL)
+            cv2.setMouseCallback(ruler_window_name, on_ruler_mouse)
+            try:
+                while True:
+                    if cv2.getWindowProperty(ruler_window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        ruler_skipped = True
+                        break
+
+                    display = frame.copy()
+                    cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
+
+                    # Draw picked ruler points and optional line.
+                    for idx, pt in enumerate(ruler_points):
+                        cv2.circle(display, tuple(pt), 7, (0, 255, 255), -1)
+                        cv2.putText(
+                            display,
+                            f"P{idx + 1}",
+                            (pt[0] + 8, pt[1] - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 255),
+                            2
+                        )
+
+                    dist_px = None
+                    mm_per_px = None
+                    if len(ruler_points) == 2:
+                        p1 = np.asarray(ruler_points[0], dtype=float)
+                        p2 = np.asarray(ruler_points[1], dtype=float)
+                        dist_px = float(np.linalg.norm(p2 - p1))
+                        if dist_px >= 1e-9:
+                            mm_per_px = ruler_known_mm / dist_px
+                        cv2.line(display, ruler_points[0], ruler_points[1], (50, 200, 255), 2)
+
+                    cv2.putText(
+                        display,
+                        "Pick 2 ruler points (100.0 mm): ENTER confirm | R reset | Q/ESC skip",
+                        (20, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 255, 255),
+                        2
+                    )
+                    cv2.putText(
+                        display,
+                        f"Crop x:[{x0},{x1}] y:[{y0},{y1}]",
+                        (20, 68),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65,
+                        (0, 255, 0),
+                        2
+                    )
+                    if dist_px is not None and mm_per_px is not None:
+                        cv2.putText(
+                            display,
+                            f"dist_px={dist_px:.2f} | mm/px={mm_per_px:.6f}",
+                            (20, 100),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            (50, 255, 120),
+                            2
+                        )
+
+                    cv2.imshow(ruler_window_name, display)
+                    key = cv2.waitKey(20) & 0xFF
+
+                    if key in (13, 32):  # Enter/Space
+                        if len(ruler_points) < 2:
+                            print("Ruler confirmation rejected: select two points first.")
+                            continue
+                        p1 = np.asarray(ruler_points[0], dtype=float)
+                        p2 = np.asarray(ruler_points[1], dtype=float)
+                        dist_px = float(np.linalg.norm(p2 - p1))
+                        if dist_px < min_valid_dist_px:
+                            print(
+                                "Ruler confirmation rejected: selected points are too close "
+                                f"({dist_px:.3f} px < {min_valid_dist_px:.1f} px). Re-pick points."
+                            )
+                            continue
+                        ruler_confirmed = True
+                        break
+                    if key in (27, ord('q')):  # Esc/q
+                        ruler_skipped = True
+                        break
+                    if key in (ord('r'), ord('R')):
+                        ruler_points.clear()
+            finally:
+                cv2.setMouseCallback(ruler_window_name, lambda *args: None)
+                cv2.destroyWindow(ruler_window_name)
+                cv2.waitKey(1)
+                cv2.destroyAllWindows()
+                cv2.waitKey(1)
+
+            if ruler_confirmed:
+                p1 = np.asarray(ruler_points[0], dtype=np.float64)
+                p2 = np.asarray(ruler_points[1], dtype=np.float64)
+                axis_vec = p2 - p1
+                pixel_dist = float(np.linalg.norm(axis_vec))
+                axis_unit = axis_vec / pixel_dist
+                axis_perp_unit = np.array([axis_unit[1], -axis_unit[0]], dtype=np.float64)
+                mm_per_px = float(ruler_known_mm / pixel_dist)
+                px_per_mm = float(pixel_dist / ruler_known_mm)
+
+                self.ruler_ref_p1_px = tuple(np.round(p1).astype(int))
+                self.ruler_ref_p2_px = tuple(np.round(p2).astype(int))
+                self.ruler_ref_distance_mm = float(ruler_known_mm)
+                self.ruler_mm_per_px = mm_per_px
+                self.ruler_px_per_mm = px_per_mm
+                self.ruler_axis_unit = axis_unit.astype(np.float64)
+                self.ruler_axis_perp_unit = axis_perp_unit.astype(np.float64)
+                self.ruler_calib_meta = {
+                    "source": "manual_setup_analysis_crop",
+                    "known_distance_mm": float(ruler_known_mm),
+                    "pixel_distance": float(pixel_dist),
+                    "crop": dict(self.analysis_crop),
+                    "p1_px": [int(self.ruler_ref_p1_px[0]), int(self.ruler_ref_p1_px[1])],
+                    "p2_px": [int(self.ruler_ref_p2_px[0]), int(self.ruler_ref_p2_px[1])],
+                }
+
+                print("Ruler-reference scale set successfully.")
+                print(f"  p1_px={self.ruler_ref_p1_px}, p2_px={self.ruler_ref_p2_px}")
+                print(f"  pixel_distance={pixel_dist:.6f} px")
+                print(f"  mm_per_px={self.ruler_mm_per_px:.9f}")
+                print(f"  px_per_mm={self.ruler_px_per_mm:.9f}")
+            elif ruler_skipped:
+                print("Crop accepted; ruler calibration skipped. Ruler scale remains unset.")
         else:
             self.analysis_crop = dict(self.default_analysis_crop)
             print(f"Manual crop cancelled. Using default analysis crop: {self.analysis_crop}")
@@ -1324,7 +1532,7 @@ class CTR_Shadow_Calibration:
 
             self.rrf.send_code("G90")
 
-        def run_pull_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float, probe_idx: int):
+        def run_pull_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float, probe_idx: int, max_pull_steps=None):
             nonlocal pos, total_images
             # Baseline at B start
             print(f" Baseline capture: {robot_rear_axis_name}={b_start:.2f}")
@@ -1333,7 +1541,9 @@ class CTR_Shadow_Calibration:
             total_images += 1
 
             # Pull sequence
-            for step_idx in range(1, b_steps + 1):
+            steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
+            steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
+            for step_idx in range(1, steps_to_run + 1):
                 b_val = b_start + step_idx * b_step_size
                 print(f" Step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
                 pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
@@ -1359,6 +1569,9 @@ class CTR_Shadow_Calibration:
         # Set pull axis to start
         print("\nMoving pull axis to start position...")
         pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+
+        n_partial_steps = max(1, int(np.floor(0.4 * b_steps)))
+        print(f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps (40%) due to tip detectability limits")
 
         total_images = 0
         for probe_idx, (x, y, z) in enumerate(probe_points, start=1):
@@ -1401,14 +1614,14 @@ class CTR_Shadow_Calibration:
             print(" Rotating to orientation 2 (C = +90 deg)...")
             rotate_rel(robot_rotation_axis_name, +c_quarter)
             print(" Phase 3: orientation 2 (C = +90 deg)")
-            run_pull_sequence_for_orientation(2, x, y, z, probe_idx)
+            run_pull_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
 
             # ---- Orientation 3: C = -90 deg ----
             # from +90 to -90 is a -180 move
             print(" Rotating to orientation 3 (C = -90 deg)...")
             rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
             print(" Phase 4: orientation 3 (C = -90 deg)")
-            run_pull_sequence_for_orientation(3, x, y, z, probe_idx)
+            run_pull_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
 
             # Return to C = 0 (from -90 to 0 is +90)
             print(" Rotating back to C = 0 deg...")
@@ -2058,6 +2271,15 @@ class CTR_Shadow_Calibration:
                     )
                     u_mm[idx] = uu
                     z_mm[idx] = zz
+            elif self.ruler_mm_per_px is not None:
+                conversion_mode = "ruler_reference_scale"
+                pixel_to_mm_scale = float(self.ruler_mm_per_px)
+                print(
+                    "Converting to physical coordinates using ruler-reference scale "
+                    "(100 mm user-picked reference)."
+                )
+                u_mm = self.tip_locations_array_coarse[:, 1].astype(float) * pixel_to_mm_scale
+                z_mm = -self.tip_locations_array_coarse[:, 0].astype(float) * pixel_to_mm_scale
             else:
                 print(
                     f"Converting to physical coordinates using legacy scale "
@@ -2186,7 +2408,7 @@ class CTR_Shadow_Calibration:
             if has_offplane_pair:
                 print("Off-plane ±90 orientation data detected (orientations 2 and 3).")
             else:
-                print("Off-plane ±90 orientation data not found; skipping off-plane cubic fitting.")
+                print("Off-plane ±90 orientation data not found; skipping off-plane linear fitting.")
 
             def circular_mean_deg(a):
                 a = np.asarray(a, dtype=float)
@@ -2252,7 +2474,8 @@ class CTR_Shadow_Calibration:
             # ---------- Step 6b: Off-plane processing using orientations 2 (+90) and 3 (-90) ----------
             offplane_tip_locations_final = None  # [Y_offplane_mm, b_pull]
             y_off_coefficients = None
-            y_off_predicted = None
+            y_off_predicted_meas = None
+            y_off_full_predicted = None
             y_off_r2 = float("nan")
             y_off_equation = None
 
@@ -2265,6 +2488,7 @@ class CTR_Shadow_Calibration:
             b_ref_offplane_mirror_line_max = float("nan")
             o2p = None
             o3p = None
+            o3_y_mirrored = None
 
             if has_offplane_pair:
                 o2c = collapse_by_bpull(o2)
@@ -2325,6 +2549,59 @@ class CTR_Shadow_Calibration:
                 print(f"tip_angle range: {tip_locations_final[:, 3].min():.3f} to {tip_locations_final[:, 3].max():.3f} deg")
             else:
                 print("tip_angle range: unavailable")
+
+            if save_plots:
+                # Plot paired pre-averaging trajectories side by side:
+                # planar XZ (O0 vs mirrored O1) and off-plane Y(proxy)Z (O2 vs mirrored O3).
+                fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(15, 6))
+
+                ax_left.scatter(o0p[:, 0], o0p[:, 1], c='tab:blue', alpha=0.85, label='Orientation 0')
+                ax_left.scatter(o1_x_mirrored, o1p[:, 1], c='tab:orange', alpha=0.85, label='Orientation 1 (mirrored)')
+                ax_left.plot(
+                    avg_x,
+                    (o0p[:, 1] + o1p[:, 1]) / 2.0,
+                    'o-',
+                    color='tab:green',
+                    linewidth=2,
+                    markersize=6,
+                    label='Averaged trajectory'
+                )
+                ax_left.axvline(x=x_ref_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
+                ax_left.set_xlabel("X (mm)")
+                ax_left.set_ylabel("Z (mm) [flipped]")
+                ax_left.set_title("XZ Before Trajectory Averaging (O0 vs O1 Mirrored)")
+                ax_left.axis("equal")
+                ax_left.grid(True, alpha=0.3)
+                ax_left.legend()
+
+                if o2p is not None and o3p is not None and y_ref_offplane_mirror_line is not None and o3_y_mirrored is not None:
+                    ax_right.scatter(o2p[:, 0], o2p[:, 1], c='tab:blue', alpha=0.85, label='Orientation 2')
+                    ax_right.scatter(o3_y_mirrored, o3p[:, 1], c='tab:orange', alpha=0.85, label='Orientation 3 (mirrored)')
+                    ax_right.plot(
+                        (o2p[:, 0] + o3_y_mirrored) / 2.0,
+                        (o2p[:, 1] + o3p[:, 1]) / 2.0,
+                        'o-',
+                        color='tab:green',
+                        linewidth=2,
+                        markersize=6,
+                        label='Averaged trajectory'
+                    )
+                    ax_right.axvline(x=y_ref_offplane_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
+                    ax_right.set_xlabel("Y proxy (mm)")
+                    ax_right.set_ylabel("Z (mm) [flipped]")
+                    ax_right.set_title("Y(proxy)Z Before Trajectory Averaging (O2 vs O3 Mirrored)")
+                    ax_right.axis("equal")
+                    ax_right.grid(True, alpha=0.3)
+                    ax_right.legend()
+                else:
+                    ax_right.text(0.5, 0.5, "Y(proxy)Z data unavailable", ha='center', va='center', transform=ax_right.transAxes)
+                    ax_right.set_title("Y(proxy)Z Before Trajectory Averaging (O2 vs O3 Mirrored)")
+                    ax_right.grid(True, alpha=0.3)
+
+                fig.suptitle("03c: Pre-Averaging Trajectories (Mirrored Orientation Pairs)")
+                fig.tight_layout()
+                fig.savefig("03c_pre_averaging_trajectories.png", dpi=150, bbox_inches='tight')
+                plt.close(fig)
 
             if save_plots:
                 plt.figure(figsize=(10, 8))
@@ -2395,21 +2672,21 @@ class CTR_Shadow_Calibration:
             z_coords = z_avg.copy()
 
             # Off-plane coordinate (from ±90 mirrored pair), referenced to the ±90 mirror line.
-            y_off_coords = None
-            delta_motor_off = None
+            y_off_coords_meas = None
+            delta_motor_off_meas = None
             y0_off_ref = None  # deprecated: off-plane is no longer B=0 referenced
 
             if offplane_tip_locations_final is not None:
                 # columns: [Y_off_raw_mm, b_pull]
-                y_off_raw = offplane_tip_locations_final[:, 0].copy()
-                delta_motor_off = offplane_tip_locations_final[:, 1].copy()
+                y_off_raw_meas = offplane_tip_locations_final[:, 0].copy()
+                delta_motor_off_meas = offplane_tip_locations_final[:, 1].copy()
 
-                y_off_coords = y_off_raw - float(y_ref_offplane_mirror_line)
+                y_off_coords_meas = y_off_raw_meas - float(y_ref_offplane_mirror_line)
 
                 print("Off-plane coordinate reference:")
                 print(f"  y_ref_offplane_mirror_line = {float(y_ref_offplane_mirror_line):.6f} mm")
                 print("  Off-plane Y is referenced to the ±90 Y-proxy mirror line (not B=0).")
-                print(f"  Y_off referenced range: {y_off_coords.min():.3f} to {y_off_coords.max():.3f} mm")
+                print(f"  Y_off referenced range: {y_off_coords_meas.min():.3f} to {y_off_coords_meas.max():.3f} mm")
 
             if save_plots:
                 # Referenced X/Z plot for simplified trajectory
@@ -2478,11 +2755,19 @@ class CTR_Shadow_Calibration:
                 if tip_angle_coefficients is not None:
                     tip_angle_predicted = np.polyval(tip_angle_coefficients, delta_motor)
 
-            # Fit cubic polynomial for off-plane coordinate (if available)
-            if y_off_coords is not None and delta_motor_off is not None:
-                y_off_coefficients, _ = fit_cubic_or_none(delta_motor_off, y_off_coords, "off-plane Y")
-                if y_off_coefficients is not None:
-                    y_off_predicted = np.polyval(y_off_coefficients, delta_motor_off)
+            # Fit linear polynomial for off-plane coordinate (if available)
+            if y_off_coords_meas is not None and delta_motor_off_meas is not None:
+                x_off = np.asarray(delta_motor_off_meas, dtype=float).ravel()
+                y_off = np.asarray(y_off_coords_meas, dtype=float).ravel()
+                valid_off = np.isfinite(x_off) & np.isfinite(y_off)
+                x_off_use = x_off[valid_off]
+                y_off_use = y_off[valid_off]
+                if x_off_use.size < 2:
+                    print(f"Warning: Need at least 2 valid points for off-plane Y linear fit. Found {x_off_use.size}; skipping.")
+                else:
+                    y_off_coefficients = np.polyfit(x_off_use, y_off_use, 1)
+                    y_off_predicted_meas = np.polyval(y_off_coefficients, delta_motor_off_meas)
+                    y_off_full_predicted = np.polyval(y_off_coefficients, delta_motor)
 
             # Calculate R² scores
             def r2_score_safe(y_true, y_pred):
@@ -2498,15 +2783,15 @@ class CTR_Shadow_Calibration:
 
             if tip_angle_predicted is not None:
                 tip_angle_r2 = r2_score_safe(tip_angle_avg, tip_angle_predicted)
-            if y_off_predicted is not None:
-                y_off_r2 = r2_score_safe(y_off_coords, y_off_predicted)
+            if y_off_predicted_meas is not None:
+                y_off_r2 = r2_score_safe(y_off_coords_meas, y_off_predicted_meas)
 
             print(f"\nCubic polynomial fit results:")
             print(f"R-coordinate (signed planar X deflection) R² score: {r_r2:.6f}")
             print(f"Z-coordinate R² score: {z_r2:.6f}")
             if tip_angle_predicted is not None:
                 print(f"Tip-angle R² score: {tip_angle_r2:.6f}")
-            if y_off_predicted is not None:
+            if y_off_predicted_meas is not None:
                 print(f"Off-plane coordinate R² score: {y_off_r2:.6f}")
 
             # Create polynomial equation strings
@@ -2528,12 +2813,22 @@ class CTR_Shadow_Calibration:
                     equation += f" - {abs(d):.6f}"
                 return equation
 
+            def format_linear_equation(coeffs, var_name):
+                """Format linear polynomial coefficients into readable equation"""
+                m, c = coeffs
+                equation = f"{var_name} = {m:.6f}*b"
+                if c >= 0:
+                    equation += f" + {c:.6f}"
+                else:
+                    equation += f" - {abs(c):.6f}"
+                return equation
+
             r_equation = format_cubic_equation(r_coefficients, "r")
             z_equation = format_cubic_equation(z_coefficients, "z")
             if tip_angle_coefficients is not None:
                 tip_angle_equation = format_cubic_equation(tip_angle_coefficients, "tip_angle_deg")
             if y_off_coefficients is not None:
-                y_off_equation = format_cubic_equation(y_off_coefficients, "y_offplane_mm")
+                y_off_equation = format_linear_equation(y_off_coefficients, "y_offplane_mm")
 
             print(f"\nCubic equations:")
             print(f"R: {r_equation}")
@@ -2573,12 +2868,12 @@ class CTR_Shadow_Calibration:
                         'Description': f'Coefficient for {power} term in tip-angle equation'
                     })
             if y_off_coefficients is not None:
-                for power, coef in zip(['b^3', 'b^2', 'b^1', 'b^0'], y_off_coefficients):
+                for power, coef in zip(['b^1', 'b^0'], y_off_coefficients):
                     coefficients_data.append({
                         'Coordinate': 'Off-plane Y (from ±90 mirrored pair)',
                         'Term': power,
                         'Coefficient': coef,
-                        'Description': f'Coefficient for {power} term in off-plane transverse displacement equation (±90 views, mirrored/averaged, mirror-line referenced)'
+                        'Description': f'Coefficient for {power} term in off-plane transverse displacement linear equation (±90 views, mirrored/averaged, mirror-line referenced)'
                     })
 
             df_coefficients = pd.DataFrame(coefficients_data)
@@ -2598,11 +2893,11 @@ class CTR_Shadow_Calibration:
                     {'Metric': 'Max_Tip_Angle_Error_deg', 'Value': np.max(np.abs(tip_angle_predicted - tip_angle_avg)), 'Description': 'Maximum absolute tip-angle prediction error'},
                     {'Metric': 'Mean_Tip_Angle_Error_deg', 'Value': np.mean(np.abs(tip_angle_predicted - tip_angle_avg)), 'Description': 'Mean absolute tip-angle prediction error'},
                 ])
-            if y_off_predicted is not None:
+            if y_off_predicted_meas is not None:
                 fit_info_data.extend([
                     {'Metric': 'Offplane_Y_R_squared', 'Value': y_off_r2, 'Description': 'R² score for off-plane displacement fit from ±90 mirrored pair (mirror-line referenced)'},
-                    {'Metric': 'Max_Offplane_Y_Error', 'Value': np.max(np.abs(y_off_predicted - y_off_coords)), 'Description': 'Maximum absolute error in off-plane displacement prediction'},
-                    {'Metric': 'Mean_Offplane_Y_Error', 'Value': np.mean(np.abs(y_off_predicted - y_off_coords)), 'Description': 'Mean absolute error in off-plane displacement prediction'},
+                    {'Metric': 'Max_Offplane_Y_Error', 'Value': np.max(np.abs(y_off_predicted_meas - y_off_coords_meas)), 'Description': 'Maximum absolute error in off-plane displacement prediction'},
+                    {'Metric': 'Mean_Offplane_Y_Error', 'Value': np.mean(np.abs(y_off_predicted_meas - y_off_coords_meas)), 'Description': 'Mean absolute error in off-plane displacement prediction'},
                 ])
             df_fit_info = pd.DataFrame(fit_info_data)
 
@@ -2696,18 +2991,19 @@ class CTR_Shadow_Calibration:
 
                 # Plot 8: Off-plane Y vs B (from ±90 pair)
                 plt.subplot(3, 3, 8)
-                if y_off_predicted is not None and y_off_coords is not None and delta_motor_off is not None:
-                    sort_idx_off = np.argsort(delta_motor_off)
-                    plt.plot(delta_motor_off[sort_idx_off], y_off_coords[sort_idx_off], 'o', markersize=6, label='Measured')
-                    plt.plot(delta_motor_off[sort_idx_off], y_off_predicted[sort_idx_off], 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
+                if y_off_predicted_meas is not None and y_off_coords_meas is not None and delta_motor_off_meas is not None and y_off_full_predicted is not None:
+                    sort_idx_off_meas = np.argsort(delta_motor_off_meas)
+                    sort_idx_off_full = np.argsort(delta_motor)
+                    plt.plot(delta_motor_off_meas[sort_idx_off_meas], y_off_coords_meas[sort_idx_off_meas], 'o', markersize=6, label='Measured (±90 partial)')
+                    plt.plot(delta_motor[sort_idx_off_full], y_off_full_predicted[sort_idx_off_full], '-', linewidth=2, color='red', label='Linear Fit (full B)')
                     plt.xlabel('B Motor Position')
                     plt.ylabel('Off-plane Y (mm, ref.)')
-                    plt.title(f'Off-plane Cubic Fit (R² = {y_off_r2:.4f})')
+                    plt.title(f'Off-plane Linear Fit (partial ±90 data, extrapolated) (R² = {y_off_r2:.4f})')
                     plt.grid(True, alpha=0.3)
                     plt.legend()
                 else:
                     plt.text(0.5, 0.5, 'Off-plane ±90 fit unavailable', ha='center', va='center', transform=plt.gca().transAxes)
-                    plt.title('Off-plane Cubic Fit')
+                    plt.title('Off-plane Linear Fit')
                     plt.grid(True, alpha=0.3)
 
                 # Plot 9: Raw pre-mirroring points in XZ and YZ with mirror lines
@@ -2800,26 +3096,26 @@ class CTR_Shadow_Calibration:
                 })
                 df_validation.to_excel(writer, sheet_name='Validation', index=False)
 
-                if y_off_coords is not None and delta_motor_off is not None:
+                if y_off_coords_meas is not None and delta_motor_off_meas is not None:
                     df_offplane_raw = pd.DataFrame({
-                        'B_Pull': delta_motor_off,
-                        'Offplane_Y_mm_ref_mirrorline': y_off_coords,
+                        'B_Pull': delta_motor_off_meas,
+                        'Offplane_Y_mm_ref_mirrorline': y_off_coords_meas,
                         'Offplane_Y_mm_raw_avg': offplane_tip_locations_final[:, 0] if offplane_tip_locations_final is not None else np.nan,
-                        'Y_ref_offplane_mirror_line_mm': np.full_like(delta_motor_off, y_ref_offplane_mirror_line, dtype=float),
+                        'Y_ref_offplane_mirror_line_mm': np.full_like(delta_motor_off_meas, y_ref_offplane_mirror_line, dtype=float),
                     })
                     df_offplane_raw.to_excel(writer, sheet_name='Offplane_Raw', index=False)
 
                     df_offplane_validation = pd.DataFrame({
-                        'B_Pull': delta_motor_off,
-                        'Actual_Offplane_Y_mm_ref_mirrorline': y_off_coords,
-                        'Predicted_Offplane_Y_mm_ref_mirrorline': y_off_predicted if y_off_predicted is not None else np.full_like(delta_motor_off, np.nan, dtype=float),
-                        'Offplane_Y_Error': (y_off_predicted - y_off_coords) if y_off_predicted is not None else np.full_like(delta_motor_off, np.nan, dtype=float),
+                        'B_Pull': delta_motor_off_meas,
+                        'Actual_Offplane_Y_mm_ref_mirrorline': y_off_coords_meas,
+                        'Predicted_Offplane_Y_mm_ref_mirrorline': y_off_predicted_meas if y_off_predicted_meas is not None else np.full_like(delta_motor_off_meas, np.nan, dtype=float),
+                        'Offplane_Y_Error': (y_off_predicted_meas - y_off_coords_meas) if y_off_predicted_meas is not None else np.full_like(delta_motor_off_meas, np.nan, dtype=float),
                     })
                     df_offplane_validation.to_excel(writer, sheet_name='Offplane_Validation', index=False)
 
             print(f"\nCubic polar coefficients saved to: {excel_filename}")
             print("Excel file contains base sheets: Cubic_Coefficients, Fit_Quality, Equations, Raw_Data, Validation")
-            if y_off_coords is not None and delta_motor_off is not None:
+            if y_off_coords_meas is not None and delta_motor_off_meas is not None:
                 print("Additional sheets added: Offplane_Raw, Offplane_Validation")
 
             # Save coefficients as numpy arrays
@@ -2833,7 +3129,7 @@ class CTR_Shadow_Calibration:
                 print(f"Tip-angle cubic coefficients saved to: {robot_name}_tip_angle_cubic_coefficients.npy")
             if y_off_coefficients is not None:
                 np.save(f"{robot_name}_offplane_y_cubic_coefficients.npy", y_off_coefficients)
-                print(f"Off-plane Y cubic coefficients saved to: {robot_name}_offplane_y_cubic_coefficients.npy")
+                print(f"Off-plane Y linear-fit coefficients saved to: {robot_name}_offplane_y_cubic_coefficients.npy")
 
             # Save the cubic model data
             cubic_model_data = {
@@ -3254,6 +3550,20 @@ def predict_tip_position_cartesian(b_motor_pos):
             print("Exporting calibration data for G-code generation...")
 
             # Create comprehensive Excel export
+            offplane_coeff_rows = []
+            if y_off_coefficients is not None:
+                # Off-plane is currently linear (order 1), but keep generic handling by length.
+                off_powers = list(range(len(y_off_coefficients) - 1, -1, -1))
+                for pwr, coef in zip(off_powers, y_off_coefficients):
+                    offplane_coeff_rows.append(
+                        {'Coordinate': 'Offplane_Y_mm', 'Power': int(pwr), 'Coefficient': float(coef)}
+                    )
+            else:
+                offplane_coeff_rows.extend([
+                    {'Coordinate': 'Offplane_Y_mm', 'Power': 1, 'Coefficient': np.nan},
+                    {'Coordinate': 'Offplane_Y_mm', 'Power': 0, 'Coefficient': np.nan},
+                ])
+
             calibration_summary = {
                 'Calibration_Info': pd.DataFrame([
                     {'Parameter': 'Robot_Name', 'Value': robot_name},
@@ -3279,10 +3589,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                     {'Coordinate': 'Tip_Angle_deg', 'Power': 2, 'Coefficient': tip_angle_coefficients[1] if tip_angle_coefficients is not None else np.nan},
                     {'Coordinate': 'Tip_Angle_deg', 'Power': 1, 'Coefficient': tip_angle_coefficients[2] if tip_angle_coefficients is not None else np.nan},
                     {'Coordinate': 'Tip_Angle_deg', 'Power': 0, 'Coefficient': tip_angle_coefficients[3] if tip_angle_coefficients is not None else np.nan},
-                    {'Coordinate': 'Offplane_Y_mm', 'Power': 3, 'Coefficient': y_off_coefficients[0] if y_off_coefficients is not None else np.nan},
-                    {'Coordinate': 'Offplane_Y_mm', 'Power': 2, 'Coefficient': y_off_coefficients[1] if y_off_coefficients is not None else np.nan},
-                    {'Coordinate': 'Offplane_Y_mm', 'Power': 1, 'Coefficient': y_off_coefficients[2] if y_off_coefficients is not None else np.nan},
-                    {'Coordinate': 'Offplane_Y_mm', 'Power': 0, 'Coefficient': y_off_coefficients[3] if y_off_coefficients is not None else np.nan},
+                    *offplane_coeff_rows,
                 ]),
                 'Working_Ranges': pd.DataFrame([
                     {'Parameter': 'B_Motor_Min', 'Value': delta_motor.min()},
@@ -3293,8 +3600,8 @@ def predict_tip_position_cartesian(b_motor_pos):
                     {'Parameter': 'Z_Max_mm', 'Value': z_coords.max()},
                     {'Parameter': 'Tip_Angle_Min_deg', 'Value': tip_angle_avg.min() if tip_angle_avg is not None else np.nan},
                     {'Parameter': 'Tip_Angle_Max_deg', 'Value': tip_angle_avg.max() if tip_angle_avg is not None else np.nan},
-                    {'Parameter': 'Offplane_Y_Min_mm', 'Value': y_off_coords.min() if y_off_coords is not None else np.nan},
-                    {'Parameter': 'Offplane_Y_Max_mm', 'Value': y_off_coords.max() if y_off_coords is not None else np.nan},
+                    {'Parameter': 'Offplane_Y_Min_mm', 'Value': (y_off_full_predicted.min() if y_off_full_predicted is not None else (y_off_coords_meas.min() if y_off_coords_meas is not None else np.nan))},
+                    {'Parameter': 'Offplane_Y_Max_mm', 'Value': (y_off_full_predicted.max() if y_off_full_predicted is not None else (y_off_coords_meas.max() if y_off_coords_meas is not None else np.nan))},
                 ])
             }
 
@@ -3335,7 +3642,8 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'offplane_zero_point_offset_mm': None,
                     'r_definition': 'signed planar transverse deflection (r = x) in strict planar bending calibration',
                     'notes': 'Z is shifted so the first averaged B=0.0 tip is z=0 (or nearest B fallback). Planar radial r is defined as signed planar transverse deflection (r=x) and referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations).',
-                    'offplane_notes': 'Off-plane displacement is derived from ±90° rotations using mirrored/averaged transverse coordinate only; tip Z from ±90° orientations is intentionally neglected. Off-plane Y zero is the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate), not B=0.'
+                    'offplane_notes': 'Off-plane displacement is derived from ±90° rotations using mirrored/averaged transverse coordinate only; tip Z from ±90° orientations is intentionally neglected. Off-plane Y zero is the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate), not B=0.',
+                    'offplane_fit_notes': '±90 data acquired over first 40% of B pull steps; off-plane linear fit evaluated over full B range.'
                 },
                 'cubic_coefficients': {
                     'r_coeffs': r_coefficients.tolist(),  # [u³, u², u¹, u⁰]
@@ -3348,6 +3656,8 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'tip_angle_equation': tip_angle_equation,
                     'offplane_y_equation': y_off_equation,
                     'offplane_y_definition': 'off-plane transverse displacement from ±90 mirrored pair, referenced to ±90 Y-proxy mirror line = mean unmirrored ±90 transverse coordinate',
+                    'offplane_y_fit_data_fraction': 0.4,
+                    'offplane_y_fit_order': 1,
                     'r_r_squared': float(r_r2),
                     'z_r_squared': float(z_r2),
                     'tip_angle_r_squared': float(tip_angle_r2) if np.isfinite(tip_angle_r2) else None,
@@ -3369,7 +3679,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'radius_range_definition': 'signed planar transverse deflection range (r = x), not Euclidean radius',
                     'z_range_mm': [float(z_coords.min()), float(z_coords.max())],
                     'tip_angle_range_deg': [float(tip_angle_avg.min()), float(tip_angle_avg.max())] if tip_angle_avg is not None else None,
-                    'offplane_y_range_mm': [float(y_off_coords.min()), float(y_off_coords.max())] if y_off_coords is not None else None,
+                    'offplane_y_range_mm': [float(np.min(y_off_full_predicted)), float(np.max(y_off_full_predicted))] if y_off_full_predicted is not None else ([float(y_off_coords_meas.min()), float(y_off_coords_meas.max())] if y_off_coords_meas is not None else None),
                     'max_radius_mm': float(r_coords.max())
                 },
                 'duet_axis_mapping': {

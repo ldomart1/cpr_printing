@@ -262,12 +262,12 @@ def _tip_pose_from_distal_pca(
     skel_u8: np.ndarray,
     dist: np.ndarray,
     mask_u8: np.ndarray,
-    distal_window: int = 80,
-    roi_margin: int = 25,
-    tangent_len: int = 30,
-    radius_frac: float = 0.55,
-    tip_keep_frac: float = 0.85,
-    weight_power: float = 2.0,
+    distal_window=50,      # was 80
+    roi_margin=25,
+    tangent_len=40,
+    radius_frac=0.30,      # was 0.55
+    tip_keep_frac=0.65,    # was 0.85
+    weight_power=0.5,      # was 2.0
 ):
     """
     Returns:
@@ -1695,9 +1695,12 @@ class CTR_Shadow_Calibration:
                 skel_u8=skel,
                 dist=dist,
                 mask_u8=mask,
-                distal_window=80,
+                distal_window=50,
                 roi_margin=25,
                 tangent_len=tip_angle_path_len,
+                radius_frac=0.30,
+                tip_keep_frac=0.65,
+                weight_power=0.5,
             )
             if return_debug:
                 debug_data = {
@@ -1712,9 +1715,12 @@ class CTR_Shadow_Calibration:
             skel_u8=skel,
             dist=dist,
             mask_u8=mask,
-            distal_window=80,
+            distal_window=50,
             roi_margin=25,
             tangent_len=tip_angle_path_len,
+            radius_frac=0.30,
+            tip_keep_frac=0.65,
+            weight_power=0.5,
         )
         if return_debug:
             debug_data = {
@@ -1780,7 +1786,26 @@ class CTR_Shadow_Calibration:
         )
 
         skel = tip_debug["skeleton"]
+        dist = tip_debug["dist"]
         tip_path = tip_debug["tip_path"]
+
+        # Keep current PCA-based angle logic, but use legacy geodesic/endpoints
+        # selection for coarse XY tip coordinates.
+        ys, xs = np.where(skel == 1)
+        dvals = dist[ys, xs]
+        idx = int(np.argmax(dvals))
+        tip_row_legacy, tip_col_legacy = int(ys[idx]), int(xs[idx])
+
+        endpoints = _endpoints_8(skel)  # Nx2 (y, x)
+        if endpoints.size > 0:
+            ed = dist[endpoints[:, 0], endpoints[:, 1]]
+            eidx = int(np.argmax(ed))
+            if ed[eidx] >= dist[tip_row_legacy, tip_col_legacy] - 1:
+                tip_row_legacy = int(endpoints[eidx, 0])
+                tip_col_legacy = int(endpoints[eidx, 1])
+
+        tip_row = tip_row_legacy
+        tip_column = tip_col_legacy
 
         orientation, ntnl_pos, ss_pos = get_pos_from_file_name(image_file_name)
 
@@ -2637,6 +2662,16 @@ class CTR_Shadow_Calibration:
             z_avg_raw = tip_locations_final_simplified[:, 1].copy()
             delta_motor = tip_locations_final_simplified[:, 2].copy()  # b_pull
             tip_angle_avg = tip_locations_final_simplified[:, 3].copy() if has_tip_angle else None
+            # Wrap high-angle values before fitting so 300deg -> -60deg, etc.
+            # This prevents the cubic fit from "jumping" across the 0/360 boundary.
+            if has_tip_angle and tip_angle_avg is not None and tip_angle_avg.size > 0:
+                finite_mask = np.isfinite(tip_angle_avg)
+                if np.any(finite_mask):
+                    tip_angle_avg[finite_mask] = np.where(
+                        tip_angle_avg[finite_mask] > 250.0,
+                        tip_angle_avg[finite_mask] - 360.0,
+                        tip_angle_avg[finite_mask]
+                    )
 
             # -------------------------------------------------------------------------
             # ZERO REFERENCE (requested):

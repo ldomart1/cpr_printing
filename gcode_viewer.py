@@ -37,6 +37,7 @@ DEFAULT_MIN_B = -5.0
 DEFAULT_MAX_B = -0.0
 DEFAULT_C0_DEG = 0.0
 DEFAULT_FIGSIZE = (12.5, 9.0)
+OFFPLANE_SIGN = -1.0
 # -----------------------------------------
 
 
@@ -48,6 +49,7 @@ class Calibration:
     pr: np.ndarray
     pz: np.ndarray
     pa: np.ndarray
+    py_off: Optional[np.ndarray]
     b_min: float
     b_max: float
     tip_angle_min: float
@@ -73,12 +75,18 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r") as f:
         data = json.load(f)
 
-    pr = np.array(data["cubic_coefficients"]["r_coeffs"], dtype=float)
-    pz = np.array(data["cubic_coefficients"]["z_coeffs"], dtype=float)
-    pa = np.array(data["cubic_coefficients"]["tip_angle_coeffs"], dtype=float)
+    cubic = data["cubic_coefficients"]
+
+    pr = np.array(cubic["r_coeffs"], dtype=float)
+    pz = np.array(cubic["z_coeffs"], dtype=float)
+    pa = np.array(cubic["tip_angle_coeffs"], dtype=float)
+    py_off_raw = cubic.get("offplane_y_coeffs", None)
+    py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
 
     if pr.shape[0] != 4 or pz.shape[0] != 4 or pa.shape[0] != 4:
         raise ValueError("Expected 4 coeffs for r_coeffs, z_coeffs, and tip_angle_coeffs")
+    if py_off is not None and py_off.shape[0] == 0:
+        raise ValueError("offplane_y_coeffs is present but empty")
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -106,7 +114,7 @@ def load_calibration(json_path: str) -> Calibration:
         tip_angle_max = float(np.max(aa))
 
     return Calibration(
-        pr=pr, pz=pz, pa=pa,
+        pr=pr, pz=pz, pa=pa, py_off=py_off,
         b_min=b_min, b_max=b_max,
         tip_angle_min=tip_angle_min, tip_angle_max=tip_angle_max,
         pull_axis=pull_axis, rot_axis=rot_axis,
@@ -251,6 +259,7 @@ class TipTrajectory:
     c_cmd: np.ndarray
     r_of_b: np.ndarray
     z_of_b: np.ndarray
+    y_off_of_b: np.ndarray
     tip_angle_deg: np.ndarray
     sgn: np.ndarray
 
@@ -275,11 +284,15 @@ def reconstruct_tip_trajectory(states: List[MotionState], cal: Calibration, c0_d
     r_of_b = _polyval4(cal.pr, b_cmd)
     z_of_b = _polyval4(cal.pz, b_cmd)
     tip_ang = _polyval4(cal.pa, b_cmd)
+    if cal.py_off is None:
+        y_off_of_b = np.zeros_like(b_cmd, dtype=float)
+    else:
+        y_off_of_b = OFFPLANE_SIGN * np.polyval(cal.py_off, b_cmd)
 
-    # Full 3D tip offset model (continuous C, including unwrapped angles)
+    # Full 3D tip offset model with transverse off-plane component, rotated by C.
     c_rad = np.deg2rad(c_cmd)
-    x_tip = x_stage + r_of_b * np.cos(c_rad)
-    y_tip = y_stage + r_of_b * np.sin(c_rad)
+    x_tip = x_stage + r_of_b * np.cos(c_rad) - y_off_of_b * np.sin(c_rad)
+    y_tip = y_stage + r_of_b * np.sin(c_rad) + y_off_of_b * np.cos(c_rad)
     z_tip = z_stage + z_of_b
 
     # Retained for debug display/backward compatibility in the info panel.
@@ -289,7 +302,7 @@ def reconstruct_tip_trajectory(states: List[MotionState], cal: Calibration, c0_d
         x_tip=x_tip, y_tip=y_tip, z_tip=z_tip,
         x_stage=x_stage, y_stage=y_stage, z_stage=z_stage,
         b_cmd=b_cmd, c_cmd=c_cmd,
-        r_of_b=r_of_b, z_of_b=z_of_b,
+        r_of_b=r_of_b, z_of_b=z_of_b, y_off_of_b=y_off_of_b,
         tip_angle_deg=tip_ang,
         sgn=sgn,
     )
@@ -410,7 +423,7 @@ def launch_interactive_plot(
     ax = fig.add_subplot(111, projection="3d")
 
     # Leave extra room for controls
-    plt.subplots_adjust(left=0.05, right=0.98, bottom=0.24, top=0.94)
+    plt.subplots_adjust(left=0.05, right=0.98, bottom=0.28, top=0.94)
 
     # Dark mode
     style_dark_3d_axes(fig, ax)
@@ -481,7 +494,7 @@ def launch_interactive_plot(
     set_major_view(ax, "ISO")
 
     # ----- Info panel -----
-    text_ax = fig.add_axes([0.05, 0.05, 0.60, 0.14])
+    text_ax = fig.add_axes([0.05, 0.025, 0.60, 0.14])
     text_ax.set_facecolor("black")
     text_ax.axis("off")
     info_text = text_ax.text(
@@ -490,7 +503,7 @@ def launch_interactive_plot(
     )
 
     # ----- Index slider -----
-    slider_ax = fig.add_axes([0.70, 0.08, 0.25, 0.03], facecolor="#111111")
+    slider_ax = fig.add_axes([0.70, 0.055, 0.25, 0.03], facecolor="#111111")
     idx_slider = Slider(
         ax=slider_ax,
         label="Index",
@@ -507,7 +520,7 @@ def launch_interactive_plot(
         pass
 
     # ----- Zoom slider -----
-    zoom_ax = fig.add_axes([0.70, 0.13, 0.25, 0.03], facecolor="#111111")
+    zoom_ax = fig.add_axes([0.70, 0.100, 0.25, 0.03], facecolor="#111111")
     zoom_slider = Slider(
         ax=zoom_ax,
         label="Zoom",
@@ -524,18 +537,18 @@ def launch_interactive_plot(
         pass
 
     # ----- Nav buttons -----
-    prev_ax = fig.add_axes([0.70, 0.18, 0.08, 0.04], facecolor="#111111")
-    next_ax = fig.add_axes([0.79, 0.18, 0.08, 0.04], facecolor="#111111")
-    zrst_ax = fig.add_axes([0.88, 0.18, 0.07, 0.04], facecolor="#111111")
+    prev_ax = fig.add_axes([0.70, 0.145, 0.08, 0.04], facecolor="#111111")
+    next_ax = fig.add_axes([0.79, 0.145, 0.08, 0.04], facecolor="#111111")
+    zrst_ax = fig.add_axes([0.88, 0.145, 0.07, 0.04], facecolor="#111111")
     btn_prev = Button(prev_ax, "Prev", color="#222222", hovercolor="#333333")
     btn_next = Button(next_ax, "Next", color="#222222", hovercolor="#333333")
     btn_zrst = Button(zrst_ax, "Zrst", color="#222222", hovercolor="#333333")
 
     # ----- Major view plane buttons -----
-    xy_ax = fig.add_axes([0.70, 0.225, 0.055, 0.035], facecolor="#111111")
-    xz_ax = fig.add_axes([0.762, 0.225, 0.055, 0.035], facecolor="#111111")
-    yz_ax = fig.add_axes([0.824, 0.225, 0.055, 0.035], facecolor="#111111")
-    iso_ax = fig.add_axes([0.886, 0.225, 0.064, 0.035], facecolor="#111111")
+    xy_ax = fig.add_axes([0.70, 0.192, 0.055, 0.035], facecolor="#111111")
+    xz_ax = fig.add_axes([0.762, 0.192, 0.055, 0.035], facecolor="#111111")
+    yz_ax = fig.add_axes([0.824, 0.192, 0.055, 0.035], facecolor="#111111")
+    iso_ax = fig.add_axes([0.886, 0.192, 0.064, 0.035], facecolor="#111111")
 
     btn_xy = Button(xy_ax, "XY", color="#222222", hovercolor="#333333")
     btn_xz = Button(xz_ax, "XZ", color="#222222", hovercolor="#333333")
@@ -552,7 +565,7 @@ def launch_interactive_plot(
     # ----- Reference dashed-line visibility -----
     ref_check = None
     if stage_path_line is not None:
-        ref_ax = fig.add_axes([0.70, 0.265, 0.16, 0.035], facecolor="#111111")
+        ref_ax = fig.add_axes([0.70, 0.232, 0.16, 0.035], facecolor="#111111")
         ref_check = CheckButtons(ref_ax, ["Ref dashed"], [True])
         try:
             for txt in ref_check.labels:
@@ -566,7 +579,7 @@ def launch_interactive_plot(
         except Exception:
             pass
 
-    help_ax = fig.add_axes([0.70, 0.045, 0.25, 0.02], facecolor="black")
+    help_ax = fig.add_axes([0.70, 0.020, 0.25, 0.02], facecolor="black")
     help_ax.axis("off")
     help_ax.text(
         0.0, 0.5,
@@ -582,7 +595,8 @@ def launch_interactive_plot(
             f"stage: X={traj.x_stage[i]: .4f}  Y={traj.y_stage[i]: .4f}  Z={traj.z_stage[i]: .4f}  "
             f"{cal.pull_axis}={traj.b_cmd[i]: .4f}  {cal.rot_axis}={traj.c_cmd[i]: .4f}\n"
             f"tip:   X={traj.x_tip[i]: .4f}  Y={traj.y_tip[i]: .4f}  Z={traj.z_tip[i]: .4f}    "
-            f"r(B)={traj.r_of_b[i]: .4f}  z(B)={traj.z_of_b[i]: .4f}  tip_angle={traj.tip_angle_deg[i]: .3f}°  sgn={int(traj.sgn[i]):+d}\n"
+            f"r(B)={traj.r_of_b[i]: .4f}  y_off(B)={traj.y_off_of_b[i]: .4f}  z(B)={traj.z_of_b[i]: .4f}  "
+            f"tip_angle={traj.tip_angle_deg[i]: .3f}°  sgn={int(traj.sgn[i]):+d}\n"
             f"zoom={current_zoom['value']:.2f}x   raw: {s.gcode_raw}"
         )
 

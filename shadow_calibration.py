@@ -1093,7 +1093,7 @@ class CTR_Shadow_Calibration:
             self.ruler_axis_perp_unit = None
             self.ruler_calib_meta = None
 
-            # Step B: ruler reference picking (100 mm known distance).
+            # Step B: ruler reference picking (150 mm known distance).
             ruler_window_name = "Ruler Reference Setup"
             ruler_points = []
             ruler_known_mm = 150.0
@@ -1152,7 +1152,7 @@ class CTR_Shadow_Calibration:
 
                     cv2.putText(
                         display,
-                        "Pick 2 ruler points (100.0 mm): ENTER confirm | R reset | Q/ESC skip",
+                        "Pick 2 ruler points (150.0 mm): ENTER confirm | R reset | Q/ESC skip",
                         (20, 35),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,

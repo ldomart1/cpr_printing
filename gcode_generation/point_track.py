@@ -32,7 +32,7 @@ DEFAULT_OUT = "gcode_generation/probe_point_c_motion_fixed_tip.gcode"
 
 DEFAULT_POINT_X = 65.0
 DEFAULT_POINT_Y = 40.0
-DEFAULT_POINT_Z = -91.0
+DEFAULT_POINT_Z = -50.0
 
 DEFAULT_TRAVEL_FEED = 1200.0
 DEFAULT_PROBE_FEED = 500.0            # user requested baseline coordinated feed
@@ -52,7 +52,7 @@ DEFAULT_C_CYCLES = 5
 DEFAULT_C_WAVEFORM = "sine"           # restored true sine by default
 DEFAULT_OSC_SAMPLES_PER_CYCLE = 120
 
-DEFAULT_B_PROFILE = "triangle"
+DEFAULT_B_PROFILE = "sine"
 
 DEFAULT_START_X = 60.0
 DEFAULT_START_Y = 40.0

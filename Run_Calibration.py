@@ -15,7 +15,7 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-03-02_04_new_fit',
+    project_name='Test_Calibration_2026-03-04_03',
     allow_existing= True,
     add_date=False
 )
@@ -26,13 +26,12 @@ print("Calibration object created!")
 MANUAL_CROP_ADJUSTMENT = True
 THRESHOLD = 200
 PULL_B_START = 0.0
-PULL_B_STEPS = 28
+PULL_B_STEPS = 26
 PULL_B_STEP_SIZE = -0.2
-CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures", "calibration_webcam_20260302_093653.npz")
+CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures", "calibration_webcam_20260304_114358.npz")
 # Optional checkerboard image from the same setup to define true vertical + mm/px reference.
 # Set to None to skip board-reference estimation.
-#BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260302_141325.png")
-
+#BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260304_114400.png")
 BOARD_REFERENCE_IMAGE = None
 
 PROBE_MODE = "middle"  # "middle" | "five"

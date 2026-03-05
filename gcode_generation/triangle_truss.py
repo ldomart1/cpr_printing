@@ -88,12 +88,12 @@ DEFAULT_OUT = "gcode_generation/tetrahedral_truss_tip_priority_tangent_soft.gcod
 
 # Placement in tip space (world coordinates): this is the V0 corner of the tetrahedron base
 DEFAULT_ORIGIN_X = 65.0
-DEFAULT_ORIGIN_Y = 0.0
-DEFAULT_ORIGIN_Z = -110.0
+DEFAULT_ORIGIN_Y = 20.0
+DEFAULT_ORIGIN_Z = -130.0
 
 # Geometry
 DEFAULT_ORDER = 2                 # 1 = single tetrahedron (identity element)
-DEFAULT_PITCH_MM = 18.0           # edge length of the identity tetrahedral element
+DEFAULT_PITCH_MM = 14.0           # edge length of the identity tetrahedral element
 DEFAULT_EDGE_SAMPLES = 12         # interpolation segments per strut (>=2)
 
 # Motion
@@ -101,25 +101,25 @@ DEFAULT_TRAVEL_FEED = 1200.0      # mm/min
 DEFAULT_PRINT_FEED = 300.0        # mm/min (coordinated path feed)
 
 # User-defined pre/post print poses (stage axes)
-DEFAULT_START_X = 60.0
-DEFAULT_START_Y = 40.0
-DEFAULT_START_Z = -30.0
+DEFAULT_START_X = 65.0
+DEFAULT_START_Y = 20.0
+DEFAULT_START_Z = 00.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
-DEFAULT_END_X = 60.0
-DEFAULT_END_Y = 40.0
-DEFAULT_END_Z = -30.0
+DEFAULT_END_X = 65.0
+DEFAULT_END_Y = 20.0
+DEFAULT_END_Z = 00.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 DEFAULT_SAFE_APPROACH_Z = 0.0
 
 # Virtual XYZ bounding box (enforced during print/travel)
-DEFAULT_BBOX_X_MIN = 10.0
-DEFAULT_BBOX_X_MAX = 110.0
-DEFAULT_BBOX_Y_MIN = 10.0
-DEFAULT_BBOX_Y_MAX = 110.0
-DEFAULT_BBOX_Z_MIN = -120.0
-DEFAULT_BBOX_Z_MAX = -20.0
+DEFAULT_BBOX_X_MIN = 00.0
+DEFAULT_BBOX_X_MAX = 160.0
+DEFAULT_BBOX_Y_MIN = 00.0
+DEFAULT_BBOX_Y_MAX = 160.0
+DEFAULT_BBOX_Z_MIN = -170.0
+DEFAULT_BBOX_Z_MAX = -10.0
 
 # Extrusion
 DEFAULT_EXTRUSION_PER_MM = 0.0    # U mm per mm of printed path; set >0 to enable U extrusion
@@ -148,6 +148,7 @@ DEFAULT_ATTACK_AZIMUTH_FLIP_DEG = 180.0
 # Syringe/tube math helpers
 DEFAULT_SYRINGE_MM_PER_ML = 6.0
 DEFAULT_TUBE_ID_INCH = 0.02
+OFFPLANE_SIGN = -1.0
 # ------------------------------------------------------------
 
 
@@ -170,6 +171,10 @@ class Calibration:
 
     c_180_deg: float
 
+    # New calibration-file metadata (optional)
+    offplane_y_equation: Optional[str] = None
+    offplane_y_r_squared: Optional[float] = None
+
 
 @dataclass
 class EdgePlan:
@@ -187,10 +192,20 @@ class EdgePlan:
 
 # ---------------- Calibration / kinematics helpers ----------------
 
-def _polyval4(coeffs: ArrayLike, u: ArrayLike) -> np.ndarray:
-    a, b, c, d = coeffs
+def poly_eval(coeffs: ArrayLike, u: ArrayLike, default_if_none: Optional[float] = None) -> np.ndarray:
     u = np.asarray(u, dtype=float)
-    return ((a * u + b) * u + c) * u + d
+    if coeffs is None:
+        if default_if_none is None:
+            raise ValueError("Missing required polynomial coefficients.")
+        return np.full_like(u, float(default_if_none), dtype=float)
+
+    arr = np.asarray(coeffs, dtype=float).reshape(-1)
+    if arr.size == 0:
+        if default_if_none is None:
+            raise ValueError("Polynomial coefficients array is empty.")
+        return np.full_like(u, float(default_if_none), dtype=float)
+
+    return np.polyval(arr, u)
 
 
 def unwrap_deg_near(angle_deg: ArrayLike, ref_deg: Optional[float]) -> np.ndarray:
@@ -241,22 +256,23 @@ def load_calibration(json_path: str) -> Calibration:
         b_min=b_min, b_max=b_max,
         x_axis=x_axis, y_axis=y_axis, z_axis=z_axis,
         b_axis=b_axis, c_axis=c_axis, u_axis=u_axis,
-        c_180_deg=c_180
+        c_180_deg=c_180,
+        offplane_y_equation=cubic.get("offplane_y_equation"),
+        offplane_y_r_squared=(None if cubic.get("offplane_y_r_squared") is None else float(cubic["offplane_y_r_squared"])),
     )
 
 
 def eval_r(cal: Calibration, b: ArrayLike) -> np.ndarray:
-    return _polyval4(cal.pr, b)
+    return poly_eval(cal.pr, b)
 
 
 def eval_z(cal: Calibration, b: ArrayLike) -> np.ndarray:
-    return _polyval4(cal.pz, b)
+    return poly_eval(cal.pz, b)
 
 
 def eval_offplane_y(cal: Calibration, b: ArrayLike) -> np.ndarray:
-    if cal.py_off is None:
-        return np.zeros_like(np.asarray(b, dtype=float), dtype=float)
-    return _polyval4(cal.py_off, b)
+    # Match point_tracking convention / calibration sign
+    return OFFPLANE_SIGN * poly_eval(cal.py_off, b, default_if_none=0.0)
 
 
 def predict_r_z_offplane(cal: Calibration, b: float) -> Tuple[float, float, float]:
@@ -303,7 +319,7 @@ def eval_tip_angle_pitch_from_vertical_deg(
 
     Starts from calibration polynomial and applies sign/offset remap.
     """
-    raw = _polyval4(cal.pa, b)
+    raw = poly_eval(cal.pa, b)
     return angle_sign * raw + angle_offset_deg
 
 
@@ -365,7 +381,7 @@ def sampled_ranges(
     rr = eval_r(cal, bb)
     yy = eval_offplane_y(cal, bb)
     zz = eval_z(cal, bb)
-    aa_raw = _polyval4(cal.pa, bb)
+    aa_raw = poly_eval(cal.pa, bb)
     aa_eff = eval_tip_angle_pitch_from_vertical_deg(cal, bb, angle_sign=angle_sign, angle_offset_deg=angle_offset_deg)
     return {
         "r_min": float(np.min(rr)),
@@ -1225,6 +1241,11 @@ def write_gcode_tetrahedral_truss(
         f.write(";   nozzle attack dir(B,C) = [sin(a(B)) cos(theta_attack), sin(a(B)) sin(theta_attack), cos(a(B))]\n")
         f.write(f";   theta_attack = C + {float(attack_azimuth_flip_deg):+.3f} deg\n")
         f.write(f";   a(B) = ({angle_sign:+.3f}) * tip_angle_poly(B) + {angle_offset_deg:+.3f} deg\n")
+        if cal.offplane_y_equation:
+            f.write(f"; offplane_y_equation (calibration): {cal.offplane_y_equation}\n")
+        if cal.offplane_y_r_squared is not None:
+            f.write(f"; offplane_y_r_squared: {cal.offplane_y_r_squared:.6f}\n")
+        f.write(f"; offplane sign convention applied: {OFFPLANE_SIGN:+.1f}\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
         f.write(f"; edges planned = {header_meta.get('n_edges', 0)} (all edges extruded exactly once)\n")
         f.write(f"; total print length ~ {header_meta.get('total_print_length_mm', 0.0):.3f} mm\n")
@@ -1561,6 +1582,11 @@ def main(args):
 
     print(f"Attack azimuth flip applied (tangency only): {float(args.attack_azimuth_flip_deg):+.3f} deg")
     print("Physical tip kinematics: [x,y]=Rot(C)@[r(B), y_off(B)], z=z(B)")
+    if cal.offplane_y_equation:
+        print(f"Off-plane equation (from calibration): y_off(B) = {cal.offplane_y_equation}")
+    if cal.offplane_y_r_squared is not None:
+        print(f"Off-plane fit R^2: {cal.offplane_y_r_squared:.6f}")
+    print(f"Off-plane sign convention applied in script: {OFFPLANE_SIGN:+.1f}")
 
     print(f"B used range:       [{plan_meta['b_min_used']:.3f}, {plan_meta['b_max_used']:.3f}]")
     print(f"C used range:       [{plan_meta['c_min_used']:.3f}, {plan_meta['c_max_used']:.3f}]")

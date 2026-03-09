@@ -15,7 +15,7 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-03-04_03',
+    project_name='Test_Calibration_2026-03-06_01',
     allow_existing= True,
     add_date=False
 )
@@ -37,7 +37,7 @@ BOARD_REFERENCE_IMAGE = None
 PROBE_MODE = "middle"  # "middle" | "five"
 
 if PROBE_MODE == "middle":
-    probe_points = [(70.0, 0.0, -125.0)]
+    probe_points = [(70.0, 0.0, -165.0)]
 elif PROBE_MODE == "five":
     probe_points = [
         (30.0, 0.0, -70.0),

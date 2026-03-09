@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Interactive 3D tip-position visualizer for G-code using calibration JSON.
+Interactive 3D tip-position visualizer for G-code using calibration JSON
+(+ optional robot-link overlay from a robot configuration JSON).
 
-Features:
-  - True equal-axis rendering (geometry is not distorted) and preserved while scrubbing.
-  - Major view plane buttons: XY, XZ, YZ, and ISO.
-  - Zoom slider + reset button (scales the equal-axis box around the fixed data center).
-  - Dark mode / black background.
-  - Slider to scrub through motion points.
-  - Current tip/stage markers + live info panel.
+UI fixes in this version:
+  ✅ Much smoother UI (debounced slider updates + cheaper redraw path)
+  ✅ Checkbox is visible + responds on single click (bigger hitbox, proper colors, higher z-order)
+  ✅ Sliders are far less laggy (precomputed extrude segments + debounced redraw)
+  ✅ Planar/ISO views no longer “pop out” when using sliders (camera preserved across updates)
+  ✅ Title moved further up; legend + controls moved further down
 
-Kinematic model (3D rotated radial offset):
-  X_tip = X_stage + r(B) * cos(C)
-  Y_tip = Y_stage + r(B) * sin(C)
-  Z_tip = Z_stage + z(B)
-
-where:
-  - r(B), z(B), tip_angle_deg(B) are cubic polynomials from calibration JSON
+Notes:
+  - Matplotlib 3D is not true “blitting-capable” everywhere; so this script focuses on
+    *reducing work per interaction* and *debouncing* slider callbacks.
 """
 
 import argparse
@@ -37,7 +33,15 @@ DEFAULT_MIN_B = -5.0
 DEFAULT_MAX_B = -0.0
 DEFAULT_C0_DEG = 0.0
 DEFAULT_FIGSIZE = (12.5, 9.0)
-OFFPLANE_SIGN = -1.0
+DEFAULT_OFFPLANE_SIGN = -1.0
+
+DEFAULT_ROBOT_DIAMETER_MM = 3.0
+DEFAULT_ROBOT_LINKS = 6
+
+# UI tuning
+UI_DEBOUNCE_MS_INDEX = 18
+UI_DEBOUNCE_MS_ZOOM = 18
+MAX_BACKGROUND_POINTS = 25000  # background path decimation for faster initial draw on huge files
 # -----------------------------------------
 
 
@@ -59,6 +63,7 @@ class Calibration:
     x_axis: str
     z_axis: str
     c_180_deg: float
+    b_home: float
 
 
 def _polyval4(coeffs: np.ndarray, u) -> np.ndarray:
@@ -67,26 +72,32 @@ def _polyval4(coeffs: np.ndarray, u) -> np.ndarray:
     return ((a * u + b) * u + c) * u + d
 
 
-def load_calibration(json_path: str) -> Calibration:
+def load_calibration_json(json_path: str) -> dict:
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Calibration JSON not found: {json_path}")
-
     with p.open("r") as f:
-        data = json.load(f)
+        return json.load(f)
 
+
+def load_calibration(json_path: str) -> Calibration:
+    data = load_calibration_json(json_path)
     cubic = data["cubic_coefficients"]
 
     pr = np.array(cubic["r_coeffs"], dtype=float)
     pz = np.array(cubic["z_coeffs"], dtype=float)
-    pa = np.array(cubic["tip_angle_coeffs"], dtype=float)
+
+    pa_raw = cubic.get("tip_angle_coeffs", None)
+    if pa_raw is None:
+        pa = np.array([0.0, 0.0, 0.0, 0.0], dtype=float)
+    else:
+        pa = np.array(pa_raw, dtype=float)
+
     py_off_raw = cubic.get("offplane_y_coeffs", None)
     py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
 
     if pr.shape[0] != 4 or pz.shape[0] != 4 or pa.shape[0] != 4:
         raise ValueError("Expected 4 coeffs for r_coeffs, z_coeffs, and tip_angle_coeffs")
-    if py_off is not None and py_off.shape[0] == 0:
-        raise ValueError("offplane_y_coeffs is present but empty")
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -102,9 +113,10 @@ def load_calibration(json_path: str) -> Calibration:
     z_axis = str(duet_map.get("vertical_axis") or motor_setup.get("vertical_axis") or "Z")
 
     c_180 = float(motor_setup.get("rotation_axis_180_deg", 180.0))
+    b_home = float(motor_setup.get("b_motor_home_position", 0.0))
 
     tip_env = data.get("working_envelope", {}).get("tip_angle_range_deg")
-    if isinstance(tip_env, list) and len(tip_env) == 2:
+    if isinstance(tip_env, list) and len(tip_env) == 2 and pa_raw is not None:
         tip_angle_min = float(min(tip_env))
         tip_angle_max = float(max(tip_env))
     else:
@@ -119,8 +131,113 @@ def load_calibration(json_path: str) -> Calibration:
         tip_angle_min=tip_angle_min, tip_angle_max=tip_angle_max,
         pull_axis=pull_axis, rot_axis=rot_axis,
         x_axis=x_axis, z_axis=z_axis,
-        c_180_deg=c_180
+        c_180_deg=c_180,
+        b_home=b_home,
     )
+
+
+# =========================
+# Robot link configuration
+# =========================
+@dataclass
+class RobotLinkConfig:
+    diameter_mm: float
+    n_links: int
+    t_knots: np.ndarray
+    show_default: bool
+    anchor_mode: str
+    shape_mode: str
+    y_mode: str
+    base_tangent_scale: float
+    tip_tangent_scale: float
+
+
+def _safe_float(x, default):
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(x, default):
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
+
+
+def load_robot_config(robot_json_path: str) -> RobotLinkConfig:
+    p = Path(robot_json_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Robot config JSON not found: {robot_json_path}")
+
+    with p.open("r") as f:
+        data = json.load(f)
+
+    diameter = _safe_float(data.get("diameter_mm", DEFAULT_ROBOT_DIAMETER_MM), DEFAULT_ROBOT_DIAMETER_MM)
+
+    n_links = data.get("n_links_curve", None)
+    if n_links is None:
+        n_links = data.get("n_links", None)
+    if n_links is None:
+        n_links = DEFAULT_ROBOT_LINKS
+    n_links = int(max(1, _safe_int(n_links, DEFAULT_ROBOT_LINKS)))
+
+    t_knots = None
+    knot_def = data.get("knot_definition", {})
+    if isinstance(knot_def, dict) and "t_i" in knot_def:
+        try:
+            t_knots = np.array(knot_def["t_i"], dtype=float).ravel()
+        except Exception:
+            t_knots = None
+    if t_knots is None or t_knots.size < 2:
+        t_knots = np.linspace(0.0, 1.0, n_links + 1)
+    t_knots[0] = 0.0
+    t_knots[-1] = 1.0
+    t_knots = np.clip(t_knots, 0.0, 1.0)
+
+    show_default = bool(data.get("show_default", False))
+
+    anchor_mode = str(data.get("anchor_mode", "tip")).strip().lower()
+    if anchor_mode not in ("tip", "base"):
+        anchor_mode = "tip"
+
+    shape_mode = str(data.get("shape_mode", "hermite_angle")).strip().lower()
+    if shape_mode not in ("hermite_angle", "poly_b"):
+        shape_mode = "hermite_angle"
+
+    y_mode = str(data.get("y_mode", "poly")).strip().lower()
+    if y_mode not in ("poly", "linear"):
+        y_mode = "poly"
+
+    hermite = data.get("hermite", {}) if isinstance(data.get("hermite", {}), dict) else {}
+    base_tangent_scale = _safe_float(hermite.get("base_tangent_scale", 0.6), 0.6)
+    tip_tangent_scale = _safe_float(hermite.get("tip_tangent_scale", 0.9), 0.9)
+
+    return RobotLinkConfig(
+        diameter_mm=float(diameter),
+        n_links=int(n_links),
+        t_knots=t_knots,
+        show_default=show_default,
+        anchor_mode=anchor_mode,
+        shape_mode=shape_mode,
+        y_mode=y_mode,
+        base_tangent_scale=float(base_tangent_scale),
+        tip_tangent_scale=float(tip_tangent_scale),
+    )
+
+
+def resolve_robot_config_from_calibration(calibration_path: str, cal_data: dict) -> Optional[Path]:
+    exported = cal_data.get("exported_models", {})
+    sk = exported.get("robot_skeleton_parametric", None)
+    if not isinstance(sk, dict):
+        return None
+    rel = sk.get("parametric_json", None)
+    if not rel:
+        return None
+    base = Path(calibration_path).resolve().parent
+    cand = (base / rel).resolve()
+    return cand if cand.exists() else None
 
 
 # =========================
@@ -205,7 +322,6 @@ def parse_gcode_motion_states(
             if not is_motion_line:
                 continue
 
-            # Track extrusion axis position even on U-only motion lines so later dU is correct.
             u_axis_u = u_axis.upper()
             if u_axis_u in words:
                 if abs_mode:
@@ -274,7 +390,12 @@ def infer_sgn_from_c(c_vals: np.ndarray, c0_deg: float, c180_deg: float) -> np.n
     return np.where(d0 <= d180, 1.0, -1.0)
 
 
-def reconstruct_tip_trajectory(states: List[MotionState], cal: Calibration, c0_deg: float = DEFAULT_C0_DEG) -> TipTrajectory:
+def reconstruct_tip_trajectory(
+    states: List[MotionState],
+    cal: Calibration,
+    c0_deg: float = DEFAULT_C0_DEG,
+    offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
+) -> TipTrajectory:
     x_stage = np.array([s.x_stage for s in states], dtype=float)
     y_stage = np.array([s.y_stage for s in states], dtype=float)
     z_stage = np.array([s.z_stage for s in states], dtype=float)
@@ -284,18 +405,17 @@ def reconstruct_tip_trajectory(states: List[MotionState], cal: Calibration, c0_d
     r_of_b = _polyval4(cal.pr, b_cmd)
     z_of_b = _polyval4(cal.pz, b_cmd)
     tip_ang = _polyval4(cal.pa, b_cmd)
+
     if cal.py_off is None:
         y_off_of_b = np.zeros_like(b_cmd, dtype=float)
     else:
-        y_off_of_b = OFFPLANE_SIGN * np.polyval(cal.py_off, b_cmd)
+        y_off_of_b = offplane_sign * np.polyval(cal.py_off, b_cmd)
 
-    # Full 3D tip offset model with transverse off-plane component, rotated by C.
     c_rad = np.deg2rad(c_cmd)
     x_tip = x_stage + r_of_b * np.cos(c_rad) - y_off_of_b * np.sin(c_rad)
     y_tip = y_stage + r_of_b * np.sin(c_rad) + y_off_of_b * np.cos(c_rad)
     z_tip = z_stage + z_of_b
 
-    # Retained for debug display/backward compatibility in the info panel.
     sgn = infer_sgn_from_c(c_cmd, c0_deg=c0_deg, c180_deg=cal.c_180_deg)
 
     return TipTrajectory(
@@ -306,6 +426,111 @@ def reconstruct_tip_trajectory(states: List[MotionState], cal: Calibration, c0_d
         tip_angle_deg=tip_ang,
         sgn=sgn,
     )
+
+
+# =========================
+# Robot link reconstruction
+# =========================
+def _hermite_curve_2d(p0: np.ndarray, p1: np.ndarray, m0: np.ndarray, m1: np.ndarray, s: np.ndarray) -> np.ndarray:
+    s = np.asarray(s, dtype=float)
+    h00 = (2*s**3 - 3*s**2 + 1)
+    h10 = (s**3 - 2*s**2 + s)
+    h01 = (-2*s**3 + 3*s**2)
+    h11 = (s**3 - s**2)
+    return (h00[:, None]*p0[None, :] +
+            h10[:, None]*m0[None, :] +
+            h01[:, None]*p1[None, :] +
+            h11[:, None]*m1[None, :])
+
+
+def compute_robot_polyline_world(
+    cal: Calibration,
+    robot_cfg: RobotLinkConfig,
+    x_stage: float,
+    y_stage: float,
+    z_stage: float,
+    b_cmd: float,
+    c_cmd_deg: float,
+    tip_world: Tuple[float, float, float],
+    tip_angle_deg: float,
+    r_tip: float,
+    z_tip: float,
+    y_off_tip: float,
+    offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
+) -> np.ndarray:
+    t = robot_cfg.t_knots
+    b0 = float(cal.b_home)
+    b = float(b_cmd)
+
+    r0 = float(_polyval4(cal.pr, b0))
+    z0 = float(_polyval4(cal.pz, b0))
+    if cal.py_off is None:
+        y0 = 0.0
+    else:
+        y0 = float(offplane_sign * np.polyval(cal.py_off, b0))
+
+    r_end = float(r_tip - r0)
+    z_end = float(z_tip - z0)
+    y_end = float(y_off_tip - y0)
+
+    if robot_cfg.shape_mode == "poly_b":
+        b_k = b0 + t * (b - b0)
+        r_k = _polyval4(cal.pr, b_k) - r0
+        z_k = _polyval4(cal.pz, b_k) - z0
+        if cal.py_off is None:
+            y_k = np.zeros_like(r_k)
+        else:
+            y_k = offplane_sign * np.polyval(cal.py_off, b_k) - y0
+    else:
+        p0 = np.array([0.0, 0.0], dtype=float)
+        p1 = np.array([r_end, z_end], dtype=float)
+
+        L = float(np.linalg.norm(p1 - p0))
+        L = max(L, 1e-6)
+
+        m0 = robot_cfg.base_tangent_scale * L * np.array([0.0, 1.0], dtype=float)
+
+        th = np.deg2rad(float(tip_angle_deg))
+        tip_dir = np.array([np.sin(th), np.cos(th)], dtype=float)
+        if not np.all(np.isfinite(tip_dir)) or float(np.linalg.norm(tip_dir)) < 1e-9:
+            tip_dir = (p1 - p0) / L
+        tip_dir = tip_dir / max(float(np.linalg.norm(tip_dir)), 1e-9)
+        m1 = robot_cfg.tip_tangent_scale * L * tip_dir
+
+        rz = _hermite_curve_2d(p0, p1, m0, m1, t)
+        r_k = rz[:, 0]
+        z_k = rz[:, 1]
+
+        if cal.py_off is None:
+            y_k = np.zeros_like(r_k)
+        else:
+            if robot_cfg.y_mode == "linear":
+                y_k = t * y_end
+            else:
+                b_k = b0 + t * (b - b0)
+                y_k = offplane_sign * np.polyval(cal.py_off, b_k) - y0
+
+    c_rad = np.deg2rad(float(c_cmd_deg))
+    cosc = float(np.cos(c_rad))
+    sinc = float(np.sin(c_rad))
+
+    x_rot = r_k * cosc - y_k * sinc
+    y_rot = r_k * sinc + y_k * cosc
+
+    pts_world = np.column_stack([
+        float(x_stage) + x_rot,
+        float(y_stage) + y_rot,
+        float(z_stage) + z_k
+    ]).astype(float)
+
+    pts_world[0, :] = np.array([x_stage, y_stage, z_stage], dtype=float)
+
+    if robot_cfg.anchor_mode == "tip":
+        tip_world_vec = np.array(tip_world, dtype=float).reshape(3)
+        delta = tip_world_vec - pts_world[-1, :]
+        pts_world = pts_world + delta[None, :]
+
+    return pts_world
 
 
 # =========================
@@ -335,13 +560,12 @@ def compute_equal_box_center_radius(xs: np.ndarray, ys: np.ndarray, zs: np.ndarr
 
 
 def apply_equal_axes_with_zoom(ax, center: Tuple[float, float, float], base_radius: float, zoom: float):
-    """
-    zoom > 1.0 => zoom in (smaller visible box)
-    zoom < 1.0 => zoom out (larger visible box)
-    """
     zoom = max(float(zoom), 1e-6)
     cx, cy, cz = center
     r = base_radius / zoom
+
+    # Preserve camera to avoid planar view "popping" on updates
+    elev, azim = getattr(ax, "elev", None), getattr(ax, "azim", None)
 
     ax.set_xlim(cx - r, cx + r)
     ax.set_ylim(cy - r, cy + r)
@@ -352,15 +576,21 @@ def apply_equal_axes_with_zoom(ax, center: Tuple[float, float, float], base_radi
     except Exception:
         pass
 
+    if elev is not None and azim is not None:
+        try:
+            ax.view_init(elev=elev, azim=azim)
+        except Exception:
+            pass
+
 
 def set_major_view(ax, view_name: str):
     name = view_name.upper()
     if name == "XY":
-        ax.view_init(elev=90, azim=-90)     # looking down +Z
+        ax.view_init(elev=90, azim=-90)
     elif name == "XZ":
-        ax.view_init(elev=0, azim=-90)      # looking along +Y
+        ax.view_init(elev=0, azim=-90)
     elif name == "YZ":
-        ax.view_init(elev=0, azim=0)        # looking along +X
+        ax.view_init(elev=0, azim=0)
     elif name == "ISO":
         ax.view_init(elev=25, azim=-60)
     else:
@@ -368,11 +598,9 @@ def set_major_view(ax, view_name: str):
 
 
 def style_dark_3d_axes(fig, ax):
-    # Figure / axes backgrounds
     fig.patch.set_facecolor("black")
     ax.set_facecolor("black")
 
-    # Pane colors (3D walls)
     try:
         ax.xaxis.set_pane_color((0.0, 0.0, 0.0, 1.0))
         ax.yaxis.set_pane_color((0.0, 0.0, 0.0, 1.0))
@@ -380,7 +608,6 @@ def style_dark_3d_axes(fig, ax):
     except Exception:
         pass
 
-    # Grid and axis/tick colors (version-compatible best effort)
     try:
         ax.grid(True, color=(0.35, 0.35, 0.35, 0.6))
     except Exception:
@@ -392,7 +619,6 @@ def style_dark_3d_axes(fig, ax):
     ax.zaxis.label.set_color("white")
     ax.title.set_color("white")
 
-    # Axis lines (deprecated/private attributes in some versions, guarded)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         try:
             axis.line.set_color("white")
@@ -406,6 +632,16 @@ def style_dark_3d_axes(fig, ax):
             pass
 
 
+def _decimate_xyz(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, max_points: int):
+    n = len(xs)
+    if n <= max_points:
+        return xs, ys, zs
+    idx = np.linspace(0, n - 1, max_points).astype(int)
+    idx[0] = 0
+    idx[-1] = n - 1
+    return xs[idx], ys[idx], zs[idx]
+
+
 # =========================
 # Interactive UI
 # =========================
@@ -413,36 +649,52 @@ def launch_interactive_plot(
     states: List[MotionState],
     traj: TipTrajectory,
     cal: Calibration,
+    robot_cfg: Optional[RobotLinkConfig] = None,
     c0_deg: float = DEFAULT_C0_DEG,
+    offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
     show_stage: bool = False,
 ):
+    # Matplotlib performance knobs (safe defaults)
+    try:
+        plt.rcParams["path.simplify"] = True
+        plt.rcParams["path.simplify_threshold"] = 0.8
+        plt.rcParams["agg.path.chunksize"] = 20000
+    except Exception:
+        pass
+
     n = len(states)
     idx0 = 0
 
     fig = plt.figure(figsize=DEFAULT_FIGSIZE)
     ax = fig.add_subplot(111, projection="3d")
 
-    # Leave extra room for controls
-    plt.subplots_adjust(left=0.05, right=0.98, bottom=0.28, top=0.94)
-
-    # Dark mode
+    # Title further up; controls further down
+    plt.subplots_adjust(left=0.05, right=0.98, bottom=0.24, top=0.975)
     style_dark_3d_axes(fig, ax)
 
     xs, ys, zs = traj.x_tip, traj.y_tip, traj.z_tip
     segs = make_line_segments(xs, ys, zs)
-    u_cmd = np.array([s.u_cmd for s in states], dtype=float)
-    extrude_seg_mask = np.abs(np.diff(u_cmd)) > 1e-12
 
-    # Full reference tip path (uniform color)
-    if len(segs) > 0:
-        lc = Line3DCollection(segs, colors=["deepskyblue"], linewidths=1.4, alpha=0.45)
+    u_cmd = np.array([s.u_cmd for s in states], dtype=float)
+    extrude_seg_mask = np.abs(np.diff(u_cmd)) > 1e-12  # length n-1
+
+    # Precompute extruding segments for fast redraw (O(log N) selection)
+    extrude_segs = segs[extrude_seg_mask] if len(segs) else np.empty((0, 2, 3), dtype=float)
+    extrude_end_idx = (np.nonzero(extrude_seg_mask)[0] + 1).astype(int)  # segment ends at index i
+
+    # Full reference tip path (decimated for responsiveness on huge files)
+    bg_x, bg_y, bg_z = _decimate_xyz(xs, ys, zs, MAX_BACKGROUND_POINTS)
+    bg_segs = make_line_segments(bg_x, bg_y, bg_z)
+    if len(bg_segs) > 0:
+        lc = Line3DCollection(bg_segs, colors=["deepskyblue"], linewidths=1.4, alpha=0.45)
         ax.add_collection3d(lc)
 
     # Optional stage path
     stage_path_line = None
     if show_stage:
+        sx, sy, sz = _decimate_xyz(traj.x_stage, traj.y_stage, traj.z_stage, MAX_BACKGROUND_POINTS)
         stage_path_line, = ax.plot(
-            traj.x_stage, traj.y_stage, traj.z_stage,
+            sx, sy, sz,
             linestyle="--", linewidth=0.7, alpha=0.35, color="0.8", label="Stage path"
         )
 
@@ -451,26 +703,53 @@ def launch_interactive_plot(
     ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], marker="x", s=46, color="red", label="End")
 
     # Current markers
-    current_tip_marker, = ax.plot(
-        [xs[idx0]], [ys[idx0]], [zs[idx0]],
-        marker="o", markersize=8, linestyle="None", color="white"
-    )
-    current_stage_marker, = ax.plot(
-        [traj.x_stage[idx0]], [traj.y_stage[idx0]], [traj.z_stage[idx0]],
-        marker="^", markersize=6, linestyle="None", alpha=0.95, color="magenta"
-    )
-    # Matplotlib 3D can error when adding an empty Line3DCollection; seed with a degenerate segment.
+    current_tip_marker, = ax.plot([xs[idx0]], [ys[idx0]], [zs[idx0]],
+                                  marker="o", markersize=8, linestyle="None", color="white")
+    current_stage_marker, = ax.plot([traj.x_stage[idx0]], [traj.y_stage[idx0]], [traj.z_stage[idx0]],
+                                    marker="^", markersize=6, linestyle="None", alpha=0.95, color="magenta")
+
+    # Current extruding portion
     p0 = np.array([[xs[idx0], ys[idx0], zs[idx0]], [xs[idx0], ys[idx0], zs[idx0]]], dtype=float)
     current_print_lc = Line3DCollection([p0], colors=["yellow"], linewidths=2.2, alpha=0.95)
     ax.add_collection3d(current_print_lc)
 
-    ax.set_title("Tip Trajectory from G-code and Calibration")
-    ax.set_xlabel("X_tip (mm)")
-    ax.set_ylabel("Y_tip (mm)")
-    ax.set_zlabel("Z_tip (mm)")
+    # Robot links (optional)
+    robot_lc = None
+    robot_joints = None
+    robot_visible = {"value": False}
+    if robot_cfg is not None:
+        robot_visible["value"] = bool(robot_cfg.show_default)
 
-    # Legend dark styling
-    leg = ax.legend(loc="upper left")
+        rp = compute_robot_polyline_world(
+            cal, robot_cfg,
+            x_stage=traj.x_stage[idx0],
+            y_stage=traj.y_stage[idx0],
+            z_stage=traj.z_stage[idx0],
+            b_cmd=traj.b_cmd[idx0],
+            c_cmd_deg=traj.c_cmd[idx0],
+            tip_world=(traj.x_tip[idx0], traj.y_tip[idx0], traj.z_tip[idx0]),
+            tip_angle_deg=traj.tip_angle_deg[idx0],
+            r_tip=traj.r_of_b[idx0],
+            z_tip=traj.z_of_b[idx0],
+            y_off_tip=traj.y_off_of_b[idx0],
+            offplane_sign=offplane_sign,
+        )
+        rsegs = np.stack([rp[:-1], rp[1:]], axis=1) if rp.shape[0] >= 2 else np.empty((0, 2, 3))
+        robot_lc = Line3DCollection(rsegs, colors=["orange"], linewidths=3.0, alpha=0.90)
+        ax.add_collection3d(robot_lc)
+        robot_joints = ax.scatter(rp[:, 0], rp[:, 1], rp[:, 2], s=18, color="orange", alpha=0.95)
+
+        robot_lc.set_visible(robot_visible["value"])
+        robot_joints.set_visible(robot_visible["value"])
+
+    # Title further up
+    ax.set_title("Tip Trajectory from G-code and Calibration", pad=18)
+    ax.set_xlabel("X (mm)")
+    ax.set_ylabel("Y (mm)")
+    ax.set_zlabel("Z (mm)")
+
+    # Legend further down on plot
+    leg = ax.legend(loc="lower left")
     if leg is not None:
         try:
             leg.get_frame().set_facecolor((0.1, 0.1, 0.1, 0.9))
@@ -493,8 +772,8 @@ def launch_interactive_plot(
     apply_view_limits()
     set_major_view(ax, "ISO")
 
-    # ----- Info panel -----
-    text_ax = fig.add_axes([0.05, 0.025, 0.60, 0.14])
+    # ----- Info panel (slightly lower) -----
+    text_ax = fig.add_axes([0.05, 0.005, 0.60, 0.12])
     text_ax.set_facecolor("black")
     text_ax.axis("off")
     info_text = text_ax.text(
@@ -502,8 +781,8 @@ def launch_interactive_plot(
         va="top", ha="left", family="monospace", fontsize=9, color="white"
     )
 
-    # ----- Index slider -----
-    slider_ax = fig.add_axes([0.70, 0.055, 0.25, 0.03], facecolor="#111111")
+    # ----- Index slider (lower) -----
+    slider_ax = fig.add_axes([0.70, 0.040, 0.25, 0.03], facecolor="#111111")
     idx_slider = Slider(
         ax=slider_ax,
         label="Index",
@@ -511,7 +790,6 @@ def launch_interactive_plot(
         valmax=n - 1,
         valinit=idx0,
         valstep=1,
-        color="#2aa1ff",
     )
     try:
         idx_slider.label.set_color("white")
@@ -519,16 +797,15 @@ def launch_interactive_plot(
     except Exception:
         pass
 
-    # ----- Zoom slider -----
-    zoom_ax = fig.add_axes([0.70, 0.100, 0.25, 0.03], facecolor="#111111")
+    # ----- Zoom slider (lower) -----
+    zoom_ax = fig.add_axes([0.70, 0.085, 0.25, 0.03], facecolor="#111111")
     zoom_slider = Slider(
         ax=zoom_ax,
         label="Zoom",
-        valmin=0.25,    # zoomed out
-        valmax=8.0,     # zoomed in
+        valmin=0.25,
+        valmax=8.0,
         valinit=1.0,
         valstep=0.01,
-        color="#66d17a",
     )
     try:
         zoom_slider.label.set_color("white")
@@ -536,50 +813,82 @@ def launch_interactive_plot(
     except Exception:
         pass
 
-    # ----- Nav buttons -----
-    prev_ax = fig.add_axes([0.70, 0.145, 0.08, 0.04], facecolor="#111111")
-    next_ax = fig.add_axes([0.79, 0.145, 0.08, 0.04], facecolor="#111111")
-    zrst_ax = fig.add_axes([0.88, 0.145, 0.07, 0.04], facecolor="#111111")
+    # ----- Nav buttons (lower) -----
+    prev_ax = fig.add_axes([0.70, 0.128, 0.08, 0.04], facecolor="#111111")
+    next_ax = fig.add_axes([0.79, 0.128, 0.08, 0.04], facecolor="#111111")
+    zrst_ax = fig.add_axes([0.88, 0.128, 0.07, 0.04], facecolor="#111111")
     btn_prev = Button(prev_ax, "Prev", color="#222222", hovercolor="#333333")
     btn_next = Button(next_ax, "Next", color="#222222", hovercolor="#333333")
     btn_zrst = Button(zrst_ax, "Zrst", color="#222222", hovercolor="#333333")
 
-    # ----- Major view plane buttons -----
-    xy_ax = fig.add_axes([0.70, 0.192, 0.055, 0.035], facecolor="#111111")
-    xz_ax = fig.add_axes([0.762, 0.192, 0.055, 0.035], facecolor="#111111")
-    yz_ax = fig.add_axes([0.824, 0.192, 0.055, 0.035], facecolor="#111111")
-    iso_ax = fig.add_axes([0.886, 0.192, 0.064, 0.035], facecolor="#111111")
-
+    # ----- Major view plane buttons (lower) -----
+    xy_ax = fig.add_axes([0.70, 0.178, 0.055, 0.035], facecolor="#111111")
+    xz_ax = fig.add_axes([0.762, 0.178, 0.055, 0.035], facecolor="#111111")
+    yz_ax = fig.add_axes([0.824, 0.178, 0.055, 0.035], facecolor="#111111")
+    iso_ax = fig.add_axes([0.886, 0.178, 0.064, 0.035], facecolor="#111111")
     btn_xy = Button(xy_ax, "XY", color="#222222", hovercolor="#333333")
     btn_xz = Button(xz_ax, "XZ", color="#222222", hovercolor="#333333")
     btn_yz = Button(yz_ax, "YZ", color="#222222", hovercolor="#333333")
     btn_iso = Button(iso_ax, "ISO", color="#222222", hovercolor="#333333")
 
-    # Style button text white
     for b in [btn_prev, btn_next, btn_zrst, btn_xy, btn_xz, btn_yz, btn_iso]:
         try:
             b.label.set_color("white")
         except Exception:
             pass
 
-    # ----- Reference dashed-line visibility -----
-    ref_check = None
+    # ----- Toggle checkboxes (bigger + above others to avoid dead clicks) -----
+    toggles = []
+    toggle_states = []
+    toggle_actions = {}
+
     if stage_path_line is not None:
-        ref_ax = fig.add_axes([0.70, 0.232, 0.16, 0.035], facecolor="#111111")
-        ref_check = CheckButtons(ref_ax, ["Ref dashed"], [True])
+        toggles.append("Ref dashed")
+        toggle_states.append(True)
+
+        def _toggle_ref():
+            stage_path_line.set_visible(not stage_path_line.get_visible())
+        toggle_actions["Ref dashed"] = _toggle_ref
+
+    if robot_cfg is not None and robot_lc is not None and robot_joints is not None:
+        toggles.append("Robot links")
+        toggle_states.append(robot_visible["value"])
+
+        def _toggle_robot():
+            robot_visible["value"] = not robot_visible["value"]
+            robot_lc.set_visible(robot_visible["value"])
+            robot_joints.set_visible(robot_visible["value"])
+        toggle_actions["Robot links"] = _toggle_robot
+
+    ref_check = None
+    if toggles:
+        ref_ax = fig.add_axes([0.70, 0.215, 0.25, 0.075], facecolor="#111111")
+        ref_ax.set_zorder(10)  # ensure it receives clicks
+        ref_check = CheckButtons(ref_ax, toggles, toggle_states)
         try:
             for txt in ref_check.labels:
                 txt.set_color("white")
+                txt.set_fontsize(10)
             for rect in ref_check.rectangles:
                 rect.set_edgecolor("white")
                 rect.set_facecolor("#111111")
+                rect.set_linewidth(1.2)
+            # Make the check marks obvious
             for lines in ref_check.lines:
                 for ln in lines:
+                    ln.set_linewidth(2.2)
                     ln.set_color("#66d17a")
         except Exception:
             pass
 
-    help_ax = fig.add_axes([0.70, 0.020, 0.25, 0.02], facecolor="black")
+        def on_check_clicked(label):
+            if label in toggle_actions:
+                toggle_actions[label]()
+            fig.canvas.draw_idle()
+
+        ref_check.on_clicked(on_check_clicked)
+
+    help_ax = fig.add_axes([0.70, 0.008, 0.28, 0.02], facecolor="black")
     help_ax.axis("off")
     help_ax.text(
         0.0, 0.5,
@@ -587,9 +896,18 @@ def launch_interactive_plot(
         va="center", ha="left", fontsize=8, color="white"
     )
 
+    # ---------------------------
+    # Fast redraw (precomputed extrude segments + debounced sliders)
+    # ---------------------------
     def fmt_state(i: int) -> str:
         s = states[i]
         f_val = s.feed if s.feed is not None else float("nan")
+        rob_line = ""
+        if robot_cfg is not None:
+            rob_line = (
+                f"robot_links: n={robot_cfg.n_links}  dia={robot_cfg.diameter_mm:.2f}mm  "
+                f"shape={robot_cfg.shape_mode}  anchor={robot_cfg.anchor_mode}  visible={robot_visible['value']}\n"
+            )
         return (
             f"idx={s.idx:6d}   gcode_line={s.gcode_line_no:6d}   motion={s.motion_code}   F={f_val:.3f}\n"
             f"stage: X={traj.x_stage[i]: .4f}  Y={traj.y_stage[i]: .4f}  Z={traj.z_stage[i]: .4f}  "
@@ -597,37 +915,87 @@ def launch_interactive_plot(
             f"tip:   X={traj.x_tip[i]: .4f}  Y={traj.y_tip[i]: .4f}  Z={traj.z_tip[i]: .4f}    "
             f"r(B)={traj.r_of_b[i]: .4f}  y_off(B)={traj.y_off_of_b[i]: .4f}  z(B)={traj.z_of_b[i]: .4f}  "
             f"tip_angle={traj.tip_angle_deg[i]: .3f}°  sgn={int(traj.sgn[i]):+d}\n"
+            f"{rob_line}"
             f"zoom={current_zoom['value']:.2f}x   raw: {s.gcode_raw}"
         )
 
+    def _update_print_segments(i: int):
+        if i <= 0 or extrude_segs.shape[0] == 0:
+            current_print_lc.set_segments([])
+            return
+        # how many extrude segments end at/before i?
+        k = int(np.searchsorted(extrude_end_idx, i, side="right"))
+        current_print_lc.set_segments(extrude_segs[:k])
+
+    def _update_robot(i: int):
+        if robot_cfg is None or robot_lc is None or robot_joints is None:
+            return
+        rp = compute_robot_polyline_world(
+            cal, robot_cfg,
+            x_stage=traj.x_stage[i],
+            y_stage=traj.y_stage[i],
+            z_stage=traj.z_stage[i],
+            b_cmd=traj.b_cmd[i],
+            c_cmd_deg=traj.c_cmd[i],
+            tip_world=(traj.x_tip[i], traj.y_tip[i], traj.z_tip[i]),
+            tip_angle_deg=traj.tip_angle_deg[i],
+            r_tip=traj.r_of_b[i],
+            z_tip=traj.z_of_b[i],
+            y_off_tip=traj.y_off_of_b[i],
+            offplane_sign=offplane_sign,
+        )
+        rsegs = np.stack([rp[:-1], rp[1:]], axis=1) if rp.shape[0] >= 2 else np.empty((0, 2, 3))
+        robot_lc.set_segments(rsegs)
+        robot_joints._offsets3d = (rp[:, 0], rp[:, 1], rp[:, 2])
+
     def redraw(i: int):
         i = int(np.clip(i, 0, n - 1))
-
         current_tip_marker.set_data_3d([traj.x_tip[i]], [traj.y_tip[i]], [traj.z_tip[i]])
         current_stage_marker.set_data_3d([traj.x_stage[i]], [traj.y_stage[i]], [traj.z_stage[i]])
-        if i <= 0 or len(segs) == 0:
-            current_print_lc.set_segments([])
-        else:
-            visible_print_segs = segs[:i][extrude_seg_mask[:i]]
-            current_print_lc.set_segments(visible_print_segs)
-
+        _update_print_segments(i)
+        _update_robot(i)
         info_text.set_text(fmt_state(i))
-
         fig.canvas.draw_idle()
+
+    # Debounce helpers (so sliders feel fluid)
+    pending = {"idx": idx0, "zoom": 1.0, "idx_dirty": False, "zoom_dirty": False}
+
+    idx_timer = fig.canvas.new_timer(interval=UI_DEBOUNCE_MS_INDEX)
+    zoom_timer = fig.canvas.new_timer(interval=UI_DEBOUNCE_MS_ZOOM)
+
+    def _idx_timer_cb():
+        if pending["idx_dirty"]:
+            pending["idx_dirty"] = False
+            redraw(int(pending["idx"]))
+        # returning None is fine for mpl timers
+
+    def _zoom_timer_cb():
+        if pending["zoom_dirty"]:
+            pending["zoom_dirty"] = False
+            current_zoom["value"] = float(pending["zoom"])
+            apply_view_limits()
+            redraw(int(idx_slider.val))
+
+    idx_timer.add_callback(_idx_timer_cb)
+    zoom_timer.add_callback(_zoom_timer_cb)
 
     def on_index_slider(val):
-        redraw(int(val))
+        pending["idx"] = int(val)
+        pending["idx_dirty"] = True
+        try:
+            idx_timer.stop()
+        except Exception:
+            pass
+        idx_timer.start()
 
     def on_zoom_slider(val):
-        current_zoom["value"] = float(val)
-        apply_view_limits()
-        redraw(int(idx_slider.val))
-
-    def on_ref_check(_label):
-        if stage_path_line is None:
-            return
-        stage_path_line.set_visible(not stage_path_line.get_visible())
-        fig.canvas.draw_idle()
+        pending["zoom"] = float(val)
+        pending["zoom_dirty"] = True
+        try:
+            zoom_timer.stop()
+        except Exception:
+            pass
+        zoom_timer.start()
 
     def on_prev(event):
         idx_slider.set_val(max(0, int(idx_slider.val) - 1))
@@ -655,8 +1023,6 @@ def launch_interactive_plot(
     btn_prev.on_clicked(on_prev)
     btn_next.on_clicked(on_next)
     btn_zrst.on_clicked(on_zoom_reset)
-    if ref_check is not None:
-        ref_check.on_clicked(on_ref_check)
 
     def on_key(event):
         key = event.key.lower() if isinstance(event.key, str) else event.key
@@ -675,21 +1041,13 @@ def launch_interactive_plot(
         elif key == "end":
             idx_slider.set_val(n - 1)
         elif key == "1":
-            set_major_view(ax, "XY")
-            apply_view_limits()
-            fig.canvas.draw_idle()
+            set_major_view(ax, "XY"); apply_view_limits(); fig.canvas.draw_idle()
         elif key == "2":
-            set_major_view(ax, "XZ")
-            apply_view_limits()
-            fig.canvas.draw_idle()
+            set_major_view(ax, "XZ"); apply_view_limits(); fig.canvas.draw_idle()
         elif key == "3":
-            set_major_view(ax, "YZ")
-            apply_view_limits()
-            fig.canvas.draw_idle()
+            set_major_view(ax, "YZ"); apply_view_limits(); fig.canvas.draw_idle()
         elif key == "0":
-            set_major_view(ax, "ISO")
-            apply_view_limits()
-            fig.canvas.draw_idle()
+            set_major_view(ax, "ISO"); apply_view_limits(); fig.canvas.draw_idle()
         elif key in ("+", "="):
             zoom_slider.set_val(min(8.0, float(zoom_slider.val) * 1.15))
         elif key in ("-", "_"):
@@ -708,14 +1066,40 @@ def main():
     ap = argparse.ArgumentParser(description="Interactive 3D tip-position plot from G-code + calibration JSON.")
     ap.add_argument("--gcode", required=True, help="Path to input G-code file.")
     ap.add_argument("--calibration", required=True, help="Path to calibration JSON (shadow_calibration schema).")
+    ap.add_argument("--robot-config", default=None,
+                    help="Optional robot skeleton config JSON (e.g. *_skeleton_parametric.json). "
+                         "If omitted, tries to auto-load from calibration JSON exported_models.")
     ap.add_argument("--y-axis", default="Y", help="Stage Y axis letter in G-code (default: Y).")
     ap.add_argument("--c0-deg", type=float, default=DEFAULT_C0_DEG,
                     help="C value corresponding to +X sign in calibration model (default: 0).")
     ap.add_argument("--show-stage", action="store_true", help="Overlay stage path.")
     ap.add_argument("--print-summary", action="store_true", help="Print summary before plotting.")
+    ap.add_argument("--offplane-sign", type=float, default=DEFAULT_OFFPLANE_SIGN,
+                    help="Sign multiplier applied to offplane_y(B) when reconstructing tip/links (default -1).")
     args = ap.parse_args()
 
+    cal_data = load_calibration_json(args.calibration)
     cal = load_calibration(args.calibration)
+
+    # Robot config load (explicit or auto)
+    robot_cfg = None
+    robot_path = None
+    if args.robot_config:
+        robot_path = Path(args.robot_config).expanduser().resolve()
+    else:
+        robot_path = resolve_robot_config_from_calibration(args.calibration, cal_data)
+
+    if robot_path is not None and robot_path.exists():
+        try:
+            robot_cfg = load_robot_config(str(robot_path))
+            print(f"[INFO] Loaded robot config: {robot_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to load robot config ({robot_path}): {e}")
+            robot_cfg = None
+    else:
+        if args.robot_config:
+            print(f"[WARN] Robot config path not found: {args.robot_config}")
+
     y_axis = args.y_axis.upper()
 
     states = parse_gcode_motion_states(
@@ -727,26 +1111,41 @@ def main():
         c_axis=cal.rot_axis,
         default_c0=args.c0_deg,
     )
-    traj = reconstruct_tip_trajectory(states, cal=cal, c0_deg=args.c0_deg)
+    traj = reconstruct_tip_trajectory(
+        states,
+        cal=cal,
+        c0_deg=args.c0_deg,
+        offplane_sign=float(args.offplane_sign),
+    )
 
     if args.print_summary:
         c_unique = np.unique(np.round(traj.c_cmd, 6))
         print(f"Parsed {len(states)} motion states from {args.gcode}")
         print(f"Axis mapping: X={cal.x_axis}, Y={y_axis}, Z={cal.z_axis}, B={cal.pull_axis}, C={cal.rot_axis}")
         print(f"C0={args.c0_deg:.3f}, C180(cal)={cal.c_180_deg:.3f}")
+        print(f"offplane_sign={float(args.offplane_sign):.3f}")
+        print(f"B home={cal.b_home:.4f}")
         print(f"Unique C values (rounded): {c_unique.tolist()[:20]}{' ...' if len(c_unique) > 20 else ''}")
         print(f"B range used: [{np.min(traj.b_cmd):.4f}, {np.max(traj.b_cmd):.4f}] (cal: [{cal.b_min:.4f}, {cal.b_max:.4f}])")
         print(f"TIP X range: [{np.min(traj.x_tip):.4f}, {np.max(traj.x_tip):.4f}]")
         print(f"TIP Y range: [{np.min(traj.y_tip):.4f}, {np.max(traj.y_tip):.4f}]")
         print(f"TIP Z range: [{np.min(traj.z_tip):.4f}, {np.max(traj.z_tip):.4f}]")
+        if robot_cfg is not None:
+            print(
+                f"Robot links enabled: n_links={robot_cfg.n_links}, dia={robot_cfg.diameter_mm:.2f}mm, "
+                f"shape={robot_cfg.shape_mode}, anchor={robot_cfg.anchor_mode}, knots={len(robot_cfg.t_knots)}"
+            )
 
     launch_interactive_plot(
         states=states,
         traj=traj,
         cal=cal,
+        robot_cfg=robot_cfg,
         c0_deg=args.c0_deg,
+        offplane_sign=float(args.offplane_sign),
         show_stage=args.show_stage,
     )
+
 
 if __name__ == "__main__":
     main()

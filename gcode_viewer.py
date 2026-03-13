@@ -748,17 +748,6 @@ def launch_interactive_plot(
     ax.set_ylabel("Y (mm)")
     ax.set_zlabel("Z (mm)")
 
-    # Legend further down on plot
-    leg = ax.legend(loc="lower left")
-    if leg is not None:
-        try:
-            leg.get_frame().set_facecolor((0.1, 0.1, 0.1, 0.9))
-            leg.get_frame().set_edgecolor((0.7, 0.7, 0.7, 0.5))
-            for txt in leg.get_texts():
-                txt.set_color("white")
-        except Exception:
-            pass
-
     all_x = xs if not show_stage else np.concatenate([xs, traj.x_stage])
     all_y = ys if not show_stage else np.concatenate([ys, traj.y_stage])
     all_z = zs if not show_stage else np.concatenate([zs, traj.z_stage])
@@ -814,18 +803,18 @@ def launch_interactive_plot(
         pass
 
     # ----- Nav buttons (lower) -----
-    prev_ax = fig.add_axes([0.70, 0.128, 0.08, 0.04], facecolor="#111111")
-    next_ax = fig.add_axes([0.79, 0.128, 0.08, 0.04], facecolor="#111111")
-    zrst_ax = fig.add_axes([0.88, 0.128, 0.07, 0.04], facecolor="#111111")
+    prev_ax = fig.add_axes([0.72, 0.118, 0.08, 0.04], facecolor="#111111")
+    next_ax = fig.add_axes([0.81, 0.118, 0.08, 0.04], facecolor="#111111")
+    zrst_ax = fig.add_axes([0.90, 0.118, 0.07, 0.04], facecolor="#111111")
     btn_prev = Button(prev_ax, "Prev", color="#222222", hovercolor="#333333")
     btn_next = Button(next_ax, "Next", color="#222222", hovercolor="#333333")
     btn_zrst = Button(zrst_ax, "Zrst", color="#222222", hovercolor="#333333")
 
     # ----- Major view plane buttons (lower) -----
-    xy_ax = fig.add_axes([0.70, 0.178, 0.055, 0.035], facecolor="#111111")
-    xz_ax = fig.add_axes([0.762, 0.178, 0.055, 0.035], facecolor="#111111")
-    yz_ax = fig.add_axes([0.824, 0.178, 0.055, 0.035], facecolor="#111111")
-    iso_ax = fig.add_axes([0.886, 0.178, 0.064, 0.035], facecolor="#111111")
+    xy_ax = fig.add_axes([0.72, 0.168, 0.055, 0.035], facecolor="#111111")
+    xz_ax = fig.add_axes([0.782, 0.168, 0.055, 0.035], facecolor="#111111")
+    yz_ax = fig.add_axes([0.844, 0.168, 0.055, 0.035], facecolor="#111111")
+    iso_ax = fig.add_axes([0.906, 0.168, 0.064, 0.035], facecolor="#111111")
     btn_xy = Button(xy_ax, "XY", color="#222222", hovercolor="#333333")
     btn_xz = Button(xz_ax, "XZ", color="#222222", hovercolor="#333333")
     btn_yz = Button(yz_ax, "YZ", color="#222222", hovercolor="#333333")
@@ -862,21 +851,28 @@ def launch_interactive_plot(
 
     ref_check = None
     if toggles:
-        ref_ax = fig.add_axes([0.70, 0.215, 0.25, 0.075], facecolor="#111111")
+        ref_ax = fig.add_axes([0.7, 0.200, 0.19, 0.060], facecolor="#2a2a2a")
         ref_ax.set_zorder(10)  # ensure it receives clicks
         ref_check = CheckButtons(ref_ax, toggles, toggle_states)
         try:
             for txt in ref_check.labels:
                 txt.set_color("white")
-                txt.set_fontsize(10)
+                txt.set_fontsize(12)
             for rect in ref_check.rectangles:
                 rect.set_edgecolor("white")
-                rect.set_facecolor("#111111")
-                rect.set_linewidth(1.2)
+                rect.set_facecolor("#000000")
+                rect.set_linewidth(2.0)
+                # Make checkbox squares larger while keeping the panel compact.
+                x, y = rect.get_xy()
+                w, h = rect.get_width(), rect.get_height()
+                nw, nh = w * 1.75, h * 1.75
+                rect.set_width(nw)
+                rect.set_height(nh)
+                rect.set_xy((x, y - 0.5 * (nh - h)))
             # Make the check marks obvious
             for lines in ref_check.lines:
                 for ln in lines:
-                    ln.set_linewidth(2.2)
+                    ln.set_linewidth(3.4)
                     ln.set_color("#66d17a")
         except Exception:
             pass
@@ -887,6 +883,29 @@ def launch_interactive_plot(
             fig.canvas.draw_idle()
 
         ref_check.on_clicked(on_check_clicked)
+
+        # Make the whole checkbox row clickable (not only the small checkbox artist).
+        def on_ref_ax_click(event):
+            if event.inaxes is not ref_ax or event.button != 1 or event.ydata is None:
+                return
+
+            # Let native CheckButtons handling process direct clicks on labels/boxes.
+            for rect in ref_check.rectangles:
+                contains, _ = rect.contains(event)
+                if contains:
+                    return
+            for txt in ref_check.labels:
+                contains, _ = txt.contains(event)
+                if contains:
+                    return
+
+            ys = np.array([txt.get_position()[1] for txt in ref_check.labels], dtype=float)
+            if ys.size == 0:
+                return
+            idx = int(np.argmin(np.abs(ys - float(event.ydata))))
+            ref_check.set_active(idx)
+
+        fig.canvas.mpl_connect("button_press_event", on_ref_ax_click)
 
     help_ax = fig.add_axes([0.70, 0.008, 0.28, 0.02], facecolor="black")
     help_ax.axis("off")

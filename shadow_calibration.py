@@ -14,6 +14,7 @@ import pickle
 import inspect
 import json
 from collections import deque
+from pathlib import Path
 
 try:
     from duetwebapi import DuetWebAPI
@@ -427,6 +428,8 @@ class CTR_Shadow_Calibration:
         self.board_homography_mm_from_px = None
         self.board_px_per_mm_local = None
         self.board_mm_per_px_local = None
+        self.board_planar_x_sign = 1.0
+        self.board_reference_correction_meta = None
         self.board_reference_image_path = None
         self.ruler_ref_p1_px = None
         self.ruler_ref_p2_px = None
@@ -552,6 +555,97 @@ class CTR_Shadow_Calibration:
 
         corners = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
         return True, corners
+
+    @staticmethod
+    def _scale_mm_from_px_homography(H, mm_scale):
+        """
+        If mm_new = mm_scale * mm_old and H_old maps px -> mm_old,
+        then H_new = S * H_old with S = diag(mm_scale, mm_scale, 1).
+        """
+        H = np.asarray(H, dtype=np.float64).copy()
+        S = np.diag([float(mm_scale), float(mm_scale), 1.0]).astype(np.float64)
+        return S @ H
+
+    @staticmethod
+    def _scale_px_from_mm_homography(H, mm_scale):
+        """
+        If mm_new = mm_scale * mm_old and H_old maps mm_old -> px,
+        then H_new = H_old * S_inv where S_inv rescales mm_new back to mm_old.
+        """
+        if abs(float(mm_scale)) < 1e-12:
+            raise ValueError("mm_scale must be non-zero.")
+        H = np.asarray(H, dtype=np.float64).copy()
+        S_inv = np.diag([1.0 / float(mm_scale), 1.0 / float(mm_scale), 1.0]).astype(np.float64)
+        return H @ S_inv
+
+    def apply_checkerboard_reference_corrections(self, mm_scale=0.5, flip_planar_x=True):
+        """
+        Correct checkerboard-backed reference axes so they match the ruler-backed convention.
+
+        Requested fixes:
+        - checkerboard mm values are 2x too large -> scale checkerboard mm conversion by 0.5
+        - checkerboard planar x sign is flipped vs motor -> negate planar x
+
+        This is applied at the checkerboard reference layer so downstream post-processing
+        uses the corrected convention on the same images.
+        """
+        if self.board_pose is None:
+            raise RuntimeError(
+                "Board reference is unavailable. Call estimate_board_reference_from_image(...) first."
+            )
+
+        mm_scale = float(mm_scale)
+        flip_planar_x = bool(flip_planar_x)
+
+        current_meta = self.board_reference_correction_meta
+        if current_meta is not None:
+            same_scale = abs(float(current_meta.get("checkerboard_mm_scale_correction", 1.0)) - mm_scale) < 1e-12
+            same_flip = bool(current_meta.get("checkerboard_planar_x_flipped", False)) == flip_planar_x
+            if same_scale and same_flip:
+                return dict(current_meta)
+            raise RuntimeError(
+                "Checkerboard reference corrections are already applied with different parameters. "
+                "Re-estimate the board reference before applying a different correction."
+            )
+
+        if abs(mm_scale) < 1e-12:
+            raise ValueError("mm_scale must be non-zero.")
+
+        if self.board_mm_per_px_local is not None:
+            self.board_mm_per_px_local = float(self.board_mm_per_px_local) * mm_scale
+        if self.board_px_per_mm_local is not None:
+            self.board_px_per_mm_local = float(self.board_px_per_mm_local) / mm_scale
+
+        if self.board_homography_mm_from_px is not None:
+            self.board_homography_mm_from_px = self._scale_mm_from_px_homography(
+                self.board_homography_mm_from_px,
+                mm_scale=mm_scale,
+            )
+        if self.board_homography_px_from_mm is not None:
+            self.board_homography_px_from_mm = self._scale_px_from_mm_homography(
+                self.board_homography_px_from_mm,
+                mm_scale=mm_scale,
+            )
+
+        self.board_planar_x_sign = -1.0 if flip_planar_x else 1.0
+        self.board_reference_correction_meta = {
+            "checkerboard_mm_scale_correction": mm_scale,
+            "checkerboard_planar_x_flipped": flip_planar_x,
+        }
+
+        if isinstance(self.board_pose, dict):
+            self.board_pose["board_homography_px_from_mm"] = None if self.board_homography_px_from_mm is None else self.board_homography_px_from_mm.copy()
+            self.board_pose["board_homography_mm_from_px"] = None if self.board_homography_mm_from_px is None else self.board_homography_mm_from_px.copy()
+            self.board_pose["board_px_per_mm_local"] = self.board_px_per_mm_local
+            self.board_pose["board_mm_per_px_local"] = self.board_mm_per_px_local
+            self.board_pose["board_planar_x_sign"] = self.board_planar_x_sign
+            self.board_pose["corrections_applied"] = dict(self.board_reference_correction_meta)
+
+        print(
+            "Applied checkerboard reference corrections: "
+            f"mm scale x{mm_scale:.3f}, planar x flipped={flip_planar_x}"
+        )
+        return dict(self.board_reference_correction_meta)
 
     def estimate_board_reference_from_image(
         self,
@@ -694,6 +788,8 @@ class CTR_Shadow_Calibration:
         self.board_homography_mm_from_px = H_mm_from_px.astype(np.float64)
         self.board_px_per_mm_local = float(board_px_per_mm_local)
         self.board_mm_per_px_local = float(board_mm_per_px_local)
+        self.board_planar_x_sign = 1.0
+        self.board_reference_correction_meta = None
         self.board_pose = {
             "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1),
             "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1),
@@ -706,7 +802,19 @@ class CTR_Shadow_Calibration:
             "inner_corners": inner_corners,
             "square_size_mm": float(square_size_mm),
             "use_undistort": bool(use_undistort),
+            "board_homography_px_from_mm": self.board_homography_px_from_mm.copy(),
+            "board_homography_mm_from_px": self.board_homography_mm_from_px.copy(),
+            "board_px_per_mm_local": self.board_px_per_mm_local,
+            "board_mm_per_px_local": self.board_mm_per_px_local,
+            "board_planar_x_sign": self.board_planar_x_sign,
         }
+
+        # Match checkerboard-backed calibrated axes to the ruler-backed convention
+        # before any downstream post-processing consumes this reference.
+        self.apply_checkerboard_reference_corrections(
+            mm_scale=0.5,
+            flip_planar_x=True,
+        )
 
         result = {
             "camera_calib_path": self.camera_calib_path,
@@ -726,6 +834,8 @@ class CTR_Shadow_Calibration:
             "inner_corners": inner_corners,
             "square_size_mm": float(square_size_mm),
             "image_shape": tuple(image_for_detection.shape),
+            "board_planar_x_sign": self.board_planar_x_sign,
+            "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
         }
 
         if draw_debug:
@@ -831,6 +941,7 @@ class CTR_Shadow_Calibration:
             "ruler_axis_unit": None if self.ruler_axis_unit is None else np.asarray(self.ruler_axis_unit, dtype=float).copy(),
             "ruler_axis_perp_unit": None if self.ruler_axis_perp_unit is None else np.asarray(self.ruler_axis_perp_unit, dtype=float).copy(),
             "ruler_calib_meta": None if self.ruler_calib_meta is None else dict(self.ruler_calib_meta),
+            "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
         }
 
     def project_pixel_delta_onto_true_vertical(self, dx_px, dy_px):
@@ -890,7 +1001,7 @@ class CTR_Shadow_Calibration:
             pt_mm = self.board_px_to_mm(pt_px[0], pt_px[1])
             origin_mm = self.board_px_to_mm(origin_px_vec[0], origin_px_vec[1])
             delta_mm = pt_mm - origin_mm
-            u_mm = float(delta_mm[0])
+            u_mm = float(delta_mm[0]) * float(self.board_planar_x_sign)
             z_mm = float(delta_mm[1])
             return u_mm, z_mm
 
@@ -903,7 +1014,7 @@ class CTR_Shadow_Calibration:
         v_hat = self.true_vertical_img_unit.astype(np.float64).reshape(2)
         u_hat = np.array([v_hat[1], -v_hat[0]], dtype=np.float64)
 
-        u_mm = float(np.dot(delta_px, u_hat) * self.board_mm_per_px_local)
+        u_mm = float(np.dot(delta_px, u_hat) * self.board_mm_per_px_local * float(self.board_planar_x_sign))
         z_mm = float(np.dot(delta_px, v_hat) * self.board_mm_per_px_local)
         return u_mm, z_mm
 
@@ -1737,11 +1848,42 @@ class CTR_Shadow_Calibration:
         def get_pos_from_file_name(file_name):
             base = os.path.splitext(os.path.basename(file_name))[0]
             parts = base.split("_")
-            # Orientation IDs are numeric and may be 0/1/2/3 (C=0/180/+90/-90 deg).
-            orientation = int(parts[0])
-            ntnl_pos = float(parts[1])
-            ss_pos = float(parts[2])
-            return [orientation, ntnl_pos, ss_pos]
+
+            orientation = 0
+            if len(parts) > 0:
+                try:
+                    orientation = int(parts[0])
+                except Exception:
+                    orientation = 0
+
+            values = {}
+            for p in parts:
+                if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
+                    try:
+                        values[p[0]] = float(p[1:])
+                    except Exception:
+                        pass
+
+            # Support both filename styles:
+            # 1) legacy positional:  0_100.00_-3.20_Y25.00_...
+            # 2) prefixed tokens:    00187_left_X100.000_..._B-2.092_...
+            if "X" in values and "B" in values:
+                ntnl_pos = float(values["X"])
+                ss_pos = float(values["B"])
+                return [orientation, ntnl_pos, ss_pos]
+
+            if len(parts) >= 3:
+                try:
+                    ntnl_pos = float(parts[1])
+                    ss_pos = float(parts[2])
+                    return [orientation, ntnl_pos, ss_pos]
+                except Exception:
+                    pass
+
+            raise ValueError(
+                "Could not parse X/B values from filename: "
+                f"{file_name}. Expected either '<ori>_<X>_<B>_...' or tokens like 'X...' and 'B...'."
+            )
 
         # Fixed path handling for Mac
         raw_data_folder = os.path.join(self.calibration_data_folder, "raw_image_data_folder")
@@ -2086,7 +2228,9 @@ class CTR_Shadow_Calibration:
         try:
             all_files = os.listdir(raw_data_folder)
             image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')
-            image_files = [f for f in all_files if f.lower().endswith(image_extensions)]
+            image_files = sorted(
+                f for f in all_files if f.lower().endswith(image_extensions)
+            )
 
             if len(image_files) == 0:
                 print(f"Error: No image files found in {raw_data_folder}")
@@ -2200,7 +2344,382 @@ class CTR_Shadow_Calibration:
         num_file = max(num_list) + 1
         return f"{target_name} ({num_file})"
 
-    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True):
+    @staticmethod
+    def _polyval(coeffs, b):
+        return np.polyval(np.asarray(coeffs, dtype=float), np.asarray(b, dtype=float))
+
+    @classmethod
+    def _sample_curve_xyz_from_calibration_json(cls, cal_json, b_vals):
+        coeffs = cal_json.get("cubic_coefficients", {})
+        r_coeffs = coeffs.get("r_coeffs")
+        z_coeffs = coeffs.get("z_coeffs")
+        y_coeffs = coeffs.get("offplane_y_coeffs")
+
+        if r_coeffs is None or z_coeffs is None:
+            raise ValueError("Missing r_coeffs/z_coeffs in calibration JSON.")
+
+        x = cls._polyval(r_coeffs, b_vals)
+        z = cls._polyval(z_coeffs, b_vals)
+        if y_coeffs is not None:
+            y = cls._polyval(y_coeffs, b_vals)
+        else:
+            y = np.zeros_like(x)
+
+        return np.column_stack([x, y, z]).astype(float)
+
+    @staticmethod
+    def _compute_link_frames(points_xyz):
+        """
+        For link i between P[i] -> P[i+1]:
+        - origin at P[i]
+        - z-axis along the link direction
+        - x/y axes are chosen to be stable with a world-up fallback
+        """
+        pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+        frames = []
+        world_up = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        for i in range(pts.shape[0] - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            d = p1 - p0
+            length_mm = float(np.linalg.norm(d))
+
+            if length_mm < 1e-9:
+                frames.append({
+                    "origin_mm": p0.tolist(),
+                    "direction_unit": [0.0, 0.0, 1.0],
+                    "length_mm": 0.0,
+                    "R_world_from_link": np.eye(3).tolist(),
+                })
+                continue
+
+            z_axis = d / length_mm
+            up = world_up
+            if abs(float(np.dot(up, z_axis))) > 0.95:
+                up = np.array([0.0, 1.0, 0.0], dtype=float)
+
+            x_axis = np.cross(up, z_axis)
+            x_norm = float(np.linalg.norm(x_axis))
+            if x_norm < 1e-12:
+                x_axis = np.array([1.0, 0.0, 0.0], dtype=float)
+            else:
+                x_axis = x_axis / x_norm
+
+            y_axis = np.cross(z_axis, x_axis)
+            y_norm = float(np.linalg.norm(y_axis))
+            if y_norm < 1e-12:
+                y_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+            else:
+                y_axis = y_axis / y_norm
+
+            R = np.column_stack([x_axis, y_axis, z_axis])
+            frames.append({
+                "origin_mm": p0.tolist(),
+                "direction_unit": z_axis.tolist(),
+                "length_mm": length_mm,
+                "R_world_from_link": R.tolist(),
+            })
+
+        return frames
+
+    @staticmethod
+    def _unit_vector(v):
+        n = float(np.linalg.norm(v))
+        if n < 1e-12:
+            return np.zeros_like(v)
+        return v / n
+
+    @classmethod
+    def _build_orthonormal_basis(cls, direction):
+        d = cls._unit_vector(np.asarray(direction, dtype=float))
+        if np.linalg.norm(d) < 1e-12:
+            return np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+
+        a = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(d, a))) > 0.9:
+            a = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        u = cls._unit_vector(np.cross(d, a))
+        v = cls._unit_vector(np.cross(d, u))
+        return u, v
+
+    @classmethod
+    def polyline_to_cylinder_mesh(cls, points_xyz, radius_mm=1.5, sides=16):
+        pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+        if pts.shape[0] < 2:
+            raise ValueError("Need at least two points for a polyline mesh.")
+
+        verts = []
+        faces = []
+
+        for i in range(pts.shape[0] - 1):
+            p0 = pts[i]
+            p1 = pts[i + 1]
+            d = p1 - p0
+            if float(np.linalg.norm(d)) < 1e-9:
+                continue
+
+            u, v = cls._build_orthonormal_basis(d)
+
+            ring0 = []
+            ring1 = []
+            for k in range(int(sides)):
+                theta = 2.0 * np.pi * (k / float(sides))
+                offset = float(radius_mm) * (np.cos(theta) * u + np.sin(theta) * v)
+                ring0.append(p0 + offset)
+                ring1.append(p1 + offset)
+
+            base_idx = len(verts)
+            verts.extend(ring0)
+            verts.extend(ring1)
+
+            for k in range(int(sides)):
+                k2 = (k + 1) % int(sides)
+                a0 = base_idx + k
+                b0 = base_idx + k2
+                a1 = base_idx + int(sides) + k
+                b1 = base_idx + int(sides) + k2
+
+                faces.append([a0, a1, b1])
+                faces.append([a0, b1, b0])
+
+        return np.asarray(verts, dtype=np.float32), np.asarray(faces, dtype=np.int32)
+
+    @classmethod
+    def write_binary_stl(cls, path, vertices, faces, solid_name="robot_skeleton"):
+        path = Path(path)
+        vertices = np.asarray(vertices, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int32)
+
+        header = bytearray(80)
+        name_bytes = str(solid_name).encode("ascii", errors="ignore")[:80]
+        header[:len(name_bytes)] = name_bytes
+
+        tri_count = faces.shape[0]
+        with open(path, "wb") as f:
+            f.write(header)
+            f.write(np.uint32(tri_count).tobytes())
+            for tri in faces:
+                p0 = vertices[tri[0]]
+                p1 = vertices[tri[1]]
+                p2 = vertices[tri[2]]
+                normal = np.cross(p1 - p0, p2 - p0)
+                normal = cls._unit_vector(normal).astype(np.float32)
+                f.write(normal.tobytes())
+                f.write(p0.astype(np.float32).tobytes())
+                f.write(p1.astype(np.float32).tobytes())
+                f.write(p2.astype(np.float32).tobytes())
+                f.write(np.uint16(0).tobytes())
+
+    def export_parametric_skeleton_model(self, robot_name, n_links=6, diameter_mm=3.0, b_ref=0.0, stl_reference_pose=True):
+        """
+        Export the fitted calibration curve as a parametric link-chain model plus predictor.
+
+        Outputs in processed_image_data_folder:
+        - <robot_name>_skeleton_parametric.json
+        - <robot_name>_skeleton_predict.py
+        - optionally <robot_name>_robot_skeleton_reference.stl
+        """
+        processed = Path(self.calibration_data_folder) / "processed_image_data_folder"
+        gcode_json_path = processed / f"{robot_name}_gcode_calibration.json"
+        if not gcode_json_path.is_file():
+            raise FileNotFoundError(f"Missing calibration JSON: {gcode_json_path}")
+
+        with open(gcode_json_path, "r") as f:
+            cal_json = json.load(f)
+
+        coeffs = cal_json.get("cubic_coefficients", {})
+        r_coeffs = coeffs.get("r_coeffs")
+        z_coeffs = coeffs.get("z_coeffs")
+        y_coeffs = coeffs.get("offplane_y_coeffs")
+        if r_coeffs is None or z_coeffs is None:
+            raise ValueError("Calibration JSON missing cubic coeffs for r/z.")
+
+        motor_setup = cal_json.get("motor_setup", {})
+        b_rng = motor_setup.get("b_motor_position_range") or coeffs.get("b_motor_range")
+        if b_rng is None or len(b_rng) != 2:
+            raise ValueError("Calibration JSON missing b_motor_position_range.")
+
+        b_min = float(b_rng[0])
+        b_max = float(b_rng[1])
+        n_links = int(max(1, n_links))
+        diameter_mm = float(diameter_mm)
+        t = np.linspace(0.0, 1.0, n_links + 1)
+        b_knots = b_min + t * (b_max - b_min)
+
+        pts_ref = self._sample_curve_xyz_from_calibration_json(cal_json, b_knots)
+
+        origin = np.array([0.0, 0.0, 0.0], dtype=float)
+        if np.linalg.norm(pts_ref[-1] - origin) > 1e-9:
+            pts_ref_with_origin = np.vstack([pts_ref, origin])
+        else:
+            pts_ref_with_origin = pts_ref.copy()
+
+        frames_ref = self._compute_link_frames(pts_ref_with_origin)
+
+        skel_param = {
+            "robot_name": robot_name,
+            "type": "parametric_link_chain",
+            "units": "mm",
+            "diameter_mm": diameter_mm,
+            "radius_mm": diameter_mm / 2.0,
+            "n_links_curve": n_links,
+            "unknown_tail_to_origin": True,
+            "b_range": [b_min, b_max],
+            "reference_b_pull_mm": float(b_ref),
+            "knot_definition": {
+                "t_i": t.tolist(),
+                "b_i": b_knots.tolist(),
+                "meaning": "Curve knots are sampled along the full calibrated B range; each knot is a point on the fitted curve.",
+            },
+            "curve_equations": {
+                "x_mm": {"poly_coeffs": r_coeffs, "definition": "x = r(b) signed planar radial deflection"},
+                "z_mm": {"poly_coeffs": z_coeffs, "definition": "z = z(b) axial position"},
+                "y_mm": {
+                    "poly_coeffs": y_coeffs,
+                    "definition": "y = y_offplane(b) if available else 0",
+                    "available": y_coeffs is not None,
+                },
+            },
+            "reference_pose": {
+                "points_xyz_mm": pts_ref_with_origin.round(6).tolist(),
+                "link_frames": frames_ref,
+                "note": "Reference pose uses knots sampled across B-range and a final link to origin. Use predictor to get poses for arbitrary b.",
+            },
+            "predictor_convention": {
+                "inputs": ["b_pull_mm"],
+                "outputs": [
+                    "points_xyz_mm (N+2 points including origin)",
+                    "link_frames (per-link origin, direction, length, rotation matrix)",
+                ],
+                "base_rule": "Append final segment to (0,0,0) if last point isn't already origin.",
+            },
+        }
+
+        param_path = processed / f"{robot_name}_skeleton_parametric.json"
+        with open(param_path, "w") as f:
+            json.dump(skel_param, f, indent=2)
+
+        py_path = processed / f"{robot_name}_skeleton_predict.py"
+        predictor_code = f"""# Auto-generated parametric skeleton predictor for {robot_name}
+# Units: mm
+import numpy as np
+
+R_COEFFS = {json.dumps(r_coeffs)}
+Z_COEFFS = {json.dumps(z_coeffs)}
+Y_COEFFS = {json.dumps(y_coeffs)}
+
+B_MIN = {b_min:.10f}
+B_MAX = {b_max:.10f}
+
+T_KNOTS = np.array({json.dumps(t.tolist())}, dtype=float)
+B_KNOTS = B_MIN + T_KNOTS * (B_MAX - B_MIN)
+
+DIAMETER_MM = {diameter_mm:.6f}
+RADIUS_MM = {diameter_mm / 2.0:.6f}
+
+def _polyval(c, b):
+    if c is None:
+        return None
+    return np.polyval(np.asarray(c, dtype=float), np.asarray(b, dtype=float))
+
+def curve_point_xyz(b):
+    x = float(_polyval(R_COEFFS, b))
+    z = float(_polyval(Z_COEFFS, b))
+    if Y_COEFFS is None:
+        y = 0.0
+    else:
+        y = float(_polyval(Y_COEFFS, b))
+    return np.array([x, y, z], dtype=float)
+
+def skeleton_points(b_pull_mm, include_origin=True):
+    pts = np.stack([curve_point_xyz(bi) for bi in B_KNOTS], axis=0)
+    if include_origin:
+        if np.linalg.norm(pts[-1] - np.array([0.0, 0.0, 0.0])) > 1e-9:
+            pts = np.vstack([pts, np.array([0.0, 0.0, 0.0])])
+    return pts
+
+def _compute_link_frames(points_xyz):
+    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    frames = []
+    world_up = np.array([0.0, 0.0, 1.0], dtype=float)
+    for i in range(pts.shape[0] - 1):
+        p0 = pts[i]
+        p1 = pts[i+1]
+        d = p1 - p0
+        L = float(np.linalg.norm(d))
+        if L < 1e-9:
+            frames.append({{
+                "origin_mm": p0.tolist(),
+                "direction_unit": [0.0, 0.0, 1.0],
+                "length_mm": 0.0,
+                "R_world_from_link": np.eye(3).tolist(),
+            }})
+            continue
+        z = d / L
+        up = world_up
+        if abs(float(np.dot(up, z))) > 0.95:
+            up = np.array([0.0, 1.0, 0.0], dtype=float)
+        x = np.cross(up, z)
+        xn = float(np.linalg.norm(x))
+        if xn < 1e-12:
+            x = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            x /= xn
+        y = np.cross(z, x)
+        yn = float(np.linalg.norm(y))
+        if yn < 1e-12:
+            y = np.array([0.0, 1.0, 0.0], dtype=float)
+        else:
+            y /= yn
+        R = np.column_stack([x, y, z])
+        frames.append({{
+            "origin_mm": p0.tolist(),
+            "direction_unit": z.tolist(),
+            "length_mm": L,
+            "R_world_from_link": R.tolist(),
+        }})
+    return frames
+
+def skeleton_link_frames(b_pull_mm, include_origin=True):
+    pts = skeleton_points(b_pull_mm, include_origin=include_origin)
+    return _compute_link_frames(pts)
+"""
+        with open(py_path, "w") as f:
+            f.write(predictor_code)
+
+        stl_path = None
+        if stl_reference_pose:
+            verts, faces = self.polyline_to_cylinder_mesh(
+                pts_ref_with_origin,
+                radius_mm=diameter_mm / 2.0,
+                sides=16,
+            )
+            stl_path = processed / f"{robot_name}_robot_skeleton_reference.stl"
+            self.write_binary_stl(
+                stl_path,
+                verts,
+                faces,
+                solid_name=f"{robot_name}_skeleton_ref",
+            )
+
+        cal_json.setdefault("exported_models", {})
+        cal_json["exported_models"]["robot_skeleton_parametric"] = {
+            "format": "json+py",
+            "parametric_json": param_path.name,
+            "predictor_py": py_path.name,
+            "reference_stl": stl_path.name if stl_path is not None else None,
+            "diameter_mm": diameter_mm,
+            "n_links": n_links,
+            "note": "Use predictor to generate link endpoints/frames for any B pull; includes final link to origin for unknown parts.",
+        }
+        with open(gcode_json_path, "w") as f:
+            json.dump(cal_json, f, indent=2)
+
+        return param_path, py_path, stl_path, gcode_json_path
+
+    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False):
         """ Postprocesses calibration data starting from step 3 (assumes pixel data already exists). This method starts from converting pixel coordinates to physical coordinates and continues with all subsequent steps. """
         # Check if we have the required data in memory, if not try to load from files
         # if not hasattr(self, 'tip_locations_array_fine') or not hasattr(self, 'tip_locations_array_coarse'):
@@ -3734,6 +4253,19 @@ def predict_tip_position_cartesian(b_motor_pos):
             print(f"\nCalibration data exported for G-code generation:")
             print(f" - {excel_filename} (human-readable)")
             print(f" - {robot_name}_gcode_calibration.json (for Python G-code class)")
+
+            if export_skeleton:
+                param_path, py_path, stl_path, _patched_json = self.export_parametric_skeleton_model(
+                    robot_name=robot_name,
+                    n_links=int(skeleton_links),
+                    diameter_mm=float(skeleton_diameter_mm),
+                    stl_reference_pose=bool(skeleton_reference_stl),
+                )
+                print(f"\nParametric skeleton export complete:")
+                print(f" - {param_path.name}")
+                print(f" - {py_path.name}")
+                if stl_path is not None:
+                    print(f" - {stl_path.name}")
 
         finally:
             # Return to original directory

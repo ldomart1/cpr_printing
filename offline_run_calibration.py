@@ -1,52 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-offline_run_calibration_gui_with_parametric_skeleton.py
+offline_run_calibration_gui_with_parametric_skeleton_parallel_tip.py
 
 OFFLINE CTR shadow calibration runner with:
   1) GUI crop selection using the FIRST raw image
   2) GUI ruler 2-point scale selection (known distance in mm)
-  3) analyze_data_batch + postprocess_calibration_data (your existing pipeline)
-  4) NEW: parametric skeleton export:
-      - A "skeleton model" defined as a small number of links (cylinders, dia=3mm)
-      - Link poses vary with B pull via polynomial equations derived from your fitted
-        r(b), z(b), and optional y_off(b).
-      - Export:
-          (a) STL for a reference pose (default at B=0)
-          (b) JSON + Python helper functions to predict link endpoints and transforms
-              for any B pull (for use in viewers / gcode planners)
+  3) analyze_data_batch + postprocess_calibration_data
+  4) Parametric skeleton export:
+      - A skeleton model defined as a small number of links (cylinders)
+      - Link poses vary with B pull via polynomial equations derived from fitted r(b), z(b)
+      - Export STL for reference pose and JSON/Python predictors
+  5) Tip localization refiners:
+      - edge_dt: walk outward along the current tip tangent until background
+      - edge_grad: use grayscale gradient along current tip tangent
+      - mainray: estimate a robust trunk tangent from the upstream skeleton path, then ray-cast
+      - parallel_centerline: fit two parallel side-lines of the distal tube extremity using the
+        CURRENT measured tip angle, build the center parallel line, and intersect it with the
+        distal black/white boundary to get the tip.
 
-Also includes knobs to improve tip localization by refining the coarse tip to the
-true distal edge of the dark segment.
+Also annotates the analyzed matplotlib images with the selected tip geometry when available.
 
-Key tip-precision improvements implemented (optional, configurable):
-  - Use distance transform on the foreground mask to estimate centerline radius near tip
-  - Use distal tangent direction and step outward until leaving the foreground
-  - Optionally subpixel refine by sampling grayscale along the tangent and choosing the
-    maximum gradient edge location.
-
-This script does NOT require you to edit shadow_calibration.py; instead it monkey-patches
-cal.analyze_data() at runtime (safe for offline debugging). If you prefer, you can copy
-the patched method into your class file later.
-
-Checkerboard correction:
-  - Applies a 0.5x correction to checkerboard mm conversion so board-referenced mm values
-    match ruler-referenced mm values on the same images.
-  - Flips planar x sign for checkerboard-backed calibrated axes so x deflection vs motor
-    matches the ruler convention.
-
-Usage:
-  python3 offline_run_calibration_gui_with_parametric_skeleton.py \
-    --project_dir "/path/to/Test_Calibration_2026-03-04_03" \
-    --threshold 200 --save_plots \
-    --robot_name "calibrated_robot_debug_02" \
-    --ruler_mm 150 \
-    --save_analysis_config \
-    --export_skeleton \
-    --skeleton_links 6 \
-    --tip_refine_mode edge_dt \
-    --tip_refine_dt_step_px 1 \
-    --tip_refine_max_step_px 80
+This script does NOT require editing shadow_calibration.py; it monkey-patches
+cal.analyze_data() at runtime for offline debugging.
 """
 
 import argparse
@@ -55,6 +31,7 @@ import os
 import shutil
 import sys
 import types
+from heapq import heappush, heappop
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any, List
 
@@ -69,6 +46,11 @@ from shadow_calibration import CTR_Shadow_Calibration  # noqa: E402
 from shadow_calibration import _endpoints_8  # noqa: E402
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+_NEI8_W = [
+    (-1, -1, 2 ** 0.5), (-1, 0, 1.0), (-1, 1, 2 ** 0.5),
+    (0, -1, 1.0),                             (0, 1, 1.0),
+    (1, -1, 2 ** 0.5),  (1, 0, 1.0),  (1, 1, 2 ** 0.5),
+]
 
 
 # -----------------------------
@@ -183,6 +165,12 @@ def apply_checkerboard_reference_corrections(
     This patch is intentionally applied at the checkerboard reference layer so downstream
     post-processing uses the corrected convention without editing shadow_calibration.py.
     """
+    if hasattr(cal, "apply_checkerboard_reference_corrections"):
+        return cal.apply_checkerboard_reference_corrections(
+            mm_scale=mm_scale,
+            flip_planar_x=flip_planar_x,
+        )
+
     if getattr(cal, "board_pose", None) is None:
         return cal
 
@@ -191,7 +179,6 @@ def apply_checkerboard_reference_corrections(
         "checkerboard_planar_x_flipped": bool(flip_planar_x),
     }
 
-    # Scale stored local conversion factors.
     if getattr(cal, "board_mm_per_px_local", None) is not None:
         cal.board_mm_per_px_local = float(cal.board_mm_per_px_local) * float(mm_scale)
     if getattr(cal, "board_px_per_mm_local", None) is not None:
@@ -199,7 +186,6 @@ def apply_checkerboard_reference_corrections(
             raise ValueError("mm_scale must be non-zero.")
         cal.board_px_per_mm_local = float(cal.board_px_per_mm_local) / float(mm_scale)
 
-    # Scale stored homographies if available.
     if getattr(cal, "board_homography_mm_from_px", None) is not None:
         cal.board_homography_mm_from_px = _scale_mm_from_px_homography(
             cal.board_homography_mm_from_px,
@@ -211,7 +197,6 @@ def apply_checkerboard_reference_corrections(
             mm_scale=float(mm_scale),
         )
 
-    # Scale selected board_pose fields if present.
     if isinstance(cal.board_pose, dict):
         bp = dict(cal.board_pose)
         if "board_homography_mm_from_px" in bp and bp["board_homography_mm_from_px"] is not None:
@@ -232,7 +217,6 @@ def apply_checkerboard_reference_corrections(
 
     cal.board_reference_correction_meta = correction_meta
 
-    # Patch forward axes conversion to flip planar x sign after checkerboard conversion.
     if hasattr(cal, "pixel_point_to_calibrated_axes"):
         original_pixel_point_to_calibrated_axes = cal.pixel_point_to_calibrated_axes
 
@@ -248,7 +232,6 @@ def apply_checkerboard_reference_corrections(
             pixel_point_to_calibrated_axes_patched, cal
         )
 
-    # Patch inverse conversion if available.
     if hasattr(cal, "calibrated_axes_to_pixel_point"):
         original_calibrated_axes_to_pixel_point = cal.calibrated_axes_to_pixel_point
 
@@ -458,7 +441,7 @@ def interactive_crop_and_ruler_from_image(
             if d < best_dist:
                 best_dist = d
                 best_name = name
-        return best_name if best_dist <= drag_threshold_px**2 else None
+        return best_name if best_dist <= drag_threshold_px ** 2 else None
 
     def clamp_rect():
         xs = [pt[0] for pt in corners.values()]
@@ -608,7 +591,7 @@ def interactive_crop_and_ruler_from_image(
                 cv2.circle(disp, pt, 7, (0, 255, 255), -1)
                 cv2.putText(
                     disp,
-                    f"P{idx+1}",
+                    f"P{idx + 1}",
                     (pt[0] + 8, pt[1] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -718,19 +701,182 @@ def interactive_crop_and_ruler_from_image(
 
 
 # ------------------------------------------
-# Tip refinement: push tip to distal boundary
+# Tip refinement helpers
 # ------------------------------------------
 def _get_pos_from_file_name(file_name: str):
     """
-    Same as your analyze_data() internal parser:
-    filename starts with: "{orientation}_{X}_{B}_..."
+    Support both legacy positional filenames and newer prefixed-token filenames.
     """
     base = os.path.splitext(os.path.basename(file_name))[0]
     parts = base.split("_")
-    orientation = int(parts[0])
-    ntnl_pos = float(parts[1])
-    ss_pos = float(parts[2])
-    return orientation, ntnl_pos, ss_pos
+
+    orientation = 0
+    if len(parts) > 0:
+        try:
+            orientation = int(parts[0])
+        except Exception:
+            orientation = 0
+
+    values = {}
+    for p in parts:
+        if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
+            try:
+                values[p[0]] = float(p[1:])
+            except Exception:
+                pass
+
+    if "X" in values and "B" in values:
+        ntnl_pos = float(values["X"])
+        ss_pos = float(values["B"])
+        return orientation, ntnl_pos, ss_pos
+
+    if len(parts) >= 3:
+        try:
+            ntnl_pos = float(parts[1])
+            ss_pos = float(parts[2])
+            return orientation, ntnl_pos, ss_pos
+        except Exception:
+            pass
+
+    raise ValueError(
+        "Could not parse X/B values from filename: "
+        f"{file_name}. Expected either '<ori>_<X>_<B>_...' or tokens like 'X...' and 'B...'."
+    )
+
+
+def _tip_angle_to_direction_xy(tip_angle_deg: float) -> np.ndarray:
+    ang = np.deg2rad(float(tip_angle_deg))
+    vx = float(np.sin(ang))
+    vy = float(np.cos(ang))
+    d = np.array([vx, vy], dtype=np.float64)
+    n = float(np.linalg.norm(d))
+    return d / max(n, 1e-12)
+
+
+def _inside_mask(mask_fg: np.ndarray, xy: np.ndarray) -> bool:
+    x = int(round(float(xy[0])))
+    y = int(round(float(xy[1])))
+    h, w = mask_fg.shape[:2]
+    return (0 <= x < w) and (0 <= y < h) and (mask_fg[y, x] > 0)
+
+
+def _backtrack_point_inside_fg(mask_fg: np.ndarray, p0_xy: np.ndarray, dir_xy: np.ndarray,
+                               max_back_px: float = 80.0, step_px: float = 0.5):
+    p0 = np.asarray(p0_xy, dtype=np.float64)
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+
+    if _inside_mask(mask_fg, p0):
+        return p0.copy(), True, 0.0
+
+    n_steps = int(max_back_px / max(step_px, 1e-6))
+    for i in range(1, n_steps + 1):
+        q = p0 - i * step_px * d
+        if _inside_mask(mask_fg, q):
+            return q, True, i * step_px
+    return p0.copy(), False, None
+
+
+def ray_last_inside(mask_fg: np.ndarray, p0_xy: np.ndarray, dir_xy: np.ndarray,
+                    step_px: float = 0.5, max_len_px: float = 120.0):
+    h, w = mask_fg.shape[:2]
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+
+    last_inside = np.asarray(p0_xy, dtype=np.float64).copy()
+    n_steps = int(max_len_px / max(step_px, 1e-6))
+
+    for i in range(1, n_steps + 1):
+        p = p0_xy + i * step_px * d
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        if not (0 <= x < w and 0 <= y < h):
+            break
+        if mask_fg[y, x] == 1:
+            last_inside = p
+        else:
+            break
+    return last_inside
+
+
+def _estimate_radius_along_axis(mask_fg: np.ndarray, dist_img: np.ndarray, p_in_xy: np.ndarray,
+                                dir_xy: np.ndarray, back_len_px: float = 60.0, step_px: float = 1.0) -> float:
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+    vals = []
+    n_steps = int(back_len_px / max(step_px, 1e-6))
+    for i in range(n_steps + 1):
+        p = p_in_xy - i * step_px * d
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        if 0 <= x < mask_fg.shape[1] and 0 <= y < mask_fg.shape[0] and mask_fg[y, x] == 1:
+            v = float(dist_img[y, x])
+            if np.isfinite(v) and v > 0:
+                vals.append(v)
+    if not vals:
+        x = int(round(float(p_in_xy[0])))
+        y = int(round(float(p_in_xy[1])))
+        if 0 <= x < dist_img.shape[1] and 0 <= y < dist_img.shape[0]:
+            return max(3.0, float(dist_img[y, x]))
+        return 6.0
+    return max(3.0, float(np.median(vals)))
+
+
+def _contiguous_runs_from_bool(mask_bool: np.ndarray):
+    m = np.asarray(mask_bool, dtype=bool)
+    edges = np.diff(np.r_[False, m, False].astype(np.int8))
+    starts = np.where(edges == 1)[0]
+    ends = np.where(edges == -1)[0] - 1
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _cross_section_boundaries(mask_fg: np.ndarray, center_xy: np.ndarray, normal_xy: np.ndarray,
+                              scan_half_width_px: float = 20.0, step_px: float = 0.5):
+    n = np.asarray(normal_xy, dtype=np.float64)
+    n /= max(np.linalg.norm(n), 1e-12)
+    ts = np.arange(-scan_half_width_px, scan_half_width_px + 0.5 * step_px, step_px, dtype=np.float64)
+    inside = np.zeros_like(ts, dtype=bool)
+
+    h, w = mask_fg.shape[:2]
+    for i, t in enumerate(ts):
+        p = center_xy + t * n
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        inside[i] = (0 <= x < w) and (0 <= y < h) and (mask_fg[y, x] == 1)
+
+    if not np.any(inside):
+        return None
+
+    runs = _contiguous_runs_from_bool(inside)
+    if not runs:
+        return None
+
+    idx0 = int(np.argmin(np.abs(ts)))
+    chosen = None
+    for s0, s1 in runs:
+        if s0 <= idx0 <= s1:
+            chosen = (s0, s1)
+            break
+
+    if chosen is None:
+        centers = [0.5 * (ts[s0] + ts[s1]) for s0, s1 in runs]
+        j = int(np.argmin(np.abs(np.asarray(centers))))
+        chosen = runs[j]
+
+    s0, s1 = chosen
+    t_left = float(ts[s0])
+    t_right = float(ts[s1])
+    p_left = center_xy + t_left * n
+    p_right = center_xy + t_right * n
+
+    return {
+        "t_left": t_left,
+        "t_right": t_right,
+        "p_left_xy": p_left,
+        "p_right_xy": p_right,
+        "ts": ts,
+        "inside": inside,
+    }
 
 
 def refine_tip_edge_distance_transform(
@@ -742,54 +888,47 @@ def refine_tip_edge_distance_transform(
     exit_mode: str = "first_background",
 ):
     """
-    Move the tip from skeleton distal point to the *edge* of the dark foreground by stepping
-    along the distal tangent direction (tip->outward) until leaving the foreground.
+    Move the tip from skeleton distal point to the edge of the dark foreground by stepping
+    along the distal tangent direction until leaving the foreground.
 
     binary_image: 0=foreground (tube), 255=background
     tip_yx: (y, x) tip on skeleton
-    tip_angle_deg: from your pipeline; defined as signed angle relative to vertical-down
-    Returns refined (y,x) float (subpixel-ish if step_px<1), plus debug dict.
+    tip_angle_deg: signed angle relative to vertical-down
+    Returns refined (y,x) float, plus debug dict.
     """
     h, w = binary_image.shape[:2]
     fg = (binary_image == 0).astype(np.uint8)
 
-    ang = np.deg2rad(float(tip_angle_deg))
-    vx = float(np.sin(ang))
-    vy = float(np.cos(ang))
+    d_xy = _tip_angle_to_direction_xy(tip_angle_deg)
+    x0, y0 = float(tip_yx[1]), float(tip_yx[0])
 
-    y0, x0 = float(tip_yx[0]), float(tip_yx[1])
-
-    iy0, ix0 = int(round(y0)), int(round(x0))
-    if not (0 <= iy0 < h and 0 <= ix0 < w) or fg[iy0, ix0] == 0:
-        pass
-
-    last_inside = (y0, x0)
+    last_inside = np.array([x0, y0], dtype=np.float64)
     exited = False
     n_steps = int(max(1, max_step_px / max(step_px, 1e-6)))
 
     for i in range(1, n_steps + 1):
-        y = y0 + i * step_px * vy
-        x = x0 + i * step_px * vx
-        iy = int(round(y))
-        ix = int(round(x))
-        if not (0 <= iy < h and 0 <= ix < w):
+        p = np.array([x0, y0], dtype=np.float64) + i * step_px * d_xy
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        if not (0 <= x < w and 0 <= y < h):
             exited = True
             break
-        if fg[iy, ix] == 1:
-            last_inside = (y, x)
+        if fg[y, x] == 1:
+            last_inside = p
             continue
-        else:
-            exited = True
-            if exit_mode == "first_background":
-                break
+        exited = True
+        if exit_mode == "first_background":
+            break
 
     dbg = {
-        "vx": vx,
-        "vy": vy,
+        "mode": "edge_dt",
+        "d_xy": d_xy.tolist(),
         "exited": exited,
-        "last_inside": last_inside,
+        "last_inside_xy": last_inside.tolist(),
+        "tip_xy": last_inside.tolist(),
+        "center_line_xy": [np.array([x0, y0]).tolist(), last_inside.tolist()],
     }
-    return float(last_inside[0]), float(last_inside[1]), dbg
+    return float(last_inside[1]), float(last_inside[0]), dbg
 
 
 def refine_tip_edge_subpixel_gradient(
@@ -805,17 +944,12 @@ def refine_tip_edge_subpixel_gradient(
     - Sample grayscale along outward direction from tip
     - Find the maximum absolute gradient location (dark->light edge)
     - Return point at that location (bounded by leaving the foreground)
-
-    Returns refined (y,x) float and debug dict.
     """
     h, w = grayscale.shape[:2]
     fg = (binary_image == 0).astype(np.uint8)
 
-    ang = np.deg2rad(float(tip_angle_deg))
-    vx = float(np.sin(ang))
-    vy = float(np.cos(ang))
-
-    y0, x0 = float(tip_yx[0]), float(tip_yx[1])
+    d_xy = _tip_angle_to_direction_xy(tip_angle_deg)
+    x0, y0 = float(tip_yx[1]), float(tip_yx[0])
     n = int(max(5, search_len_px / max(step_px, 1e-6)))
 
     samples = []
@@ -823,39 +957,508 @@ def refine_tip_edge_subpixel_gradient(
     inside_mask = []
 
     for i in range(n + 1):
-        y = y0 + i * step_px * vy
-        x = x0 + i * step_px * vx
-        iy = int(np.clip(round(y), 0, h - 1))
-        ix = int(np.clip(round(x), 0, w - 1))
-        samples.append(float(grayscale[iy, ix]))
-        coords.append((y, x))
-        inside_mask.append(int(fg[iy, ix] == 1))
+        p = np.array([x0, y0], dtype=np.float64) + i * step_px * d_xy
+        x = int(np.clip(round(float(p[0])), 0, w - 1))
+        y = int(np.clip(round(float(p[1])), 0, h - 1))
+        samples.append(float(grayscale[y, x]))
+        coords.append(p.copy())
+        inside_mask.append(int(fg[y, x] == 1))
 
     s = np.array(samples, dtype=float)
     g = np.diff(s)
     g_abs = np.abs(g)
 
-    valid = []
-    for i in range(len(g_abs)):
-        if inside_mask[i] == 1:
-            valid.append(i)
+    valid = [i for i in range(len(g_abs)) if inside_mask[i] == 1]
     if not valid:
         yy, xx, dbg = refine_tip_edge_distance_transform(binary_image, tip_yx, tip_angle_deg)
-        return yy, xx, {"fallback": "edge_dt", "edge_dt": dbg}
+        dbg["fallback"] = "edge_dt"
+        return yy, xx, dbg
 
     valid = np.array(valid, dtype=int)
     j = int(valid[np.argmax(g_abs[valid])])
-    y_edge = 0.5 * (coords[j][0] + coords[j + 1][0])
-    x_edge = 0.5 * (coords[j][1] + coords[j + 1][1])
+    p_edge = 0.5 * (coords[j] + coords[j + 1])
 
     dbg = {
-        "vx": vx,
-        "vy": vy,
+        "mode": "edge_grad",
+        "d_xy": d_xy.tolist(),
         "j": j,
         "g_max": float(g_abs[j]),
         "step_px": float(step_px),
+        "tip_xy": p_edge.tolist(),
+        "center_line_xy": [np.array([x0, y0]).tolist(), p_edge.tolist()],
     }
-    return float(y_edge), float(x_edge), dbg
+    return float(p_edge[1]), float(p_edge[0]), dbg
+
+
+def skeletonize_mask(mask_fg: np.ndarray) -> np.ndarray:
+    """
+    mask_fg: uint8, 1=foreground, 0=background
+    returns: uint8, 1=skeleton, 0=background
+    """
+    try:
+        from skimage.morphology import skeletonize
+        skel = skeletonize(mask_fg.astype(bool))
+        return skel.astype(np.uint8)
+    except Exception:
+        if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
+            skel = cv2.ximgproc.thinning((mask_fg * 255).astype(np.uint8))
+            return (skel > 0).astype(np.uint8)
+        raise RuntimeError(
+            "Need either scikit-image (preferred) or cv2.ximgproc.thinning for skeletonization."
+        )
+
+
+def skeleton_degree_image(skel: np.ndarray) -> np.ndarray:
+    k = np.ones((3, 3), dtype=np.uint8)
+    k[1, 1] = 0
+    deg = cv2.filter2D(skel.astype(np.uint8), cv2.CV_16U, k)
+    return deg
+
+
+def build_skeleton_graph(skel: np.ndarray):
+    pts = np.argwhere(skel > 0)
+    pointset = {tuple(p) for p in pts}
+    adj = {}
+    for y, x in pointset:
+        nbrs = []
+        for dy, dx, w in _NEI8_W:
+            q = (y + dy, x + dx)
+            if q in pointset:
+                nbrs.append((q, w))
+        adj[(y, x)] = nbrs
+    return adj
+
+
+def dijkstra_skeleton(adj, src):
+    dist = {src: 0.0}
+    prev = {}
+    pq = [(0.0, src)]
+    visited = set()
+
+    while pq:
+        d, u = heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+
+        for v, w in adj[u]:
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                prev[v] = u
+                heappush(pq, (nd, v))
+    return dist, prev
+
+
+def reconstruct_path(prev, dst):
+    path = [dst]
+    cur = dst
+    while cur in prev:
+        cur = prev[cur]
+        path.append(cur)
+    path.reverse()
+    return path
+
+
+def path_to_xy(path_yx):
+    return np.array([[x, y] for y, x in path_yx], dtype=np.float64)
+
+
+def cumulative_arclength(xy: np.ndarray) -> np.ndarray:
+    if len(xy) == 0:
+        return np.zeros((0,), dtype=np.float64)
+    if len(xy) == 1:
+        return np.array([0.0], dtype=np.float64)
+    ds = np.linalg.norm(np.diff(xy, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(ds)])
+
+
+def interp_point_on_path(xy: np.ndarray, s: np.ndarray, target_s: float) -> np.ndarray:
+    target_s = float(np.clip(target_s, s[0], s[-1]))
+    x = np.interp(target_s, s, xy[:, 0])
+    y = np.interp(target_s, s, xy[:, 1])
+    return np.array([x, y], dtype=np.float64)
+
+
+def robust_tangent_from_path_window(xy: np.ndarray, s: np.ndarray, s0: float, s1: float) -> np.ndarray:
+    mask = (s >= s0) & (s <= s1)
+    pts = xy[mask]
+
+    if pts.shape[0] < 5:
+        i1 = max(0, len(xy) - 15)
+        i2 = max(i1 + 2, len(xy) - 3)
+        pts = xy[i1:i2]
+
+    if pts.shape[0] < 2:
+        v = xy[-1] - xy[max(0, len(xy) - 2)]
+        n = np.linalg.norm(v)
+        return v / max(n, 1e-9)
+
+    mu = pts.mean(axis=0)
+    uu, ss, vh = np.linalg.svd(pts - mu, full_matrices=False)
+    t = vh[0]
+    if np.dot(t, xy[-1] - xy[0]) < 0:
+        t = -t
+    n = np.linalg.norm(t)
+    return t / max(n, 1e-9)
+
+
+def refine_tip_edge_mainray(
+    grayscale: np.ndarray,
+    binary_image: np.ndarray,
+    tip_yx: tuple,
+    fit_back_near_r: float = 1.5,
+    fit_back_far_r: float = 6.0,
+    anchor_back_r: float = 1.0,
+    ray_step_px: float = 0.5,
+    ray_max_len_r: float = 8.0,
+):
+    """
+    Robust coarse-tip estimator:
+      - skeletonize foreground
+      - choose endpoint nearest current coarse tip
+      - estimate tangent from upstream path window
+      - march a straight ray to the foreground edge
+
+    Returns (y, x, debug).
+    """
+    mask_fg = (binary_image == 0).astype(np.uint8)
+    if mask_fg.sum() == 0:
+        return float(tip_yx[0]), float(tip_yx[1]), {"mode": "mainray", "fallback": "empty_fg"}
+
+    skel = skeletonize_mask(mask_fg)
+    deg = skeleton_degree_image(skel)
+    endpoints = np.argwhere((skel > 0) & (deg == 1))
+    if len(endpoints) < 2:
+        return float(tip_yx[0]), float(tip_yx[1]), {"mode": "mainray", "fallback": "not_enough_endpoints"}
+
+    tip_arr = np.asarray(tip_yx, dtype=np.float64)
+    d2 = np.sum((endpoints.astype(np.float64) - tip_arr[None, :]) ** 2, axis=1)
+    distal_ep = tuple(endpoints[int(np.argmin(d2))])
+
+    adj = build_skeleton_graph(skel)
+    dist_map, prev = dijkstra_skeleton(adj, distal_ep)
+    endpoint_tuples = [tuple(p) for p in endpoints]
+    proximal_ep = max(endpoint_tuples, key=lambda p: dist_map.get(p, -1.0))
+
+    path_yx = reconstruct_path(prev, proximal_ep)
+    if len(path_yx) < 5:
+        return float(tip_yx[0]), float(tip_yx[1]), {"mode": "mainray", "fallback": "short_path"}
+
+    path_xy = path_to_xy(path_yx)
+    s = cumulative_arclength(path_xy)
+    s_end = float(s[-1])
+
+    dist_img = cv2.distanceTransform(mask_fg, cv2.DIST_L2, 5)
+    tail = path_yx[max(0, len(path_yx) - 20):max(1, len(path_yx) - 3)]
+    r_vals = [float(dist_img[y, x]) for (y, x) in tail if 0 <= y < dist_img.shape[0] and 0 <= x < dist_img.shape[1]]
+    r_px = float(np.median(r_vals)) if len(r_vals) else float(dist_img[distal_ep[0], distal_ep[1]])
+    r_px = max(r_px, 3.0)
+
+    fit_near = fit_back_near_r * r_px
+    fit_far = fit_back_far_r * r_px
+    anchor_back = anchor_back_r * r_px
+    ray_max_len = ray_max_len_r * r_px
+
+    s0 = max(0.0, s_end - fit_far)
+    s1 = max(0.0, s_end - fit_near)
+
+    tangent_xy = robust_tangent_from_path_window(path_xy, s, s0, s1)
+    anchor_xy = interp_point_on_path(path_xy, s, max(0.0, s_end - anchor_back))
+    edge_xy = ray_last_inside(mask_fg, anchor_xy, tangent_xy, step_px=ray_step_px, max_len_px=ray_max_len)
+
+    dbg = {
+        "mode": "mainray",
+        "distal_endpoint_yx": list(distal_ep),
+        "proximal_endpoint_yx": list(proximal_ep),
+        "radius_px": r_px,
+        "fit_window_px": [fit_near, fit_far],
+        "anchor_xy": anchor_xy.tolist(),
+        "tangent_xy": tangent_xy.tolist(),
+        "tip_xy": edge_xy.tolist(),
+        "path_len_px": s_end,
+        "center_line_xy": [anchor_xy.tolist(), edge_xy.tolist()],
+        "path_window_xy": path_xy[(s >= s0) & (s <= s1)].tolist(),
+    }
+    return float(edge_xy[1]), float(edge_xy[0]), dbg
+
+
+def refine_tip_parallel_centerline(
+    grayscale: np.ndarray,
+    binary_image: np.ndarray,
+    tip_yx: Tuple[int, int],
+    tip_angle_deg: float,
+    section_near_r: float = 1.0,
+    section_far_r: float = 6.0,
+    scan_half_r: float = 3.0,
+    num_sections: int = 9,
+    cross_step_px: float = 0.5,
+    ray_step_px: float = 0.5,
+    ray_max_len_r: float = 8.0,
+):
+    """
+    Distal tube extremity via two parallel side-lines constrained to the CURRENT measured tip angle.
+
+    Procedure:
+      1) Use the current tip angle as the common line direction.
+      2) Backtrack from the coarse tip until inside the foreground.
+      3) Sample several cross-sections upstream, orthogonal to the line direction.
+      4) Estimate the two side boundaries as robust constant offsets (parallel lines).
+      5) Build the center parallel line and ray-cast it distally to the black/white boundary.
+
+    Returns: refined (y, x) and debug dict with annotation geometry.
+    """
+    mask_fg = (binary_image == 0).astype(np.uint8)
+    if mask_fg.sum() == 0:
+        return float(tip_yx[0]), float(tip_yx[1]), {"mode": "parallel_centerline", "fallback": "empty_fg"}
+
+    d_xy = _tip_angle_to_direction_xy(tip_angle_deg)
+    n_xy = np.array([-d_xy[1], d_xy[0]], dtype=np.float64)
+    n_xy /= max(np.linalg.norm(n_xy), 1e-12)
+
+    p_guess_xy = np.array([float(tip_yx[1]), float(tip_yx[0])], dtype=np.float64)
+    p_in_xy, found_inside, back_dist = _backtrack_point_inside_fg(mask_fg, p_guess_xy, d_xy, max_back_px=120.0, step_px=0.5)
+    if not found_inside:
+        return float(tip_yx[0]), float(tip_yx[1]), {
+            "mode": "parallel_centerline",
+            "fallback": "could_not_backtrack_inside",
+        }
+
+    dist_img = cv2.distanceTransform(mask_fg, cv2.DIST_L2, 5)
+    r_px = _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, d_xy, back_len_px=80.0, step_px=1.0)
+
+    section_near_px = max(0.5 * r_px, float(section_near_r) * r_px)
+    section_far_px = max(section_near_px + 2.0, float(section_far_r) * r_px)
+    scan_half_px = max(2.5 * r_px, float(scan_half_r) * r_px)
+    ray_max_len_px = max(20.0, float(ray_max_len_r) * r_px)
+
+    s_samples = np.linspace(section_near_px, section_far_px, int(max(3, num_sections)))
+    left_offsets = []
+    right_offsets = []
+    section_centers = []
+    left_points = []
+    right_points = []
+
+    for s_back in s_samples:
+        c_xy = p_in_xy - s_back * d_xy
+        res = _cross_section_boundaries(
+            mask_fg,
+            center_xy=c_xy,
+            normal_xy=n_xy,
+            scan_half_width_px=scan_half_px,
+            step_px=float(cross_step_px),
+        )
+        if res is None:
+            continue
+        t_left = float(res["t_left"])
+        t_right = float(res["t_right"])
+        if t_left > t_right:
+            t_left, t_right = t_right, t_left
+        left_offsets.append(t_left)
+        right_offsets.append(t_right)
+        section_centers.append(c_xy.tolist())
+        left_points.append(np.asarray(res["p_left_xy"], dtype=np.float64).tolist())
+        right_points.append(np.asarray(res["p_right_xy"], dtype=np.float64).tolist())
+
+    if len(left_offsets) < 2 or len(right_offsets) < 2:
+        return float(tip_yx[0]), float(tip_yx[1]), {
+            "mode": "parallel_centerline",
+            "fallback": "insufficient_cross_sections",
+            "radius_px": r_px,
+        }
+
+    t_left_med = float(np.median(left_offsets))
+    t_right_med = float(np.median(right_offsets))
+    if t_left_med > t_right_med:
+        t_left_med, t_right_med = t_right_med, t_left_med
+    t_center = 0.5 * (t_left_med + t_right_med)
+    width_px = float(t_right_med - t_left_med)
+
+    line_back_px = section_far_px + 0.75 * r_px
+    base_center_xy = p_in_xy - line_back_px * d_xy
+
+    left_line_start = base_center_xy + t_left_med * n_xy
+    right_line_start = base_center_xy + t_right_med * n_xy
+    center_line_start = base_center_xy + t_center * n_xy
+
+    if not _inside_mask(mask_fg, center_line_start):
+        center_line_start, ok_center, _ = _backtrack_point_inside_fg(mask_fg, center_line_start, d_xy, max_back_px=3.0 * r_px, step_px=0.5)
+        if not ok_center:
+            center_line_start = p_in_xy + t_center * n_xy
+
+    tip_xy = ray_last_inside(mask_fg, center_line_start, d_xy, step_px=float(ray_step_px), max_len_px=ray_max_len_px + line_back_px)
+
+    line_forward_px = float(np.linalg.norm(tip_xy - base_center_xy)) + 0.5 * r_px
+    left_line_end = base_center_xy + line_forward_px * d_xy + t_left_med * n_xy
+    right_line_end = base_center_xy + line_forward_px * d_xy + t_right_med * n_xy
+    center_line_end = base_center_xy + line_forward_px * d_xy + t_center * n_xy
+
+    dbg = {
+        "mode": "parallel_centerline",
+        "tip_angle_deg": float(tip_angle_deg),
+        "d_xy": d_xy.tolist(),
+        "n_xy": n_xy.tolist(),
+        "tip_guess_xy": p_guess_xy.tolist(),
+        "inside_anchor_xy": p_in_xy.tolist(),
+        "backtrack_dist_px": None if back_dist is None else float(back_dist),
+        "radius_px": float(r_px),
+        "width_px": width_px,
+        "left_offset_px": float(t_left_med),
+        "right_offset_px": float(t_right_med),
+        "center_offset_px": float(t_center),
+        "section_centers_xy": section_centers,
+        "section_left_points_xy": left_points,
+        "section_right_points_xy": right_points,
+        "parallel_left_line_xy": [left_line_start.tolist(), left_line_end.tolist()],
+        "parallel_right_line_xy": [right_line_start.tolist(), right_line_end.tolist()],
+        "center_line_xy": [center_line_start.tolist(), tip_xy.tolist()],
+        "center_line_full_xy": [center_line_start.tolist(), center_line_end.tolist()],
+        "tip_xy": tip_xy.tolist(),
+    }
+    return float(tip_xy[1]), float(tip_xy[0]), dbg
+
+
+def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = ""):
+    """
+    Add overlays to the analysis matplotlib axes returned by the original pipeline.
+    Geometry is assumed to be in local crop coordinates.
+    """
+    if axs is None or not isinstance(dbg, dict):
+        return
+
+    try:
+        if isinstance(axs, np.ndarray):
+            target_axes = [axs.flat[-1]]
+            if axs.size >= 3:
+                target_axes.append(axs.flat[-2])
+        elif isinstance(axs, (list, tuple)):
+            target_axes = [axs[-1]]
+        else:
+            target_axes = [axs]
+
+        used_labels = set()
+        mode = str(dbg.get("mode", "tip_refine"))
+        tip_xy = np.asarray(dbg.get("tip_xy", []), dtype=float).reshape(-1)
+
+        for ax in target_axes:
+            if ax is None:
+                continue
+
+            def _plot_line(key, color, label):
+                line = dbg.get(key)
+                if line is None:
+                    return
+                arr = np.asarray(line, dtype=float).reshape(-1, 2)
+                if arr.shape[0] < 2:
+                    return
+                line_label = label if label not in used_labels else None
+                if line_label is not None:
+                    used_labels.add(label)
+                ax.plot(arr[:, 0], arr[:, 1], color=color, linewidth=2.0, label=line_label)
+
+            _plot_line("parallel_left_line_xy", "#00ff66", "tube side lines")
+            _plot_line("parallel_right_line_xy", "#00ff66", "tube side lines")
+            _plot_line("center_line_xy", "#ffd400", "center parallel line")
+            _plot_line("center_line_full_xy", "#ffaa00", "center line (full)")
+
+            if "path_window_xy" in dbg:
+                pts = np.asarray(dbg["path_window_xy"], dtype=float).reshape(-1, 2)
+                if pts.size > 0:
+                    lbl = "tangent fit window" if "tangent fit window" not in used_labels else None
+                    if lbl is not None:
+                        used_labels.add(lbl)
+                    ax.plot(pts[:, 0], pts[:, 1], color="#00e5ff", linewidth=2.0, label=lbl)
+
+            if "section_left_points_xy" in dbg and len(dbg["section_left_points_xy"]) > 0:
+                pts = np.asarray(dbg["section_left_points_xy"], dtype=float).reshape(-1, 2)
+                lbl = "sampled edge points" if "sampled edge points" not in used_labels else None
+                if lbl is not None:
+                    used_labels.add(lbl)
+                ax.scatter(pts[:, 0], pts[:, 1], s=10, c="#44ff44", label=lbl)
+
+            if "section_right_points_xy" in dbg and len(dbg["section_right_points_xy"]) > 0:
+                pts = np.asarray(dbg["section_right_points_xy"], dtype=float).reshape(-1, 2)
+                ax.scatter(pts[:, 0], pts[:, 1], s=10, c="#44ff44")
+
+            if "inside_anchor_xy" in dbg:
+                p = np.asarray(dbg["inside_anchor_xy"], dtype=float).reshape(-1)
+                lbl = "inside anchor" if "inside anchor" not in used_labels else None
+                if lbl is not None:
+                    used_labels.add(lbl)
+                ax.scatter([p[0]], [p[1]], s=40, c="#ffffff", edgecolors="#000000", label=lbl, zorder=5)
+
+            if tip_xy.size == 2 and np.all(np.isfinite(tip_xy)):
+                lbl = f"refined tip ({mode})" if f"refined tip ({mode})" not in used_labels else None
+                if lbl is not None:
+                    used_labels.add(lbl)
+                ax.scatter([tip_xy[0]], [tip_xy[1]], s=55, c="#ff3b30", edgecolors="#ffffff", label=lbl, zorder=6)
+                ax.annotate(
+                    f"tip{title_suffix}",
+                    (tip_xy[0], tip_xy[1]),
+                    xytext=(6, -8),
+                    textcoords="offset points",
+                    color="white",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none", alpha=0.55),
+                )
+
+            try:
+                ax.legend(loc="best", fontsize=8)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] Failed to annotate analysis axes: {e}")
+
+
+def _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min: int, zoom_x_max: int, zoom_y_min: int, zoom_y_max: int):
+    """
+    Re-express the lower zoom panels in the same cropped-image pixel coordinates
+    used by the refinement geometry so overlays land on the underlying image.
+    """
+    if axs is None or not isinstance(axs, np.ndarray) or axs.size < 4:
+        return
+
+    zoom_axes = [axs[1, 0], axs[1, 1]]
+    x_offset = float(zoom_x_min)
+    y_offset = float(zoom_y_min)
+    extent = [float(zoom_x_min), float(zoom_x_max + 1), float(zoom_y_max + 1), float(zoom_y_min)]
+
+    for ax in zoom_axes:
+        if ax is None:
+            continue
+
+        for image in ax.images:
+            image.set_extent(extent)
+
+        for coll in ax.collections:
+            try:
+                offsets = coll.get_offsets()
+            except Exception:
+                continue
+            if offsets is None:
+                continue
+            offsets = np.asarray(offsets, dtype=float)
+            if offsets.size == 0:
+                continue
+            shifted = offsets.copy()
+            shifted[:, 0] += x_offset
+            shifted[:, 1] += y_offset
+            coll.set_offsets(shifted)
+
+        for line in ax.lines:
+            try:
+                xdata = np.asarray(line.get_xdata(), dtype=float)
+                ydata = np.asarray(line.get_ydata(), dtype=float)
+            except Exception:
+                continue
+            if xdata.size == 0 or ydata.size == 0:
+                continue
+            line.set_xdata(xdata + x_offset)
+            line.set_ydata(ydata + y_offset)
+
+        ax.set_xlim(float(zoom_x_min), float(zoom_x_max + 1))
+        ax.set_ylim(float(zoom_y_max + 1), float(zoom_y_min))
+        ax.set_aspect("equal")
 
 
 # ---------------------------------------------------------
@@ -868,20 +1471,36 @@ def patch_analyze_data_for_tip_refinement(
     dt_max_step_px: int = 80,
     grad_step_px: float = 0.25,
     grad_search_len_px: int = 60,
+    mainray_fit_back_near_r: float = 1.5,
+    mainray_fit_back_far_r: float = 6.0,
+    mainray_anchor_back_r: float = 1.0,
+    mainray_ray_step_px: float = 0.5,
+    mainray_ray_max_len_r: float = 8.0,
+    parallel_section_near_r: float = 1.0,
+    parallel_section_far_r: float = 6.0,
+    parallel_scan_half_r: float = 3.0,
+    parallel_num_sections: int = 9,
+    parallel_cross_step_px: float = 0.5,
+    parallel_ray_step_px: float = 0.5,
+    parallel_ray_max_len_r: float = 8.0,
 ):
     """
     Patches cal.analyze_data(image_file_name, ...) so that:
-      - It still uses your skeleton + angle pipeline
-      - It refines tip_row/tip_col to distal edge (optional)
+      - It still uses the original skeleton + angle pipeline
+      - It refines tip_row/tip_col to a distal edge estimate (optional)
       - It writes refined pixel coordinates into tip_locations_array_coarse
+      - It annotates the returned matplotlib axes with the fitted geometry when available
 
     refine_mode:
-      - "none"     : unchanged (skeleton distal pixel)
-      - "edge_dt"  : step along tangent until leaving foreground (fast, robust)
-      - "edge_grad": sample grayscale gradient for subpixel edge (more precise, slightly noisier)
+      - "none"
+      - "edge_dt"
+      - "edge_grad"
+      - "mainray"
+      - "parallel_centerline"
     """
-
     original_analyze_data = cal.analyze_data
+    if not hasattr(cal, "tip_refine_debug_records"):
+        cal.tip_refine_debug_records = {}
 
     def analyze_data_patched(
         image_file_name,
@@ -932,9 +1551,13 @@ def patch_analyze_data_for_tip_refinement(
 
         tip_y = tip_y_full - crop_y_min_img
         tip_x = tip_x_full - crop_x_min_img
-
         tip_y = float(np.clip(tip_y, 0, binary.shape[0] - 1))
         tip_x = float(np.clip(tip_x, 0, binary.shape[1] - 1))
+
+        zoom_x_min = int(max(int(round(tip_x)) - 75, 0))
+        zoom_x_max = int(min(int(round(tip_x)) + 75, binary.shape[1] - 1))
+        zoom_y_min = int(max(int(round(tip_y)) - 75, 0))
+        zoom_y_max = int(min(int(round(tip_y)) + 75, binary.shape[0] - 1))
 
         if refine_mode == "edge_dt":
             yy, xx, _dbg = refine_tip_edge_distance_transform(
@@ -953,13 +1576,48 @@ def patch_analyze_data_for_tip_refinement(
                 search_len_px=int(grad_search_len_px),
                 step_px=float(grad_step_px),
             )
+        elif refine_mode == "mainray":
+            yy, xx, _dbg = refine_tip_edge_mainray(
+                grayscale=gray,
+                binary_image=binary,
+                tip_yx=(int(round(tip_y)), int(round(tip_x))),
+                fit_back_near_r=float(mainray_fit_back_near_r),
+                fit_back_far_r=float(mainray_fit_back_far_r),
+                anchor_back_r=float(mainray_anchor_back_r),
+                ray_step_px=float(mainray_ray_step_px),
+                ray_max_len_r=float(mainray_ray_max_len_r),
+            )
+        elif refine_mode == "parallel_centerline":
+            yy, xx, _dbg = refine_tip_parallel_centerline(
+                grayscale=gray,
+                binary_image=binary,
+                tip_yx=(int(round(tip_y)), int(round(tip_x))),
+                tip_angle_deg=tip_angle_deg,
+                section_near_r=float(parallel_section_near_r),
+                section_far_r=float(parallel_section_far_r),
+                scan_half_r=float(parallel_scan_half_r),
+                num_sections=int(parallel_num_sections),
+                cross_step_px=float(parallel_cross_step_px),
+                ray_step_px=float(parallel_ray_step_px),
+                ray_max_len_r=float(parallel_ray_max_len_r),
+            )
         else:
-            yy, xx, _dbg = tip_y, tip_x, {}
+            yy, xx, _dbg = tip_y, tip_x, {"mode": "none", "tip_xy": [tip_x, tip_y]}
 
         coarse_row_refined = np.array(coarse_row, dtype=float).copy()
         coarse_row_refined[0] = yy + crop_y_min_img
         coarse_row_refined[1] = xx + crop_x_min_img
 
+        dbg_local = dict(_dbg) if isinstance(_dbg, dict) else {}
+        dbg_local["image_file_name"] = image_file_name
+        dbg_local["tip_angle_deg"] = tip_angle_deg
+        dbg_local["coarse_tip_before_local_xy"] = [float(tip_x), float(tip_y)]
+        dbg_local["coarse_tip_after_local_xy"] = [float(xx), float(yy)]
+        dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
+        cal.tip_refine_debug_records[image_file_name] = _json_ready(dbg_local)
+
+        _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
+        annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=f" ({refine_mode})")
         return fig, axs, coarse_row_refined, fine_row
 
     cal.analyze_data = analyze_data_patched
@@ -1005,8 +1663,7 @@ def _compute_link_frames(points_xyz: np.ndarray):
       - origin at P[i]
       - z-axis along direction
       - x/y axes arbitrary but stable (constructed from world up fallback)
-    Returns list of per-link dicts with:
-      origin, direction_unit, length, R (3x3)
+    Returns list of per-link dicts.
     """
     pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
     frames = []
@@ -1152,8 +1809,7 @@ def export_parametric_skeleton_model(
     with open(param_path, "w") as f:
         json.dump(skel_param, f, indent=2)
 
-    py_path = processed / f"{robot_name}_skeleton_predict.py"
-    predictor_code = f"""# Auto-generated parametric skeleton predictor for {robot_name}
+    predictor_code = f'''# Auto-generated parametric skeleton predictor for {robot_name}
 # Units: mm
 import numpy as np
 
@@ -1168,7 +1824,7 @@ T_KNOTS = np.array({json.dumps(t.tolist())}, dtype=float)
 B_KNOTS = B_MIN + T_KNOTS * (B_MAX - B_MIN)
 
 DIAMETER_MM = {float(diameter_mm):.6f}
-RADIUS_MM = {float(diameter_mm)/2.0:.6f}
+RADIUS_MM = {float(diameter_mm) / 2.0:.6f}
 
 def _polyval(c, b):
     if c is None:
@@ -1197,7 +1853,7 @@ def _compute_link_frames(points_xyz):
     world_up = np.array([0.0, 0.0, 1.0], dtype=float)
     for i in range(pts.shape[0] - 1):
         p0 = pts[i]
-        p1 = pts[i+1]
+        p1 = pts[i + 1]
         d = p1 - p0
         L = float(np.linalg.norm(d))
         if L < 1e-9:
@@ -1236,7 +1892,8 @@ def _compute_link_frames(points_xyz):
 def skeleton_link_frames(b_pull_mm, include_origin=True):
     pts = skeleton_points(b_pull_mm, include_origin=include_origin)
     return _compute_link_frames(pts)
-"""
+'''
+    py_path = processed / f"{robot_name}_skeleton_predict.py"
     with open(py_path, "w") as f:
         f.write(predictor_code)
 
@@ -1363,23 +2020,29 @@ TIP_PRECISION_GUIDE = r"""
 Tip precision: how to get closer to the distal edge of the black segment
 ------------------------------------------------------------
 Your current pipeline finds a skeleton tip (centerline distal pixel). That is
-usually *inside* the tube and thus upstream from the true physical tip edge.
+usually inside the tube and thus upstream from the true physical tip edge.
 
-Better "edge-of-black" tip options (implemented here):
-  (1) edge_dt (recommended starting point)
+Available refiners:
+  (1) edge_dt
       - Step from the skeleton tip along the distal tangent direction until
-        you leave the foreground (binary black region).
-      - The last-in-foreground point is your tip-on-edge estimate.
-      - Knobs:
-          --tip_refine_dt_step_px
-          --tip_refine_max_step_px
+        you leave the foreground.
+      - Last in-foreground point is the tip estimate.
 
-  (2) edge_grad (subpixel-ish)
+  (2) edge_grad
       - Sample grayscale along distal tangent direction and locate the strongest
         intensity gradient (dark->light edge).
-      - Knobs:
-          --tip_refine_grad_step_px
-          --tip_refine_grad_search_len_px
+
+  (3) mainray
+      - Skeletonize the foreground, estimate a stable tangent from the upstream
+        trunk path, then ray-cast straight to the boundary.
+      - Best when the end has a small weird hook/branch that corrupts the local tip angle.
+
+  (4) parallel_centerline
+      - Use the CURRENT measured tip angle to define the tube extremity side-line direction.
+      - Find the two side offsets from multiple upstream cross-sections.
+      - Build the center parallel line.
+      - Intersect that center line with the distal black/white boundary.
+      - Annotates the side lines, center line, anchor, and refined tip on the analyzed images.
 """
 
 
@@ -1412,7 +2075,6 @@ def main():
     ap.add_argument("--checkerboard_no_undistort", action="store_true",
                     help="Disable undistortion before checkerboard pose estimation.")
 
-    # Requested checkerboard corrections
     ap.add_argument("--checkerboard_mm_scale_correction", type=float, default=0.5,
                     help="Multiply checkerboard-derived mm values by this factor. Default 0.5 fixes the observed 2x overscale.")
     ap.add_argument("--checkerboard_no_flip_planar_x", action="store_true",
@@ -1423,12 +2085,26 @@ def main():
                     help="Write analysis_reference.json into project_dir for reuse without GUI later.")
 
     ap.add_argument("--tip_refine_mode", type=str, default="none",
-                    choices=["none", "edge_dt", "edge_grad"],
+                    choices=["none", "edge_dt", "edge_grad", "mainray", "parallel_centerline"],
                     help="Refine tip position toward distal edge of black segment.")
     ap.add_argument("--tip_refine_dt_step_px", type=float, default=1.0)
     ap.add_argument("--tip_refine_max_step_px", type=int, default=80)
     ap.add_argument("--tip_refine_grad_step_px", type=float, default=0.25)
     ap.add_argument("--tip_refine_grad_search_len_px", type=int, default=60)
+
+    ap.add_argument("--tip_mainray_fit_back_near_r", type=float, default=1.5)
+    ap.add_argument("--tip_mainray_fit_back_far_r", type=float, default=6.0)
+    ap.add_argument("--tip_mainray_anchor_back_r", type=float, default=1.0)
+    ap.add_argument("--tip_mainray_ray_step_px", type=float, default=0.5)
+    ap.add_argument("--tip_mainray_ray_max_len_r", type=float, default=8.0)
+
+    ap.add_argument("--tip_parallel_section_near_r", type=float, default=1.0)
+    ap.add_argument("--tip_parallel_section_far_r", type=float, default=6.0)
+    ap.add_argument("--tip_parallel_scan_half_r", type=float, default=3.0)
+    ap.add_argument("--tip_parallel_num_sections", type=int, default=9)
+    ap.add_argument("--tip_parallel_cross_step_px", type=float, default=0.5)
+    ap.add_argument("--tip_parallel_ray_step_px", type=float, default=0.5)
+    ap.add_argument("--tip_parallel_ray_max_len_r", type=float, default=8.0)
 
     ap.add_argument("--export_skeleton", action="store_true",
                     help="Export parametric skeleton (equations) and patch it into *_gcode_calibration.json.")
@@ -1486,6 +2162,18 @@ def main():
             dt_max_step_px=int(args.tip_refine_max_step_px),
             grad_step_px=float(args.tip_refine_grad_step_px),
             grad_search_len_px=int(args.tip_refine_grad_search_len_px),
+            mainray_fit_back_near_r=float(args.tip_mainray_fit_back_near_r),
+            mainray_fit_back_far_r=float(args.tip_mainray_fit_back_far_r),
+            mainray_anchor_back_r=float(args.tip_mainray_anchor_back_r),
+            mainray_ray_step_px=float(args.tip_mainray_ray_step_px),
+            mainray_ray_max_len_r=float(args.tip_mainray_ray_max_len_r),
+            parallel_section_near_r=float(args.tip_parallel_section_near_r),
+            parallel_section_far_r=float(args.tip_parallel_section_far_r),
+            parallel_scan_half_r=float(args.tip_parallel_scan_half_r),
+            parallel_num_sections=int(args.tip_parallel_num_sections),
+            parallel_cross_step_px=float(args.tip_parallel_cross_step_px),
+            parallel_ray_step_px=float(args.tip_parallel_ray_step_px),
+            parallel_ray_max_len_r=float(args.tip_parallel_ray_max_len_r),
         )
         print(f"[INFO] Tip refinement enabled: {args.tip_refine_mode}")
 
@@ -1521,7 +2209,6 @@ def main():
             )
             board_reference_debug_image = board_result.get("debug_image")
 
-            # Apply requested checkerboard corrections immediately after board estimation.
             apply_checkerboard_reference_corrections(
                 cal,
                 mm_scale=float(args.checkerboard_mm_scale_correction),
@@ -1564,6 +2251,8 @@ def main():
     if args.save_analysis_config:
         cfg = cal.get_analysis_reference_info()
         cfg["board_reference"] = collect_board_reference_info(cal)
+        if hasattr(cal, "tip_refine_debug_records"):
+            cfg["tip_refine_mode"] = args.tip_refine_mode
         cfg_path = project_dir / "analysis_reference.json"
         with open(cfg_path, "w") as f:
             json.dump(_json_ready(cfg), f, indent=2)
@@ -1571,6 +2260,13 @@ def main():
 
     print("\n[INFO] Running analyze_data_batch (offline)...")
     cal.analyze_data_batch(threshold=int(args.threshold))
+
+    if hasattr(cal, "tip_refine_debug_records") and len(cal.tip_refine_debug_records) > 0:
+        dbg_path = project_dir / "processed_image_data_folder" / "tip_refine_debug_records.json"
+        dbg_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(dbg_path, "w") as f:
+            json.dump(_json_ready(cal.tip_refine_debug_records), f, indent=2)
+        print(f"[INFO] Saved tip refinement debug records: {dbg_path}")
 
     print("\n[INFO] Running postprocess_calibration_data (offline)...")
     cal.postprocess_calibration_data(

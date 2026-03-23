@@ -27,6 +27,7 @@ from datetime import date
 from skimage.morphology import skeletonize
 import math
 from scipy.interpolate import CubicSpline
+from scipy.interpolate import PchipInterpolator
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import curve_fit
 
@@ -350,6 +351,371 @@ def _tip_pose_from_distal_pca(
     return tip_y, tip_x, angle_deg, tip_path
 
 
+def _tip_angle_to_direction_xy(tip_angle_deg):
+    ang = np.deg2rad(float(tip_angle_deg))
+    vx = float(np.sin(ang))
+    vy = float(np.cos(ang))
+    d = np.array([vx, vy], dtype=np.float64)
+    n = float(np.linalg.norm(d))
+    return d / max(n, 1e-12)
+
+
+def _inside_mask(mask_fg, xy):
+    x = int(round(float(xy[0])))
+    y = int(round(float(xy[1])))
+    h, w = mask_fg.shape[:2]
+    return (0 <= x < w) and (0 <= y < h) and (mask_fg[y, x] > 0)
+
+
+def _backtrack_point_inside_fg(mask_fg, p0_xy, dir_xy, max_back_px=80.0, step_px=0.5):
+    p0 = np.asarray(p0_xy, dtype=np.float64)
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+
+    if _inside_mask(mask_fg, p0):
+        return p0.copy(), True, 0.0
+
+    n_steps = int(max_back_px / max(step_px, 1e-6))
+    for i in range(1, n_steps + 1):
+        q = p0 - i * step_px * d
+        if _inside_mask(mask_fg, q):
+            return q, True, i * step_px
+    return p0.copy(), False, None
+
+
+def ray_last_inside(mask_fg, p0_xy, dir_xy, step_px=0.5, max_len_px=120.0):
+    h, w = mask_fg.shape[:2]
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+
+    last_inside = np.asarray(p0_xy, dtype=np.float64).copy()
+    n_steps = int(max_len_px / max(step_px, 1e-6))
+
+    for i in range(1, n_steps + 1):
+        p = p0_xy + i * step_px * d
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        if not (0 <= x < w and 0 <= y < h):
+            break
+        if mask_fg[y, x] == 1:
+            last_inside = p
+        else:
+            break
+    return last_inside
+
+
+def _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, dir_xy, back_len_px=60.0, step_px=1.0):
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+    vals = []
+    n_steps = int(back_len_px / max(step_px, 1e-6))
+    for i in range(n_steps + 1):
+        p = p_in_xy - i * step_px * d
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        if 0 <= x < mask_fg.shape[1] and 0 <= y < mask_fg.shape[0] and mask_fg[y, x] == 1:
+            v = float(dist_img[y, x])
+            if np.isfinite(v) and v > 0:
+                vals.append(v)
+    if not vals:
+        x = int(round(float(p_in_xy[0])))
+        y = int(round(float(p_in_xy[1])))
+        if 0 <= x < dist_img.shape[1] and 0 <= y < dist_img.shape[0]:
+            return max(3.0, float(dist_img[y, x]))
+        return 6.0
+    return max(3.0, float(np.median(vals)))
+
+
+def _contiguous_runs_from_bool(mask_bool):
+    m = np.asarray(mask_bool, dtype=bool)
+    edges = np.diff(np.r_[False, m, False].astype(np.int8))
+    starts = np.where(edges == 1)[0]
+    ends = np.where(edges == -1)[0] - 1
+    return list(zip(starts.tolist(), ends.tolist()))
+
+
+def _cross_section_boundaries(mask_fg, center_xy, normal_xy, scan_half_width_px=20.0, step_px=0.5):
+    n = np.asarray(normal_xy, dtype=np.float64)
+    n /= max(np.linalg.norm(n), 1e-12)
+    ts = np.arange(-scan_half_width_px, scan_half_width_px + 0.5 * step_px, step_px, dtype=np.float64)
+    inside = np.zeros_like(ts, dtype=bool)
+
+    h, w = mask_fg.shape[:2]
+    for i, t in enumerate(ts):
+        p = center_xy + t * n
+        x = int(round(float(p[0])))
+        y = int(round(float(p[1])))
+        inside[i] = (0 <= x < w) and (0 <= y < h) and (mask_fg[y, x] == 1)
+
+    if not np.any(inside):
+        return None
+
+    runs = _contiguous_runs_from_bool(inside)
+    if not runs:
+        return None
+
+    idx0 = int(np.argmin(np.abs(ts)))
+    chosen = None
+    for s0, s1 in runs:
+        if s0 <= idx0 <= s1:
+            chosen = (s0, s1)
+            break
+
+    if chosen is None:
+        centers = [0.5 * (ts[s0] + ts[s1]) for s0, s1 in runs]
+        j = int(np.argmin(np.abs(np.asarray(centers))))
+        chosen = runs[j]
+
+    s0, s1 = chosen
+    t_left = float(ts[s0])
+    t_right = float(ts[s1])
+    p_left = center_xy + t_left * n
+    p_right = center_xy + t_right * n
+
+    return {
+        "t_left": t_left,
+        "t_right": t_right,
+        "p_left_xy": p_left,
+        "p_right_xy": p_right,
+    }
+
+
+def refine_tip_parallel_centerline(
+    grayscale,
+    binary_image,
+    tip_yx,
+    tip_angle_deg,
+    section_near_r=1.0,
+    section_far_r=6.0,
+    scan_half_r=3.0,
+    num_sections=9,
+    cross_step_px=0.5,
+    ray_step_px=0.5,
+    ray_max_len_r=8.0,
+):
+    mask_fg = (binary_image == 0).astype(np.uint8)
+    if mask_fg.sum() == 0:
+        return float(tip_yx[0]), float(tip_yx[1]), {"mode": "parallel_centerline", "fallback": "empty_fg"}
+
+    d_xy = _tip_angle_to_direction_xy(tip_angle_deg)
+    n_xy = np.array([-d_xy[1], d_xy[0]], dtype=np.float64)
+    n_xy /= max(np.linalg.norm(n_xy), 1e-12)
+
+    p_guess_xy = np.array([float(tip_yx[1]), float(tip_yx[0])], dtype=np.float64)
+    p_in_xy, found_inside, back_dist = _backtrack_point_inside_fg(mask_fg, p_guess_xy, d_xy, max_back_px=120.0, step_px=0.5)
+    if not found_inside:
+        return float(tip_yx[0]), float(tip_yx[1]), {
+            "mode": "parallel_centerline",
+            "fallback": "could_not_backtrack_inside",
+        }
+
+    dist_img = cv2.distanceTransform(mask_fg, cv2.DIST_L2, 5)
+    r_px = _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, d_xy, back_len_px=80.0, step_px=1.0)
+
+    section_near_px = max(0.5 * r_px, float(section_near_r) * r_px)
+    section_far_px = max(section_near_px + 2.0, float(section_far_r) * r_px)
+    scan_half_px = max(2.5 * r_px, float(scan_half_r) * r_px)
+    ray_max_len_px = max(20.0, float(ray_max_len_r) * r_px)
+
+    s_samples = np.linspace(section_near_px, section_far_px, int(max(3, num_sections)))
+    left_offsets = []
+    right_offsets = []
+    section_centers = []
+    left_points = []
+    right_points = []
+
+    for s_back in s_samples:
+        c_xy = p_in_xy - s_back * d_xy
+        res = _cross_section_boundaries(
+            mask_fg,
+            center_xy=c_xy,
+            normal_xy=n_xy,
+            scan_half_width_px=scan_half_px,
+            step_px=float(cross_step_px),
+        )
+        if res is None:
+            continue
+        t_left = float(res["t_left"])
+        t_right = float(res["t_right"])
+        if t_left > t_right:
+            t_left, t_right = t_right, t_left
+        left_offsets.append(t_left)
+        right_offsets.append(t_right)
+        section_centers.append(c_xy.tolist())
+        left_points.append(np.asarray(res["p_left_xy"], dtype=np.float64).tolist())
+        right_points.append(np.asarray(res["p_right_xy"], dtype=np.float64).tolist())
+
+    if len(left_offsets) < 2 or len(right_offsets) < 2:
+        return float(tip_yx[0]), float(tip_yx[1]), {
+            "mode": "parallel_centerline",
+            "fallback": "insufficient_cross_sections",
+            "radius_px": r_px,
+        }
+
+    t_left_med = float(np.median(left_offsets))
+    t_right_med = float(np.median(right_offsets))
+    if t_left_med > t_right_med:
+        t_left_med, t_right_med = t_right_med, t_left_med
+    t_center = 0.5 * (t_left_med + t_right_med)
+    width_px = float(t_right_med - t_left_med)
+
+    line_back_px = section_far_px + 0.75 * r_px
+    base_center_xy = p_in_xy - line_back_px * d_xy
+
+    left_line_start = base_center_xy + t_left_med * n_xy
+    right_line_start = base_center_xy + t_right_med * n_xy
+    center_line_start = base_center_xy + t_center * n_xy
+
+    if not _inside_mask(mask_fg, center_line_start):
+        center_line_start, ok_center, _ = _backtrack_point_inside_fg(mask_fg, center_line_start, d_xy, max_back_px=3.0 * r_px, step_px=0.5)
+        if not ok_center:
+            center_line_start = p_in_xy + t_center * n_xy
+
+    tip_xy = ray_last_inside(mask_fg, center_line_start, d_xy, step_px=float(ray_step_px), max_len_px=ray_max_len_px + line_back_px)
+
+    line_forward_px = float(np.linalg.norm(tip_xy - base_center_xy)) + 0.5 * r_px
+    left_line_end = base_center_xy + line_forward_px * d_xy + t_left_med * n_xy
+    right_line_end = base_center_xy + line_forward_px * d_xy + t_right_med * n_xy
+    center_line_end = base_center_xy + line_forward_px * d_xy + t_center * n_xy
+
+    dbg = {
+        "mode": "parallel_centerline",
+        "tip_angle_deg": float(tip_angle_deg),
+        "d_xy": d_xy.tolist(),
+        "n_xy": n_xy.tolist(),
+        "tip_guess_xy": p_guess_xy.tolist(),
+        "inside_anchor_xy": p_in_xy.tolist(),
+        "backtrack_dist_px": None if back_dist is None else float(back_dist),
+        "radius_px": float(r_px),
+        "width_px": width_px,
+        "left_offset_px": float(t_left_med),
+        "right_offset_px": float(t_right_med),
+        "center_offset_px": float(t_center),
+        "section_centers_xy": section_centers,
+        "section_left_points_xy": left_points,
+        "section_right_points_xy": right_points,
+        "parallel_left_line_xy": [left_line_start.tolist(), left_line_end.tolist()],
+        "parallel_right_line_xy": [right_line_start.tolist(), right_line_end.tolist()],
+        "center_line_xy": [center_line_start.tolist(), tip_xy.tolist()],
+        "center_line_full_xy": [center_line_start.tolist(), center_line_end.tolist()],
+        "tip_xy": tip_xy.tolist(),
+    }
+    return float(tip_xy[1]), float(tip_xy[0]), dbg
+
+
+def _shift_tip_debug_geometry(dbg, x_offset, y_offset):
+    if not isinstance(dbg, dict):
+        return {}
+
+    shifted = {}
+    pair_keys = {
+        "tip_xy",
+        "tip_guess_xy",
+        "inside_anchor_xy",
+    }
+    line_keys = {
+        "section_centers_xy",
+        "section_left_points_xy",
+        "section_right_points_xy",
+        "parallel_left_line_xy",
+        "parallel_right_line_xy",
+        "center_line_xy",
+        "center_line_full_xy",
+    }
+
+    for key, value in dbg.items():
+        if key in pair_keys:
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if arr.size == 2:
+                shifted[key] = [float(arr[0] - x_offset), float(arr[1] - y_offset)]
+                continue
+        if key in line_keys:
+            arr = np.asarray(value, dtype=float).reshape(-1, 2)
+            shifted[key] = (arr - np.array([[float(x_offset), float(y_offset)]])).tolist()
+            continue
+        shifted[key] = value
+    return shifted
+
+
+def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
+    if axs is None or not isinstance(dbg, dict):
+        return
+
+    try:
+        if isinstance(axs, np.ndarray):
+            target_axes = [axs[1, 0], axs[1, 1]] if axs.size >= 4 else [axs.flat[-1]]
+        elif isinstance(axs, (list, tuple)):
+            target_axes = [axs[-1]]
+        else:
+            target_axes = [axs]
+
+        used_labels = set()
+        mode = str(dbg.get("mode", "tip_refine"))
+        tip_xy = np.asarray(dbg.get("tip_xy", []), dtype=float).reshape(-1)
+
+        for ax in target_axes:
+            if ax is None:
+                continue
+
+            def _plot_line(key, color, label):
+                line = dbg.get(key)
+                if line is None:
+                    return
+                arr = np.asarray(line, dtype=float).reshape(-1, 2)
+                if arr.shape[0] < 2:
+                    return
+                line_label = label if label not in used_labels else None
+                if line_label is not None:
+                    used_labels.add(label)
+                ax.plot(arr[:, 0], arr[:, 1], color=color, linewidth=2.0, label=line_label)
+
+            _plot_line("parallel_left_line_xy", "#00ff66", "tube side lines")
+            _plot_line("parallel_right_line_xy", "#00ff66", "tube side lines")
+            _plot_line("center_line_xy", "#ffd400", "center parallel line")
+            _plot_line("center_line_full_xy", "#ffaa00", "center line (full)")
+
+            if "section_left_points_xy" in dbg and len(dbg["section_left_points_xy"]) > 0:
+                pts = np.asarray(dbg["section_left_points_xy"], dtype=float).reshape(-1, 2)
+                lbl = "sampled edge points" if "sampled edge points" not in used_labels else None
+                if lbl is not None:
+                    used_labels.add(lbl)
+                ax.scatter(pts[:, 0], pts[:, 1], s=10, c="#44ff44", label=lbl)
+
+            if "section_right_points_xy" in dbg and len(dbg["section_right_points_xy"]) > 0:
+                pts = np.asarray(dbg["section_right_points_xy"], dtype=float).reshape(-1, 2)
+                ax.scatter(pts[:, 0], pts[:, 1], s=10, c="#44ff44")
+
+            if "inside_anchor_xy" in dbg:
+                p = np.asarray(dbg["inside_anchor_xy"], dtype=float).reshape(-1)
+                if p.size == 2:
+                    lbl = "inside anchor" if "inside anchor" not in used_labels else None
+                    if lbl is not None:
+                        used_labels.add(lbl)
+                    ax.scatter([p[0]], [p[1]], s=40, c="#ffffff", edgecolors="#000000", label=lbl, zorder=5)
+
+            if tip_xy.size == 2 and np.all(np.isfinite(tip_xy)):
+                lbl = f"refined tip ({mode})" if f"refined tip ({mode})" not in used_labels else None
+                if lbl is not None:
+                    used_labels.add(lbl)
+                ax.scatter([tip_xy[0]], [tip_xy[1]], s=55, c="#ff3b30", edgecolors="#ffffff", label=lbl, zorder=6)
+                ax.annotate(
+                    f"tip{title_suffix}",
+                    (tip_xy[0], tip_xy[1]),
+                    xytext=(6, -8),
+                    textcoords="offset points",
+                    color="white",
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none", alpha=0.55),
+                )
+
+            try:
+                ax.legend(loc="best", fontsize=8)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] Failed to annotate analysis axes: {e}")
+
+
 class CTR_Shadow_Calibration:
     """
     The following code is designed to acquire image data and track the tip of a curve in 2-D space using computer vision (non-AI) methods.
@@ -439,6 +805,15 @@ class CTR_Shadow_Calibration:
         self.ruler_axis_unit = None
         self.ruler_axis_perp_unit = None
         self.ruler_calib_meta = None
+        self.tip_refine_debug_records = {}
+        self.tip_refine_mode = "parallel_centerline"
+        self.tip_parallel_section_near_r = 1.0
+        self.tip_parallel_section_far_r = 6.0
+        self.tip_parallel_scan_half_r = 3.0
+        self.tip_parallel_num_sections = 9
+        self.tip_parallel_cross_step_px = 0.5
+        self.tip_parallel_ray_step_px = 0.5
+        self.tip_parallel_ray_max_len_r = 8.0
 
         print("Calibration object initialized successfully!")
 
@@ -1530,9 +1905,9 @@ class CTR_Shadow_Calibration:
         large_move_safety = 0.0
         small_move_safety = 0.3
         rotation_safety = 0.0
-        settling_time_large = 3.0
-        settling_time_small = 0.2
-        rotation_settling_time = 1.8
+        settling_time_large = 5.0
+        settling_time_small = 0.5
+        rotation_settling_time = 2.0
         small_move_threshold = 0.5
 
         # Prepare output folder
@@ -1647,7 +2022,7 @@ class CTR_Shadow_Calibration:
             nonlocal pos, total_images
             # Baseline at B start
             print(f" Baseline capture: {robot_rear_axis_name}={b_start:.2f}")
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            pos = move_abs(0.3*jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
             capture_and_save(orientation_id, x, y, z, b_start, probe_idx, 0)
             total_images += 1
 
@@ -1657,7 +2032,7 @@ class CTR_Shadow_Calibration:
             for step_idx in range(1, steps_to_run + 1):
                 b_val = b_start + step_idx * b_step_size
                 print(f" Step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
-                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
+                pos = move_abs(0.3*jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
                 capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx)
                 total_images += 1
 
@@ -1852,12 +2227,27 @@ class CTR_Shadow_Calibration:
             orientation = 0
             if len(parts) > 0:
                 try:
-                    orientation = int(parts[0])
+                    candidate = int(parts[0])
+                    if candidate in (0, 1, 2, 3):
+                        orientation = candidate
+                    else:
+                        orientation = 0
                 except Exception:
                     orientation = 0
 
             values = {}
             for p in parts:
+                matched_prefixed = False
+                for key in ("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA"):
+                    if p.startswith(key):
+                        try:
+                            values[key] = float(p[len(key):])
+                            matched_prefixed = True
+                        except Exception:
+                            pass
+                        break
+                if matched_prefixed:
+                    continue
                 if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
                     try:
                         values[p[0]] = float(p[1:])
@@ -1867,8 +2257,10 @@ class CTR_Shadow_Calibration:
             # Support both filename styles:
             # 1) legacy positional:  0_100.00_-3.20_Y25.00_...
             # 2) prefixed tokens:    00187_left_X100.000_..._B-2.092_...
-            if "X" in values and "B" in values:
-                ntnl_pos = float(values["X"])
+            # 3) Cartesian tokens:   00043_pass01_reqA0.0_useA15.653_tipX100.000_..._B-0.095_...
+            x_value = values["tipX"] if "tipX" in values else values.get("X")
+            if x_value is not None and "B" in values:
+                ntnl_pos = float(x_value)
                 ss_pos = float(values["B"])
                 return [orientation, ntnl_pos, ss_pos]
 
@@ -1949,12 +2341,26 @@ class CTR_Shadow_Calibration:
         tip_row = tip_row_legacy
         tip_column = tip_col_legacy
 
+        yy_refined, xx_refined, tip_refine_dbg = refine_tip_parallel_centerline(
+            grayscale=grayscale_image,
+            binary_image=binary_image,
+            tip_yx=(int(round(tip_row)), int(round(tip_column))),
+            tip_angle_deg=tip_angle_deg,
+            section_near_r=float(self.tip_parallel_section_near_r),
+            section_far_r=float(self.tip_parallel_section_far_r),
+            scan_half_r=float(self.tip_parallel_scan_half_r),
+            num_sections=int(self.tip_parallel_num_sections),
+            cross_step_px=float(self.tip_parallel_cross_step_px),
+            ray_step_px=float(self.tip_parallel_ray_step_px),
+            ray_max_len_r=float(self.tip_parallel_ray_max_len_r),
+        )
+
         orientation, ntnl_pos, ss_pos = get_pos_from_file_name(image_file_name)
 
         tip_locations_array_coarse[i, :] = np.array(
             [
-                tip_row + crop_y_min_img,
-                tip_column + crop_x_min_img,
+                yy_refined + crop_y_min_img,
+                xx_refined + crop_x_min_img,
                 float(orientation),
                 float(ss_pos),
                 float(ntnl_pos),
@@ -2134,6 +2540,17 @@ class CTR_Shadow_Calibration:
              float(tip_angle_deg)]
         )
 
+        dbg_local = dict(tip_refine_dbg) if isinstance(tip_refine_dbg, dict) else {}
+        dbg_local["image_file_name"] = image_file_name
+        dbg_local["tip_angle_deg"] = float(tip_angle_deg)
+        dbg_local["coarse_tip_before_local_xy"] = [float(tip_column), float(tip_row)]
+        dbg_local["coarse_tip_after_local_xy"] = [float(xx_refined), float(yy_refined)]
+        dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
+        self.tip_refine_debug_records[image_file_name] = dbg_local
+
+        dbg_zoom = _shift_tip_debug_geometry(dbg_local, crop_x_min, crop_y_min)
+        annotate_tip_geometry_on_axes(axs, dbg_zoom, title_suffix=" (parallel_centerline)")
+
         calibrated_tip_axes = None
         if (
             self.board_homography_mm_from_px is not None
@@ -2153,11 +2570,11 @@ class CTR_Shadow_Calibration:
         if calibrated_tip_axes is not None:
             u_mm, z_mm = calibrated_tip_axes
             axs[1, 1].set_title(
-                f'Identified coarse tip (angle={tip_angle_deg:.2f} deg)\n'
+                f'Identified refined tip (angle={tip_angle_deg:.2f} deg)\n'
                 f'Calibrated: u={u_mm:.2f} mm, z={z_mm:.2f} mm'
             )
         else:
-            axs[1, 1].set_title(f'Identified coarse tip (angle={tip_angle_deg:.2f} deg)')
+            axs[1, 1].set_title(f'Identified refined tip (angle={tip_angle_deg:.2f} deg)')
 
         return fig, axs, tip_locations_array_coarse[i, :], tip_locations_array_fine[i, :]
 
@@ -2348,22 +2765,171 @@ class CTR_Shadow_Calibration:
     def _polyval(coeffs, b):
         return np.polyval(np.asarray(coeffs, dtype=float), np.asarray(b, dtype=float))
 
+    @staticmethod
+    def _prepare_fit_samples(x_vals, y_vals):
+        x_vals = np.asarray(x_vals, dtype=float).ravel()
+        y_vals = np.asarray(y_vals, dtype=float).ravel()
+        valid = np.isfinite(x_vals) & np.isfinite(y_vals)
+        x_use = x_vals[valid]
+        y_use = y_vals[valid]
+        if x_use.size == 0:
+            return x_use, y_use
+
+        order = np.argsort(x_use)
+        x_use = x_use[order]
+        y_use = y_use[order]
+
+        unique_x, inverse = np.unique(x_use, return_inverse=True)
+        if unique_x.size != x_use.size:
+            y_sum = np.zeros(unique_x.shape, dtype=float)
+            counts = np.zeros(unique_x.shape, dtype=float)
+            np.add.at(y_sum, inverse, y_use)
+            np.add.at(counts, inverse, 1.0)
+            x_use = unique_x
+            y_use = y_sum / np.maximum(counts, 1.0)
+
+        return x_use, y_use
+
+    @staticmethod
+    def _curve_fit_label(model_descriptor):
+        if model_descriptor is None:
+            return "Unknown Fit"
+        model_type = str(model_descriptor.get("model_type", "")).lower()
+        if model_type == "pchip":
+            return "PCHIP Fit"
+        degree = model_descriptor.get("degree")
+        if degree is None:
+            return "Polynomial Fit"
+        if int(degree) == 3:
+            return "Cubic Fit"
+        return f"Degree-{int(degree)} Polynomial Fit"
+
+    @classmethod
+    def _evaluate_curve_model(cls, model_descriptor, b_vals):
+        if model_descriptor is None:
+            return None
+
+        b_arr = np.asarray(b_vals, dtype=float)
+        model_type = str(model_descriptor.get("model_type", "polynomial")).lower()
+
+        if model_type == "polynomial":
+            coeffs = model_descriptor.get("coefficients")
+            if coeffs is None:
+                raise ValueError("Polynomial fit descriptor missing coefficients.")
+            return cls._polyval(coeffs, b_arr)
+
+        if model_type == "pchip":
+            x_knots = model_descriptor.get("x_knots")
+            y_knots = model_descriptor.get("y_knots")
+            if x_knots is None or y_knots is None:
+                raise ValueError("PCHIP fit descriptor missing knots.")
+            interpolator = PchipInterpolator(
+                np.asarray(x_knots, dtype=float),
+                np.asarray(y_knots, dtype=float),
+                extrapolate=True,
+            )
+            return interpolator(b_arr)
+
+        raise ValueError(f"Unsupported curve model_type: {model_type}")
+
+    @classmethod
+    def _fit_curve_model(cls, x_vals, y_vals, model_kind, value_name, min_points=None):
+        model_kind = str(model_kind).strip().lower()
+        x_use, y_use = cls._prepare_fit_samples(x_vals, y_vals)
+
+        if model_kind == "cubic":
+            min_required = 4 if min_points is None else max(4, int(min_points))
+            if x_use.size < min_required:
+                return None
+            coeffs = np.polyfit(x_use, y_use, 3)
+            return {
+                "model_type": "polynomial",
+                "basis": "monomial",
+                "degree": 3,
+                "input_axis": "b_motor",
+                "value_name": str(value_name),
+                "coefficients": coeffs.tolist(),
+                "equation": cls._format_polynomial_equation(coeffs, str(value_name)),
+                "sample_count": int(x_use.size),
+                "fit_x_range": [float(np.min(x_use)), float(np.max(x_use))],
+            }
+
+        if model_kind == "pchip":
+            min_required = 2 if min_points is None else max(2, int(min_points))
+            if x_use.size < min_required:
+                return None
+            return {
+                "model_type": "pchip",
+                "input_axis": "b_motor",
+                "value_name": str(value_name),
+                "x_knots": x_use.tolist(),
+                "y_knots": y_use.tolist(),
+                "equation": f"{value_name}(b) = PCHIP interpolation through {int(x_use.size)} calibration knots",
+                "sample_count": int(x_use.size),
+                "fit_x_range": [float(np.min(x_use)), float(np.max(x_use))],
+            }
+
+        raise ValueError(f"Unsupported fit model: {model_kind}")
+
+    @staticmethod
+    def _format_polynomial_equation(coeffs, var_name):
+        coeffs = np.asarray(coeffs, dtype=float).ravel()
+        degree = coeffs.size - 1
+        pieces = [f"{var_name} ="]
+        for idx, coef in enumerate(coeffs):
+            power = degree - idx
+            sign = "+" if coef >= 0 else "-"
+            mag = abs(float(coef))
+            if idx == 0:
+                sign = "" if coef >= 0 else "-"
+            term = f"{mag:.6f}"
+            if power >= 1:
+                term += "*b"
+                if power >= 2:
+                    term += f"^{power}"
+            pieces.append(f"{sign} {term}".strip())
+        return " ".join(pieces)
+
+    @classmethod
+    def _legacy_curve_model_from_calibration_json(cls, cal_json, curve_key):
+        coeffs = cal_json.get("cubic_coefficients", {})
+        key_map = {
+            "r": ("r_coeffs", "r_equation"),
+            "z": ("z_coeffs", "z_equation"),
+            "tip_angle": ("tip_angle_coeffs", "tip_angle_equation"),
+            "offplane_y": ("offplane_y_coeffs", "offplane_y_equation"),
+        }
+        coeff_key, equation_key = key_map[curve_key]
+        curve_coeffs = coeffs.get(coeff_key)
+        if curve_coeffs is None:
+            return None
+        degree = len(curve_coeffs) - 1
+        return {
+            "model_type": "polynomial",
+            "basis": "monomial",
+            "degree": int(degree),
+            "input_axis": "b_motor",
+            "value_name": curve_key,
+            "coefficients": curve_coeffs,
+            "equation": coeffs.get(equation_key),
+        }
+
     @classmethod
     def _sample_curve_xyz_from_calibration_json(cls, cal_json, b_vals):
-        coeffs = cal_json.get("cubic_coefficients", {})
-        r_coeffs = coeffs.get("r_coeffs")
-        z_coeffs = coeffs.get("z_coeffs")
-        y_coeffs = coeffs.get("offplane_y_coeffs")
+        fit_models = cal_json.get("fit_models", {})
+        r_model = fit_models.get("r") or cls._legacy_curve_model_from_calibration_json(cal_json, "r")
+        z_model = fit_models.get("z") or cls._legacy_curve_model_from_calibration_json(cal_json, "z")
+        y_model = fit_models.get("offplane_y") or cls._legacy_curve_model_from_calibration_json(cal_json, "offplane_y")
 
-        if r_coeffs is None or z_coeffs is None:
-            raise ValueError("Missing r_coeffs/z_coeffs in calibration JSON.")
+        if r_model is None or z_model is None:
+            raise ValueError("Missing r/z fit models in calibration JSON.")
 
-        x = cls._polyval(r_coeffs, b_vals)
-        z = cls._polyval(z_coeffs, b_vals)
-        if y_coeffs is not None:
-            y = cls._polyval(y_coeffs, b_vals)
+        x = cls._evaluate_curve_model(r_model, b_vals)
+        z = cls._evaluate_curve_model(z_model, b_vals)
+        if y_model is not None:
+            y = cls._evaluate_curve_model(y_model, b_vals)
         else:
-            y = np.zeros_like(x)
+            y = np.zeros_like(x, dtype=float)
 
         return np.column_stack([x, y, z]).astype(float)
 
@@ -2529,14 +3095,15 @@ class CTR_Shadow_Calibration:
         with open(gcode_json_path, "r") as f:
             cal_json = json.load(f)
 
-        coeffs = cal_json.get("cubic_coefficients", {})
-        r_coeffs = coeffs.get("r_coeffs")
-        z_coeffs = coeffs.get("z_coeffs")
-        y_coeffs = coeffs.get("offplane_y_coeffs")
-        if r_coeffs is None or z_coeffs is None:
-            raise ValueError("Calibration JSON missing cubic coeffs for r/z.")
+        fit_models = cal_json.get("fit_models", {})
+        r_model = fit_models.get("r") or self._legacy_curve_model_from_calibration_json(cal_json, "r")
+        z_model = fit_models.get("z") or self._legacy_curve_model_from_calibration_json(cal_json, "z")
+        y_model = fit_models.get("offplane_y") or self._legacy_curve_model_from_calibration_json(cal_json, "offplane_y")
+        if r_model is None or z_model is None:
+            raise ValueError("Calibration JSON missing r/z fit models.")
 
         motor_setup = cal_json.get("motor_setup", {})
+        coeffs = cal_json.get("cubic_coefficients", {})
         b_rng = motor_setup.get("b_motor_position_range") or coeffs.get("b_motor_range")
         if b_rng is None or len(b_rng) != 2:
             raise ValueError("Calibration JSON missing b_motor_position_range.")
@@ -2574,12 +3141,12 @@ class CTR_Shadow_Calibration:
                 "meaning": "Curve knots are sampled along the full calibrated B range; each knot is a point on the fitted curve.",
             },
             "curve_equations": {
-                "x_mm": {"poly_coeffs": r_coeffs, "definition": "x = r(b) signed planar radial deflection"},
-                "z_mm": {"poly_coeffs": z_coeffs, "definition": "z = z(b) axial position"},
+                "x_mm": {"fit_model": r_model, "definition": "x = r(b) signed planar radial deflection"},
+                "z_mm": {"fit_model": z_model, "definition": "z = z(b) axial position"},
                 "y_mm": {
-                    "poly_coeffs": y_coeffs,
+                    "fit_model": y_model,
                     "definition": "y = y_offplane(b) if available else 0",
-                    "available": y_coeffs is not None,
+                    "available": y_model is not None,
                 },
             },
             "reference_pose": {
@@ -2605,10 +3172,11 @@ class CTR_Shadow_Calibration:
         predictor_code = f"""# Auto-generated parametric skeleton predictor for {robot_name}
 # Units: mm
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
-R_COEFFS = {json.dumps(r_coeffs)}
-Z_COEFFS = {json.dumps(z_coeffs)}
-Y_COEFFS = {json.dumps(y_coeffs)}
+R_MODEL = {json.dumps(r_model)}
+Z_MODEL = {json.dumps(z_model)}
+Y_MODEL = {json.dumps(y_model)}
 
 B_MIN = {b_min:.10f}
 B_MAX = {b_max:.10f}
@@ -2624,13 +3192,31 @@ def _polyval(c, b):
         return None
     return np.polyval(np.asarray(c, dtype=float), np.asarray(b, dtype=float))
 
+def _evaluate_curve_model(model_descriptor, b):
+    if model_descriptor is None:
+        return None
+    b_arr = np.asarray(b, dtype=float)
+    model_type = str(model_descriptor.get("model_type", "polynomial")).lower()
+    if model_type == "polynomial":
+        coeffs = model_descriptor.get("coefficients")
+        if coeffs is None:
+            raise ValueError("Polynomial fit model missing coefficients.")
+        return _polyval(coeffs, b_arr)
+    if model_type == "pchip":
+        x_knots = model_descriptor.get("x_knots")
+        y_knots = model_descriptor.get("y_knots")
+        if x_knots is None or y_knots is None:
+            raise ValueError("PCHIP fit model missing knots.")
+        return PchipInterpolator(np.asarray(x_knots, dtype=float), np.asarray(y_knots, dtype=float), extrapolate=True)(b_arr)
+    raise ValueError(f"Unsupported model_type: {{model_type}}")
+
 def curve_point_xyz(b):
-    x = float(_polyval(R_COEFFS, b))
-    z = float(_polyval(Z_COEFFS, b))
-    if Y_COEFFS is None:
+    x = float(_evaluate_curve_model(R_MODEL, b))
+    z = float(_evaluate_curve_model(Z_MODEL, b))
+    if Y_MODEL is None:
         y = 0.0
     else:
-        y = float(_polyval(Y_COEFFS, b))
+        y = float(_evaluate_curve_model(Y_MODEL, b))
     return np.array([x, y, z], dtype=float)
 
 def skeleton_points(b_pull_mm, include_origin=True):
@@ -2719,7 +3305,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
         return param_path, py_path, stl_path, gcode_json_path
 
-    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False):
+    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic"):
         """ Postprocesses calibration data starting from step 3 (assumes pixel data already exists). This method starts from converting pixel coordinates to physical coordinates and continues with all subsequent steps. """
         # Check if we have the required data in memory, if not try to load from files
         # if not hasattr(self, 'tip_locations_array_fine') or not hasattr(self, 'tip_locations_array_coarse'):
@@ -3172,8 +3758,12 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             print(f"Simplified data shape: {tip_locations_final_simplified.shape}")
             print(f"b_pull unique count: {len(np.unique(tip_locations_final_simplified[:, 2]))}")
 
-            # Step 8.5: Convert to planar bending coordinates and fit cubic equations
-            print("\nConverting to planar bending coordinates and fitting cubic equations...")
+            # Step 8.5: Convert to planar bending coordinates and fit selected equations
+            fit_model = str(fit_model).strip().lower()
+            if fit_model not in {"cubic", "pchip"}:
+                raise ValueError(f"Unsupported fit_model '{fit_model}'. Use 'cubic' or 'pchip'.")
+            fit_model_display = "cubic polynomial" if fit_model == "cubic" else "PCHIP"
+            print(f"\nConverting to planar bending coordinates and fitting {fit_model_display} equations...")
 
             # --- Bridge for Step 8.5 (NEW pipeline: b_pull only) ---
             # tip_locations_final_simplified columns: [X_mm, Z_mm, b_pull, tip_angle_deg]
@@ -3254,7 +3844,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 plt.savefig("04_final_calibrated_locations.png", dpi=150, bbox_inches='tight')
                 plt.close()
 
-            print(f"Using {len(x_avg)} averaged data points for planar-coordinate conversion and cubic fitting")
+            print(f"Using {len(x_avg)} averaged data points for planar-coordinate conversion and {fit_model_display} fitting")
             print(f"Zero reference index: {zero_idx} | B_ref = {delta_motor[zero_idx]:.6f}")
             print(f"Reference tip (raw): x_ref_mirror_line = {x0_ref:.6f} mm, z0 = {z0_ref:.6f} mm")
             print(
@@ -3269,45 +3859,43 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             print(f"  R (signed planar X deflection) range: {r_coords.min():.3f} to {r_coords.max():.3f} mm")
             print(f"  b_pull range: {delta_motor.min():.3f} to {delta_motor.max():.3f}")
 
-            # Fit cubic polynomials: r = f(B_motor) and z = f(B_motor)
-            print("\nFitting cubic equations:")
+            # Fit planar curve models: r = f(B_motor) and z = f(B_motor)
+            print(f"\nFitting {fit_model_display} equations:")
             print("r = f(B_motor) - signed planar transverse deflection (r = x) as function of B-axis translation")
             print("z = f(B_motor) - axial position as function of B-axis translation")
 
-            def fit_cubic_or_none(x_vals, y_vals, label):
-                x_vals = np.asarray(x_vals, dtype=float).ravel()
-                y_vals = np.asarray(y_vals, dtype=float).ravel()
-                valid = np.isfinite(x_vals) & np.isfinite(y_vals)
-                x_use = x_vals[valid]
-                y_use = y_vals[valid]
-                if x_use.size < 4:
-                    print(f"Warning: Need at least 4 valid points for {label} cubic fit. Found {x_use.size}; skipping.")
-                    return None, None
-                coeffs = np.polyfit(x_use, y_use, 3)
-                pred = np.polyval(coeffs, x_use)
-                return coeffs, pred
+            r_model_descriptor = self._fit_curve_model(delta_motor, r_coords, fit_model, "r")
+            if r_model_descriptor is None:
+                raise ValueError(f"Insufficient points for planar R {fit_model} fit.")
+            r_predicted = self._evaluate_curve_model(r_model_descriptor, delta_motor)
 
-            # Fit cubic polynomial for r-coordinate
-            r_coefficients, r_predicted_valid = fit_cubic_or_none(delta_motor, r_coords, "R-coordinate")
-            if r_coefficients is None:
-                raise ValueError("Insufficient points for planar R cubic fit.")
-            r_predicted = np.polyval(r_coefficients, delta_motor)
+            z_model_descriptor = self._fit_curve_model(delta_motor, z_coords, fit_model, "z")
+            if z_model_descriptor is None:
+                raise ValueError(f"Insufficient points for axial Z {fit_model} fit.")
+            z_predicted = self._evaluate_curve_model(z_model_descriptor, delta_motor)
 
-            # Fit cubic polynomial for z-coordinate
-            z_coefficients, z_predicted_valid = fit_cubic_or_none(delta_motor, z_coords, "Z-coordinate")
-            if z_coefficients is None:
-                raise ValueError("Insufficient points for axial Z cubic fit.")
-            z_predicted = np.polyval(z_coefficients, delta_motor)
+            # Preserve legacy cubic coefficients for backward-compatible exports.
+            r_legacy_cubic_descriptor = self._fit_curve_model(delta_motor, r_coords, "cubic", "r")
+            z_legacy_cubic_descriptor = self._fit_curve_model(delta_motor, z_coords, "cubic", "z")
+            if r_legacy_cubic_descriptor is None or z_legacy_cubic_descriptor is None:
+                raise ValueError("Insufficient points for legacy cubic export.")
+            r_coefficients = np.asarray(r_legacy_cubic_descriptor["coefficients"], dtype=float)
+            z_coefficients = np.asarray(z_legacy_cubic_descriptor["coefficients"], dtype=float)
 
             tip_angle_coefficients = None
+            tip_angle_model_descriptor = None
             tip_angle_predicted = None
             tip_angle_r2 = float("nan")
             tip_angle_equation = None
+            y_off_model_descriptor = None
 
             if has_tip_angle and np.all(np.isfinite(tip_angle_avg)):
-                tip_angle_coefficients, _ = fit_cubic_or_none(delta_motor, tip_angle_avg, "tip-angle")
-                if tip_angle_coefficients is not None:
-                    tip_angle_predicted = np.polyval(tip_angle_coefficients, delta_motor)
+                tip_angle_model_descriptor = self._fit_curve_model(delta_motor, tip_angle_avg, fit_model, "tip_angle_deg")
+                tip_angle_legacy_cubic_descriptor = self._fit_curve_model(delta_motor, tip_angle_avg, "cubic", "tip_angle_deg")
+                if tip_angle_model_descriptor is not None:
+                    tip_angle_predicted = self._evaluate_curve_model(tip_angle_model_descriptor, delta_motor)
+                if tip_angle_legacy_cubic_descriptor is not None:
+                    tip_angle_coefficients = np.asarray(tip_angle_legacy_cubic_descriptor["coefficients"], dtype=float)
 
             # Fit linear polynomial for off-plane coordinate (if available)
             if y_off_coords_meas is not None and delta_motor_off_meas is not None:
@@ -3322,6 +3910,17 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     y_off_coefficients = np.polyfit(x_off_use, y_off_use, 1)
                     y_off_predicted_meas = np.polyval(y_off_coefficients, delta_motor_off_meas)
                     y_off_full_predicted = np.polyval(y_off_coefficients, delta_motor)
+                    y_off_model_descriptor = {
+                        "model_type": "polynomial",
+                        "basis": "monomial",
+                        "degree": 1,
+                        "input_axis": "b_motor",
+                        "value_name": "y_offplane_mm",
+                        "coefficients": y_off_coefficients.tolist(),
+                        "equation": None,
+                        "sample_count": int(x_off_use.size),
+                        "fit_x_range": [float(np.min(x_off_use)), float(np.max(x_off_use))],
+                    }
 
             # Calculate R² scores
             def r2_score_safe(y_true, y_pred):
@@ -3340,32 +3939,13 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             if y_off_predicted_meas is not None:
                 y_off_r2 = r2_score_safe(y_off_coords_meas, y_off_predicted_meas)
 
-            print(f"\nCubic polynomial fit results:")
+            print(f"\nSelected fit results ({fit_model_display}):")
             print(f"R-coordinate (signed planar X deflection) R² score: {r_r2:.6f}")
             print(f"Z-coordinate R² score: {z_r2:.6f}")
             if tip_angle_predicted is not None:
                 print(f"Tip-angle R² score: {tip_angle_r2:.6f}")
             if y_off_predicted_meas is not None:
                 print(f"Off-plane coordinate R² score: {y_off_r2:.6f}")
-
-            # Create polynomial equation strings
-            def format_cubic_equation(coeffs, var_name):
-                """Format cubic polynomial coefficients into readable equation"""
-                a, b, c, d = coeffs
-                equation = f"{var_name} = {a:.6f}*b³"
-                if b >= 0:
-                    equation += f" + {b:.6f}*b²"
-                else:
-                    equation += f" - {abs(b):.6f}*b²"
-                if c >= 0:
-                    equation += f" + {c:.6f}*b"
-                else:
-                    equation += f" - {abs(c):.6f}*b"
-                if d >= 0:
-                    equation += f" + {d:.6f}"
-                else:
-                    equation += f" - {abs(d):.6f}"
-                return equation
 
             def format_linear_equation(coeffs, var_name):
                 """Format linear polynomial coefficients into readable equation"""
@@ -3377,14 +3957,16 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     equation += f" - {abs(c):.6f}"
                 return equation
 
-            r_equation = format_cubic_equation(r_coefficients, "r")
-            z_equation = format_cubic_equation(z_coefficients, "z")
-            if tip_angle_coefficients is not None:
-                tip_angle_equation = format_cubic_equation(tip_angle_coefficients, "tip_angle_deg")
+            r_equation = r_model_descriptor.get("equation")
+            z_equation = z_model_descriptor.get("equation")
+            if tip_angle_model_descriptor is not None:
+                tip_angle_equation = tip_angle_model_descriptor.get("equation")
             if y_off_coefficients is not None:
                 y_off_equation = format_linear_equation(y_off_coefficients, "y_offplane_mm")
+                if y_off_model_descriptor is not None:
+                    y_off_model_descriptor["equation"] = y_off_equation
 
-            print(f"\nCubic equations:")
+            print(f"\nSelected fit equations:")
             print(f"R: {r_equation}")
             print(f"Z: {z_equation}")
             if tip_angle_equation is not None:
@@ -3490,7 +4072,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 # Plot 3: R vs B Motor
                 plt.subplot(3, 3, 3)
                 plt.plot(delta_motor, r_coords, 'o', linewidth=2, markersize=6, label='Measured')
-                plt.plot(delta_motor, r_predicted, 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
+                plt.plot(delta_motor, r_predicted, 's-', linewidth=2, markersize=4, color='red', label=self._curve_fit_label(r_model_descriptor))
                 plt.xlabel('B Motor Position')
                 plt.ylabel('R = X (signed transverse deflection, mm)')
                 plt.title(f'Planar X Deflection vs Motor (R² = {r_r2:.4f})')
@@ -3500,7 +4082,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 # Plot 4: Z vs B Motor
                 plt.subplot(3, 3, 4)
                 plt.plot(delta_motor, z_coords, 'o', linewidth=2, markersize=6, label='Measured')
-                plt.plot(delta_motor, z_predicted, 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
+                plt.plot(delta_motor, z_predicted, 's-', linewidth=2, markersize=4, color='red', label=self._curve_fit_label(z_model_descriptor))
                 plt.xlabel('B Motor Position')
                 plt.ylabel('Z (axial) Position (mm)')
                 plt.title(f'Axial Position vs Motor (R² = {z_r2:.4f})')
@@ -3527,20 +4109,20 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 plt.title('Axial Fit Residuals')
                 plt.grid(True, alpha=0.3)
 
-                # Plot 7: Tip angle vs B (cubic fit)
+                # Plot 7: Tip angle vs B (selected fit)
                 plt.subplot(3, 3, 7)
                 if tip_angle_predicted is not None:
                     sort_idx_ang = np.argsort(delta_motor)
                     plt.plot(delta_motor[sort_idx_ang], tip_angle_avg[sort_idx_ang], 'o', markersize=6, label='Measured')
-                    plt.plot(delta_motor[sort_idx_ang], tip_angle_predicted[sort_idx_ang], 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
+                    plt.plot(delta_motor[sort_idx_ang], tip_angle_predicted[sort_idx_ang], 's-', linewidth=2, markersize=4, color='red', label=self._curve_fit_label(tip_angle_model_descriptor))
                     plt.xlabel('B Motor Position')
                     plt.ylabel('Tip Angle vs Vertical (deg)')
-                    plt.title(f'Tip Angle Cubic Fit (R² = {tip_angle_r2:.4f})')
+                    plt.title(f'Tip Angle {self._curve_fit_label(tip_angle_model_descriptor)} (R² = {tip_angle_r2:.4f})')
                     plt.grid(True, alpha=0.3)
                     plt.legend()
                 else:
                     plt.text(0.5, 0.5, 'Tip angle fit unavailable', ha='center', va='center', transform=plt.gca().transAxes)
-                    plt.title('Tip Angle Cubic Fit')
+                    plt.title('Tip Angle Fit')
                     plt.grid(True, alpha=0.3)
 
                 # Plot 8: Off-plane Y vs B (from ±90 pair)
@@ -3687,6 +4269,13 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
             # Save the cubic model data
             cubic_model_data = {
+                'selected_fit_model': fit_model,
+                'fit_models': {
+                    'r': r_model_descriptor,
+                    'z': z_model_descriptor,
+                    'tip_angle': tip_angle_model_descriptor,
+                    'offplane_y': y_off_model_descriptor,
+                },
                 'r_coefficients': r_coefficients,
                 'z_coefficients': z_coefficients,
                 'r_r2': r_r2,
@@ -3734,24 +4323,23 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     r, z: predicted planar coordinates where r is signed transverse deflection (r=x) and z is axial position, referenced to the first measured B=0.0 tip location
                 """
                 b_motor = np.atleast_1d(b_motor_pos)
-                # Calculate r and z using cubic polynomials
-                r_pred = np.polyval(r_coefficients, b_motor)
-                z_pred = np.polyval(z_coefficients, b_motor)
+                r_pred = self._evaluate_curve_model(r_model_descriptor, b_motor)
+                z_pred = self._evaluate_curve_model(z_model_descriptor, b_motor)
                 return r_pred, z_pred
 
             def predict_tip_angle(b_motor_pos):
                 """Predict tip angle (deg vs vertical) from B motor position."""
-                if tip_angle_coefficients is None:
+                if tip_angle_model_descriptor is None:
                     return None
                 b_motor = np.atleast_1d(b_motor_pos)
-                return np.polyval(tip_angle_coefficients, b_motor)
+                return self._evaluate_curve_model(tip_angle_model_descriptor, b_motor)
 
             def predict_offplane_y(b_motor_pos):
                 """Predict off-plane transverse displacement from ±90 mirrored-pair calibration."""
                 if y_off_coefficients is None:
                     return None
                 b_motor = np.atleast_1d(b_motor_pos)
-                return np.polyval(y_off_coefficients, b_motor)
+                return self._evaluate_curve_model(y_off_model_descriptor, b_motor)
 
             def predict_tip_position_cartesian(b_motor_pos):
                 """
@@ -3843,7 +4431,7 @@ def predict_tip_position_cartesian(b_motor_pos):
             print(f"Prediction functions saved to: {robot_name}_cubic_prediction_functions.py")
 
             print("\n" + "="*60)
-            print("PLANAR-BENDING CUBIC FITTING COMPLETE!")
+            print("PLANAR-BENDING FITTING COMPLETE!")
             print("="*60)
             print(f"Planar transverse-deflection equation (r=x) R² score: {r_r2:.6f}")
             print(f"Axial equation R² score: {z_r2:.6f}")
@@ -3853,7 +4441,7 @@ def predict_tip_position_cartesian(b_motor_pos):
                 print(f"Off-plane equation R² score: {y_off_r2:.6f}")
             print(f"B motor fit range: {float(np.min(delta_motor)):.6f} to {float(np.max(delta_motor)):.6f}")
 
-            print(f"\nCubic equations fitted:")
+            print(f"\nSelected equations fitted:")
             print(f"R: {r_equation}")
             print(f"Z: {z_equation}")
             if tip_angle_equation is not None:
@@ -3878,6 +4466,13 @@ def predict_tip_position_cartesian(b_motor_pos):
 
             # Save the cubic model and function
             cubic_calibration_data = {
+                'selected_fit_model': fit_model,
+                'fit_models': {
+                    'r': r_model_descriptor,
+                    'z': z_model_descriptor,
+                    'tip_angle': tip_angle_model_descriptor,
+                    'offplane_y': y_off_model_descriptor,
+                },
                 'r_coefficients': r_coefficients,
                 'z_coefficients': z_coefficients,
                 'r_r2': r_r2,
@@ -3923,22 +4518,21 @@ def predict_tip_position_cartesian(b_motor_pos):
                 """
                 # Ensure inputs are arrays
                 b_motor = np.atleast_1d(b_motor_pos)
-                # Calculate r and z using cubic polynomials
-                r_pred = np.polyval(r_coefficients, b_motor)
-                z_pred = np.polyval(z_coefficients, b_motor)
+                r_pred = self._evaluate_curve_model(r_model_descriptor, b_motor)
+                z_pred = self._evaluate_curve_model(z_model_descriptor, b_motor)
                 return r_pred, z_pred
 
             def predict_tip_angle_from_b(b_motor_pos):
-                if tip_angle_coefficients is None:
+                if tip_angle_model_descriptor is None:
                     return None
                 b_motor = np.atleast_1d(b_motor_pos)
-                return np.polyval(tip_angle_coefficients, b_motor)
+                return self._evaluate_curve_model(tip_angle_model_descriptor, b_motor)
 
             def predict_offplane_y_from_b(b_motor_pos):
-                if y_off_coefficients is None:
+                if y_off_model_descriptor is None:
                     return None
                 b_motor = np.atleast_1d(b_motor_pos)
-                return np.polyval(y_off_coefficients, b_motor)
+                return self._evaluate_curve_model(y_off_model_descriptor, b_motor)
 
             def predict_cartesian_from_b(b_motor_pos):
                 """
@@ -3956,90 +4550,71 @@ def predict_tip_position_cartesian(b_motor_pos):
 
             # Save the function definition as a string
             function_code = f'''import numpy as np
+from scipy.interpolate import PchipInterpolator
 
-            # Cubic polynomial coefficients from calibration
-            r_coefficients = {r_coefficients.tolist()}
-            z_coefficients = {z_coefficients.tolist()}
-            tip_angle_coefficients = {tip_angle_coeffs_list}
-            offplane_y_coefficients = {y_off_coeffs_list}
+R_MODEL = {json.dumps(r_model_descriptor, indent=12)}
+Z_MODEL = {json.dumps(z_model_descriptor, indent=12)}
+TIP_ANGLE_MODEL = {json.dumps(tip_angle_model_descriptor, indent=12)}
+OFFPLANE_Y_MODEL = {json.dumps(y_off_model_descriptor, indent=12)}
 
-            # Cubic equations:
-            # R: {r_equation}
-            # Z: {z_equation}
-            # Tip Angle: {tip_angle_equation if tip_angle_equation is not None else "N/A"}
-            # Off-plane Y: {y_off_equation if y_off_equation is not None else "N/A"}
+def _polyval(coeffs, b_vals):
+    return np.polyval(np.asarray(coeffs, dtype=float), np.asarray(b_vals, dtype=float))
 
-            def predict_tip_position_from_b(b_motor_pos):
-                """
-                Predict tip position in planar bending coordinates (r=x, z) given B motor position.
+def _evaluate_curve_model(model_descriptor, b_vals):
+    if model_descriptor is None:
+        return None
+    b_arr = np.asarray(b_vals, dtype=float)
+    model_type = str(model_descriptor.get("model_type", "polynomial")).lower()
+    if model_type == "polynomial":
+        coeffs = model_descriptor.get("coefficients")
+        if coeffs is None:
+            raise ValueError("Polynomial model descriptor missing coefficients.")
+        return _polyval(coeffs, b_arr)
+    if model_type == "pchip":
+        x_knots = model_descriptor.get("x_knots")
+        y_knots = model_descriptor.get("y_knots")
+        if x_knots is None or y_knots is None:
+            raise ValueError("PCHIP model descriptor missing knots.")
+        interp = PchipInterpolator(np.asarray(x_knots, dtype=float), np.asarray(y_knots, dtype=float), extrapolate=True)
+        return interp(b_arr)
+    raise ValueError(f"Unsupported model_type: {{model_type}}")
 
-                Parameters:
-                    b_motor_pos: float or array-like, B motor position(s)
+def predict_tip_position_from_b(b_motor_pos):
+    b_motor = np.atleast_1d(b_motor_pos)
+    r_pred = _evaluate_curve_model(R_MODEL, b_motor)
+    z_pred = _evaluate_curve_model(Z_MODEL, b_motor)
+    return r_pred, z_pred
 
-                Returns:
-                    r, z: predicted planar coordinates where r is signed transverse deflection (r=x) and z is axial position, referenced to the first measured B=0.0 tip location
-                """
-                b_motor = np.atleast_1d(b_motor_pos)
-                # Calculate r and z using cubic polynomials
-                r_pred = np.polyval(r_coefficients, b_motor)
-                z_pred = np.polyval(z_coefficients, b_motor)
-                return r_pred, z_pred
+def predict_tip_angle_from_b(b_motor_pos):
+    if TIP_ANGLE_MODEL is None:
+        return None
+    b_motor = np.atleast_1d(b_motor_pos)
+    return _evaluate_curve_model(TIP_ANGLE_MODEL, b_motor)
 
-            def predict_tip_angle_from_b(b_motor_pos):
-                """
-                Predict tip angle (deg vs vertical) given B motor position.
-                Returns None if angle calibration is unavailable.
-                """
-                if tip_angle_coefficients is None:
-                    return None
-                b_motor = np.atleast_1d(b_motor_pos)
-                return np.polyval(tip_angle_coefficients, b_motor)
+def predict_offplane_y_from_b(b_motor_pos):
+    if OFFPLANE_Y_MODEL is None:
+        return None
+    b_motor = np.atleast_1d(b_motor_pos)
+    return _evaluate_curve_model(OFFPLANE_Y_MODEL, b_motor)
 
-            def predict_offplane_y_from_b(b_motor_pos):
-                """
-                Predict off-plane transverse displacement (from ±90 mirrored-pair calibration) vs B motor position.
-                Returns None if off-plane calibration is unavailable.
-                """
-                if offplane_y_coefficients is None:
-                    return None
-                b_motor = np.atleast_1d(b_motor_pos)
-                return np.polyval(offplane_y_coefficients, b_motor)
+def predict_cartesian_from_b(b_motor_pos):
+    r_pred, z_pred = predict_tip_position_from_b(b_motor_pos)
+    x_pred = r_pred
+    y_pred = z_pred
+    return x_pred, y_pred
 
-            def predict_cartesian_from_b(b_motor_pos):
-                """
-                Predict tip position in Cartesian coordinates given B motor position.
+def predict_tip_position_from_delta(delta_motor_pos):
+    return predict_tip_position_from_b(delta_motor_pos)
 
-                Parameters:
-                    b_motor_pos: float or array-like, B motor position(s)
+def predict_cartesian_from_delta(delta_motor_pos):
+    return predict_cartesian_from_b(delta_motor_pos)
 
-                Returns:
-                    x, y: predicted Cartesian coordinates referenced to the first measured B=0.0 tip location
-                """
-                r_pred, z_pred = predict_tip_position_from_b(b_motor_pos)
-                # Convert to Cartesian
-                x_pred = r_pred
-                y_pred = z_pred
-                return x_pred, y_pred
+def predict_tip_angle_from_delta(delta_motor_pos):
+    return predict_tip_angle_from_b(delta_motor_pos)
 
-            # Backward-compatible aliases
-            def predict_tip_position_from_delta(delta_motor_pos):
-                return predict_tip_position_from_b(delta_motor_pos)
-
-            def predict_cartesian_from_delta(delta_motor_pos):
-                return predict_cartesian_from_b(delta_motor_pos)
-
-            def predict_tip_angle_from_delta(delta_motor_pos):
-                return predict_tip_angle_from_b(delta_motor_pos)
-
-            def predict_offplane_y_from_delta(delta_motor_pos):
-                return predict_offplane_y_from_b(delta_motor_pos)
-
-            # Example usage:
-            # r, z = predict_tip_position_from_b(-1.2)
-            # x, y = predict_cartesian_from_b(-1.2)
-            # angle_deg = predict_tip_angle_from_b(-1.2)
-            # y_off = predict_offplane_y_from_b(-1.2)
-            '''
+def predict_offplane_y_from_delta(delta_motor_pos):
+    return predict_offplane_y_from_b(delta_motor_pos)
+'''
             with open(f"{robot_name}_cubic_prediction_functions.py", "w") as f:
                 f.write(function_code)
             print(f"Prediction function saved to {robot_name}_cubic_prediction_functions.py")
@@ -4174,6 +4749,7 @@ def predict_tip_position_cartesian(b_motor_pos):
             gcode_calibration_data = {
                 'robot_name': robot_name,
                 'calibration_date': pd.Timestamp.now().isoformat(),
+                'selected_fit_model': fit_model,
                 'orientation_map': {
                     '0': 'C=0 deg',
                     '1': 'C=180 deg',
@@ -4216,6 +4792,12 @@ def predict_tip_position_cartesian(b_motor_pos):
                     'z_r_squared': float(z_r2),
                     'tip_angle_r_squared': float(tip_angle_r2) if np.isfinite(tip_angle_r2) else None,
                     'offplane_y_r_squared': float(y_off_r2) if np.isfinite(y_off_r2) else None
+                },
+                'fit_models': {
+                    'r': r_model_descriptor,
+                    'z': z_model_descriptor,
+                    'tip_angle': tip_angle_model_descriptor,
+                    'offplane_y': y_off_model_descriptor,
                 },
                 'motor_setup': {
                     # Current machine setup: single pull motor on B axis, homed at 0.

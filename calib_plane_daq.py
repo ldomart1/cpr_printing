@@ -1,47 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Standalone fixed-tip acquisition script with cyclic continuous sweep.
+Standalone fixed-tip acquisition script for dual fixed-C orientations.
 
 What it does:
 - Loads the calibration JSON
-- Generates a fixed-tip tracked XYZ/B/C motion
+- Tracks ONE fixed tip point
+- Runs two acquisition blocks:
+    1) C = 0 deg
+    2) C = 180 deg
+- For EACH C orientation, performs 6 smooth B oscillations while keeping the
+  tip fixed in space by compensating with XYZ
 - Connects to the Duet robot and the camera
 - Executes the motion directly on the robot
-- Captures images only at selected visible phases and saves them to:
+- Captures images at selected samples and saves them to:
     <project folder>/raw_image_data_folder/
 
-Motion model:
-- One cycle consists of:
-    1) forward leg: C = -360 -> 360
-    2) return  leg: C =  360 -> -360
-- C moves near constant speed on each leg, with small cosine easing at the
-  boundaries / reversals.
-- B tip angle oscillates smoothly over the whole cycle with continuous phase.
-- You set how many B oscillations happen during ONE one-way sweep using:
-      --b-oscillations-per-sweep
-  Example:
-      --b-oscillations-per-sweep 2
-  means:
-      - 2 oscillations during -360 -> 360
-      - 2 oscillations during 360 -> -360
-- Motion sampling and capture sampling are independent:
-    * leg_move_steps     = robot motion discretization per leg
-    * leg_capture_steps  = image opportunity discretization per leg
-- Only capture during visible phases:
-    * if -20 <= tip_angle <= 90: capture at all C
-    * if tip_angle > 90: capture only when C is visible:
-          (-75 < C_wrapped < 75) or (105 < C_wrapped < 255)
-      where C_wrapped is modulo 360 in [0, 360)
+Key behavior changes vs the old cyclic C-sweep script:
+- C is NOT swept continuously anymore
+- The point is tracked only at C=0, then at C=180
+- Each orientation gets its own smooth B-only oscillation block
+- After the first large move onto the first tracked point, the script waits 4 s
+  before starting the actual sweep
+- Accuracy tricks included:
+    * smooth sinusoidal B motion with zero velocity at block boundaries
+    * exact fixed-tip XYZ compensation at every sample
+    * per-segment feed scheduling
+    * explicit M400 waits
+    * fine re-approach to the first point of each block at a slower feed
+    * conservative large-move handling between blocks
 
 If requested tip angles fall outside calibration, the script uses the closest
 tip angles that do exist in calibration.
 
 Optional sweep-range override:
-- Use --b-0-to-90-only to force the cyclic B/tip oscillation to stay within
+- Use --b-0-to-90-only to force the B/tip oscillation to stay within
   0 to 90 degrees.
 
-New sign correction option:
+Optional sign correction:
 - Use --flip-rz-sign if your calibration file has r and z polynomial signs flipped.
 """
 
@@ -82,34 +78,23 @@ DEFAULT_POINT_X = 100.0
 DEFAULT_POINT_Y = 20.0
 DEFAULT_POINT_Z = -155.0
 
-DEFAULT_TRAVEL_FEED = 1500.0
-DEFAULT_PROBE_FEED = 500.0
-DEFAULT_C_FEED = 15000.0
-DEFAULT_C_MAX_FEED = 15000.0
-DEFAULT_C_ACCEL_TIME_S = 0.2
-DEFAULT_C_DECEL_TIME_S = 0.2
+DEFAULT_TRAVEL_FEED = 2000.0
+DEFAULT_FINE_APPROACH_FEED = 500.0
+DEFAULT_PROBE_FEED = 100.0
+DEFAULT_B_MAX_FEED = 100.0
+DEFAULT_B_ACCEL_TIME_S = 0.5
+DEFAULT_B_DECEL_TIME_S = 0.5
 
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
-DEFAULT_CYCLE_REPEATS = 1
-DEFAULT_LEG_MOVE_STEPS = 1200
-DEFAULT_LEG_CAPTURE_STEPS = 120
+DEFAULT_ORIENTATION_SEQUENCE = (0.0, 180.0)
+DEFAULT_OSCILLATIONS_PER_ORIENTATION = 2.0
+DEFAULT_ORIENTATION_MOVE_STEPS = 1200
+DEFAULT_ORIENTATION_CAPTURE_STEPS = 100
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
 DEFAULT_SWEEP_TIP_MAX_DEG = 180.0
-DEFAULT_B_OSCILLATIONS_PER_SWEEP = 4.0
-DEFAULT_B_PHASE_OFFSET_DEG = -90.0  # starts at tip_min
-DEFAULT_B_0_TO_90_ONLY = False
-
-DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MIN_DEG = -20.0
-DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MAX_DEG = 90.0
-
-DEFAULT_C_VISIBLE_WIN1_MIN = -75.0
-DEFAULT_C_VISIBLE_WIN1_MAX = 75.0
-DEFAULT_C_VISIBLE_WIN2_MIN = 105.0
-DEFAULT_C_VISIBLE_WIN2_MAX = 255.0
-
-DEFAULT_C_BOUNDARY_EASE_FRAC = 0.04
+DEFAULT_B_PHASE_OFFSET_DEG = -90.0   # starts at tip_min and ends at tip_min
 
 DEFAULT_START_X = 100.0
 DEFAULT_START_Y = 20.0
@@ -125,8 +110,10 @@ DEFAULT_END_C = 0.0
 
 DEFAULT_SAFE_APPROACH_Z = -155.0
 
-DEFAULT_DWELL_BEFORE_MS = 0.3
+DEFAULT_DWELL_BEFORE_MS = 0.5
 DEFAULT_DWELL_AFTER_MS = 0
+DEFAULT_INITIAL_SWEEP_WAIT_S = 4.0
+DEFAULT_C_FLIP_FEED = 10000.0
 
 DEFAULT_BBOX_X_MIN = 0.0
 DEFAULT_BBOX_X_MAX = 200.0
@@ -141,10 +128,10 @@ DEFAULT_CAMERA_WIDTH = 3840
 DEFAULT_CAMERA_HEIGHT = 2160
 DEFAULT_CAMERA_FLUSH_FRAMES = 1
 
-DEFAULT_ROTATION_SETTLE_S = 0.0
-DEFAULT_TRACKED_MOVE_SETTLE_S = 0.0
-DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
+DEFAULT_TRACKED_MOVE_SETTLE_S = 0.02
+DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.05
 DEFAULT_CAPTURE_AT_START = False
+DEFAULT_CAPTURE_EVERY_MOVE_POINT = False
 
 DEFAULT_FLIP_RZ_SIGN = True
 
@@ -185,9 +172,10 @@ class TrajectoryPoint:
     segment_kind: str
     capture_image: bool = False
     tip_angle_deg: Optional[float] = None
-    cycle_phase_01: Optional[float] = None
-    leg_phase_01: Optional[float] = None
-    leg_name: Optional[str] = None
+    block_name: Optional[str] = None
+    block_phase_01: Optional[float] = None
+    oscillation_phase_rad: Optional[float] = None
+    block_index: Optional[int] = None
 
 
 # =========================
@@ -395,10 +383,6 @@ def clamp_c_bounded(c_deg: float) -> float:
     return clamp(float(c_deg), -360.0, 360.0)
 
 
-def wrap_deg_360(angle_deg: float) -> float:
-    return float(angle_deg) % 360.0
-
-
 def build_tip_angle_inverse_table(
     cal: Calibration,
     num_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
@@ -437,234 +421,106 @@ def tip_angle_deg_to_b_clipped(
     return b_val, used_angle
 
 
-def _smooth_cosine_edge_map_01(u: float, edge_frac: float) -> float:
-    """
-    Monotone map [0,1] -> [0,1] that is nearly linear in the middle and uses
-    cosine easing in small edge regions.
-    """
-    u = clamp(float(u), 0.0, 1.0)
-    e = clamp(float(edge_frac), 0.0, 0.49)
-
-    if e <= 1e-12:
-        return u
-
-    if u < e:
-        t = u / e
-        return e * (1.0 - math.cos(0.5 * math.pi * t))
-
-    if u > 1.0 - e:
-        t = (u - (1.0 - e)) / e
-        return 1.0 - e * math.cos(0.5 * math.pi * t)
-
-    return u
-
-
-def _c_deg_for_leg_phase(
-    leg_phase_01: float,
-    c_start_deg: float,
-    c_end_deg: float,
-    boundary_ease_frac: float,
-) -> float:
-    s = _smooth_cosine_edge_map_01(leg_phase_01, boundary_ease_frac)
-    c = (1.0 - s) * float(c_start_deg) + s * float(c_end_deg)
-    return clamp_c_bounded(c)
-
-
-def _tip_angle_cycle_deg(
-    cycle_phase_01: float,
+def _tip_angle_for_block_phase_deg(
+    block_phase_01: float,
     tip_min_deg: float,
     tip_max_deg: float,
-    oscillations_per_cycle: float,
+    oscillations: float,
     phase_offset_deg: float,
-) -> float:
+) -> Tuple[float, float]:
     center = 0.5 * (float(tip_min_deg) + float(tip_max_deg))
     amp = 0.5 * (float(tip_max_deg) - float(tip_min_deg))
     ph = math.radians(float(phase_offset_deg))
-    return float(center + amp * math.sin(2.0 * math.pi * float(oscillations_per_cycle) * float(cycle_phase_01) + ph))
-
-
-def _is_c_visible_high_tip(
-    c_deg: float,
-    vis1_min_deg: float,
-    vis1_max_deg: float,
-    vis2_min_deg: float,
-    vis2_max_deg: float,
-) -> bool:
-    cw = wrap_deg_360(c_deg)
-
-    w1_lo = wrap_deg_360(vis1_min_deg)
-    w1_hi = wrap_deg_360(vis1_max_deg)
-    if w1_lo <= w1_hi:
-        in_w1 = (w1_lo < cw < w1_hi)
-    else:
-        in_w1 = (cw > w1_lo) or (cw < w1_hi)
-
-    w2_lo = wrap_deg_360(vis2_min_deg)
-    w2_hi = wrap_deg_360(vis2_max_deg)
-    if w2_lo <= w2_hi:
-        in_w2 = (w2_lo < cw < w2_hi)
-    else:
-        in_w2 = (cw > w2_lo) or (cw < w2_hi)
-
-    return bool(in_w1 or in_w2)
-
-
-def _capture_allowed(
-    tip_angle_deg: float,
-    c_deg: float,
-    tip_full_visible_min_deg: float,
-    tip_full_visible_max_deg: float,
-    vis1_min_deg: float,
-    vis1_max_deg: float,
-    vis2_min_deg: float,
-    vis2_max_deg: float,
-) -> bool:
-    tip = float(tip_angle_deg)
-    if float(tip_full_visible_min_deg) <= tip <= float(tip_full_visible_max_deg):
-        return True
-    if tip > float(tip_full_visible_max_deg):
-        return _is_c_visible_high_tip(
-            c_deg=c_deg,
-            vis1_min_deg=vis1_min_deg,
-            vis1_max_deg=vis1_max_deg,
-            vis2_min_deg=vis2_min_deg,
-            vis2_max_deg=vis2_max_deg,
-        )
-    return False
+    osc_phase = 2.0 * math.pi * float(oscillations) * float(block_phase_01) + ph
+    return float(center + amp * math.sin(osc_phase)), float(osc_phase)
 
 
 # =========================
-# Cyclic continuous trajectory
+# Fixed-C dual-orientation trajectory
 # =========================
 
-def _append_leg(
+def _append_fixed_c_block(
     traj: List[TrajectoryPoint],
     cal: Calibration,
     p_tip_fixed: np.ndarray,
     angle_table_deg: np.ndarray,
     b_table: np.ndarray,
-    leg_name: str,
-    c_start_deg: float,
-    c_end_deg: float,
-    cycle_phase_start: float,
-    cycle_phase_end: float,
+    c_deg: float,
+    block_name: str,
+    block_index: int,
     move_steps: int,
     capture_steps: int,
     tip_min_deg: float,
     tip_max_deg: float,
-    b_oscillations_per_cycle: float,
-    b_phase_offset_deg: float,
-    tip_full_visible_min_deg: float,
-    tip_full_visible_max_deg: float,
-    vis1_min_deg: float,
-    vis1_max_deg: float,
-    vis2_min_deg: float,
-    vis2_max_deg: float,
-    boundary_ease_frac: float,
+    oscillations: float,
+    phase_offset_deg: float,
     flip_rz_sign: bool = False,
-    include_first_point: bool = False,
+    include_first_point: bool = True,
+    capture_every_move_point: bool = False,
 ):
     nmove = max(1, int(move_steps))
     ncap = max(1, int(capture_steps))
 
     capture_move_indices: Set[int] = set()
-
-    for j in range(1, ncap + 1):
-        leg_phase = j / float(ncap)
-        cycle_phase = (1.0 - leg_phase) * float(cycle_phase_start) + leg_phase * float(cycle_phase_end)
-        c_cmd = _c_deg_for_leg_phase(
-            leg_phase_01=leg_phase,
-            c_start_deg=c_start_deg,
-            c_end_deg=c_end_deg,
-            boundary_ease_frac=boundary_ease_frac,
-        )
-        req_tip = _tip_angle_cycle_deg(
-            cycle_phase_01=cycle_phase,
-            tip_min_deg=tip_min_deg,
-            tip_max_deg=tip_max_deg,
-            oscillations_per_cycle=b_oscillations_per_cycle,
-            phase_offset_deg=b_phase_offset_deg,
-        )
-        if _capture_allowed(
-            tip_angle_deg=req_tip,
-            c_deg=c_cmd,
-            tip_full_visible_min_deg=tip_full_visible_min_deg,
-            tip_full_visible_max_deg=tip_full_visible_max_deg,
-            vis1_min_deg=vis1_min_deg,
-            vis1_max_deg=vis1_max_deg,
-            vis2_min_deg=vis2_min_deg,
-            vis2_max_deg=vis2_max_deg,
-        ):
-            idx = int(round(leg_phase * nmove))
-            idx = max(1, min(nmove, idx))
+    if capture_every_move_point:
+        capture_move_indices = set(range(0 if include_first_point else 1, nmove + 1))
+    else:
+        for j in range(0 if include_first_point else 1, ncap + 1):
+            phase = j / float(ncap)
+            idx = int(round(phase * nmove))
+            idx = max(0 if include_first_point else 1, min(nmove, idx))
             capture_move_indices.add(idx)
 
     i_start = 0 if include_first_point else 1
     for i in range(i_start, nmove + 1):
-        leg_phase = i / float(nmove)
-        cycle_phase = (1.0 - leg_phase) * float(cycle_phase_start) + leg_phase * float(cycle_phase_end)
-
-        req_tip = _tip_angle_cycle_deg(
-            cycle_phase_01=cycle_phase,
+        block_phase = i / float(nmove)
+        req_tip, osc_phase = _tip_angle_for_block_phase_deg(
+            block_phase_01=block_phase,
             tip_min_deg=tip_min_deg,
             tip_max_deg=tip_max_deg,
-            oscillations_per_cycle=b_oscillations_per_cycle,
-            phase_offset_deg=b_phase_offset_deg,
+            oscillations=oscillations,
+            phase_offset_deg=phase_offset_deg,
         )
         b_cmd, used_tip = tip_angle_deg_to_b_clipped(
             requested_tip_angle_deg=req_tip,
             angle_table_deg=angle_table_deg,
             b_table=b_table,
         )
-
-        c_cmd = _c_deg_for_leg_phase(
-            leg_phase_01=leg_phase,
-            c_start_deg=c_start_deg,
-            c_end_deg=c_end_deg,
-            boundary_ease_frac=boundary_ease_frac,
-        )
-
         p_stage = stage_xyz_for_fixed_tip(
-            cal,
-            p_tip_fixed,
-            b_cmd,
-            c_cmd,
+            cal=cal,
+            p_tip_xyz=p_tip_fixed,
+            b=b_cmd,
+            c_deg=c_deg,
             flip_rz_sign=flip_rz_sign,
         )
 
         traj.append(
             TrajectoryPoint(
                 b=float(b_cmd),
-                c=float(c_cmd),
+                c=float(c_deg),
                 stage_xyz=p_stage,
-                segment_kind="cycle",
+                segment_kind="tracked_block",
                 capture_image=(i in capture_move_indices),
                 tip_angle_deg=float(used_tip),
-                cycle_phase_01=float(cycle_phase),
-                leg_phase_01=float(leg_phase),
-                leg_name=str(leg_name),
+                block_name=str(block_name),
+                block_phase_01=float(block_phase),
+                oscillation_phase_rad=float(osc_phase),
+                block_index=int(block_index),
             )
         )
 
 
-def generate_cyclic_visibility_gated_trajectory(
+def generate_dual_orientation_fixed_tip_trajectory(
     cal: Calibration,
     p_tip_fixed: np.ndarray,
-    repeats: int = DEFAULT_CYCLE_REPEATS,
-    leg_move_steps: int = DEFAULT_LEG_MOVE_STEPS,
-    leg_capture_steps: int = DEFAULT_LEG_CAPTURE_STEPS,
+    move_steps_per_orientation: int = DEFAULT_ORIENTATION_MOVE_STEPS,
+    capture_steps_per_orientation: int = DEFAULT_ORIENTATION_CAPTURE_STEPS,
     tip_min_deg: float = DEFAULT_SWEEP_TIP_MIN_DEG,
     tip_max_deg: float = DEFAULT_SWEEP_TIP_MAX_DEG,
-    b_oscillations_per_sweep: float = DEFAULT_B_OSCILLATIONS_PER_SWEEP,
+    oscillations_per_orientation: float = DEFAULT_OSCILLATIONS_PER_ORIENTATION,
     b_phase_offset_deg: float = DEFAULT_B_PHASE_OFFSET_DEG,
-    tip_full_visible_min_deg: float = DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MIN_DEG,
-    tip_full_visible_max_deg: float = DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MAX_DEG,
-    vis1_min_deg: float = DEFAULT_C_VISIBLE_WIN1_MIN,
-    vis1_max_deg: float = DEFAULT_C_VISIBLE_WIN1_MAX,
-    vis2_min_deg: float = DEFAULT_C_VISIBLE_WIN2_MIN,
-    vis2_max_deg: float = DEFAULT_C_VISIBLE_WIN2_MAX,
-    boundary_ease_frac: float = DEFAULT_C_BOUNDARY_EASE_FRAC,
     inverse_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
+    capture_every_move_point: bool = False,
     flip_rz_sign: bool = False,
 ) -> Tuple[List[TrajectoryPoint], dict]:
     angle_table_deg, b_table = build_tip_angle_inverse_table(
@@ -680,97 +536,50 @@ def generate_cyclic_visibility_gated_trajectory(
     if used_tip_min > used_tip_max:
         used_tip_min, used_tip_max = used_tip_max, used_tip_min
 
-    # Full cycle = forward leg + return leg
-    b_oscillations_per_cycle = 2.0 * float(b_oscillations_per_sweep)
-
     traj: List[TrajectoryPoint] = []
 
-    # Exact first point: start of cycle at C = -360, cycle phase = 0
-    cycle_phase0 = 0.0
-    req_tip0 = _tip_angle_cycle_deg(
-        cycle_phase_01=cycle_phase0,
-        tip_min_deg=used_tip_min,
-        tip_max_deg=used_tip_max,
-        oscillations_per_cycle=b_oscillations_per_cycle,
-        phase_offset_deg=b_phase_offset_deg,
-    )
-    b0, used_tip0 = tip_angle_deg_to_b_clipped(req_tip0, angle_table_deg, b_table)
-    c0 = -360.0
-    p0 = stage_xyz_for_fixed_tip(cal, p_tip_fixed, b0, c0, flip_rz_sign=flip_rz_sign)
+    c0 = 0.0
+    c180 = float(cal.c_180_deg)
 
-    traj.append(
-        TrajectoryPoint(
-            b=float(b0),
-            c=float(c0),
-            stage_xyz=p0,
-            segment_kind="start",
-            capture_image=False,
-            tip_angle_deg=float(used_tip0),
-            cycle_phase_01=0.0,
-            leg_phase_01=0.0,
-            leg_name="forward",
-        )
+    _append_fixed_c_block(
+        traj=traj,
+        cal=cal,
+        p_tip_fixed=p_tip_fixed,
+        angle_table_deg=angle_table_deg,
+        b_table=b_table,
+        c_deg=c0,
+        block_name="C0",
+        block_index=0,
+        move_steps=int(move_steps_per_orientation),
+        capture_steps=int(capture_steps_per_orientation),
+        tip_min_deg=float(used_tip_min),
+        tip_max_deg=float(used_tip_max),
+        oscillations=float(oscillations_per_orientation),
+        phase_offset_deg=float(b_phase_offset_deg),
+        flip_rz_sign=flip_rz_sign,
+        include_first_point=True,
+        capture_every_move_point=bool(capture_every_move_point),
     )
 
-    for rep in range(max(1, int(repeats))):
-        _append_leg(
-            traj=traj,
-            cal=cal,
-            p_tip_fixed=p_tip_fixed,
-            angle_table_deg=angle_table_deg,
-            b_table=b_table,
-            leg_name="forward",
-            c_start_deg=-360.0,
-            c_end_deg=360.0,
-            cycle_phase_start=0.0,
-            cycle_phase_end=0.5,
-            move_steps=int(leg_move_steps),
-            capture_steps=int(leg_capture_steps),
-            tip_min_deg=float(used_tip_min),
-            tip_max_deg=float(used_tip_max),
-            b_oscillations_per_cycle=float(b_oscillations_per_cycle),
-            b_phase_offset_deg=float(b_phase_offset_deg),
-            tip_full_visible_min_deg=float(tip_full_visible_min_deg),
-            tip_full_visible_max_deg=float(tip_full_visible_max_deg),
-            vis1_min_deg=float(vis1_min_deg),
-            vis1_max_deg=float(vis1_max_deg),
-            vis2_min_deg=float(vis2_min_deg),
-            vis2_max_deg=float(vis2_max_deg),
-            boundary_ease_frac=float(boundary_ease_frac),
-            flip_rz_sign=flip_rz_sign,
-            include_first_point=False,
-        )
-
-        _append_leg(
-            traj=traj,
-            cal=cal,
-            p_tip_fixed=p_tip_fixed,
-            angle_table_deg=angle_table_deg,
-            b_table=b_table,
-            leg_name="return",
-            c_start_deg=360.0,
-            c_end_deg=-360.0,
-            cycle_phase_start=0.5,
-            cycle_phase_end=1.0,
-            move_steps=int(leg_move_steps),
-            capture_steps=int(leg_capture_steps),
-            tip_min_deg=float(used_tip_min),
-            tip_max_deg=float(used_tip_max),
-            b_oscillations_per_cycle=float(b_oscillations_per_cycle),
-            b_phase_offset_deg=float(b_phase_offset_deg),
-            tip_full_visible_min_deg=float(tip_full_visible_min_deg),
-            tip_full_visible_max_deg=float(tip_full_visible_max_deg),
-            vis1_min_deg=float(vis1_min_deg),
-            vis1_max_deg=float(vis1_max_deg),
-            vis2_min_deg=float(vis2_min_deg),
-            vis2_max_deg=float(vis2_max_deg),
-            boundary_ease_frac=float(boundary_ease_frac),
-            flip_rz_sign=flip_rz_sign,
-            include_first_point=False,
-        )
-
-        # End of one cycle already lands exactly back at the next cycle start state
-        # for integer oscillations-per-sweep and chosen phase offset.
+    _append_fixed_c_block(
+        traj=traj,
+        cal=cal,
+        p_tip_fixed=p_tip_fixed,
+        angle_table_deg=angle_table_deg,
+        b_table=b_table,
+        c_deg=c180,
+        block_name="C180",
+        block_index=1,
+        move_steps=int(move_steps_per_orientation),
+        capture_steps=int(capture_steps_per_orientation),
+        tip_min_deg=float(used_tip_min),
+        tip_max_deg=float(used_tip_max),
+        oscillations=float(oscillations_per_orientation),
+        phase_offset_deg=float(b_phase_offset_deg),
+        flip_rz_sign=flip_rz_sign,
+        include_first_point=True,
+        capture_every_move_point=bool(capture_every_move_point),
+    )
 
     n_captures = int(sum(1 for pt in traj if pt.capture_image))
     meta = {
@@ -779,19 +588,13 @@ def generate_cyclic_visibility_gated_trajectory(
         "used_tip_min_deg": float(used_tip_min),
         "used_tip_max_deg": float(used_tip_max),
         "available_tip_angle_range_deg": [available_tip_min, available_tip_max],
-        "leg_move_steps": int(leg_move_steps),
-        "leg_capture_steps": int(leg_capture_steps),
-        "boundary_ease_frac": float(boundary_ease_frac),
-        "b_oscillations_per_sweep": float(b_oscillations_per_sweep),
-        "b_oscillations_per_cycle": float(b_oscillations_per_cycle),
+        "move_steps_per_orientation": int(move_steps_per_orientation),
+        "capture_steps_per_orientation": int(capture_steps_per_orientation),
+        "oscillations_per_orientation": float(oscillations_per_orientation),
         "b_phase_offset_deg": float(b_phase_offset_deg),
-        "capture_tip_full_visible_min_deg": float(tip_full_visible_min_deg),
-        "capture_tip_full_visible_max_deg": float(tip_full_visible_max_deg),
-        "visible_c_windows_deg": [
-            [float(vis1_min_deg), float(vis1_max_deg)],
-            [float(vis2_min_deg), float(vis2_max_deg)],
-        ],
+        "orientation_sequence_deg": [float(c0), float(c180)],
         "planned_capture_points": n_captures,
+        "capture_every_move_point": bool(capture_every_move_point),
         "flip_rz_sign": bool(flip_rz_sign),
     }
     return traj, meta
@@ -806,12 +609,12 @@ def _smoothstep01(x: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
-def _c_speed_envelope_factor(
+def _speed_envelope_factor(
     t01: float,
     accel_s: float,
     decel_s: float,
     total_s: float,
-    floor_frac: float = 0.05,
+    floor_frac: float = 0.08,
 ) -> float:
     if total_s <= 1e-9:
         return 1.0
@@ -831,60 +634,60 @@ def _c_speed_envelope_factor(
     return float(floor_frac + (1.0 - floor_frac) * f)
 
 
-def plan_segment_feeds_with_c_envelope(
+def plan_segment_feeds_with_b_envelope(
     traj: List[TrajectoryPoint],
     probe_feed_mm_min: float,
-    c_max_feed_deg_min: float,
-    c_accel_time_s: float,
-    c_decel_time_s: float,
-    min_seg_time_s: float = 0.005,
+    b_max_feed_units_min: float,
+    b_accel_time_s: float,
+    b_decel_time_s: float,
+    min_seg_time_s: float = 0.008,
 ) -> Tuple[List[float], dict]:
     nseg = max(0, len(traj) - 1)
     if nseg == 0:
-        return [], {"est_total_time_s": 0.0, "max_est_c_speed_deg_min": 0.0}
+        return [], {"est_total_time_s": 0.0, "max_est_b_speed_units_min": 0.0}
 
     probe_feed = max(1e-6, float(probe_feed_mm_min))
-    cmax = max(1e-6, float(c_max_feed_deg_min))
+    bmax = max(1e-6, float(b_max_feed_units_min))
 
     xyzlens = []
-    dcs = []
+    dbs = []
     for i in range(1, len(traj)):
         p0 = traj[i - 1].stage_xyz
         p1 = traj[i].stage_xyz
-        c0 = traj[i - 1].c
-        c1 = traj[i].c
+        b0 = traj[i - 1].b
+        b1 = traj[i].b
         xyzlens.append(float(np.linalg.norm(p1 - p0)))
-        dcs.append(abs(float(c1) - float(c0)))
+        dbs.append(abs(float(b1) - float(b0)))
 
     xyzlens = np.asarray(xyzlens, dtype=float)
-    dcs = np.asarray(dcs, dtype=float)
+    dbs = np.asarray(dbs, dtype=float)
 
     dt_xyz0 = xyzlens / (probe_feed / 60.0)
-    dt_c0 = dcs / (cmax / 60.0)
-    dt0 = np.maximum(dt_xyz0, dt_c0)
+    dt_b0 = dbs / (bmax / 60.0)
+    dt0 = np.maximum(dt_xyz0, dt_b0)
     dt0 = np.maximum(dt0, min_seg_time_s)
     total_est = float(np.sum(dt0))
 
     feeds = []
     dts = []
     t_cum = 0.0
-    max_est_c_speed = 0.0
+    max_est_b_speed = 0.0
 
     for i in range(nseg):
         t_mid = t_cum + 0.5 * float(dt0[i])
         t01 = 0.0 if total_est <= 1e-9 else (t_mid / total_est)
-        env = _c_speed_envelope_factor(
+        env = _speed_envelope_factor(
             t01=t01,
-            accel_s=float(c_accel_time_s),
-            decel_s=float(c_decel_time_s),
+            accel_s=float(b_accel_time_s),
+            decel_s=float(b_decel_time_s),
             total_s=total_est,
-            floor_frac=0.05,
+            floor_frac=0.08,
         )
-        c_cap_i = cmax * env
+        b_cap_i = bmax * env
 
         dt_xyz = xyzlens[i] / (probe_feed / 60.0)
-        dt_c = dcs[i] / (c_cap_i / 60.0)
-        dt = max(float(dt_xyz), float(dt_c), float(min_seg_time_s))
+        dt_b = dbs[i] / (b_cap_i / 60.0)
+        dt = max(float(dt_xyz), float(dt_b), float(min_seg_time_s))
 
         if xyzlens[i] > 1e-9:
             f_i = 60.0 * xyzlens[i] / dt
@@ -893,8 +696,8 @@ def plan_segment_feeds_with_c_envelope(
         else:
             f_i = probe_feed
 
-        c_speed_est = (dcs[i] / dt) * 60.0 if dt > 1e-12 else 0.0
-        max_est_c_speed = max(max_est_c_speed, c_speed_est)
+        b_speed_est = (dbs[i] / dt) * 60.0 if dt > 1e-12 else 0.0
+        max_est_b_speed = max(max_est_b_speed, b_speed_est)
 
         feeds.append(float(f_i))
         dts.append(float(dt))
@@ -902,7 +705,7 @@ def plan_segment_feeds_with_c_envelope(
 
     return feeds, {
         "est_total_time_s": float(sum(dts)),
-        "max_est_c_speed_deg_min": float(max_est_c_speed),
+        "max_est_b_speed_units_min": float(max_est_b_speed),
         "mean_seg_time_ms": float(1000.0 * np.mean(dts)) if dts else 0.0,
     }
 
@@ -927,8 +730,8 @@ def compute_traj_meta(traj: List[TrajectoryPoint]) -> dict:
             "c_min_used": 0.0,
             "c_max_used": 0.0,
             "xyz_path_len_mm": 0.0,
-            "max_dc_step_deg": 0.0,
-            "c_abs_path_deg": 0.0,
+            "max_db_step": 0.0,
+            "b_abs_path": 0.0,
             "n_capture_points": 0,
         }
 
@@ -938,7 +741,7 @@ def compute_traj_meta(traj: List[TrajectoryPoint]) -> dict:
 
     diffs_xyz = xyz[1:] - xyz[:-1] if len(xyz) > 1 else np.zeros((0, 3))
     seglens = np.linalg.norm(diffs_xyz, axis=1) if len(diffs_xyz) else np.array([], dtype=float)
-    dc = np.diff(cc) if len(cc) > 1 else np.array([], dtype=float)
+    db = np.diff(bb) if len(bb) > 1 else np.array([], dtype=float)
 
     return {
         "n_samples": int(len(traj)),
@@ -954,8 +757,8 @@ def compute_traj_meta(traj: List[TrajectoryPoint]) -> dict:
         "c_min_used": float(np.min(cc)),
         "c_max_used": float(np.max(cc)),
         "xyz_path_len_mm": float(np.sum(seglens)) if len(seglens) else 0.0,
-        "max_dc_step_deg": float(np.max(np.abs(dc))) if len(dc) else 0.0,
-        "c_abs_path_deg": float(np.sum(np.abs(dc))) if len(dc) else 0.0,
+        "max_db_step": float(np.max(np.abs(db))) if len(db) else 0.0,
+        "b_abs_path": float(np.sum(np.abs(db))) if len(db) else 0.0,
         "n_capture_points": int(sum(1 for pt in traj if pt.capture_image)),
     }
 
@@ -985,6 +788,25 @@ def _clamp_stage_xyz_to_bbox(
     yc = clamp_one("Y", float(y), float(bbox["y_min"]), float(bbox["y_max"]))
     zc = clamp_one("Z", float(z), float(bbox["z_min"]), float(bbox["z_max"]))
     return xc, yc, zc
+
+
+def split_trajectory_into_blocks(traj: List[TrajectoryPoint]) -> List[List[TrajectoryPoint]]:
+    if not traj:
+        return []
+
+    blocks: List[List[TrajectoryPoint]] = []
+    current: List[TrajectoryPoint] = [traj[0]]
+
+    for pt in traj[1:]:
+        prev = current[-1]
+        if pt.block_index != prev.block_index:
+            blocks.append(current)
+            current = [pt]
+        else:
+            current.append(pt)
+
+    blocks.append(current)
+    return blocks
 
 
 # =========================
@@ -1096,8 +918,8 @@ class FixedTipPointTracker:
         c: float,
         flush_frames: int = 1,
         tip_angle_deg: Optional[float] = None,
-        cycle_phase_01: Optional[float] = None,
-        leg_name: Optional[str] = None,
+        block_name: Optional[str] = None,
+        block_phase_01: Optional[float] = None,
     ) -> Optional[str]:
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1112,12 +934,12 @@ class FixedTipPointTracker:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
         extra = ""
-        if leg_name is not None:
-            extra += f"_{leg_name}"
+        if block_name is not None:
+            extra += f"_{block_name}"
         if tip_angle_deg is not None:
             extra += f"_TIP{float(tip_angle_deg):.3f}"
-        if cycle_phase_01 is not None:
-            extra += f"_CPH{float(cycle_phase_01):.5f}"
+        if block_phase_01 is not None:
+            extra += f"_BPH{float(block_phase_01):.5f}"
 
         filename = (
             f"{sample_idx:05d}"
@@ -1176,6 +998,71 @@ class FixedTipPointTracker:
         print(f" Command: {gcode}")
         self.rrf.send_code(gcode)
 
+    def _move_to_pose_safe(
+        self,
+        cal: Calibration,
+        pose: Tuple[float, float, float, float, float],
+        safe_approach_z: float,
+        travel_feed: float,
+        settle_s: float,
+    ):
+        x, y, z, b, c = [float(v) for v in pose]
+
+        self.send_absolute_move(
+            travel_feed,
+            **{
+                cal.z_axis: float(safe_approach_z),
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            }
+        )
+        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+
+        self.send_absolute_move(
+            travel_feed,
+            **{
+                cal.x_axis: x,
+                cal.y_axis: y,
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            }
+        )
+        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+
+        self.send_absolute_move(
+            travel_feed,
+            **{
+                cal.z_axis: z,
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            }
+        )
+        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+
+    def _fine_land_on_point(
+        self,
+        cal: Calibration,
+        x: float,
+        y: float,
+        z: float,
+        b: float,
+        c: float,
+        fine_feed: float,
+        settle_s: float,
+    ):
+        print(" Fine landing move for accuracy...")
+        self.send_absolute_move(
+            fine_feed,
+            **{
+                cal.x_axis: x,
+                cal.y_axis: y,
+                cal.z_axis: z,
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            }
+        )
+        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+
     def execute_motion_and_capture(
         self,
         cal: Calibration,
@@ -1184,21 +1071,21 @@ class FixedTipPointTracker:
         end_pose: Tuple[float, float, float, float, float],
         safe_approach_z: float,
         travel_feed: float,
+        fine_approach_feed: float,
         probe_feed: float,
-        c_feed: float,
-        c_max_feed: float,
-        c_accel_time_s: float,
-        c_decel_time_s: float,
+        b_max_feed: float,
+        b_accel_time_s: float,
+        b_decel_time_s: float,
         virtual_bbox: dict,
         dwell_before_ms: int = 0,
         dwell_after_ms: int = 0,
-        preposition_c_only: bool = False,
         use_segment_feed_scheduler: bool = True,
         tracked_move_settle_s: float = 0.0,
         travel_move_settle_s: float = 0.0,
-        rotation_settle_s: float = 0.0,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
+        initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
+        c_flip_feed: float = DEFAULT_C_FLIP_FEED,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1208,86 +1095,107 @@ class FixedTipPointTracker:
         bbox_warnings: List[str] = []
         sample_counter = 0
 
-        seg_feeds: List[float] = []
-        sched_meta = {"est_total_time_s": 0.0, "max_est_c_speed_deg_min": 0.0, "mean_seg_time_ms": 0.0}
-        if use_segment_feed_scheduler and len(traj) > 1:
-            seg_feeds, sched_meta = plan_segment_feeds_with_c_envelope(
-                traj=traj,
-                probe_feed_mm_min=float(probe_feed),
-                c_max_feed_deg_min=float(c_max_feed),
-                c_accel_time_s=float(c_accel_time_s),
-                c_decel_time_s=float(c_decel_time_s),
-            )
+        blocks = split_trajectory_into_blocks(traj)
 
         print("\n" + "=" * 72)
         print("STARTING TRACKED POINT-ACQUISITION RUN")
         print("=" * 72)
-        print(f"Tracked samples: {len(traj)}")
-        print(f"Estimated tracked time: {sched_meta['est_total_time_s']:.3f} s")
-        print(f"Estimated max C speed: {sched_meta['max_est_c_speed_deg_min']:.1f} deg/min")
-        print(f"Mean segment time: {sched_meta['mean_seg_time_ms']:.2f} ms")
-
-        sx, sy, sz, sb, sc = [float(v) for v in start_pose]
+        print(f"Tracked samples total: {len(traj)}")
+        print(f"Orientation blocks: {len(blocks)}")
 
         print("\nSafe startup approach...")
-        self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.z_axis: float(safe_approach_z),
-                cal.b_axis: sb,
-                cal.c_axis: clamp_c_bounded(sc),
-            }
+        self._move_to_pose_safe(
+            cal=cal,
+            pose=start_pose,
+            safe_approach_z=float(safe_approach_z),
+            travel_feed=float(travel_feed),
+            settle_s=float(travel_move_settle_s),
         )
-        self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
 
-        self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.x_axis: sx,
-                cal.y_axis: sy,
-                cal.b_axis: sb,
-                cal.c_axis: clamp_c_bounded(sc),
+        if int(dwell_before_ms) > 0:
+            print(f"Dwell before tracked acquisition: {int(dwell_before_ms)} ms")
+            time.sleep(float(dwell_before_ms) / 1000.0)
+
+        for block_idx, block in enumerate(blocks):
+            if not block:
+                continue
+
+            first_pt = block[0]
+            block_name = first_pt.block_name or f"block_{block_idx}"
+            print("\n" + "-" * 72)
+            print(f"Starting block {block_idx + 1}/{len(blocks)}: {block_name} (C={first_pt.c:.3f})")
+            print("-" * 72)
+
+            block_sched_feeds: List[float] = []
+            block_sched_meta = {
+                "est_total_time_s": 0.0,
+                "max_est_b_speed_units_min": 0.0,
+                "mean_seg_time_ms": 0.0,
             }
-        )
-        self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+            if use_segment_feed_scheduler and len(block) > 1:
+                block_sched_feeds, block_sched_meta = plan_segment_feeds_with_b_envelope(
+                    traj=block,
+                    probe_feed_mm_min=float(probe_feed),
+                    b_max_feed_units_min=float(b_max_feed),
+                    b_accel_time_s=float(b_accel_time_s),
+                    b_decel_time_s=float(b_decel_time_s),
+                )
 
-        self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.z_axis: sz,
-                cal.b_axis: sb,
-                cal.c_axis: clamp_c_bounded(sc),
-            }
-        )
-        self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-        if not traj:
-            print("No trajectory points generated.")
-        else:
-            p0 = traj[0]
-            b0, c0, p0_stage = p0.b, p0.c, p0.stage_xyz
+            print(f"Estimated block time: {block_sched_meta['est_total_time_s']:.3f} s")
+            print(f"Estimated max B speed: {block_sched_meta['max_est_b_speed_units_min']:.3f} units/min")
+            print(f"Mean segment time: {block_sched_meta['mean_seg_time_ms']:.2f} ms")
 
             x0, y0, z0 = _clamp_stage_xyz_to_bbox(
-                p0_stage[0], p0_stage[1], p0_stage[2],
+                first_pt.stage_xyz[0], first_pt.stage_xyz[1], first_pt.stage_xyz[2],
                 virtual_bbox,
-                "move to tracked start",
+                f"{block_name} first point",
                 bbox_warnings,
             )
 
-            print("\nMoving to first tracked sample...")
+            if block_idx > 0 and math.isclose(float(first_pt.c), float(cal.c_180_deg), abs_tol=1e-6):
+                print(f"Flipping C to {float(first_pt.c):.3f} at feed {float(c_flip_feed):.3f}...")
+                self.send_absolute_move(
+                    float(c_flip_feed),
+                    **{cal.c_axis: clamp_c_bounded(float(first_pt.c))}
+                )
+                self.wait_for_duet_motion_complete(extra_settle=float(travel_move_settle_s))
+
+            print("Large move onto first tracked point of block...")
             self.send_absolute_move(
-                travel_feed,
+                float(travel_feed),
                 **{
                     cal.x_axis: x0,
                     cal.y_axis: y0,
                     cal.z_axis: z0,
-                    cal.b_axis: b0,
-                    cal.c_axis: clamp_c_bounded(c0),
+                    cal.b_axis: float(first_pt.b),
+                    cal.c_axis: clamp_c_bounded(float(first_pt.c)),
                 }
             )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+            self.wait_for_duet_motion_complete(extra_settle=float(travel_move_settle_s))
 
-            if capture_at_start and p0.capture_image:
+            self._fine_land_on_point(
+                cal=cal,
+                x=x0,
+                y=y0,
+                z=z0,
+                b=float(first_pt.b),
+                c=float(first_pt.c),
+                fine_feed=float(fine_approach_feed),
+                settle_s=max(float(tracked_move_settle_s), 0.05),
+            )
+
+            if (
+                float(initial_sweep_wait_s) > 0
+                and (
+                    block_idx == 0
+                    or (block_idx > 0 and math.isclose(float(first_pt.c), float(cal.c_180_deg), abs_tol=1e-6))
+                )
+            ):
+                sweep_label = "first" if block_idx == 0 else "second"
+                print(f"Waiting {float(initial_sweep_wait_s):.3f} s before starting the {sweep_label} sweep...")
+                time.sleep(float(initial_sweep_wait_s))
+
+            if capture_at_start and first_pt.capture_image:
                 sample_counter += 1
                 self.capture_and_save(
                     sample_idx=sample_counter,
@@ -1295,34 +1203,26 @@ class FixedTipPointTracker:
                     x=x0,
                     y=y0,
                     z=z0,
-                    b=b0,
-                    c=clamp_c_bounded(c0),
+                    b=float(first_pt.b),
+                    c=clamp_c_bounded(float(first_pt.c)),
                     flush_frames=camera_flush_frames,
-                    tip_angle_deg=p0.tip_angle_deg,
-                    cycle_phase_01=p0.cycle_phase_01,
-                    leg_name=p0.leg_name,
+                    tip_angle_deg=first_pt.tip_angle_deg,
+                    block_name=first_pt.block_name,
+                    block_phase_01=first_pt.block_phase_01,
                 )
             else:
                 print("Start point not captured.")
 
-            if int(dwell_before_ms) > 0:
-                print(f"Dwell before motion: {int(dwell_before_ms)} ms")
-                time.sleep(float(dwell_before_ms) / 1000.0)
-
-            print("\nExecuting coordinated tracked motion...")
-            for i, point in enumerate(traj[1:], start=1):
-                b, c, p_stage = point.b, point.c, point.stage_xyz
+            print("Executing tracked oscillation block...")
+            for i, point in enumerate(block[1:], start=1):
                 x, y, z = _clamp_stage_xyz_to_bbox(
-                    p_stage[0], p_stage[1], p_stage[2],
+                    point.stage_xyz[0], point.stage_xyz[1], point.stage_xyz[2],
                     virtual_bbox,
-                    f"tracked sample {i}",
+                    f"{block_name} sample {i}",
                     bbox_warnings,
                 )
 
-                if seg_feeds:
-                    fseg = seg_feeds[i - 1]
-                else:
-                    fseg = float(probe_feed)
+                fseg = block_sched_feeds[i - 1] if block_sched_feeds else float(probe_feed)
 
                 self.send_absolute_move(
                     fseg,
@@ -1330,11 +1230,11 @@ class FixedTipPointTracker:
                         cal.x_axis: x,
                         cal.y_axis: y,
                         cal.z_axis: z,
-                        cal.b_axis: b,
-                        cal.c_axis: clamp_c_bounded(c),
+                        cal.b_axis: float(point.b),
+                        cal.c_axis: clamp_c_bounded(float(point.c)),
                     }
                 )
-                self.wait_for_duet_motion_complete(extra_settle=tracked_move_settle_s)
+                self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
 
                 if point.capture_image:
                     sample_counter += 1
@@ -1344,51 +1244,26 @@ class FixedTipPointTracker:
                         x=x,
                         y=y,
                         z=z,
-                        b=b,
-                        c=clamp_c_bounded(c),
+                        b=float(point.b),
+                        c=clamp_c_bounded(float(point.c)),
                         flush_frames=camera_flush_frames,
                         tip_angle_deg=point.tip_angle_deg,
-                        cycle_phase_01=point.cycle_phase_01,
-                        leg_name=point.leg_name,
+                        block_name=point.block_name,
+                        block_phase_01=point.block_phase_01,
                     )
 
-            if int(dwell_after_ms) > 0:
-                print(f"Dwell after motion: {int(dwell_after_ms)} ms")
-                time.sleep(float(dwell_after_ms) / 1000.0)
-
-        ex, ey, ez, eb, ec = [float(v) for v in end_pose]
+        if int(dwell_after_ms) > 0:
+            print(f"Dwell after motion: {int(dwell_after_ms)} ms")
+            time.sleep(float(dwell_after_ms) / 1000.0)
 
         print("\nSafe end move...")
-        self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.z_axis: float(safe_approach_z),
-                cal.b_axis: eb,
-                cal.c_axis: clamp_c_bounded(ec),
-            }
+        self._move_to_pose_safe(
+            cal=cal,
+            pose=end_pose,
+            safe_approach_z=float(safe_approach_z),
+            travel_feed=float(travel_feed),
+            settle_s=float(travel_move_settle_s),
         )
-        self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-        self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.x_axis: ex,
-                cal.y_axis: ey,
-                cal.b_axis: eb,
-                cal.c_axis: clamp_c_bounded(ec),
-            }
-        )
-        self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-        self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.z_axis: ez,
-                cal.b_axis: eb,
-                cal.c_axis: clamp_c_bounded(ec),
-            }
-        )
-        self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
 
         print("\n" + "=" * 72)
         print("RUN COMPLETE")
@@ -1402,7 +1277,6 @@ class FixedTipPointTracker:
         return {
             "images_saved": sample_counter,
             "bbox_warnings": bbox_warnings,
-            "scheduler_meta": sched_meta,
         }
 
 
@@ -1424,24 +1298,17 @@ def main(args):
         sweep_tip_min_deg = 0.0
         sweep_tip_max_deg = 90.0
 
-    traj, custom_meta = generate_cyclic_visibility_gated_trajectory(
+    traj, custom_meta = generate_dual_orientation_fixed_tip_trajectory(
         cal=cal,
         p_tip_fixed=p_tip_fixed,
-        repeats=int(args.cycle_repeats),
-        leg_move_steps=int(args.leg_move_steps),
-        leg_capture_steps=int(args.leg_capture_steps),
+        move_steps_per_orientation=int(args.orientation_move_steps),
+        capture_steps_per_orientation=int(args.orientation_capture_steps),
         tip_min_deg=sweep_tip_min_deg,
         tip_max_deg=sweep_tip_max_deg,
-        b_oscillations_per_sweep=float(args.b_oscillations_per_sweep),
+        oscillations_per_orientation=float(args.oscillations_per_orientation),
         b_phase_offset_deg=float(args.b_phase_offset_deg),
-        tip_full_visible_min_deg=float(args.capture_tip_full_visible_min_deg),
-        tip_full_visible_max_deg=float(args.capture_tip_full_visible_max_deg),
-        vis1_min_deg=float(args.c_visible_win1_min_deg),
-        vis1_max_deg=float(args.c_visible_win1_max_deg),
-        vis2_min_deg=float(args.c_visible_win2_min_deg),
-        vis2_max_deg=float(args.c_visible_win2_max_deg),
-        boundary_ease_frac=float(args.c_boundary_ease_frac),
         inverse_samples=int(args.custom_inverse_samples),
+        capture_every_move_point=bool(args.capture_every_move_point),
         flip_rz_sign=bool(args.flip_rz_sign),
     )
 
@@ -1459,22 +1326,20 @@ def main(args):
         )
     print(f"  C range used: [{meta['c_min_used']:.3f}, {meta['c_max_used']:.3f}]")
     print(f"  XYZ path length: {meta['xyz_path_len_mm']:.3f} mm")
+    print(f"  Max B step: {meta['max_db_step']:.6f}")
 
-    print("Cycle / capture summary:")
+    print("Block summary:")
     print(f"  Requested tip min/max: [{custom_meta['requested_tip_min_deg']}, {custom_meta['requested_tip_max_deg']}]")
     print(f"  Used tip min/max:      [{custom_meta['used_tip_min_deg']}, {custom_meta['used_tip_max_deg']}]")
     print(f"  B 0..90 only mode: {bool(args.b_0_to_90_only)}")
     print(f"  Available calibrated tip-angle range: {custom_meta['available_tip_angle_range_deg']}")
-    print(f"  Leg move steps: {custom_meta['leg_move_steps']}")
-    print(f"  Leg capture steps: {custom_meta['leg_capture_steps']}")
-    print(f"  Boundary ease fraction: {custom_meta['boundary_ease_frac']}")
-    print(f"  B oscillations per sweep: {custom_meta['b_oscillations_per_sweep']}")
-    print(f"  B oscillations per cycle: {custom_meta['b_oscillations_per_cycle']}")
+    print(f"  Move steps per orientation: {custom_meta['move_steps_per_orientation']}")
+    print(f"  Capture steps per orientation: {custom_meta['capture_steps_per_orientation']}")
+    print(f"  Oscillations per orientation: {custom_meta['oscillations_per_orientation']}")
     print(f"  B phase offset deg: {custom_meta['b_phase_offset_deg']}")
-    print(f"  Full-visible tip range: [{custom_meta['capture_tip_full_visible_min_deg']}, "
-          f"{custom_meta['capture_tip_full_visible_max_deg']}]")
-    print(f"  Visible C windows (deg): {custom_meta['visible_c_windows_deg']}")
+    print(f"  Orientation sequence (deg): {custom_meta['orientation_sequence_deg']}")
     print(f"  Planned capture points: {custom_meta['planned_capture_points']}")
+    print(f"  Capture every move point: {custom_meta['capture_every_move_point']}")
     print(f"  flip_rz_sign: {custom_meta['flip_rz_sign']}")
 
     start_pose = (
@@ -1533,21 +1398,20 @@ def main(args):
             end_pose=end_pose,
             safe_approach_z=float(args.safe_approach_z),
             travel_feed=float(args.travel_feed),
+            fine_approach_feed=float(args.fine_approach_feed),
             probe_feed=float(args.probe_feed),
-            c_feed=float(args.c_feed),
-            c_max_feed=float(args.c_max_feed),
-            c_accel_time_s=float(args.c_accel_time),
-            c_decel_time_s=float(args.c_decel_time),
+            b_max_feed=float(args.b_max_feed),
+            b_accel_time_s=float(args.b_accel_time),
+            b_decel_time_s=float(args.b_decel_time),
             virtual_bbox=virtual_bbox,
             dwell_before_ms=int(args.dwell_before_ms),
             dwell_after_ms=int(args.dwell_after_ms),
-            preposition_c_only=False,
             use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
             tracked_move_settle_s=float(args.tracked_move_settle_s),
             travel_move_settle_s=float(args.travel_move_settle_s),
-            rotation_settle_s=float(args.rotation_settle_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
+            initial_sweep_wait_s=float(args.initial_sweep_wait_s),
         )
 
         print("\nFinal results:")
@@ -1563,8 +1427,8 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description=(
-            "Run a cyclic bounded-C fixed-tip tracked XYZ/B/C motion from the calibration JSON "
-            "and capture images only at visible phases."
+            "Run a fixed-tip tracked XYZ/B/C motion at C=0 and C=180 only, "
+            "with 6 B oscillations at each orientation."
         )
     )
 
@@ -1609,63 +1473,53 @@ if __name__ == "__main__":
         help="Multiply the polynomial-derived r and z offsets by -1. Use this if your calibration file has flipped r/z signs.",
     )
 
-    # Cyclic sweep controls
-    ap.add_argument("--cycle-repeats", type=int, default=DEFAULT_CYCLE_REPEATS,
-                    help="How many full forward+return cycles to run.")
-    ap.add_argument("--leg-move-steps", type=int, default=DEFAULT_LEG_MOVE_STEPS,
-                    help="Tracked motion segments used for each one-way C leg.")
-    ap.add_argument("--leg-capture-steps", type=int, default=DEFAULT_LEG_CAPTURE_STEPS,
-                    help="Capture opportunity samples evaluated over each one-way C leg.")
+    # Fixed-C dual-orientation sweep controls
+    ap.add_argument("--orientation-move-steps", type=int, default=DEFAULT_ORIENTATION_MOVE_STEPS,
+                    help="Tracked motion segments used for each fixed-C orientation block.")
+    ap.add_argument("--orientation-capture-steps", type=int, default=DEFAULT_ORIENTATION_CAPTURE_STEPS,
+                    help="Capture opportunity samples evaluated over each fixed-C orientation block.")
+    ap.add_argument("--oscillations-per-orientation", type=float, default=DEFAULT_OSCILLATIONS_PER_ORIENTATION,
+                    help="How many B oscillations occur at each fixed C orientation. Default is 6.")
     ap.add_argument("--sweep-tip-min-deg", type=float, default=DEFAULT_SWEEP_TIP_MIN_DEG,
-                    help="Minimum tip angle during the cyclic B oscillation.")
+                    help="Minimum tip angle during the B oscillation.")
     ap.add_argument("--sweep-tip-max-deg", type=float, default=DEFAULT_SWEEP_TIP_MAX_DEG,
-                    help="Maximum tip angle during the cyclic B oscillation.")
-    ap.add_argument("--b-0-to-90-only", action="store_true", default=DEFAULT_B_0_TO_90_ONLY,
+                    help="Maximum tip angle during the B oscillation.")
+    ap.add_argument("--b-0-to-90-only", action="store_true", default=False,
                     help="Force the cyclic B/tip oscillation range to 0..90 deg.")
-    ap.add_argument("--b-oscillations-per-sweep", type=float, default=DEFAULT_B_OSCILLATIONS_PER_SWEEP,
-                    help="How many B oscillations occur during one one-way sweep of C (e.g. 2).")
     ap.add_argument("--b-phase-offset-deg", type=float, default=DEFAULT_B_PHASE_OFFSET_DEG,
-                    help="Phase offset for the B oscillation. -90 starts at tip_min.")
-    ap.add_argument("--c-boundary-ease-frac", type=float, default=DEFAULT_C_BOUNDARY_EASE_FRAC,
-                    help="Small edge fraction for C boundary easing, in [0, 0.49].")
+                    help="Phase offset for the B oscillation. -90 starts at tip_min and ends at tip_min.")
     ap.add_argument("--custom-inverse-samples", type=int, default=DEFAULT_CUSTOM_INV_SAMPLES,
                     help="Dense sampling count used for numeric tip-angle -> B inversion.")
-
-    # Capture visibility controls
-    ap.add_argument("--capture-tip-full-visible-min-deg", type=float,
-                    default=DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MIN_DEG,
-                    help="Below/within this tip range, capture is allowed at all C.")
-    ap.add_argument("--capture-tip-full-visible-max-deg", type=float,
-                    default=DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MAX_DEG,
-                    help="Below/within this tip range, capture is allowed at all C.")
-    ap.add_argument("--c-visible-win1-min-deg", type=float, default=DEFAULT_C_VISIBLE_WIN1_MIN)
-    ap.add_argument("--c-visible-win1-max-deg", type=float, default=DEFAULT_C_VISIBLE_WIN1_MAX)
-    ap.add_argument("--c-visible-win2-min-deg", type=float, default=DEFAULT_C_VISIBLE_WIN2_MIN)
-    ap.add_argument("--c-visible-win2-max-deg", type=float, default=DEFAULT_C_VISIBLE_WIN2_MAX)
+    ap.add_argument("--capture-every-move-point", action="store_true", default=DEFAULT_CAPTURE_EVERY_MOVE_POINT,
+                    help="Capture at every tracked motion point instead of only at capture-step samples.")
 
     # Feedrates
-    ap.add_argument("--travel-feed", type=float, default=DEFAULT_TRAVEL_FEED)
-    ap.add_argument("--probe-feed", type=float, default=DEFAULT_PROBE_FEED)
-    ap.add_argument("--c-feed", type=float, default=DEFAULT_C_FEED)
+    ap.add_argument("--travel-feed", type=float, default=DEFAULT_TRAVEL_FEED,
+                    help="Feedrate for large moves.")
+    ap.add_argument("--fine-approach-feed", type=float, default=DEFAULT_FINE_APPROACH_FEED,
+                    help="Slow final landing feed for the first point of each orientation block.")
+    ap.add_argument("--probe-feed", type=float, default=DEFAULT_PROBE_FEED,
+                    help="Nominal tracked-motion XYZ feed.")
+    ap.add_argument("--b-max-feed", type=float, default=DEFAULT_B_MAX_FEED,
+                    help="Max allowed B-axis speed used by the segment feed scheduler.")
 
-    # Tracked C cap + feed scheduler
-    ap.add_argument("--c-max-feed", type=float, default=DEFAULT_C_MAX_FEED)
-    ap.add_argument("--c-accel-time", type=float, default=DEFAULT_C_ACCEL_TIME_S)
-    ap.add_argument("--c-decel-time", type=float, default=DEFAULT_C_DECEL_TIME_S)
+    # Tracked B cap + feed scheduler
+    ap.add_argument("--b-accel-time", type=float, default=DEFAULT_B_ACCEL_TIME_S)
+    ap.add_argument("--b-decel-time", type=float, default=DEFAULT_B_DECEL_TIME_S)
     ap.add_argument("--disable-segment-feed-scheduler", action="store_true",
                     help="Disable per-segment feed scheduling.")
 
     # Optional waits / capture behavior
     ap.add_argument("--dwell-before-ms", type=int, default=DEFAULT_DWELL_BEFORE_MS)
     ap.add_argument("--dwell-after-ms", type=int, default=DEFAULT_DWELL_AFTER_MS)
+    ap.add_argument("--initial-sweep-wait-s", type=float, default=DEFAULT_INITIAL_SWEEP_WAIT_S,
+                    help="Wait after the first large move to the first tracked point, before starting the first sweep.")
     ap.add_argument("--tracked-move-settle-s", type=float, default=DEFAULT_TRACKED_MOVE_SETTLE_S,
                     help="Extra settle time after each tracked move, before capture.")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
-    ap.add_argument("--rotation-settle-s", type=float, default=DEFAULT_ROTATION_SETTLE_S,
-                    help="Extra settle time after any rotation-related move.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
-                    help="Legacy option; only used if the first trajectory point is marked for acquisition.")
+                    help="Capture at the first point of each block if that point is marked for acquisition.")
 
     # Startup / end poses
     ap.add_argument("--safe-approach-z", type=float, default=DEFAULT_SAFE_APPROACH_Z)

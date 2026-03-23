@@ -15,7 +15,7 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-03-19_01',
+    project_name='Test_Calibration_2026-03-20_03',
     allow_existing= True,
     add_date=False
 )
@@ -26,15 +26,16 @@ print("Calibration object created!")
 MANUAL_CROP_ADJUSTMENT = True
 THRESHOLD = 200
 PULL_B_START = 0.0
-PULL_B_STEPS = 28
+PULL_B_STEPS = 30
 PULL_B_STEP_SIZE = -0.2
-CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260318_154836.npz")
+CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260320_091517.npz")
 # Optional checkerboard image from the same setup to define true vertical + mm/px reference.
 # Set to None to skip board-reference estimation.
-BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260319_103954.png")
+BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260320_091547.png")
 #BOARD_REFERENCE_IMAGE = None
 
 PROBE_MODE = "middle"  # "middle" | "five"
+FIT_MODEL = "pchip"  # "pchip" | "cubic"
 
 if PROBE_MODE == "middle":
     probe_points = [(100.0, 25.0, -185.0)]
@@ -76,4 +77,4 @@ cal.calibrate(
 cal.analyze_data_batch(
     threshold=THRESHOLD,
 )
-cal.postprocess_calibration_data(save_plots=True)
+cal.postprocess_calibration_data(save_plots=True, fit_model=FIT_MODEL)

@@ -1,49 +1,74 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-offline_run_calibration_gui_with_parametric_skeleton_parallel_tip.py
+offline_fixed_b_grid_desired_vs_measured_checkerboard_analysis.py
 
-OFFLINE CTR shadow calibration runner with:
-  1) GUI crop selection using the FIRST raw image
-  2) GUI ruler 2-point scale selection (known distance in mm)
-  3) analyze_data_batch + postprocess_calibration_data
-  4) Parametric skeleton export:
-      - A skeleton model defined as a small number of links (cylinders)
-      - Link poses vary with B pull via polynomial equations derived from fitted r(b), z(b)
-      - Export STL for reference pose and JSON/Python predictors
-  5) Tip localization refiners:
-      - edge_dt: walk outward along the current tip tangent until background
-      - edge_grad: use grayscale gradient along current tip tangent
-      - mainray: estimate a robust trunk tangent from the upstream skeleton path, then ray-cast
-      - parallel_centerline: fit two parallel side-lines of the distal tube extremity using the
-        CURRENT measured tip angle, build the center parallel line, and intersect it with the
-        distal black/white boundary to get the tip.
+Adapted offline checkerboard-referenced tip analysis for fixed-B / fixed-tip-angle grid runs.
 
-Also annotates the analyzed matplotlib images with the selected tip geometry when available.
+What it does:
+  1) Opens a project/raw image folder
+  2) Lets you choose crop bounds from the FIRST raw image
+  3) Uses a checkerboard reference image + camera calibration to define mm axes
+  4) Runs analyze_data_batch + existing tracking pipeline
+  5) Converts tracked tip pixels to checkerboard-referenced mm coordinates
+  6) Parses desired grid metadata from filenames:
+       - tipX
+       - tipY
+       - tipZ
+       - useA (used tip angle)
+       - B
+  7) Reconstructs desired grid coordinates from unique commanded X/Z values
+     using user-specified step sizes (default: 5 mm in X and Z)
+  8) For each used tip-angle pass:
+       - aligns desired grid to measured points by CENTERING the two point sets
+         using the mean of sampled points
+       - computes per-point errors
+       - computes per-angle RMSE
+  9) Computes global RMSE across all valid aligned points
+ 10) Saves:
+       - CSV of desired / aligned desired / measured / errors
+       - JSON metrics summary
+       - desired-vs-actual plot for each B tip angle
+       - optional checkerboard overlay, including centroid alignment overlay
 
-This script does NOT require editing shadow_calibration.py; it monkey-patches
-cal.analyze_data() at runtime for offline debugging.
+Important note:
+  - The requested hard pre-capture time buffer of 5 seconds must be implemented
+    in the IMAGE ACQUISITION script that triggers the camera, not in this offline
+    analysis script. This file does not take pictures.
 """
 
 import argparse
+import csv
 import json
+import math
 import os
+import re
 import shutil
 import sys
 import types
-from heapq import heappush, heappop
+from collections import defaultdict
+from heapq import heappop, heappush
 from pathlib import Path
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 
-# Add the path to your shadow_calibration script
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(SCRIPT_DIR)
+# -----------------------------------------------------------------------------
+# Acquisition note
+# -----------------------------------------------------------------------------
+# This constant is intentionally here as a reminder for the acquisition script.
+# It is NOT enforceable in this offline analysis script because no images are captured here.
+HARD_PRE_CAPTURE_BUFFER_SECONDS = 5.0
 
+# Add path to your shadow_calibration script
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+import shadow_calibration as shadow_calibration_module  # noqa: E402
 from shadow_calibration import CTR_Shadow_Calibration  # noqa: E402
-from shadow_calibration import _endpoints_8  # noqa: E402
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 _NEI8_W = [
@@ -56,7 +81,7 @@ _NEI8_W = [
 # -----------------------------
 # Utilities: IO and discovery
 # -----------------------------
-def list_images(folder: Path):
+def list_images(folder: Path) -> List[Path]:
     imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
     imgs.sort()
     return imgs
@@ -128,21 +153,12 @@ def _undistort_points_to_image(points_xy: np.ndarray, camera_K: np.ndarray, came
 
 
 def _scale_mm_from_px_homography(H: np.ndarray, mm_scale: float) -> np.ndarray:
-    """
-    If x_mm_old = H_old * x_px and new desired mm are x_mm_new = mm_scale * x_mm_old,
-    then H_new = S * H_old with S = diag(mm_scale, mm_scale, 1).
-    """
     H = np.asarray(H, dtype=np.float64).copy()
     S = np.diag([float(mm_scale), float(mm_scale), 1.0]).astype(np.float64)
     return S @ H
 
 
 def _scale_px_from_mm_homography(H: np.ndarray, mm_scale: float) -> np.ndarray:
-    """
-    Inverse companion of _scale_mm_from_px_homography.
-    If H_old maps old-mm -> px and new-mm = mm_scale * old-mm,
-    then old-mm = new-mm / mm_scale, so H_new = H_old * S_inv.
-    """
     H = np.asarray(H, dtype=np.float64).copy()
     if abs(float(mm_scale)) < 1e-12:
         raise ValueError("mm_scale must be non-zero.")
@@ -161,9 +177,6 @@ def apply_checkerboard_reference_corrections(
     Requested fixes:
       1) checkerboard mm values are 2x too large -> scale checkerboard mm conversion by 0.5
       2) checkerboard planar x sign is flipped vs motor -> negate planar x
-
-    This patch is intentionally applied at the checkerboard reference layer so downstream
-    post-processing uses the corrected convention without editing shadow_calibration.py.
     """
     if hasattr(cal, "apply_checkerboard_reference_corrections"):
         return cal.apply_checkerboard_reference_corrections(
@@ -266,146 +279,16 @@ def collect_board_reference_info(cal: CTR_Shadow_Calibration) -> Dict[str, Any]:
     }
 
 
-def draw_checkerboard_analysis_overlay(
-    cal: CTR_Shadow_Calibration,
-    output_path: Path,
-    tracked_rows: np.ndarray,
-    image_files: List[Path],
-    board_debug_image: np.ndarray,
-):
-    if board_debug_image is None:
-        raise ValueError("board_debug_image is required.")
-    if tracked_rows is None or tracked_rows.size == 0:
-        raise ValueError("tracked_rows is empty; run analyze_data_batch first.")
-    if getattr(cal, "board_pose", None) is None or getattr(cal, "true_vertical_img_unit", None) is None:
-        raise RuntimeError("Board reference is unavailable; estimate checkerboard reference first.")
-
-    valid_mask = np.all(np.isfinite(tracked_rows[:, :2]), axis=1)
-    if tracked_rows.shape[1] > 3:
-        valid_mask &= np.isfinite(tracked_rows[:, 3])
-    valid_rows = tracked_rows[valid_mask]
-    valid_files = [image_files[i] for i, ok in enumerate(valid_mask) if ok and i < len(image_files)]
-    if valid_rows.size == 0:
-        raise RuntimeError("No valid tracked points were found for annotation.")
-
-    pts_xy = np.column_stack([valid_rows[:, 1], valid_rows[:, 0]]).astype(np.float64)
-    if bool(cal.board_pose.get("use_undistort", False)):
-        pts_xy_draw = _undistort_points_to_image(pts_xy, cal.camera_K, cal.camera_dist)
-    else:
-        pts_xy_draw = pts_xy.copy()
-
-    overlay = board_debug_image.copy()
-    h, w = overlay.shape[:2]
-    origin = np.asarray(cal.board_pose["origin_px"], dtype=np.float64).reshape(2)
-    v_hat = np.asarray(cal.true_vertical_img_unit, dtype=np.float64).reshape(2)
-    v_hat /= max(np.linalg.norm(v_hat), 1e-12)
-    u_hat = np.array([v_hat[1], -v_hat[0]], dtype=np.float64)
-
-    arrow_len = int(max(60, min(h, w) * 0.14))
-    origin_i = tuple(np.round(origin).astype(int))
-    horiz_end = tuple(np.round(origin + u_hat * arrow_len).astype(int))
-    vert_end = tuple(np.round(origin + v_hat * arrow_len).astype(int))
-    cv2.arrowedLine(overlay, origin_i, horiz_end, (40, 80, 255), 3, tipLength=0.14)
-    cv2.arrowedLine(overlay, origin_i, vert_end, (0, 220, 0), 3, tipLength=0.14)
-    cv2.putText(overlay, "camera horizontal", (horiz_end[0] + 8, horiz_end[1] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 80, 255), 2)
-    cv2.putText(overlay, "camera vertical", (vert_end[0] + 8, vert_end[1] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
-
-    for pt in pts_xy_draw:
-        px = int(round(pt[0]))
-        py = int(round(pt[1]))
-        if 0 <= px < w and 0 <= py < h:
-            cv2.circle(overlay, (px, py), 4, (0, 255, 255), -1)
-            cv2.circle(overlay, (px, py), 7, (0, 0, 0), 1)
-
-    if pts_xy_draw.shape[0] >= 2:
-        pts_poly = np.round(pts_xy_draw).astype(np.int32).reshape(-1, 1, 2)
-        cv2.polylines(overlay, [pts_poly], False, (255, 200, 0), 1, lineType=cv2.LINE_AA)
-
-    rep_indices = sorted(set(np.linspace(0, len(valid_rows) - 1, num=min(3, len(valid_rows)), dtype=int).tolist()))
-    for label_idx, idx in enumerate(rep_indices, start=1):
-        pt_draw = pts_xy_draw[idx]
-        pt_measure = pt_draw
-        u_mm, z_mm = cal.pixel_point_to_calibrated_axes(
-            x_px=float(pt_measure[0]),
-            y_px=float(pt_measure[1]),
-            origin_px=origin,
-        )
-        delta = pt_draw - origin
-        du_px = float(np.dot(delta, u_hat))
-        dz_px = float(np.dot(delta, v_hat))
-        corner = origin + du_px * u_hat
-
-        p0 = tuple(np.round(origin).astype(int))
-        p1 = tuple(np.round(corner).astype(int))
-        p2 = tuple(np.round(pt_draw).astype(int))
-        cv2.line(overlay, p0, p1, (40, 80, 255), 2, lineType=cv2.LINE_AA)
-        cv2.line(overlay, p1, p2, (0, 220, 0), 2, lineType=cv2.LINE_AA)
-        cv2.circle(overlay, p2, 7, (255, 255, 255), 2)
-
-        b_pull = float(valid_rows[idx, 3]) if valid_rows.shape[1] > 3 else float("nan")
-        file_label = valid_files[idx].stem if idx < len(valid_files) else f"pt_{idx}"
-        label = f"P{label_idx}  B={b_pull:.2f}  H={u_mm:.2f}mm  V={z_mm:.2f}mm"
-        label_pos = (p2[0] + 10, p2[1] - 10 - 18 * (label_idx - 1))
-        cv2.putText(overlay, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 3)
-        cv2.putText(overlay, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.55, (10, 10, 10), 1)
-        file_pos = (label_pos[0], label_pos[1] + 18)
-        cv2.putText(overlay, file_label, file_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
-        cv2.putText(overlay, file_label, file_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1)
-
-    all_u_mm = []
-    all_z_mm = []
-    for pt in pts_xy_draw:
-        uu, zz = cal.pixel_point_to_calibrated_axes(
-            x_px=float(pt[0]),
-            y_px=float(pt[1]),
-            origin_px=origin,
-        )
-        all_u_mm.append(uu)
-        all_z_mm.append(zz)
-
-    u_span = float(np.max(all_u_mm) - np.min(all_u_mm))
-    z_span = float(np.max(all_z_mm) - np.min(all_z_mm))
-    summary_lines = [
-        f"tracked points: {len(valid_rows)}",
-        f"horizontal span: {u_span:.2f} mm",
-        f"vertical span: {z_span:.2f} mm",
-        f"local scale: {float(cal.board_px_per_mm_local):.4f} px/mm",
-    ]
-    if getattr(cal, "board_reference_correction_meta", None):
-        cmeta = cal.board_reference_correction_meta
-        summary_lines.append(f"checkerboard mm scale correction: {float(cmeta['checkerboard_mm_scale_correction']):.3f}")
-        summary_lines.append(f"checkerboard x sign flipped: {bool(cmeta['checkerboard_planar_x_flipped'])}")
-
-    y_text = 32
-    for line in summary_lines:
-        cv2.putText(overlay, line, (24, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 3)
-        cv2.putText(overlay, line, (24, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (20, 20, 20), 1)
-        y_text += 30
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(output_path), overlay):
-        raise RuntimeError(f"Failed to write annotated checkerboard image: {output_path}")
-    return output_path
-
-
 # -------------------------------------------
-# GUI: crop + ruler selection from one image
+# GUI: crop selection from one image
 # -------------------------------------------
-def interactive_crop_and_ruler_from_image(
+def interactive_crop_from_image(
     image_bgr: np.ndarray,
     default_crop=None,
-    ruler_known_mm: float = 150.0,
     window_crop="Manual Crop Setup (OFFLINE)",
-    window_ruler="Ruler Reference Setup (OFFLINE)",
 ):
     """
-    Returns:
-      analysis_crop dict (same format CTR_Shadow_Calibration expects)
-      ruler dict with fields:
-        p1_px, p2_px, mm_per_px, px_per_mm, axis_unit, axis_perp_unit, meta
-      If ruler step skipped, ruler dict fields are None except meta.
+    Returns analysis_crop dict in the format CTR_Shadow_Calibration expects.
     """
     if image_bgr is None or image_bgr.size == 0:
         raise ValueError("Empty image passed to interactive GUI.")
@@ -441,7 +324,7 @@ def interactive_crop_and_ruler_from_image(
             if d < best_dist:
                 best_dist = d
                 best_name = name
-        return best_name if best_dist <= drag_threshold_px ** 2 else None
+        return best_name if best_dist <= drag_threshold_px**2 else None
 
     def clamp_rect():
         xs = [pt[0] for pt in corners.values()]
@@ -550,200 +433,12 @@ def interactive_crop_and_ruler_from_image(
         analysis_crop = dict(default_crop)
         print(f"[GUI] Crop cancelled, using default analysis_crop: {analysis_crop}")
 
-    ruler_points = []
-    ruler_confirmed = False
-    ruler_skipped = False
-    min_valid_dist_px = 5.0
-
-    def on_mouse_ruler(event, mx, my, flags, param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        if len(ruler_points) >= 2:
-            return
-        mx = int(np.clip(mx, 0, img_w - 1))
-        my = int(np.clip(my, 0, img_h - 1))
-        ruler_points.append((mx, my))
-
-    print("\n[GUI] Ruler reference setup (OFFLINE)")
-    print(f"- Click two points on the physical ruler (known distance = {ruler_known_mm:.1f} mm).")
-    print("- Press ENTER or SPACE to confirm once two points are selected.")
-    print("- Press R to reset ruler points.")
-    print("- Press Q or ESC to skip ruler calibration.")
-
-    cv2.namedWindow(window_ruler, cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback(window_ruler, on_mouse_ruler)
-
-    try:
-        while True:
-            if cv2.getWindowProperty(window_ruler, cv2.WND_PROP_VISIBLE) < 1:
-                ruler_skipped = True
-                break
-
-            disp = image_bgr.copy()
-
-            x0 = analysis_crop["crop_width_min"]
-            x1 = analysis_crop["crop_width_max"]
-            y0 = img_h - analysis_crop["crop_height_max"]
-            y1 = img_h - analysis_crop["crop_height_min"]
-            cv2.rectangle(disp, (x0, y0), (x1, y1), (0, 255, 0), 2)
-
-            for idx, pt in enumerate(ruler_points):
-                cv2.circle(disp, pt, 7, (0, 255, 255), -1)
-                cv2.putText(
-                    disp,
-                    f"P{idx + 1}",
-                    (pt[0] + 8, pt[1] - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                )
-
-            if len(ruler_points) == 2:
-                p1 = np.asarray(ruler_points[0], dtype=float)
-                p2 = np.asarray(ruler_points[1], dtype=float)
-                dist_px = float(np.linalg.norm(p2 - p1))
-                mm_per_px = (ruler_known_mm / dist_px) if dist_px > 1e-9 else float("nan")
-                cv2.line(disp, ruler_points[0], ruler_points[1], (50, 200, 255), 2)
-                cv2.putText(
-                    disp,
-                    f"dist_px={dist_px:.2f}  mm/px={mm_per_px:.6f}",
-                    (20, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75,
-                    (255, 255, 255),
-                    2,
-                )
-
-            cv2.putText(
-                disp,
-                f"Pick 2 ruler points ({ruler_known_mm:.1f} mm): ENTER confirm | R reset | Q/ESC skip",
-                (20, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.75,
-                (255, 255, 255),
-                2,
-            )
-
-            cv2.imshow(window_ruler, disp)
-            key = cv2.waitKey(20) & 0xFF
-
-            if key in (13, 32):
-                if len(ruler_points) < 2:
-                    print("[GUI] Select two points before confirming.")
-                    continue
-                p1 = np.asarray(ruler_points[0], dtype=float)
-                p2 = np.asarray(ruler_points[1], dtype=float)
-                dist_px = float(np.linalg.norm(p2 - p1))
-                if dist_px < min_valid_dist_px:
-                    print(f"[GUI] Points too close ({dist_px:.3f}px). Re-pick.")
-                    continue
-                ruler_confirmed = True
-                break
-            if key in (27, ord("q")):
-                ruler_skipped = True
-                break
-            if key in (ord("r"), ord("R")):
-                ruler_points.clear()
-    finally:
-        cv2.setMouseCallback(window_ruler, lambda *args: None)
-        cv2.destroyWindow(window_ruler)
-        cv2.waitKey(1)
-        cv2.destroyAllWindows()
-        cv2.waitKey(1)
-
-    ruler = {
-        "p1_px": None,
-        "p2_px": None,
-        "known_distance_mm": float(ruler_known_mm),
-        "mm_per_px": None,
-        "px_per_mm": None,
-        "axis_unit": None,
-        "axis_perp_unit": None,
-        "meta": None,
-    }
-
-    if ruler_confirmed:
-        p1 = np.asarray(ruler_points[0], dtype=np.float64)
-        p2 = np.asarray(ruler_points[1], dtype=np.float64)
-        axis_vec = p2 - p1
-        pixel_dist = float(np.linalg.norm(axis_vec))
-        axis_unit = axis_vec / pixel_dist
-        axis_perp_unit = np.array([axis_unit[1], -axis_unit[0]], dtype=np.float64)
-
-        mm_per_px = float(ruler_known_mm / pixel_dist)
-        px_per_mm = float(pixel_dist / ruler_known_mm)
-
-        ruler["p1_px"] = (int(round(p1[0])), int(round(p1[1])))
-        ruler["p2_px"] = (int(round(p2[0])), int(round(p2[1])))
-        ruler["mm_per_px"] = mm_per_px
-        ruler["px_per_mm"] = px_per_mm
-        ruler["axis_unit"] = axis_unit.tolist()
-        ruler["axis_perp_unit"] = axis_perp_unit.tolist()
-        ruler["meta"] = {
-            "source": "offline_gui",
-            "known_distance_mm": float(ruler_known_mm),
-            "pixel_distance": float(pixel_dist),
-            "analysis_crop": dict(analysis_crop),
-        }
-
-        print("[GUI] Ruler scale set:")
-        print(f"  p1_px={ruler['p1_px']}  p2_px={ruler['p2_px']}")
-        print(
-            f"  pixel_distance={pixel_dist:.6f}px  "
-            f"mm_per_px={mm_per_px:.9f}  px_per_mm={px_per_mm:.9f}"
-        )
-    else:
-        print("[GUI] Ruler calibration skipped.")
-        ruler["meta"] = {"source": "offline_gui", "skipped": True, "analysis_crop": dict(analysis_crop)}
-
-    return analysis_crop, ruler
+    return analysis_crop
 
 
 # ------------------------------------------
 # Tip refinement helpers
 # ------------------------------------------
-def _get_pos_from_file_name(file_name: str):
-    """
-    Support both legacy positional filenames and newer prefixed-token filenames.
-    """
-    base = os.path.splitext(os.path.basename(file_name))[0]
-    parts = base.split("_")
-
-    orientation = 0
-    if len(parts) > 0:
-        try:
-            orientation = int(parts[0])
-        except Exception:
-            orientation = 0
-
-    values = {}
-    for p in parts:
-        if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
-            try:
-                values[p[0]] = float(p[1:])
-            except Exception:
-                pass
-
-    if "X" in values and "B" in values:
-        ntnl_pos = float(values["X"])
-        ss_pos = float(values["B"])
-        return orientation, ntnl_pos, ss_pos
-
-    if len(parts) >= 3:
-        try:
-            ntnl_pos = float(parts[1])
-            ss_pos = float(parts[2])
-            return orientation, ntnl_pos, ss_pos
-        except Exception:
-            pass
-
-    raise ValueError(
-        "Could not parse X/B values from filename: "
-        f"{file_name}. Expected either '<ori>_<X>_<B>_...' or tokens like 'X...' and 'B...'."
-    )
-
-
 def _tip_angle_to_direction_xy(tip_angle_deg: float) -> np.ndarray:
     ang = np.deg2rad(float(tip_angle_deg))
     vx = float(np.sin(ang))
@@ -1119,8 +814,6 @@ def refine_tip_edge_mainray(
       - choose endpoint nearest current coarse tip
       - estimate tangent from upstream path window
       - march a straight ray to the foreground edge
-
-    Returns (y, x, debug).
     """
     mask_fg = (binary_image == 0).astype(np.uint8)
     if mask_fg.sum() == 0:
@@ -1198,15 +891,6 @@ def refine_tip_parallel_centerline(
 ):
     """
     Distal tube extremity via two parallel side-lines constrained to the CURRENT measured tip angle.
-
-    Procedure:
-      1) Use the current tip angle as the common line direction.
-      2) Backtrack from the coarse tip until inside the foreground.
-      3) Sample several cross-sections upstream, orthogonal to the line direction.
-      4) Estimate the two side boundaries as robust constant offsets (parallel lines).
-      5) Build the center parallel line and ray-cast it distally to the black/white boundary.
-
-    Returns: refined (y, x) and debug dict with annotation geometry.
     """
     mask_fg = (binary_image == 0).astype(np.uint8)
     if mask_fg.sum() == 0:
@@ -1319,10 +1003,6 @@ def refine_tip_parallel_centerline(
 
 
 def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = ""):
-    """
-    Add overlays to the analysis matplotlib axes returned by the original pipeline.
-    Geometry is assumed to be in local crop coordinates.
-    """
     if axs is None or not isinstance(dbg, dict):
         return
 
@@ -1411,10 +1091,6 @@ def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = 
 
 
 def _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min: int, zoom_x_max: int, zoom_y_min: int, zoom_y_max: int):
-    """
-    Re-express the lower zoom panels in the same cropped-image pixel coordinates
-    used by the refinement geometry so overlays land on the underlying image.
-    """
     if axs is None or not isinstance(axs, np.ndarray) or axs.size < 4:
         return
 
@@ -1461,9 +1137,6 @@ def _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min: int, zoom_x_max: int, 
         ax.set_aspect("equal")
 
 
-# ---------------------------------------------------------
-# Monkey-patch analyze_data to output refined tip coordinates
-# ---------------------------------------------------------
 def patch_analyze_data_for_tip_refinement(
     cal: CTR_Shadow_Calibration,
     refine_mode: str = "none",
@@ -1490,13 +1163,6 @@ def patch_analyze_data_for_tip_refinement(
       - It refines tip_row/tip_col to a distal edge estimate (optional)
       - It writes refined pixel coordinates into tip_locations_array_coarse
       - It annotates the returned matplotlib axes with the fitted geometry when available
-
-    refine_mode:
-      - "none"
-      - "edge_dt"
-      - "edge_grad"
-      - "mainray"
-      - "parallel_centerline"
     """
     original_analyze_data = cal.analyze_data
     if not hasattr(cal, "tip_refine_debug_records"):
@@ -1625,444 +1291,971 @@ def patch_analyze_data_for_tip_refinement(
 
 
 # -----------------------------------------
-# Parametric skeleton export (equations)
+# Visualization helpers
 # -----------------------------------------
-def _polyval(coeffs, b):
-    return np.polyval(np.asarray(coeffs, dtype=float), np.asarray(b, dtype=float))
+def _extract_checkerboard_center_px(cal: CTR_Shadow_Calibration, board_debug_image: np.ndarray) -> np.ndarray:
+    """
+    Robustly infer checkerboard center in image pixels.
+    Preference:
+      1) mean of any detected/known checkerboard corner array found in board_pose
+      2) origin_px
+      3) image center
+    """
+    board_pose = getattr(cal, "board_pose", None)
+    if isinstance(board_pose, dict):
+        candidate_keys = [
+            "corners_px",
+            "board_corners_px",
+            "image_points",
+            "image_points_px",
+            "detected_corners_px",
+            "checkerboard_corners_px",
+        ]
+        for key in candidate_keys:
+            arr = board_pose.get(key, None)
+            if arr is None:
+                continue
+            arr = np.asarray(arr, dtype=np.float64)
+            if arr.size >= 2:
+                arr = arr.reshape(-1, 2)
+                good = np.all(np.isfinite(arr), axis=1)
+                if np.any(good):
+                    return np.mean(arr[good], axis=0)
+
+        origin = board_pose.get("origin_px", None)
+        if origin is not None:
+            origin = np.asarray(origin, dtype=np.float64).reshape(-1)
+            if origin.size >= 2 and np.all(np.isfinite(origin[:2])):
+                return origin[:2].copy()
+
+    h, w = board_debug_image.shape[:2]
+    return np.array([0.5 * (w - 1), 0.5 * (h - 1)], dtype=np.float64)
 
 
-def _sample_curve_xyz(cal_json: dict, b_vals: np.ndarray):
-    fit_models = cal_json.get("fit_models", {})
-    r_model = fit_models.get("r") or CTR_Shadow_Calibration._legacy_curve_model_from_calibration_json(cal_json, "r")
-    z_model = fit_models.get("z") or CTR_Shadow_Calibration._legacy_curve_model_from_calibration_json(cal_json, "z")
-    y_model = fit_models.get("offplane_y") or CTR_Shadow_Calibration._legacy_curve_model_from_calibration_json(cal_json, "offplane_y")
+def draw_checkerboard_analysis_overlay(
+    cal: CTR_Shadow_Calibration,
+    output_path: Path,
+    tracked_rows: np.ndarray,
+    image_files: List[Path],
+    board_debug_image: np.ndarray,
+):
+    if board_debug_image is None:
+        raise ValueError("board_debug_image is required.")
+    if tracked_rows is None or tracked_rows.size == 0:
+        raise ValueError("tracked_rows is empty; run analyze_data_batch first.")
+    if getattr(cal, "board_pose", None) is None or getattr(cal, "true_vertical_img_unit", None) is None:
+        raise RuntimeError("Board reference is unavailable.")
 
-    if r_model is None or z_model is None:
-        raise ValueError("Missing r/z fit models in calibration JSON.")
+    valid_mask = np.all(np.isfinite(tracked_rows[:, :2]), axis=1)
+    if tracked_rows.shape[1] > 3:
+        valid_mask &= np.isfinite(tracked_rows[:, 3])
+    valid_rows = tracked_rows[valid_mask]
+    valid_files = [image_files[i] for i, ok in enumerate(valid_mask) if ok and i < len(image_files)]
+    if valid_rows.size == 0:
+        raise RuntimeError("No valid tracked points were found for annotation.")
 
-    x = CTR_Shadow_Calibration._evaluate_curve_model(r_model, b_vals)
-    z = CTR_Shadow_Calibration._evaluate_curve_model(z_model, b_vals)
-    if y_model is not None:
-        y = CTR_Shadow_Calibration._evaluate_curve_model(y_model, b_vals)
+    pts_xy = np.column_stack([valid_rows[:, 1], valid_rows[:, 0]]).astype(np.float64)
+    if bool(cal.board_pose.get("use_undistort", False)):
+        pts_xy_draw = _undistort_points_to_image(pts_xy, cal.camera_K, cal.camera_dist)
     else:
-        y = np.zeros_like(x, dtype=float)
+        pts_xy_draw = pts_xy.copy()
 
-    return np.column_stack([x, y, z]).astype(float)
+    overlay = board_debug_image.copy()
+    h, w = overlay.shape[:2]
+    origin = np.asarray(cal.board_pose["origin_px"], dtype=np.float64).reshape(2)
+    v_hat = np.asarray(cal.true_vertical_img_unit, dtype=np.float64).reshape(2)
+    v_hat /= max(np.linalg.norm(v_hat), 1e-12)
+    u_hat = np.array([v_hat[1], -v_hat[0]], dtype=np.float64)
+
+    arrow_len = int(max(60, min(h, w) * 0.14))
+    origin_i = tuple(np.round(origin).astype(int))
+    horiz_end = tuple(np.round(origin + u_hat * arrow_len).astype(int))
+    vert_end = tuple(np.round(origin + v_hat * arrow_len).astype(int))
+    cv2.arrowedLine(overlay, origin_i, horiz_end, (40, 80, 255), 3, tipLength=0.14)
+    cv2.arrowedLine(overlay, origin_i, vert_end, (0, 220, 0), 3, tipLength=0.14)
+    cv2.putText(overlay, "camera horizontal", (horiz_end[0] + 8, horiz_end[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (40, 80, 255), 2)
+    cv2.putText(overlay, "camera vertical", (vert_end[0] + 8, vert_end[1] - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 0), 2)
+
+    # Raw measured points
+    for pt in pts_xy_draw:
+        px = int(round(pt[0]))
+        py = int(round(pt[1]))
+        if 0 <= px < w and 0 <= py < h:
+            cv2.drawMarker(
+                overlay,
+                (px, py),
+                (0, 255, 255),
+                markerType=cv2.MARKER_TILTED_CROSS,
+                markerSize=8,
+                thickness=1,
+                line_type=cv2.LINE_AA,
+            )
+
+    if pts_xy_draw.shape[0] >= 2:
+        pts_poly = np.round(pts_xy_draw).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(overlay, [pts_poly], False, (255, 200, 0), 1, lineType=cv2.LINE_AA)
+
+    # Center alignment overlay: align centroid of measured points to checkerboard center
+    measured_center = np.mean(pts_xy_draw, axis=0)
+    checkerboard_center = _extract_checkerboard_center_px(cal, board_debug_image)
+    center_shift = checkerboard_center - measured_center
+    pts_xy_centered = pts_xy_draw + center_shift
+
+    for pt in pts_xy_centered:
+        px = int(round(pt[0]))
+        py = int(round(pt[1]))
+        if 0 <= px < w and 0 <= py < h:
+            cv2.drawMarker(
+                overlay,
+                (px, py),
+                (255, 0, 255),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=8,
+                thickness=1,
+                line_type=cv2.LINE_AA,
+            )
+
+    if pts_xy_centered.shape[0] >= 2:
+        pts_poly_centered = np.round(pts_xy_centered).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(overlay, [pts_poly_centered], False, (255, 0, 255), 1, lineType=cv2.LINE_AA)
+
+    # Draw centers
+    mci = tuple(np.round(measured_center).astype(int))
+    cci = tuple(np.round(checkerboard_center).astype(int))
+
+    cv2.drawMarker(
+        overlay, mci, (0, 255, 255),
+        markerType=cv2.MARKER_STAR, markerSize=18, thickness=2, line_type=cv2.LINE_AA
+    )
+    cv2.putText(
+        overlay, "measured points center", (mci[0] + 10, mci[1] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2
+    )
+
+    cv2.drawMarker(
+        overlay, cci, (255, 0, 255),
+        markerType=cv2.MARKER_STAR, markerSize=18, thickness=2, line_type=cv2.LINE_AA
+    )
+    cv2.putText(
+        overlay, "checkerboard center", (cci[0] + 10, cci[1] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2
+    )
+
+    cv2.arrowedLine(
+        overlay,
+        mci,
+        cci,
+        (180, 180, 180),
+        2,
+        tipLength=0.05
+    )
+
+    summary_lines = [
+        f"tracked points: {len(valid_rows)}",
+        f"local scale: {float(cal.board_px_per_mm_local):.4f} px/mm",
+        f"raw measured center: ({measured_center[0]:.2f}, {measured_center[1]:.2f}) px",
+        f"checkerboard center: ({checkerboard_center[0]:.2f}, {checkerboard_center[1]:.2f}) px",
+        f"center shift applied: dx={center_shift[0]:.2f} px, dy={center_shift[1]:.2f} px",
+    ]
+    if getattr(cal, "board_reference_correction_meta", None):
+        cmeta = cal.board_reference_correction_meta
+        summary_lines.append(f"checkerboard mm scale correction: {float(cmeta['checkerboard_mm_scale_correction']):.3f}")
+        summary_lines.append(f"checkerboard x sign flipped: {bool(cmeta['checkerboard_planar_x_flipped'])}")
+
+    y_text = 32
+    for line in summary_lines:
+        cv2.putText(overlay, line, (24, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 3)
+        cv2.putText(overlay, line, (24, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (20, 20, 20), 1)
+        y_text += 30
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), overlay):
+        raise RuntimeError(f"Failed to write annotated checkerboard image: {output_path}")
+    return output_path
 
 
-def _downsample_polyline(points: np.ndarray, n_links: int):
-    n_links = int(max(1, n_links))
-    k = n_links + 1
-    idx = np.linspace(0, points.shape[0] - 1, k).round().astype(int)
-    return points[idx]
+# -----------------------------------------
+# Filename metadata parsing
+# -----------------------------------------
+_FLOAT_RE = r"[-+]?\d+(?:\.\d+)?"
+
+_FILENAME_PATTERNS = {
+    "requested_tip_angle_deg": re.compile(r"_reqA(" + _FLOAT_RE + r")"),
+    "used_tip_angle_deg": re.compile(r"_useA(" + _FLOAT_RE + r")"),
+    "tip_x_cmd": re.compile(r"_tipX(" + _FLOAT_RE + r")"),
+    "tip_y_cmd": re.compile(r"_tipY(" + _FLOAT_RE + r")"),
+    "tip_z_cmd": re.compile(r"_tipZ(" + _FLOAT_RE + r")"),
+    "stage_x_cmd": re.compile(r"_stageX(" + _FLOAT_RE + r")"),
+    "stage_y_cmd": re.compile(r"_stageY(" + _FLOAT_RE + r")"),
+    "stage_z_cmd": re.compile(r"_stageZ(" + _FLOAT_RE + r")"),
+    "b_cmd": re.compile(r"_B(" + _FLOAT_RE + r")"),
+    "c_cmd": re.compile(r"_C(" + _FLOAT_RE + r")"),
+    "pass_index": re.compile(r"_pass(\d+)"),
+    "sample_index": re.compile(r"^(\d+)"),
+}
 
 
-def _compute_link_frames(points_xyz: np.ndarray):
+def _extract_tagged_float_from_tokens(name: str, tag: str) -> Optional[float]:
+    stem = Path(name).stem
+    for token in stem.split("_"):
+        if token.startswith(tag):
+            suffix = token[len(tag):]
+            if not suffix:
+                continue
+            try:
+                return float(suffix)
+            except Exception:
+                continue
+    return None
+
+
+def _extract_tagged_int_from_tokens(name: str, tag: str) -> Optional[int]:
+    stem = Path(name).stem
+    for token in stem.split("_"):
+        if token.startswith(tag):
+            suffix = token[len(tag):]
+            if not suffix:
+                continue
+            try:
+                return int(suffix)
+            except Exception:
+                continue
+    return None
+
+
+def _extract_float_from_name(name: str, pattern: re.Pattern) -> Optional[float]:
+    m = pattern.search(name)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _extract_int_from_name(name: str, pattern: re.Pattern) -> Optional[int]:
+    m = pattern.search(name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def parse_image_metadata_from_name(image_name: str) -> Dict[str, Any]:
+    stem = Path(image_name).stem
+
+    def pick_float(pattern_key: str, token_tag: str) -> Optional[float]:
+        value = _extract_float_from_name(stem, _FILENAME_PATTERNS[pattern_key])
+        if value is not None:
+            return value
+        return _extract_tagged_float_from_tokens(stem, token_tag)
+
+    def pick_int(pattern_key: str, token_tag: str) -> Optional[int]:
+        value = _extract_int_from_name(stem, _FILENAME_PATTERNS[pattern_key])
+        if value is not None:
+            return value
+        return _extract_tagged_int_from_tokens(stem, token_tag)
+
+    meta = {
+        "image_name": image_name,
+        "requested_tip_angle_deg": pick_float("requested_tip_angle_deg", "reqA"),
+        "used_tip_angle_deg": pick_float("used_tip_angle_deg", "useA"),
+        "tip_x_cmd": pick_float("tip_x_cmd", "tipX"),
+        "tip_y_cmd": pick_float("tip_y_cmd", "tipY"),
+        "tip_z_cmd": pick_float("tip_z_cmd", "tipZ"),
+        "stage_x_cmd": pick_float("stage_x_cmd", "stageX"),
+        "stage_y_cmd": pick_float("stage_y_cmd", "stageY"),
+        "stage_z_cmd": pick_float("stage_z_cmd", "stageZ"),
+        "b_cmd": pick_float("b_cmd", "B"),
+        "c_cmd": pick_float("c_cmd", "C"),
+        "pass_index": pick_int("pass_index", "pass"),
+        "sample_index_from_name": _extract_int_from_name(stem, _FILENAME_PATTERNS["sample_index"]),
+    }
+    return meta
+
+
+def robust_parse_positions_from_filename(file_name: str):
     """
-    For link i between P[i] -> P[i+1]:
-      - origin at P[i]
-      - z-axis along direction
-      - x/y axes arbitrary but stable (constructed from world up fallback)
-    Returns list of per-link dicts.
-    """
-    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
-    frames = []
-    world_up = np.array([0.0, 0.0, 1.0], dtype=float)
+    Parse the filename format produced by calib_cartes_daq.py and fall back to
+    the legacy orientation/X/B format expected by shadow_calibration.
 
-    for i in range(pts.shape[0] - 1):
-        p0 = pts[i]
-        p1 = pts[i + 1]
-        d = p1 - p0
-        L = float(np.linalg.norm(d))
-        if L < 1e-9:
-            frames.append({
-                "origin_mm": p0.tolist(),
-                "direction_unit": [0.0, 0.0, 1.0],
-                "length_mm": 0.0,
-                "R_world_from_link": np.eye(3).tolist(),
-            })
+    Returns:
+      orientation, ntnl_pos, ss_pos
+
+    Mapping used for shadow_calibration compatibility:
+      - orientation = inferred from side token / C value / legacy numeric token
+      - ntnl_pos    = tipX when available, otherwise X
+      - ss_pos      = B
+    """
+    base = os.path.splitext(os.path.basename(file_name))[0]
+    parts = base.split("_")
+
+    orientation = None
+    side_token = None
+    values: Dict[str, float] = {}
+
+    for token in parts:
+        lower = token.lower()
+        if lower in ("right", "left"):
+            side_token = lower
             continue
 
-        z = d / L
-
-        up = world_up
-        if abs(float(np.dot(up, z))) > 0.95:
-            up = np.array([0.0, 1.0, 0.0], dtype=float)
-
-        x = np.cross(up, z)
-        xn = float(np.linalg.norm(x))
-        if xn < 1e-12:
-            x = np.array([1.0, 0.0, 0.0], dtype=float)
+        for key in ("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA"):
+            if token.startswith(key):
+                try:
+                    values[key] = float(token[len(key):])
+                except Exception:
+                    pass
+                break
         else:
-            x = x / xn
+            if len(token) >= 2 and token[0] in ("X", "Y", "Z", "B", "C"):
+                try:
+                    values[token[0]] = float(token[1:])
+                except Exception:
+                    pass
 
-        y = np.cross(z, x)
-        yn = float(np.linalg.norm(y))
-        if yn < 1e-12:
-            y = np.array([0.0, 1.0, 0.0], dtype=float)
-        else:
-            y = y / yn
+    if side_token == "right":
+        orientation = 0
+    elif side_token == "left":
+        orientation = 1
 
-        R = np.column_stack([x, y, z])
+    if orientation is None and "C" in values:
+        c_val = float(values["C"])
+        c_norm = ((c_val + 180.0) % 360.0) - 180.0
+        if abs(c_norm - 0.0) <= 5.0:
+            orientation = 0
+        elif abs(abs(c_norm) - 180.0) <= 5.0:
+            orientation = 1
+        elif abs(c_norm - 90.0) <= 5.0:
+            orientation = 2
+        elif abs(c_norm + 90.0) <= 5.0:
+            orientation = 3
 
-        frames.append({
-            "origin_mm": p0.tolist(),
-            "direction_unit": z.tolist(),
-            "length_mm": L,
-            "R_world_from_link": R.tolist(),
-        })
+    if orientation is None and parts:
+        try:
+            candidate = int(parts[0])
+            if candidate in (0, 1, 2, 3):
+                orientation = candidate
+        except Exception:
+            pass
 
-    return frames
+    if orientation is None:
+        orientation = 0
+
+    x_value = values.get("tipX", values.get("X"))
+    b_value = values.get("B")
+    if x_value is None:
+        raise ValueError(f"Could not parse X value from filename: {file_name}")
+    if b_value is None:
+        raise ValueError(f"Could not parse B value from filename: {file_name}")
+
+    return int(orientation), float(x_value), float(b_value)
 
 
-def export_parametric_skeleton_model(
-    project_dir: Path,
-    robot_name: str,
-    n_links: int = 6,
-    diameter_mm: float = 3.0,
-    b_ref: float = 0.0,
-    stl_reference_pose: bool = True,
+def patch_filename_parser():
+    """
+    Patch shadow_calibration filename parsing so analyze_data_batch can read
+    Cartesian-tracking filenames like:
+      00043_pass01_reqA0.0_useA15.653_tipX100.000_..._B-0.095_C0.000_...
+    """
+    shadow_calibration_module._get_pos_from_file_name = robust_parse_positions_from_filename
+    print("[INFO] Patched filename parser for Cartesian tipX..._B... filenames.")
+
+
+def angle_group_key(angle_deg: Any, decimals: int = 6) -> Optional[float]:
+    if angle_deg is None:
+        return None
+    try:
+        v = float(angle_deg)
+        if not np.isfinite(v):
+            return None
+        return round(v, decimals)
+    except Exception:
+        return None
+
+
+# -----------------------------------------
+# Convert tracked tips to checkerboard mm
+# and attach desired commanded coordinates
+# -----------------------------------------
+def compute_tracked_tip_positions_mm_with_targets(
+    cal: CTR_Shadow_Calibration,
+    tracked_rows: np.ndarray,
+    image_files: List[Path],
+) -> Dict[str, Any]:
+    """
+    Convert tracked tip pixel coordinates to checkerboard-referenced mm
+    and attach filename-derived target metadata.
+    """
+    if getattr(cal, "board_pose", None) is None:
+        raise RuntimeError("Checkerboard board_pose is not available.")
+    if tracked_rows is None or tracked_rows.size == 0:
+        raise RuntimeError("tracked_rows is empty.")
+
+    origin = np.asarray(cal.board_pose["origin_px"], dtype=np.float64).reshape(2)
+
+    records = []
+    valid_indices = []
+    measured_mm_points = []
+
+    for i, row in enumerate(np.asarray(tracked_rows, dtype=float)):
+        file_name = image_files[i].name if i < len(image_files) else f"sample_{i:04d}"
+        meta = parse_image_metadata_from_name(file_name)
+
+        y_px = None
+        x_px = None
+        u_mm = None
+        z_mm = None
+        valid = False
+
+        if np.all(np.isfinite(row[:2])):
+            y_px = float(row[0])
+            x_px = float(row[1])
+
+            try:
+                u_mm, z_mm = cal.pixel_point_to_calibrated_axes(
+                    x_px=x_px,
+                    y_px=y_px,
+                    origin_px=origin,
+                )
+                u_mm = float(u_mm)
+                z_mm = float(z_mm)
+                valid = np.isfinite(u_mm) and np.isfinite(z_mm)
+            except Exception:
+                u_mm, z_mm = None, None
+                valid = False
+
+        rec = {
+            "sample_index": i,
+            "image_name": file_name,
+            "tip_y_px": y_px,
+            "tip_x_px": x_px,
+            "u_mm": u_mm,
+            "z_mm": z_mm,
+            "valid": bool(valid),
+
+            "requested_tip_angle_deg": meta["requested_tip_angle_deg"],
+            "used_tip_angle_deg": meta["used_tip_angle_deg"],
+            "tip_x_cmd": meta["tip_x_cmd"],
+            "tip_y_cmd": meta["tip_y_cmd"],
+            "tip_z_cmd": meta["tip_z_cmd"],
+            "stage_x_cmd": meta["stage_x_cmd"],
+            "stage_y_cmd": meta["stage_y_cmd"],
+            "stage_z_cmd": meta["stage_z_cmd"],
+            "b_cmd": meta["b_cmd"],
+            "c_cmd": meta["c_cmd"],
+            "pass_index": meta["pass_index"],
+            "sample_index_from_name": meta["sample_index_from_name"],
+        }
+        records.append(rec)
+
+        if valid:
+            valid_indices.append(i)
+            measured_mm_points.append([u_mm, z_mm])
+
+    measured_mm_points = (
+        np.asarray(measured_mm_points, dtype=float)
+        if len(measured_mm_points) else np.empty((0, 2), dtype=float)
+    )
+
+    return {
+        "records": records,
+        "valid_indices": valid_indices,
+        "measured_mm_points": measured_mm_points,
+    }
+
+
+# -----------------------------------------
+# Desired grid reconstruction + alignment
+# -----------------------------------------
+def build_desired_grid_coordinates_per_angle(
+    records: List[Dict[str, Any]],
+    x_step_mm: float = 5.0,
+    z_step_mm: float = 5.0,
 ):
     """
-    Reads <robot_name>_gcode_calibration.json, creates a parametric skeleton definition.
+    For each used tip-angle pass, map commanded tipX/tipZ values to desired grid coordinates:
+      desired_grid_u_mm = column_index * x_step_mm
+      desired_grid_z_mm = row_index    * z_step_mm
 
-    Exports:
-      - processed_image_data_folder/<robot_name>_skeleton_parametric.json
-      - processed_image_data_folder/<robot_name>_skeleton_predict.py
-      - optionally an STL for reference pose at b_ref (default 0.0)
+    This removes dependence on absolute commanded origin and uses only spacing/order.
     """
-    processed = project_dir / "processed_image_data_folder"
-    gcode_json_path = processed / f"{robot_name}_gcode_calibration.json"
-    if not gcode_json_path.is_file():
-        raise FileNotFoundError(f"Missing calibration JSON: {gcode_json_path}")
-
-    with open(gcode_json_path, "r") as f:
-        cal_json = json.load(f)
-
-    fit_models = cal_json.get("fit_models", {})
-    r_model = fit_models.get("r") or CTR_Shadow_Calibration._legacy_curve_model_from_calibration_json(cal_json, "r")
-    z_model = fit_models.get("z") or CTR_Shadow_Calibration._legacy_curve_model_from_calibration_json(cal_json, "z")
-    y_model = fit_models.get("offplane_y") or CTR_Shadow_Calibration._legacy_curve_model_from_calibration_json(cal_json, "offplane_y")
-    if r_model is None or z_model is None:
-        raise ValueError("Calibration JSON missing r/z fit models.")
-
-    motor_setup = cal_json.get("motor_setup", {})
-    b_rng = motor_setup.get("b_motor_position_range") or coeffs.get("b_motor_range")
-    if b_rng is None or len(b_rng) != 2:
-        raise ValueError("Calibration JSON missing b_motor_position_range.")
-
-    b_min, b_max = float(b_rng[0]), float(b_rng[1])
-
-    n_links = int(max(1, n_links))
-    t = np.linspace(0.0, 1.0, n_links + 1)
-    b_knots = b_min + t * (b_max - b_min)
-
-    pts_ref = _sample_curve_xyz(cal_json, b_knots)
-
-    origin = np.array([0.0, 0.0, 0.0], dtype=float)
-    if np.linalg.norm(pts_ref[-1] - origin) > 1e-9:
-        pts_ref_with_origin = np.vstack([pts_ref, origin])
-    else:
-        pts_ref_with_origin = pts_ref.copy()
-
-    frames_ref = _compute_link_frames(pts_ref_with_origin)
-
-    skel_param = {
-        "robot_name": robot_name,
-        "type": "parametric_link_chain",
-        "units": "mm",
-        "diameter_mm": float(diameter_mm),
-        "radius_mm": float(diameter_mm) / 2.0,
-        "n_links_curve": int(n_links),
-        "unknown_tail_to_origin": True,
-        "b_range": [b_min, b_max],
-        "knot_definition": {
-            "t_i": t.tolist(),
-            "b_i": b_knots.tolist(),
-            "meaning": "Curve knots are sampled along the full calibrated B range; each knot is a point on the fitted curve.",
-        },
-        "curve_equations": {
-            "x_mm": {"fit_model": r_model, "definition": "x = r(b) signed planar radial deflection"},
-            "z_mm": {"fit_model": z_model, "definition": "z = z(b) axial position"},
-            "y_mm": {
-                "fit_model": y_model,
-                "definition": "y = y_offplane(b) if available else 0",
-                "available": y_model is not None,
-            },
-        },
-        "reference_pose": {
-            "points_xyz_mm": pts_ref_with_origin.round(6).tolist(),
-            "link_frames": frames_ref,
-            "note": "Reference pose uses knots sampled across B-range and a final link to origin. Use predictor to get poses for arbitrary b.",
-        },
-        "predictor_convention": {
-            "inputs": ["b_pull_mm"],
-            "outputs": [
-                "points_xyz_mm (N+2 points including origin)",
-                "link_frames (per-link origin, direction, length, rotation matrix)",
-            ],
-            "base_rule": "Append final segment to (0,0,0) if last point isn't already origin.",
-        },
-    }
-
-    param_path = processed / f"{robot_name}_skeleton_parametric.json"
-    with open(param_path, "w") as f:
-        json.dump(skel_param, f, indent=2)
-
-    predictor_code = f'''# Auto-generated parametric skeleton predictor for {robot_name}
-# Units: mm
-import numpy as np
-from scipy.interpolate import PchipInterpolator
-
-R_MODEL = {json.dumps(r_model)}
-Z_MODEL = {json.dumps(z_model)}
-Y_MODEL = {json.dumps(y_model)}
-
-B_MIN = {b_min:.10f}
-B_MAX = {b_max:.10f}
-
-T_KNOTS = np.array({json.dumps(t.tolist())}, dtype=float)
-B_KNOTS = B_MIN + T_KNOTS * (B_MAX - B_MIN)
-
-DIAMETER_MM = {float(diameter_mm):.6f}
-RADIUS_MM = {float(diameter_mm) / 2.0:.6f}
-
-def _polyval(c, b):
-    if c is None:
-        return None
-    return np.polyval(np.asarray(c, dtype=float), np.asarray(b, dtype=float))
-
-def _evaluate_curve_model(model_descriptor, b):
-    if model_descriptor is None:
-        return None
-    b_arr = np.asarray(b, dtype=float)
-    model_type = str(model_descriptor.get("model_type", "polynomial")).lower()
-    if model_type == "polynomial":
-        coeffs = model_descriptor.get("coefficients")
-        if coeffs is None:
-            raise ValueError("Polynomial fit model missing coefficients.")
-        return _polyval(coeffs, b_arr)
-    if model_type == "pchip":
-        x_knots = model_descriptor.get("x_knots")
-        y_knots = model_descriptor.get("y_knots")
-        if x_knots is None or y_knots is None:
-            raise ValueError("PCHIP fit model missing knots.")
-        return PchipInterpolator(np.asarray(x_knots, dtype=float), np.asarray(y_knots, dtype=float), extrapolate=True)(b_arr)
-    raise ValueError(f"Unsupported model_type: {{model_type}}")
-
-def curve_point_xyz(b):
-    x = float(_evaluate_curve_model(R_MODEL, b))
-    z = float(_evaluate_curve_model(Z_MODEL, b))
-    if Y_MODEL is None:
-        y = 0.0
-    else:
-        y = float(_evaluate_curve_model(Y_MODEL, b))
-    return np.array([x, y, z], dtype=float)
-
-def skeleton_points(b_pull_mm, include_origin=True):
-    pts = np.stack([curve_point_xyz(bi) for bi in B_KNOTS], axis=0)
-    if include_origin:
-        if np.linalg.norm(pts[-1] - np.array([0.0, 0.0, 0.0])) > 1e-9:
-            pts = np.vstack([pts, np.array([0.0, 0.0, 0.0])])
-    return pts
-
-def _compute_link_frames(points_xyz):
-    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
-    frames = []
-    world_up = np.array([0.0, 0.0, 1.0], dtype=float)
-    for i in range(pts.shape[0] - 1):
-        p0 = pts[i]
-        p1 = pts[i + 1]
-        d = p1 - p0
-        L = float(np.linalg.norm(d))
-        if L < 1e-9:
-            frames.append({{
-                "origin_mm": p0.tolist(),
-                "direction_unit": [0.0, 0.0, 1.0],
-                "length_mm": 0.0,
-                "R_world_from_link": np.eye(3).tolist(),
-            }})
+    groups = defaultdict(list)
+    for rec in records:
+        ang = angle_group_key(rec.get("used_tip_angle_deg"))
+        if ang is None:
             continue
-        z = d / L
-        up = world_up
-        if abs(float(np.dot(up, z))) > 0.95:
-            up = np.array([0.0, 1.0, 0.0], dtype=float)
-        x = np.cross(up, z)
-        xn = float(np.linalg.norm(x))
-        if xn < 1e-12:
-            x = np.array([1.0, 0.0, 0.0], dtype=float)
-        else:
-            x /= xn
-        y = np.cross(z, x)
-        yn = float(np.linalg.norm(y))
-        if yn < 1e-12:
-            y = np.array([0.0, 1.0, 0.0], dtype=float)
-        else:
-            y /= yn
-        R = np.column_stack([x, y, z])
-        frames.append({{
-            "origin_mm": p0.tolist(),
-            "direction_unit": z.tolist(),
-            "length_mm": L,
-            "R_world_from_link": R.tolist(),
-        }})
-    return frames
+        tx = rec.get("tip_x_cmd")
+        tz = rec.get("tip_z_cmd")
+        if tx is None or tz is None:
+            continue
+        groups[ang].append(rec)
 
-def skeleton_link_frames(b_pull_mm, include_origin=True):
-    pts = skeleton_points(b_pull_mm, include_origin=include_origin)
-    return _compute_link_frames(pts)
-'''
-    py_path = processed / f"{robot_name}_skeleton_predict.py"
-    with open(py_path, "w") as f:
-        f.write(predictor_code)
+    group_grid_meta = {}
 
-    stl_path = None
-    if stl_reference_pose:
-        verts, faces = polyline_to_cylinder_mesh(pts_ref_with_origin, radius_mm=float(diameter_mm) / 2.0, sides=16)
-        stl_path = processed / f"{robot_name}_robot_skeleton_reference.stl"
-        write_binary_stl(stl_path, verts, faces, solid_name=f"{robot_name}_skeleton_ref")
+    for ang, grecs in groups.items():
+        x_vals = sorted({float(r["tip_x_cmd"]) for r in grecs if r.get("tip_x_cmd") is not None})
+        z_vals = sorted({float(r["tip_z_cmd"]) for r in grecs if r.get("tip_z_cmd") is not None})
 
-    cal_json.setdefault("exported_models", {})
-    cal_json["exported_models"]["robot_skeleton_parametric"] = {
-        "format": "json+py",
-        "parametric_json": param_path.name,
-        "predictor_py": py_path.name,
-        "reference_stl": stl_path.name if stl_path is not None else None,
-        "diameter_mm": float(diameter_mm),
-        "n_links": int(n_links),
-        "note": "Use predictor to generate link endpoints/frames for any B pull; includes final link to origin for unknown parts.",
-    }
-    with open(gcode_json_path, "w") as f:
-        json.dump(cal_json, f, indent=2)
+        x_map = {x: ix * float(x_step_mm) for ix, x in enumerate(x_vals)}
+        z_map = {z: iz * float(z_step_mm) for iz, z in enumerate(z_vals)}
 
-    return param_path, py_path, stl_path, gcode_json_path
+        group_grid_meta[ang] = {
+            "raw_tip_x_values": x_vals,
+            "raw_tip_z_values": z_vals,
+            "desired_grid_x_map": x_map,
+            "desired_grid_z_map": z_map,
+            "num_x": len(x_vals),
+            "num_z": len(z_vals),
+            "x_step_mm": float(x_step_mm),
+            "z_step_mm": float(z_step_mm),
+        }
+
+        for rec in grecs:
+            tx = float(rec["tip_x_cmd"])
+            tz = float(rec["tip_z_cmd"])
+            rec["desired_grid_u_mm"] = float(x_map[tx])
+            rec["desired_grid_z_mm"] = float(z_map[tz])
+
+    return records, group_grid_meta
 
 
-# -----------------------------------------
-# STL helpers
-# -----------------------------------------
-def _unit(v: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v))
-    if n < 1e-12:
-        return np.zeros_like(v)
-    return v / n
+def align_desired_to_measured_per_angle(
+    records: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[float, Dict[str, Any]]]:
+    """
+    For each used tip-angle pass:
+      aligned_desired_u_mm = desired_grid_u_mm + offset_u
+      aligned_desired_z_mm = desired_grid_z_mm + offset_z
 
+    Alignment is center-based using means of sampled points:
+      measured_center_u = mean(measured_u)
+      measured_center_z = mean(measured_z)
+      desired_center_u  = mean(desired_u)
+      desired_center_z  = mean(desired_z)
 
-def _build_orthonormal_basis(direction: np.ndarray):
-    d = _unit(direction)
-    if np.linalg.norm(d) < 1e-12:
-        return np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
+      offset_u = measured_center_u - desired_center_u
+      offset_z = measured_center_z - desired_center_z
+    """
+    grouped = defaultdict(list)
+    for rec in records:
+        ang = angle_group_key(rec.get("used_tip_angle_deg"))
+        if ang is None:
+            continue
+        grouped[ang].append(rec)
 
-    a = np.array([0.0, 0.0, 1.0])
-    if abs(float(np.dot(d, a))) > 0.9:
-        a = np.array([0.0, 1.0, 0.0])
+    alignments = {}
 
-    u = np.cross(d, a)
-    u = _unit(u)
-    v = np.cross(d, u)
-    v = _unit(v)
-    return u, v
+    for ang, grecs in grouped.items():
+        valid = [
+            r for r in grecs
+            if r.get("valid", False)
+            and r.get("u_mm") is not None
+            and r.get("z_mm") is not None
+            and r.get("desired_grid_u_mm") is not None
+            and r.get("desired_grid_z_mm") is not None
+        ]
 
-
-def polyline_to_cylinder_mesh(points_xyz: np.ndarray, radius_mm: float = 1.5, sides: int = 16):
-    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
-    if pts.shape[0] < 2:
-        raise ValueError("Need at least two points for a polyline mesh.")
-
-    verts = []
-    faces = []
-
-    for i in range(pts.shape[0] - 1):
-        p0 = pts[i]
-        p1 = pts[i + 1]
-        d = p1 - p0
-        if float(np.linalg.norm(d)) < 1e-9:
+        if not valid:
+            alignments[ang] = {
+                "used_tip_angle_deg": float(ang),
+                "offset_u_mm": None,
+                "offset_z_mm": None,
+                "num_valid_points": 0,
+                "measured_center_u_mm": None,
+                "measured_center_z_mm": None,
+                "desired_center_u_mm": None,
+                "desired_center_z_mm": None,
+            }
+            for rec in grecs:
+                rec["aligned_desired_u_mm"] = None
+                rec["aligned_desired_z_mm"] = None
             continue
 
-        u, v = _build_orthonormal_basis(d)
+        measured_u = np.asarray([float(r["u_mm"]) for r in valid], dtype=float)
+        measured_z = np.asarray([float(r["z_mm"]) for r in valid], dtype=float)
+        desired_u = np.asarray([float(r["desired_grid_u_mm"]) for r in valid], dtype=float)
+        desired_z = np.asarray([float(r["desired_grid_z_mm"]) for r in valid], dtype=float)
 
-        ring0 = []
-        ring1 = []
-        for k in range(sides):
-            theta = 2.0 * np.pi * (k / sides)
-            offset = radius_mm * (np.cos(theta) * u + np.sin(theta) * v)
-            ring0.append(p0 + offset)
-            ring1.append(p1 + offset)
+        measured_center_u = float(np.mean(measured_u))
+        measured_center_z = float(np.mean(measured_z))
+        desired_center_u = float(np.mean(desired_u))
+        desired_center_z = float(np.mean(desired_z))
 
-        base_idx = len(verts)
-        verts.extend(ring0)
-        verts.extend(ring1)
+        offset_u = float(measured_center_u - desired_center_u)
+        offset_z = float(measured_center_z - desired_center_z)
 
-        for k in range(sides):
-            k2 = (k + 1) % sides
-            a0 = base_idx + k
-            b0 = base_idx + k2
-            a1 = base_idx + sides + k
-            b1 = base_idx + sides + k2
+        alignments[ang] = {
+            "used_tip_angle_deg": float(ang),
+            "offset_u_mm": offset_u,
+            "offset_z_mm": offset_z,
+            "num_valid_points": int(len(valid)),
+            "measured_center_u_mm": measured_center_u,
+            "measured_center_z_mm": measured_center_z,
+            "desired_center_u_mm": desired_center_u,
+            "desired_center_z_mm": desired_center_z,
+        }
 
-            faces.append([a0, a1, b1])
-            faces.append([a0, b1, b0])
+        for rec in grecs:
+            du = rec.get("desired_grid_u_mm")
+            dz = rec.get("desired_grid_z_mm")
+            rec["aligned_desired_u_mm"] = None if du is None else float(du) + offset_u
+            rec["aligned_desired_z_mm"] = None if dz is None else float(dz) + offset_z
 
-    return np.asarray(verts, dtype=np.float32), np.asarray(faces, dtype=np.int32)
+    return records, alignments
 
 
-def write_binary_stl(path: Path, vertices: np.ndarray, faces: np.ndarray, solid_name: str = "robot_skeleton"):
-    path = Path(path)
-    vertices = np.asarray(vertices, dtype=np.float32)
-    faces = np.asarray(faces, dtype=np.int32)
+def compute_errors_against_aligned_desired(
+    records: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Adds:
+      du_error_mm = measured_u - aligned_desired_u
+      dz_error_mm = measured_z - aligned_desired_z
+      error_distance_mm = sqrt(du^2 + dz^2)
 
-    header = bytearray(80)
-    name_bytes = solid_name.encode("ascii", errors="ignore")[:80]
-    header[: len(name_bytes)] = name_bytes
+    Returns updated records and summary metrics:
+      - global_rmse_mm
+      - per_angle_rmse_mm
+    """
+    grouped = defaultdict(list)
 
-    tri_count = faces.shape[0]
-    with open(path, "wb") as f:
-        f.write(header)
-        f.write(np.uint32(tri_count).tobytes())
-        for tri in faces:
-            p0 = vertices[tri[0]]
-            p1 = vertices[tri[1]]
-            p2 = vertices[tri[2]]
-            n = np.cross(p1 - p0, p2 - p0)
-            n = _unit(n).astype(np.float32)
-            f.write(n.tobytes())
-            f.write(p0.astype(np.float32).tobytes())
-            f.write(p1.astype(np.float32).tobytes())
-            f.write(p2.astype(np.float32).tobytes())
-            f.write(np.uint16(0).tobytes())
+    for rec in records:
+        u = rec.get("u_mm")
+        z = rec.get("z_mm")
+        du_t = rec.get("aligned_desired_u_mm")
+        dz_t = rec.get("aligned_desired_z_mm")
+
+        valid_cmp = (
+            rec.get("valid", False)
+            and u is not None and z is not None
+            and du_t is not None and dz_t is not None
+        )
+
+        if valid_cmp:
+            du_err = float(u) - float(du_t)
+            dz_err = float(z) - float(dz_t)
+            dist = float(np.hypot(du_err, dz_err))
+        else:
+            du_err = None
+            dz_err = None
+            dist = None
+
+        rec["du_error_mm"] = du_err
+        rec["dz_error_mm"] = dz_err
+        rec["error_distance_mm"] = dist
+
+        ang = angle_group_key(rec.get("used_tip_angle_deg"))
+        if ang is not None:
+            grouped[ang].append(rec)
+
+    all_err = np.asarray(
+        [float(r["error_distance_mm"]) for r in records if r.get("error_distance_mm") is not None],
+        dtype=float
+    )
+
+    if all_err.size == 0:
+        raise RuntimeError("No valid aligned points available for RMSE calculation.")
+
+    global_rmse_mm = float(np.sqrt(np.mean(all_err ** 2)))
+    global_mean_err_mm = float(np.mean(all_err))
+    global_std_err_mm = float(np.std(all_err))
+    global_median_err_mm = float(np.median(all_err))
+    global_min_err_mm = float(np.min(all_err))
+    global_max_err_mm = float(np.max(all_err))
+
+    per_angle = {}
+    for ang, grecs in grouped.items():
+        errs = np.asarray(
+            [float(r["error_distance_mm"]) for r in grecs if r.get("error_distance_mm") is not None],
+            dtype=float
+        )
+        if errs.size == 0:
+            per_angle[ang] = {
+                "used_tip_angle_deg": float(ang),
+                "num_samples": 0,
+                "rmse_mm": None,
+                "mean_error_mm": None,
+                "std_error_mm": None,
+                "median_error_mm": None,
+                "min_error_mm": None,
+                "max_error_mm": None,
+            }
+            continue
+
+        per_angle[ang] = {
+            "used_tip_angle_deg": float(ang),
+            "num_samples": int(errs.size),
+            "rmse_mm": float(np.sqrt(np.mean(errs ** 2))),
+            "mean_error_mm": float(np.mean(errs)),
+            "std_error_mm": float(np.std(errs)),
+            "median_error_mm": float(np.median(errs)),
+            "min_error_mm": float(np.min(errs)),
+            "max_error_mm": float(np.max(errs)),
+        }
+
+    metrics = {
+        "global_num_samples": int(all_err.size),
+        "global_rmse_mm": global_rmse_mm,
+        "global_mean_error_mm": global_mean_err_mm,
+        "global_std_error_mm": global_std_err_mm,
+        "global_median_error_mm": global_median_err_mm,
+        "global_min_error_mm": global_min_err_mm,
+        "global_max_error_mm": global_max_err_mm,
+        "per_angle_metrics": per_angle,
+    }
+    return records, metrics
 
 
 # -----------------------------------------
-# Tip precision guidance
+# Saving outputs
 # -----------------------------------------
-TIP_PRECISION_GUIDE = r"""
-Tip precision: how to get closer to the distal edge of the black segment
-------------------------------------------------------------
-Your current pipeline finds a skeleton tip (centerline distal pixel). That is
-usually inside the tube and thus upstream from the true physical tip edge.
+def save_desired_vs_measured_csv(csv_path: Path, records: List[Dict[str, Any]]):
+    fieldnames = [
+        "sample_index",
+        "sample_index_from_name",
+        "image_name",
+        "pass_index",
+        "requested_tip_angle_deg",
+        "used_tip_angle_deg",
+        "b_cmd",
+        "c_cmd",
+        "tip_x_cmd",
+        "tip_y_cmd",
+        "tip_z_cmd",
+        "stage_x_cmd",
+        "stage_y_cmd",
+        "stage_z_cmd",
+        "desired_grid_u_mm",
+        "desired_grid_z_mm",
+        "aligned_desired_u_mm",
+        "aligned_desired_z_mm",
+        "tip_y_px",
+        "tip_x_px",
+        "u_mm",
+        "z_mm",
+        "du_error_mm",
+        "dz_error_mm",
+        "error_distance_mm",
+        "valid",
+    ]
+    extra_fields = sorted({
+        key
+        for record in records
+        for key in record.keys()
+        if key not in fieldnames
+    })
+    fieldnames.extend(extra_fields)
 
-Available refiners:
-  (1) edge_dt
-      - Step from the skeleton tip along the distal tangent direction until
-        you leave the foreground.
-      - Last in-foreground point is the tip estimate.
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for r in records:
+            writer.writerow(r)
 
-  (2) edge_grad
-      - Sample grayscale along distal tangent direction and locate the strongest
-        intensity gradient (dark->light edge).
 
-  (3) mainray
-      - Skeletonize the foreground, estimate a stable tangent from the upstream
-        trunk path, then ray-cast straight to the boundary.
-      - Best when the end has a small weird hook/branch that corrupts the local tip angle.
+def save_metrics_json(
+    json_path: Path,
+    metrics: Dict[str, Any],
+    alignments: Dict[float, Dict[str, Any]],
+    grid_meta: Dict[float, Dict[str, Any]],
+    cal: CTR_Shadow_Calibration,
+    args,
+):
+    payload = {
+        "global_metrics": {
+            "num_samples": metrics["global_num_samples"],
+            "rmse_mm": metrics["global_rmse_mm"],
+            "mean_error_mm": metrics["global_mean_error_mm"],
+            "std_error_mm": metrics["global_std_error_mm"],
+            "median_error_mm": metrics["global_median_error_mm"],
+            "min_error_mm": metrics["global_min_error_mm"],
+            "max_error_mm": metrics["global_max_error_mm"],
+        },
+        "per_angle_metrics": metrics["per_angle_metrics"],
+        "per_angle_alignments": alignments,
+        "per_angle_grid_meta": grid_meta,
+        "analysis_crop": getattr(cal, "analysis_crop", None),
+        "board_reference": collect_board_reference_info(cal),
+        "settings": {
+            "threshold": int(args.threshold),
+            "tip_refine_mode": str(args.tip_refine_mode),
+            "tip_refine_dt_step_px": float(args.tip_refine_dt_step_px),
+            "tip_refine_max_step_px": int(args.tip_refine_max_step_px),
+            "tip_refine_grad_step_px": float(args.tip_refine_grad_step_px),
+            "tip_refine_grad_search_len_px": int(args.tip_refine_grad_search_len_px),
+            "tip_refine_mainray_fit_back_near_r": float(args.tip_refine_mainray_fit_back_near_r),
+            "tip_refine_mainray_fit_back_far_r": float(args.tip_refine_mainray_fit_back_far_r),
+            "tip_refine_mainray_anchor_back_r": float(args.tip_refine_mainray_anchor_back_r),
+            "tip_refine_mainray_ray_step_px": float(args.tip_refine_mainray_ray_step_px),
+            "tip_refine_mainray_ray_max_len_r": float(args.tip_refine_mainray_ray_max_len_r),
+            "tip_refine_parallel_section_near_r": float(args.tip_refine_parallel_section_near_r),
+            "tip_refine_parallel_section_far_r": float(args.tip_refine_parallel_section_far_r),
+            "tip_refine_parallel_scan_half_r": float(args.tip_refine_parallel_scan_half_r),
+            "tip_refine_parallel_num_sections": int(args.tip_refine_parallel_num_sections),
+            "tip_refine_parallel_cross_step_px": float(args.tip_refine_parallel_cross_step_px),
+            "tip_refine_parallel_ray_step_px": float(args.tip_refine_parallel_ray_step_px),
+            "tip_refine_parallel_ray_max_len_r": float(args.tip_refine_parallel_ray_max_len_r),
+            "desired_x_step_mm": float(args.desired_x_step_mm),
+            "desired_z_step_mm": float(args.desired_z_step_mm),
+            "hard_pre_capture_buffer_seconds_note_for_acquisition_script": float(HARD_PRE_CAPTURE_BUFFER_SECONDS),
+        },
+    }
+    with open(json_path, "w") as f:
+        json.dump(_json_ready(payload), f, indent=2)
 
-  (4) parallel_centerline
-      - Use the CURRENT measured tip angle to define the tube extremity side-line direction.
-      - Find the two side offsets from multiple upstream cross-sections.
-      - Build the center parallel line.
-      - Intersect that center line with the distal black/white boundary.
-      - Annotates the side lines, center line, anchor, and refined tip on the analyzed images.
-"""
+
+def save_desired_vs_actual_plot(
+    plot_path: Path,
+    records: List[Dict[str, Any]],
+    metrics: Dict[str, Any],
+    title_prefix: str = "",
+):
+    def style_ax(ax, title: str):
+        ax.set_title(title, color="#f4f8fb")
+        ax.set_xlabel("Horizontal / u (mm)", color="#e5f1fb")
+        ax.set_ylabel("Vertical / z (mm)", color="#e5f1fb")
+        ax.tick_params(colors="#d7e9f8")
+        for spine in ax.spines.values():
+            spine.set_color((0.78, 0.88, 0.96, 0.55))
+        ax.grid(True, alpha=0.14, color="#b7d3eb", linewidth=0.8)
+        ax.set_facecolor((0.0, 0.0, 0.0, 0.0))
+
+    grouped = defaultdict(list)
+    for rec in records:
+        ang = angle_group_key(rec.get("used_tip_angle_deg"))
+        if ang is not None:
+            grouped[ang].append(rec)
+
+    angle_keys = sorted(grouped.keys())
+    if not angle_keys:
+        raise RuntimeError("No angle groups available for plotting.")
+
+    # Stack vertically as requested
+    n = len(angle_keys)
+    ncols = 1
+    nrows = n
+
+    fig, axs = plt.subplots(nrows, ncols, figsize=(8.2, 5.2 * nrows), squeeze=False)
+    fig.patch.set_alpha(0.0)
+
+    for ax in axs.flat:
+        ax.set_visible(False)
+
+    for idx, ang in enumerate(angle_keys):
+        ax = axs.flat[idx]
+        ax.set_visible(True)
+
+        grecs = grouped[ang]
+        valid = [
+            r for r in grecs
+            if r.get("valid", False)
+            and r.get("u_mm") is not None
+            and r.get("z_mm") is not None
+            and r.get("aligned_desired_u_mm") is not None
+            and r.get("aligned_desired_z_mm") is not None
+        ]
+        if not valid:
+            style_ax(ax, f"Used tip angle {ang:.3f}°\n(no valid data)")
+            continue
+
+        desired_u = np.asarray([float(r["aligned_desired_u_mm"]) for r in valid], dtype=float)
+        desired_z = np.asarray([float(r["aligned_desired_z_mm"]) for r in valid], dtype=float)
+        measured_u = np.asarray([float(r["u_mm"]) for r in valid], dtype=float)
+        measured_z = np.asarray([float(r["z_mm"]) for r in valid], dtype=float)
+
+        for r in valid:
+            ax.plot(
+                [float(r["aligned_desired_u_mm"]), float(r["u_mm"])],
+                [float(r["aligned_desired_z_mm"]), float(r["z_mm"])],
+                linewidth=0.8,
+                alpha=0.45,
+                color=(0.61, 0.82, 0.96, 0.34),
+            )
+
+        # Desired shown as rectangle centers / square markers
+        ax.scatter(
+            desired_u, desired_z,
+            s=46,
+            marker="s",
+            facecolors="none",
+            edgecolors="#8ae1ff",
+            linewidths=1.5,
+            label="Reference (aligned centers)",
+        )
+
+        # Measured points smaller and as points, not circles
+        ax.scatter(
+            measured_u, measured_z,
+            s=14,
+            marker=".",
+            color="#ffd166",
+            label="Measured",
+        )
+
+        # Draw centers explicitly
+        desired_center = np.array([np.mean(desired_u), np.mean(desired_z)], dtype=float)
+        measured_center = np.array([np.mean(measured_u), np.mean(measured_z)], dtype=float)
+
+        ax.scatter(
+            [desired_center[0]], [desired_center[1]],
+            s=60, marker="s", facecolors="none", edgecolors="#00e5ff", linewidths=2.0,
+            label="Reference center",
+        )
+        ax.scatter(
+            [measured_center[0]], [measured_center[1]],
+            s=36, marker="+", color="#ff5ea8", linewidths=1.8,
+            label="Measured center",
+        )
+        ax.plot(
+            [desired_center[0], measured_center[0]],
+            [desired_center[1], measured_center[1]],
+            linestyle="--",
+            linewidth=1.0,
+            alpha=0.7,
+            color="#ff5ea8",
+        )
+
+        per_angle = metrics["per_angle_metrics"].get(ang, {})
+        rmse_txt = "n/a" if per_angle.get("rmse_mm") is None else f"{float(per_angle['rmse_mm']):.4f} mm"
+
+        b_vals = [r.get("b_cmd") for r in valid if r.get("b_cmd") is not None]
+        b_txt = f"{float(np.median(np.asarray(b_vals, dtype=float))):.3f}" if b_vals else "n/a"
+
+        style_ax(
+            ax,
+            f"{title_prefix}Used angle {ang:.3f}°  |  B={b_txt}\n"
+            f"RMSE = {rmse_txt}  |  n = {len(valid)}",
+        )
+        ax.set_aspect("equal", adjustable="box")
+        leg = ax.legend(loc="best", frameon=True)
+        leg.get_frame().set_facecolor((0.04, 0.09, 0.14, 0.72))
+        leg.get_frame().set_edgecolor((0.72, 0.84, 0.94, 0.35))
+        for txt in leg.get_texts():
+            txt.set_color("#edf6ff")
+
+        all_u = np.concatenate([desired_u, measured_u])
+        all_z = np.concatenate([desired_z, measured_z])
+        pad_u = max(2.0, 0.06 * max(1.0, np.ptp(all_u)))
+        pad_z = max(2.0, 0.06 * max(1.0, np.ptp(all_z)))
+        ax.set_xlim(float(np.min(all_u) - pad_u), float(np.max(all_u) + pad_u))
+        ax.set_ylim(float(np.min(all_z) - pad_z), float(np.max(all_z) + pad_z))
+
+    global_rmse = float(metrics["global_rmse_mm"])
+    fig.suptitle(
+        f"{title_prefix}Desired vs measured tracked tip points by used tip angle\n"
+        f"Global RMSE = {global_rmse:.4f} mm",
+        fontsize=14,
+        y=0.995,
+        color="#f8fbff",
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(plot_path, dpi=220, transparent=True)
+    plt.close(fig)
 
 
 # -----------------------------
@@ -2075,72 +2268,57 @@ def main():
     ap.add_argument("--raw_dir", type=str, default=None,
                     help="raw_image_data_folder or any folder of images (will be wrapped into a project)")
     ap.add_argument("--threshold", type=int, default=200)
-    ap.add_argument("--robot_name", type=str, default="calibrated_robot")
-    ap.add_argument("--save_plots", action="store_true")
 
-    ap.add_argument("--width_in_pixels", type=float, default=3025)
-    ap.add_argument("--width_in_mm", type=float, default=140)
-    ap.add_argument("--fit_model", type=str, default="pchip", choices=["cubic", "pchip"],
-                    help="Fit model used for planar deflection, axial position, and tip angle exports.")
-
-    ap.add_argument("--ruler_mm", type=float, default=150.0,
-                    help="Known ruler distance in mm for the 2-point reference.")
-    ap.add_argument("--camera_calibration_file", type=str, default=None,
+    ap.add_argument("--camera_calibration_file", type=str, required=True,
                     help="Path to camera calibration .npz for checkerboard-reference analysis.")
-    ap.add_argument("--checkerboard_reference_image", type=str, default=None,
-                    help="Path to checkerboard reference image. If omitted, board-reference analysis is skipped.")
+    ap.add_argument("--checkerboard_reference_image", type=str, required=True,
+                    help="Path to checkerboard reference image.")
     ap.add_argument("--checkerboard_inner_corners", type=_parse_inner_corners_arg, default=None,
-                    help="Checkerboard inner-corner grid as 'Nx,Ny' or 'NxXNy'. Defaults to metadata in the camera calibration file.")
+                    help="Checkerboard inner-corner grid as 'Nx,Ny' or 'NxXNy'. Defaults to metadata in the calibration file.")
     ap.add_argument("--checkerboard_square_size_mm", type=float, default=None,
-                    help="Checkerboard square size in mm. Defaults to metadata in the camera calibration file.")
+                    help="Checkerboard square size in mm. Defaults to metadata in the calibration file.")
     ap.add_argument("--checkerboard_no_undistort", action="store_true",
                     help="Disable undistortion before checkerboard pose estimation.")
 
     ap.add_argument("--checkerboard_mm_scale_correction", type=float, default=0.5,
-                    help="Multiply checkerboard-derived mm values by this factor. Default 0.5 fixes the observed 2x overscale.")
+                    help="Multiply checkerboard-derived mm values by this factor. Default 0.5 fixes observed 2x overscale.")
     ap.add_argument("--checkerboard_no_flip_planar_x", action="store_true",
-                    help="Disable the checkerboard planar-x sign flip. By default x is flipped to match the ruler convention.")
+                    help="Disable checkerboard planar-x sign flip.")
 
     ap.add_argument("--link_mode", type=str, default="symlink", choices=["symlink", "copy"])
-    ap.add_argument("--save_analysis_config", action="store_true",
-                    help="Write analysis_reference.json into project_dir for reuse without GUI later.")
+    ap.add_argument("--save_analysis_config", action="store_true")
 
     ap.add_argument("--tip_refine_mode", type=str, default="none",
                     choices=["none", "edge_dt", "edge_grad", "mainray", "parallel_centerline"],
-                    help="Refine tip position toward distal edge of black segment.")
+                    help="Refine tip position using the same distal tip analysis modes as offline_run_calibration.py.")
     ap.add_argument("--tip_refine_dt_step_px", type=float, default=1.0)
     ap.add_argument("--tip_refine_max_step_px", type=int, default=80)
     ap.add_argument("--tip_refine_grad_step_px", type=float, default=0.25)
     ap.add_argument("--tip_refine_grad_search_len_px", type=int, default=60)
+    ap.add_argument("--tip_refine_mainray_fit_back_near_r", type=float, default=1.5)
+    ap.add_argument("--tip_refine_mainray_fit_back_far_r", type=float, default=6.0)
+    ap.add_argument("--tip_refine_mainray_anchor_back_r", type=float, default=1.0)
+    ap.add_argument("--tip_refine_mainray_ray_step_px", type=float, default=0.5)
+    ap.add_argument("--tip_refine_mainray_ray_max_len_r", type=float, default=8.0)
+    ap.add_argument("--tip_refine_parallel_section_near_r", type=float, default=1.0)
+    ap.add_argument("--tip_refine_parallel_section_far_r", type=float, default=6.0)
+    ap.add_argument("--tip_refine_parallel_scan_half_r", type=float, default=3.0)
+    ap.add_argument("--tip_refine_parallel_num_sections", type=int, default=9)
+    ap.add_argument("--tip_refine_parallel_cross_step_px", type=float, default=0.5)
+    ap.add_argument("--tip_refine_parallel_ray_step_px", type=float, default=0.5)
+    ap.add_argument("--tip_refine_parallel_ray_max_len_r", type=float, default=8.0)
 
-    ap.add_argument("--tip_mainray_fit_back_near_r", type=float, default=1.5)
-    ap.add_argument("--tip_mainray_fit_back_far_r", type=float, default=6.0)
-    ap.add_argument("--tip_mainray_anchor_back_r", type=float, default=1.0)
-    ap.add_argument("--tip_mainray_ray_step_px", type=float, default=0.5)
-    ap.add_argument("--tip_mainray_ray_max_len_r", type=float, default=8.0)
-
-    ap.add_argument("--tip_parallel_section_near_r", type=float, default=1.0)
-    ap.add_argument("--tip_parallel_section_far_r", type=float, default=6.0)
-    ap.add_argument("--tip_parallel_scan_half_r", type=float, default=3.0)
-    ap.add_argument("--tip_parallel_num_sections", type=int, default=9)
-    ap.add_argument("--tip_parallel_cross_step_px", type=float, default=0.5)
-    ap.add_argument("--tip_parallel_ray_step_px", type=float, default=0.5)
-    ap.add_argument("--tip_parallel_ray_max_len_r", type=float, default=8.0)
-
-    ap.add_argument("--export_skeleton", action="store_true",
-                    help="Export parametric skeleton (equations) and patch it into *_gcode_calibration.json.")
-    ap.add_argument("--skeleton_diameter_mm", type=float, default=3.0)
-    ap.add_argument("--skeleton_links", type=int, default=6)
-    ap.add_argument("--skeleton_reference_stl", action="store_true",
-                    help="Also export a reference-pose STL for quick viewing.")
-    ap.add_argument("--print_tip_precision_guide", action="store_true",
-                    help="Print tips for improving tip accuracy and exit.")
+    ap.add_argument("--desired_x_step_mm", type=float, default=5.0,
+                    help="Desired horizontal step between commanded grid columns.")
+    ap.add_argument("--desired_z_step_mm", type=float, default=5.0,
+                    help="Desired vertical step between commanded grid rows.")
 
     args = ap.parse_args()
-
-    if args.print_tip_precision_guide:
-        print(TIP_PRECISION_GUIDE)
-        return
+    print(f"[INFO] Using shadow_calibration module: {shadow_calibration_module.__file__}")
+    print(
+        "[INFO] Requested hard pre-capture buffer = "
+        f"{HARD_PRE_CAPTURE_BUFFER_SECONDS:.1f} s (must be enforced in the acquisition script, not here)."
+    )
 
     if args.project_dir is None and args.raw_dir is None:
         raise SystemExit("Provide --project_dir or --raw_dir")
@@ -2183,18 +2361,18 @@ def main():
             dt_max_step_px=int(args.tip_refine_max_step_px),
             grad_step_px=float(args.tip_refine_grad_step_px),
             grad_search_len_px=int(args.tip_refine_grad_search_len_px),
-            mainray_fit_back_near_r=float(args.tip_mainray_fit_back_near_r),
-            mainray_fit_back_far_r=float(args.tip_mainray_fit_back_far_r),
-            mainray_anchor_back_r=float(args.tip_mainray_anchor_back_r),
-            mainray_ray_step_px=float(args.tip_mainray_ray_step_px),
-            mainray_ray_max_len_r=float(args.tip_mainray_ray_max_len_r),
-            parallel_section_near_r=float(args.tip_parallel_section_near_r),
-            parallel_section_far_r=float(args.tip_parallel_section_far_r),
-            parallel_scan_half_r=float(args.tip_parallel_scan_half_r),
-            parallel_num_sections=int(args.tip_parallel_num_sections),
-            parallel_cross_step_px=float(args.tip_parallel_cross_step_px),
-            parallel_ray_step_px=float(args.tip_parallel_ray_step_px),
-            parallel_ray_max_len_r=float(args.tip_parallel_ray_max_len_r),
+            mainray_fit_back_near_r=float(args.tip_refine_mainray_fit_back_near_r),
+            mainray_fit_back_far_r=float(args.tip_refine_mainray_fit_back_far_r),
+            mainray_anchor_back_r=float(args.tip_refine_mainray_anchor_back_r),
+            mainray_ray_step_px=float(args.tip_refine_mainray_ray_step_px),
+            mainray_ray_max_len_r=float(args.tip_refine_mainray_ray_max_len_r),
+            parallel_section_near_r=float(args.tip_refine_parallel_section_near_r),
+            parallel_section_far_r=float(args.tip_refine_parallel_section_far_r),
+            parallel_scan_half_r=float(args.tip_refine_parallel_scan_half_r),
+            parallel_num_sections=int(args.tip_refine_parallel_num_sections),
+            parallel_cross_step_px=float(args.tip_refine_parallel_cross_step_px),
+            parallel_ray_step_px=float(args.tip_refine_parallel_ray_step_px),
+            parallel_ray_max_len_r=float(args.tip_refine_parallel_ray_max_len_r),
         )
         print(f"[INFO] Tip refinement enabled: {args.tip_refine_mode}")
 
@@ -2209,102 +2387,99 @@ def main():
 
     print(f"[INFO] Using first image for GUI: {first_img_path.name}")
 
-    board_reference_debug_image = None
-    if args.camera_calibration_file:
-        calib_path = Path(args.camera_calibration_file).expanduser().resolve()
-        print(f"[INFO] Loading camera calibration: {calib_path}")
-        cal.load_camera_calibration(str(calib_path))
+    calib_path = Path(args.camera_calibration_file).expanduser().resolve()
+    board_ref_path = Path(args.checkerboard_reference_image).expanduser().resolve()
 
-        if args.checkerboard_reference_image:
-            board_ref_path = Path(args.checkerboard_reference_image).expanduser().resolve()
-            processed_dir = project_dir / "processed_image_data_folder"
-            processed_dir.mkdir(parents=True, exist_ok=True)
-            checkerboard_debug_path = processed_dir / "checkerboard_reference_debug.png"
-            board_result = cal.estimate_board_reference_from_image(
-                str(board_ref_path),
-                inner_corners=args.checkerboard_inner_corners,
-                square_size_mm=args.checkerboard_square_size_mm,
-                use_undistort=(not args.checkerboard_no_undistort),
-                draw_debug=True,
-                save_debug_path=str(checkerboard_debug_path),
-            )
-            board_reference_debug_image = board_result.get("debug_image")
+    print(f"[INFO] Loading camera calibration: {calib_path}")
+    cal.load_camera_calibration(str(calib_path))
 
-            apply_checkerboard_reference_corrections(
-                cal,
-                mm_scale=float(args.checkerboard_mm_scale_correction),
-                flip_planar_x=(not bool(args.checkerboard_no_flip_planar_x)),
-            )
+    processed_dir = project_dir / "processed_image_data_folder"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    checkerboard_debug_path = processed_dir / "checkerboard_reference_debug.png"
 
-            print(f"[INFO] Checkerboard reference estimated from: {board_ref_path}")
-        else:
-            print("[INFO] Camera calibration loaded, but no checkerboard reference image was provided.")
-    elif args.checkerboard_reference_image:
-        print("[WARN] checkerboard_reference_image was provided without camera_calibration_file; skipping board-reference analysis.")
+    board_result = cal.estimate_board_reference_from_image(
+        str(board_ref_path),
+        inner_corners=args.checkerboard_inner_corners,
+        square_size_mm=args.checkerboard_square_size_mm,
+        use_undistort=(not args.checkerboard_no_undistort),
+        draw_debug=True,
+        save_debug_path=str(checkerboard_debug_path),
+    )
+    board_reference_debug_image = board_result.get("debug_image")
 
-    analysis_crop, ruler = interactive_crop_and_ruler_from_image(
-        img_bgr,
-        default_crop=cal.default_analysis_crop,
-        ruler_known_mm=float(args.ruler_mm),
+    apply_checkerboard_reference_corrections(
+        cal,
+        mm_scale=float(args.checkerboard_mm_scale_correction),
+        flip_planar_x=(not bool(args.checkerboard_no_flip_planar_x)),
     )
 
+    print(f"[INFO] Checkerboard reference estimated from: {board_ref_path}")
+
+    analysis_crop = interactive_crop_from_image(
+        img_bgr,
+        default_crop=cal.default_analysis_crop,
+    )
     cal.analysis_crop = dict(analysis_crop)
 
-    if ruler["p1_px"] is not None and ruler["p2_px"] is not None:
-        cal.ruler_ref_p1_px = tuple(ruler["p1_px"])
-        cal.ruler_ref_p2_px = tuple(ruler["p2_px"])
-        cal.ruler_ref_distance_mm = float(ruler["known_distance_mm"])
-        cal.ruler_mm_per_px = float(ruler["mm_per_px"])
-        cal.ruler_px_per_mm = float(ruler["px_per_mm"])
-        cal.ruler_axis_unit = np.asarray(ruler["axis_unit"], dtype=float)
-        cal.ruler_axis_perp_unit = np.asarray(ruler["axis_perp_unit"], dtype=float)
-        cal.ruler_calib_meta = dict(ruler["meta"]) if ruler["meta"] else None
-    else:
-        cal.ruler_ref_p1_px = None
-        cal.ruler_ref_p2_px = None
-        cal.ruler_ref_distance_mm = None
-        cal.ruler_mm_per_px = None
-        cal.ruler_px_per_mm = None
-        cal.ruler_axis_unit = None
-        cal.ruler_axis_perp_unit = None
-        cal.ruler_calib_meta = dict(ruler["meta"]) if ruler["meta"] else None
-
     if args.save_analysis_config:
-        cfg = cal.get_analysis_reference_info()
+        cfg = {}
+        if hasattr(cal, "get_analysis_reference_info"):
+            cfg = cal.get_analysis_reference_info()
         cfg["board_reference"] = collect_board_reference_info(cal)
-        if hasattr(cal, "tip_refine_debug_records"):
-            cfg["tip_refine_mode"] = args.tip_refine_mode
         cfg_path = project_dir / "analysis_reference.json"
         with open(cfg_path, "w") as f:
             json.dump(_json_ready(cfg), f, indent=2)
         print(f"[INFO] Saved analysis config to: {cfg_path}")
 
+    patch_filename_parser()
+
     print("\n[INFO] Running analyze_data_batch (offline)...")
     cal.analyze_data_batch(threshold=int(args.threshold))
 
-    if hasattr(cal, "tip_refine_debug_records") and len(cal.tip_refine_debug_records) > 0:
-        dbg_path = project_dir / "processed_image_data_folder" / "tip_refine_debug_records.json"
-        dbg_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(dbg_path, "w") as f:
-            json.dump(_json_ready(cal.tip_refine_debug_records), f, indent=2)
-        print(f"[INFO] Saved tip refinement debug records: {dbg_path}")
+    tracked_rows = np.asarray(cal.tip_locations_array_coarse, dtype=float)
+    if tracked_rows.size == 0:
+        raise RuntimeError("No tracked tip data found in cal.tip_locations_array_coarse after analyze_data_batch.")
 
-    print("\n[INFO] Running postprocess_calibration_data (offline)...")
-    cal.postprocess_calibration_data(
-        width_in_pixels=float(args.width_in_pixels),
-        width_in_mm=float(args.width_in_mm),
-        robot_name=str(args.robot_name),
-        save_plots=bool(args.save_plots),
-        fit_model=str(args.fit_model),
+    print("[INFO] Converting tracked tips to checkerboard-referenced mm and parsing filename targets...")
+    tip_data = compute_tracked_tip_positions_mm_with_targets(cal, tracked_rows, imgs)
+
+    print("[INFO] Reconstructing desired grid coordinates from commanded tipX/tipZ...")
+    records, grid_meta = build_desired_grid_coordinates_per_angle(
+        tip_data["records"],
+        x_step_mm=float(args.desired_x_step_mm),
+        z_step_mm=float(args.desired_z_step_mm),
     )
+
+    print("[INFO] Aligning reference and measured point sets by the mean center of sampled points...")
+    records, alignments = align_desired_to_measured_per_angle(records)
+
+    print("[INFO] Computing global and per-angle RMSE...")
+    records, metrics = compute_errors_against_aligned_desired(records)
+
+    csv_path = processed_dir / "tracked_tip_positions_desired_vs_measured_mm.csv"
+    metrics_json_path = processed_dir / "tracked_tip_desired_vs_measured_metrics.json"
+    plot_path = processed_dir / "desired_vs_actual_by_angle.png"
+
+    save_desired_vs_measured_csv(csv_path, records)
+    save_metrics_json(metrics_json_path, metrics, alignments, grid_meta, cal, args)
+    save_desired_vs_actual_plot(
+        plot_path,
+        records,
+        metrics,
+        title_prefix="Checkerboard-referenced ",
+    )
+
+    print(f"[INFO] Saved CSV: {csv_path}")
+    print(f"[INFO] Saved metrics JSON: {metrics_json_path}")
+    print(f"[INFO] Saved desired-vs-actual plot: {plot_path}")
 
     if board_reference_debug_image is not None:
         try:
-            annotated_board_path = project_dir / "processed_image_data_folder" / "checkerboard_reference_annotated_analysis.png"
+            annotated_board_path = processed_dir / "checkerboard_reference_annotated_analysis.png"
             draw_checkerboard_analysis_overlay(
                 cal=cal,
                 output_path=annotated_board_path,
-                tracked_rows=np.asarray(cal.tip_locations_array_coarse, dtype=float),
+                tracked_rows=tracked_rows,
                 image_files=imgs,
                 board_debug_image=board_reference_debug_image,
             )
@@ -2312,27 +2487,30 @@ def main():
         except Exception as e:
             print(f"[WARN] Failed to create annotated checkerboard analysis image: {e}")
 
-    if args.export_skeleton:
-        try:
-            param_path, py_path, stl_path, patched_json = export_parametric_skeleton_model(
-                project_dir=project_dir,
-                robot_name=str(args.robot_name),
-                n_links=int(args.skeleton_links),
-                diameter_mm=float(args.skeleton_diameter_mm),
-                b_ref=0.0,
-                stl_reference_pose=bool(args.skeleton_reference_stl),
-            )
-            print("\n[INFO] Parametric skeleton export complete:")
-            print(f"  Parametric JSON: {param_path}")
-            print(f"  Predictor PY:    {py_path}")
-            if stl_path is not None:
-                print(f"  Reference STL:   {stl_path}")
-            print(f"  GCode JSON patched: {patched_json}")
-        except Exception as e:
-            print(f"[WARN] Parametric skeleton export failed: {e}")
+    print("\n========== RESULTS ==========")
+    print(f"Valid samples: {metrics['global_num_samples']}")
+    print(f"Global RMSE:   {metrics['global_rmse_mm']:.6f} mm")
+    print(f"Mean error:    {metrics['global_mean_error_mm']:.6f} mm")
+    print(f"Std error:     {metrics['global_std_error_mm']:.6f} mm")
+    print(f"Median error:  {metrics['global_median_error_mm']:.6f} mm")
+    print(f"Min error:     {metrics['global_min_error_mm']:.6f} mm")
+    print(f"Max error:     {metrics['global_max_error_mm']:.6f} mm")
 
-    print("\n[DONE] Offline GUI + pipeline complete.")
-    print(f"Outputs are in: {project_dir / 'processed_image_data_folder'}")
+    print("\nPer-angle RMSE:")
+    for ang in sorted(metrics["per_angle_metrics"].keys()):
+        m = metrics["per_angle_metrics"][ang]
+        if m["rmse_mm"] is None:
+            print(f"  Used angle {ang:.3f} deg: no valid data")
+        else:
+            print(
+                f"  Used angle {ang:.3f} deg: "
+                f"RMSE = {m['rmse_mm']:.6f} mm, "
+                f"n = {m['num_samples']}"
+            )
+    print("=============================\n")
+
+    print("[DONE] Offline desired-vs-measured checkerboard analysis complete.")
+    print(f"Outputs are in: {processed_dir}")
 
 
 if __name__ == "__main__":

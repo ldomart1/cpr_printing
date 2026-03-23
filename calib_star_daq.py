@@ -10,8 +10,9 @@ What it does:
     single C flip
     mirrored left half at fixed C=c180
 - Preserves the robot/camera execution style of script 1
-- Captures an image after every executed tracked move and saves it to:
+- Captures images only during star-path moves (not startup/end travel) and saves them to:
     <project folder>/point_tracking/
+- Motion interpolation resolution and image-capture cadence are configured independently.
 - Adds offplane-tracking:
     Y stage motion is solved so the tip remains at the requested constant tip-space Y
     while compensating the calibrated offplane offset of the robot.
@@ -102,7 +103,7 @@ DEFAULT_DWELL_BEFORE_MS = 0
 DEFAULT_DWELL_AFTER_MS = 0
 DEFAULT_TRACKED_MOVE_SETTLE_S = 0.0
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
-DEFAULT_CAPTURE_AT_START = True
+DEFAULT_CAPTURE_AT_START = False
 
 DEFAULT_SAFE_APPROACH_Z = -145.0
 
@@ -131,8 +132,9 @@ STAR_CENTER_Z = -145.0
 
 DESIRED_STAR_OUTER_RADIUS = 18.0
 INNER_RADIUS_RATIO = 0.38196601125
-STAR_ROTATION_DEG = 90.0
+STAR_ROTATION_DEG = 270.0
 SAMPLES_PER_EDGE = 30
+DEFAULT_CAPTURE_EVERY_N_STAR_MOVES = 1
 
 DEFAULT_SAFETY_MARGIN = 0.5
 DEFAULT_C0_DEG = 0.0
@@ -784,6 +786,91 @@ def _clamp_stage_xyz_to_bbox(
     return xc, yc, zc
 
 
+def save_desired_star_motion_plot(
+    plot_path: str,
+    command_sequence: List[CommandPoint],
+) -> str:
+    if not command_sequence:
+        raise RuntimeError("Cannot save desired star motion plot: command_sequence is empty.")
+
+    import matplotlib.pyplot as plt
+
+    tip_x = np.asarray([cp.tip_x for cp in command_sequence], dtype=float)
+    tip_z = np.asarray([cp.tip_z for cp in command_sequence], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.5, 7.5), facecolor=(0.0, 0.0, 0.0, 0.0))
+    ax.set_facecolor((0.04, 0.09, 0.14, 0.88))
+
+    ax.plot(
+        tip_x,
+        tip_z,
+        color="#8cf7ff",
+        linewidth=2.4,
+        alpha=0.98,
+        label="Desired star motion",
+        zorder=2,
+    )
+    ax.scatter(
+        tip_x,
+        tip_z,
+        s=14,
+        color="#f8fafc",
+        edgecolors="#8cf7ff",
+        linewidths=0.45,
+        alpha=0.95,
+        label="Sampled tip targets",
+        zorder=3,
+    )
+    ax.scatter(
+        [tip_x[0]],
+        [tip_z[0]],
+        s=72,
+        color="#f4d35e",
+        edgecolors="none",
+        label="Start",
+        zorder=4,
+    )
+
+    phases = [cp.phase for cp in command_sequence]
+    mirror_idx = next((i for i, phase in enumerate(phases) if phase == "mirror_flip"), None)
+    if mirror_idx is not None:
+        ax.scatter(
+            [tip_x[mirror_idx]],
+            [tip_z[mirror_idx]],
+            s=60,
+            color="#ff8fab",
+            edgecolors="none",
+            label="Mirror flip",
+            zorder=4,
+        )
+
+    cx = float(np.mean(tip_x))
+    cz = float(np.mean(tip_z))
+    span_x = max(float(np.max(np.abs(tip_x - cx))), 1.0)
+    span_z = max(float(np.max(np.abs(tip_z - cz))), 1.0)
+    span = 1.08 * max(span_x, span_z)
+
+    ax.set_xlim(cx - span, cx + span)
+    ax.set_ylim(cz - span, cz + span)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Desired tip X (mm)", color="#e8f3ff")
+    ax.set_ylabel("Desired tip Z (mm)", color="#e8f3ff")
+    ax.set_title("Desired Generated Star Motion", color="#f8fbff")
+    ax.grid(True, color="#8eb8d8", alpha=0.14, linewidth=0.8)
+    ax.tick_params(colors="#dceaf7")
+    for spine in ax.spines.values():
+        spine.set_color("#6b92b3")
+
+    legend = ax.legend(frameon=True, facecolor="#102131", edgecolor="#6b92b3")
+    for txt in legend.get_texts():
+        txt.set_color("#f8fbff")
+
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=220, transparent=True)
+    plt.close(fig)
+    return plot_path
+
+
 # =========================
 # Acquisition runner
 # =========================
@@ -967,6 +1054,7 @@ class StarTrackerRunner:
         travel_move_settle_s: float = 0.0,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
+        capture_every_n_star_moves: int = 1,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -975,6 +1063,8 @@ class StarTrackerRunner:
 
         bbox_warnings: List[str] = []
         sample_counter = 0
+        star_move_counter = 0
+        capture_every_n_star_moves = max(1, int(capture_every_n_star_moves))
 
         print("\n" + "=" * 72)
         print("STARTING STAR-TRACKING ACQUISITION RUN")
@@ -1082,17 +1172,20 @@ class StarTrackerRunner:
                 )
                 self.wait_for_duet_motion_complete(extra_settle=tracked_move_settle_s)
 
-                sample_counter += 1
-                self.capture_and_save(
-                    sample_idx=sample_counter,
-                    phase=cp.phase,
-                    x=x,
-                    y=y,
-                    z=z,
-                    b=cp.b,
-                    c=cp.c,
-                    flush_frames=camera_flush_frames,
-                )
+                if cp.phase in {"right", "left"}:
+                    star_move_counter += 1
+                    if (star_move_counter % capture_every_n_star_moves) == 0:
+                        sample_counter += 1
+                        self.capture_and_save(
+                            sample_idx=sample_counter,
+                            phase=cp.phase,
+                            x=x,
+                            y=y,
+                            z=z,
+                            b=cp.b,
+                            c=cp.c,
+                            flush_frames=camera_flush_frames,
+                        )
 
             if int(dwell_after_ms) > 0:
                 print(f"Dwell after motion: {int(dwell_after_ms)} ms")
@@ -1266,6 +1359,13 @@ def main(args):
         add_date=bool(args.add_date),
     )
 
+    desired_star_plot_path = os.path.join(runner.run_folder, "desired_star_motion.png")
+    save_desired_star_motion_plot(
+        plot_path=desired_star_plot_path,
+        command_sequence=command_sequence,
+    )
+    print(f"Saved desired star motion plot: {desired_star_plot_path}")
+
     try:
         runner.connect_to_camera(
             cam_port=int(args.cam_port),
@@ -1292,6 +1392,7 @@ def main(args):
             travel_move_settle_s=float(args.travel_move_settle_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
+            capture_every_n_star_moves=int(args.capture_every_n_star_moves),
         )
 
         print("\nFinal results:")
@@ -1363,7 +1464,7 @@ if __name__ == "__main__":
     ap.add_argument("--rotation-deg", type=float, default=STAR_ROTATION_DEG,
                     help="Star rotation in XZ plane (deg).")
     ap.add_argument("--samples-per-edge", type=int, default=SAMPLES_PER_EDGE,
-                    help="Interpolation points per star edge before half-plane extraction.")
+                    help="Interpolation points per star edge for motion generation before half-plane extraction.")
     ap.add_argument("--safety-margin", type=float, default=DEFAULT_SAFETY_MARGIN,
                     help="Margin subtracted from max reachable |r(B)| when auto-scaling.")
 
@@ -1394,8 +1495,10 @@ if __name__ == "__main__":
                     help="Extra settle time after each tracked move, before capture.")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
+    ap.add_argument("--capture-every-n-star-moves", type=int, default=DEFAULT_CAPTURE_EVERY_N_STAR_MOVES,
+                    help="Capture one image every N star-path moves. Travel moves and the mirror flip are not captured.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
-                    help="Capture one image at the first tracked sample before the tracked sequence starts.")
+                    help="Also capture once at the first tracked sample after positioning there.")
 
     # Startup / end poses
     ap.add_argument("--safe-approach-z", type=float, default=DEFAULT_SAFE_APPROACH_Z)

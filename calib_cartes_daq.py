@@ -62,15 +62,15 @@ DEFAULT_PROJECT_NAME = "Fixed_Orientation_Grid_Run"
 DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
-DEFAULT_POINT_Y = 20.0
+DEFAULT_POINT_Y = 45.0
 
 DEFAULT_X_START = 60.0
-DEFAULT_X_END = 140.0
-DEFAULT_X_STEP = 1.0
+DEFAULT_X_END = 155.0
+DEFAULT_X_STEP = 5.0
 
 DEFAULT_Z_START = -155.0
 DEFAULT_Z_END = -135.0
-DEFAULT_Z_STEP = 1.0
+DEFAULT_Z_STEP = 5.0
 
 DEFAULT_FIXED_C = 0.0
 DEFAULT_REQUESTED_TIP_ANGLES_DEG = [0.0, 90.0, 180.0]
@@ -79,24 +79,25 @@ DEFAULT_TRAVEL_FEED = 1500.0
 DEFAULT_SCAN_FEED = 1000.0
 
 DEFAULT_START_X = 60.0
-DEFAULT_START_Y = 20.0
+DEFAULT_START_Y = 45.0
 DEFAULT_START_Z = -155.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 60.0
-DEFAULT_END_Y = 20.0
+DEFAULT_END_Y = 45.0
 DEFAULT_END_Z = -155.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
 DEFAULT_SAFE_APPROACH_Z = -155.0
 
-DEFAULT_DWELL_BEFORE_MS = 0
-DEFAULT_DWELL_AFTER_MS = 0
+DEFAULT_DWELL_BEFORE_MS = 0.2
+DEFAULT_DWELL_AFTER_MS = 0.2
 DEFAULT_CAPTURE_SETTLE_S = 0.6
-DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
-DEFAULT_PRE_CAPTURE_BUFFER_S = 5.0
+DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.2
+DEFAULT_INTER_GRID_WAIT_S = 5.0
+DEFAULT_PRE_CAPTURE_BUFFER_S = 0.2
 
 DEFAULT_BBOX_X_MIN = 0.0
 DEFAULT_BBOX_X_MAX = 200.0
@@ -711,6 +712,7 @@ class FixedOrientationGridRunner:
         dwell_after_ms: int = 0,
         capture_settle_s: float = 0.0,
         travel_move_settle_s: float = 0.0,
+        inter_grid_wait_s: float = 0.0,
         camera_flush_frames: int = 1,
     ):
         if self.cam is None:
@@ -779,6 +781,43 @@ class FixedOrientationGridRunner:
             if not pass_plan.grid_points:
                 print("Skipping empty pass.")
                 continue
+
+            print("Returning to start pose before pass...")
+            self.send_absolute_move(
+                travel_feed,
+                **{
+                    cal.z_axis: float(safe_approach_z),
+                    cal.b_axis: current_pose[3],
+                    cal.c_axis: current_pose[4],
+                }
+            )
+            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+
+            self.send_absolute_move(
+                travel_feed,
+                **{
+                    cal.x_axis: sx,
+                    cal.y_axis: sy,
+                    cal.b_axis: sb,
+                    cal.c_axis: clamp_c_bounded(sc),
+                }
+            )
+            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+
+            self.send_absolute_move(
+                travel_feed,
+                **{
+                    cal.z_axis: sz,
+                    cal.b_axis: sb,
+                    cal.c_axis: clamp_c_bounded(sc),
+                }
+            )
+            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+            current_pose = (sx, sy, sz, sb, clamp_c_bounded(sc))
+
+            if inter_grid_wait_s > 0:
+                print(f"Waiting at start pose before pass: {inter_grid_wait_s:.3f} s")
+                time.sleep(inter_grid_wait_s)
 
             first_pt = pass_plan.grid_points[0]
             x0, y0, z0 = _clamp_stage_xyz_to_bbox(
@@ -1063,6 +1102,7 @@ def main(args):
             dwell_after_ms=int(args.dwell_after_ms),
             capture_settle_s=float(args.capture_settle_s),
             travel_move_settle_s=float(args.travel_move_settle_s),
+            inter_grid_wait_s=float(args.inter_grid_wait_s),
             camera_flush_frames=int(args.camera_flush_frames),
         )
 
@@ -1158,6 +1198,8 @@ if __name__ == "__main__":
                     help="Extra settle time after each scan move, before capture (default: 0.5 s).")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
+    ap.add_argument("--inter-grid-wait-s", type=float, default=DEFAULT_INTER_GRID_WAIT_S,
+                    help="Wait time at the configured start pose before each grid/pass.")
 
     # Startup / end poses
     ap.add_argument("--safe-approach-z", type=float, default=DEFAULT_SAFE_APPROACH_Z)

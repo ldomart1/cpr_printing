@@ -72,16 +72,17 @@ DEFAULT_TRAVEL_FEED = 2000.0
 DEFAULT_FINE_APPROACH_FEED = 500.0
 DEFAULT_PROBE_FEED = 50.0
 DEFAULT_B_MAX_FEED = 50.0
-DEFAULT_B_ACCEL_TIME_S = 0.2
-DEFAULT_B_DECEL_TIME_S = 0.2
-DEFAULT_C_FEED_FLIP = 10000.0
+DEFAULT_B_FEED_SEQUENCE = (50.0, 100.0, 500.0, 1000.0, 2500.0)
+DEFAULT_B_ACCEL_TIME_S = 0.1
+DEFAULT_B_DECEL_TIME_S = 0.1
+DEFAULT_C_FEED_FLIP = 15000.0
 
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
 DEFAULT_ORIENTATION_SEQUENCE = (0.0, 180.0)
-DEFAULT_OSCILLATIONS_PER_ORIENTATION = 2.0
-DEFAULT_ORIENTATION_MOVE_STEPS = 1200
-DEFAULT_ORIENTATION_CAPTURE_STEPS = 120
+DEFAULT_OSCILLATIONS_PER_ORIENTATION = 3.0
+DEFAULT_ORIENTATION_MOVE_STEPS = 120
+DEFAULT_ORIENTATION_CAPTURE_STEPS = 60
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
 DEFAULT_SWEEP_TIP_MAX_DEG = 180.0
@@ -101,8 +102,8 @@ DEFAULT_END_C = 0.0
 
 DEFAULT_SAFE_APPROACH_Z = -155.0
 
-DEFAULT_DWELL_BEFORE_MS = 0.5
-DEFAULT_DWELL_AFTER_MS = 0
+DEFAULT_DWELL_BEFORE_MS = 0.2
+DEFAULT_DWELL_AFTER_MS = 0.2
 DEFAULT_INITIAL_SWEEP_WAIT_S = 4.0
 
 DEFAULT_BBOX_X_MIN = 0.0
@@ -706,6 +707,13 @@ def split_trajectory_into_blocks(traj: List[TrajectoryPoint]) -> List[List[Traje
     return blocks
 
 
+def format_feed_value_for_path(feed: float) -> str:
+    feed_val = float(feed)
+    if feed_val.is_integer():
+        return str(int(feed_val))
+    return str(feed_val).replace(".", "p")
+
+
 # =========================
 # Acquisition runner
 # =========================
@@ -740,14 +748,24 @@ class FixedTipPointTracker:
         else:
             os.makedirs(self.run_folder, exist_ok=True)
 
-        self.point_tracking_folder = os.path.join(self.run_folder, "raw_image_data_folder")
-        os.makedirs(self.point_tracking_folder, exist_ok=True)
+        self.point_tracking_folder = ""
+        self.set_output_subfolder(None)
 
         self.cam = None
         self.rrf = None
         self.cam_port = None
 
         print(f"Using run folder: {self.run_folder}")
+        print(f"Using point-tracking folder: {self.point_tracking_folder}")
+
+    def set_output_subfolder(self, subfolder_name: Optional[str]):
+        output_root = self.run_folder
+        if subfolder_name:
+            output_root = os.path.join(self.run_folder, str(subfolder_name))
+            os.makedirs(output_root, exist_ok=True)
+
+        self.point_tracking_folder = os.path.join(output_root, "raw_image_data_folder")
+        os.makedirs(self.point_tracking_folder, exist_ok=True)
         print(f"Using point-tracking folder: {self.point_tracking_folder}")
 
     # ---------- Camera ----------
@@ -1336,6 +1354,8 @@ def main(args):
         add_date=bool(args.add_date),
     )
 
+    b_feed_sequence = [float(v) for v in args.b_feed_sequence]
+
     try:
         runner.connect_to_camera(
             cam_port=int(args.cam_port),
@@ -1348,29 +1368,44 @@ def main(args):
 
         runner.connect_to_robot(args.duet_web_address)
 
-        results = runner.execute_motion_and_capture(
-            cal=cal,
-            traj=traj,
-            start_pose=start_pose,
-            end_pose=end_pose,
-            safe_approach_z=float(args.safe_approach_z),
-            travel_feed=float(args.travel_feed),
-            fine_approach_feed=float(args.fine_approach_feed),
-            probe_feed=float(args.probe_feed),
-            b_max_feed=float(args.b_max_feed),
-            c_feed_flip=float(args.c_feed_flip),
-            b_accel_time_s=float(args.b_accel_time),
-            b_decel_time_s=float(args.b_decel_time),
-            virtual_bbox=virtual_bbox,
-            dwell_before_ms=int(args.dwell_before_ms),
-            dwell_after_ms=int(args.dwell_after_ms),
-            use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
-            tracked_move_settle_s=float(args.tracked_move_settle_s),
-            travel_move_settle_s=float(args.travel_move_settle_s),
-            camera_flush_frames=int(args.camera_flush_frames),
-            capture_at_start=bool(args.capture_at_start),
-            initial_sweep_wait_s=float(args.initial_sweep_wait_s),
-        )
+        results = []
+        for batch_idx, b_feed in enumerate(b_feed_sequence, start=1):
+            subfolder_name = f"B_feed_{format_feed_value_for_path(b_feed)}"
+            print("\n" + "#" * 72)
+            print(
+                f"Starting acquisition batch {batch_idx}/{len(b_feed_sequence)} "
+                f"with B feed {b_feed:.3f}"
+            )
+            print("#" * 72)
+
+            runner.set_output_subfolder(subfolder_name)
+
+            batch_result = runner.execute_motion_and_capture(
+                cal=cal,
+                traj=traj,
+                start_pose=start_pose,
+                end_pose=end_pose,
+                safe_approach_z=float(args.safe_approach_z),
+                travel_feed=float(args.travel_feed),
+                fine_approach_feed=float(args.fine_approach_feed),
+                probe_feed=float(b_feed),
+                b_max_feed=float(b_feed),
+                c_feed_flip=float(args.c_feed_flip),
+                b_accel_time_s=float(args.b_accel_time),
+                b_decel_time_s=float(args.b_decel_time),
+                virtual_bbox=virtual_bbox,
+                dwell_before_ms=int(args.dwell_before_ms),
+                dwell_after_ms=int(args.dwell_after_ms),
+                use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
+                tracked_move_settle_s=float(args.tracked_move_settle_s),
+                travel_move_settle_s=float(args.travel_move_settle_s),
+                camera_flush_frames=int(args.camera_flush_frames),
+                capture_at_start=bool(args.capture_at_start),
+                initial_sweep_wait_s=float(args.initial_sweep_wait_s),
+            )
+            batch_result["b_feed"] = float(b_feed)
+            batch_result["output_folder"] = runner.point_tracking_folder
+            results.append(batch_result)
 
         print("\nFinal results:")
         print(results)
@@ -1460,6 +1495,8 @@ if __name__ == "__main__":
                     help="Nominal tracked-motion feed for the B-only block execution.")
     ap.add_argument("--b-max-feed", type=float, default=DEFAULT_B_MAX_FEED,
                     help="Max allowed B-axis speed used by the segment feed scheduler.")
+    ap.add_argument("--b-feed-sequence", type=float, nargs="+", default=list(DEFAULT_B_FEED_SEQUENCE),
+                    help="Sequential B-feed values to run in separate acquisition batches.")
     ap.add_argument("--c-feed-flip", type=float, default=DEFAULT_C_FEED_FLIP,
                     help="Feedrate used when flipping C from 0 to 180 before the second block.")
 

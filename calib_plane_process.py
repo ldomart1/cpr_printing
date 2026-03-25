@@ -1621,56 +1621,17 @@ def build_reference_points_mm(
     mm_points: np.ndarray,
 ) -> Dict[str, Any]:
     """
-    Build per-sample Cartesian reference points when filename metadata provides
-    the commanded target coordinates. The predicted set is shifted so its
-    centroid matches the measured centroid in checkerboard mm coordinates.
-
-    If the required per-sample metadata is missing, fall back to the global
-    measured centroid as the reference for all valid points.
+    Fixed-tip reference definition: use the global measured centroid as the
+    reference for all valid points.
     """
     mm_points = np.asarray(mm_points, dtype=float).reshape(-1, 2)
     if mm_points.shape[0] == 0:
         raise RuntimeError("No valid mm points available for error analysis.")
 
-    predicted_points = []
-    for global_idx in valid_indices:
-        rec = records[global_idx]
-        u_pred = rec.get("stage_x_cmd")
-        z_pred = rec.get("stage_z_cmd")
-        if u_pred is None or z_pred is None:
-            continue
-        if not (np.isfinite(u_pred) and np.isfinite(z_pred)):
-            continue
-        predicted_points.append([float(u_pred), float(z_pred)])
-
-    if len(predicted_points) == mm_points.shape[0]:
-        predicted_points = np.asarray(predicted_points, dtype=float)
-        measured_center = np.mean(mm_points, axis=0)
-        predicted_center = np.mean(predicted_points, axis=0)
-        alignment_shift = measured_center - predicted_center
-        aligned_reference_points = predicted_points + alignment_shift[None, :]
-        return {
-            "reference_points_mm": aligned_reference_points,
-            "reference_point_mm": {
-                "u_mean_mm": float(np.mean(aligned_reference_points[:, 0])),
-                "z_mean_mm": float(np.mean(aligned_reference_points[:, 1])),
-            },
-            "reference_points_raw_mm": predicted_points,
-            "reference_mode": "per_point_predicted_cartesian_aligned_centers",
-            "reference_description": (
-                "Each measured point is compared to its corresponding predicted Cartesian "
-                "target after centroid alignment into checkerboard mm coordinates."
-            ),
-            "alignment_shift_mm": {
-                "u_mm": float(alignment_shift[0]),
-                "z_mm": float(alignment_shift[1]),
-            },
-        }
-
     ref_mean = np.mean(mm_points, axis=0)
-    fallback_points = np.repeat(ref_mean[None, :], mm_points.shape[0], axis=0)
+    reference_points = np.repeat(ref_mean[None, :], mm_points.shape[0], axis=0)
     return {
-        "reference_points_mm": fallback_points,
+        "reference_points_mm": reference_points,
         "reference_point_mm": {
             "u_mean_mm": float(ref_mean[0]),
             "z_mean_mm": float(ref_mean[1]),
@@ -1678,8 +1639,8 @@ def build_reference_points_mm(
         "reference_points_raw_mm": None,
         "reference_mode": "global_measured_centroid",
         "reference_description": (
-            "Fallback reference: all measured points are compared to the global "
-            "measured centroid because per-sample predicted Cartesian targets were unavailable."
+            "Fixed-tip reference: all measured points are compared to the global "
+            "measured centroid."
         ),
         "alignment_shift_mm": {
             "u_mm": 0.0,
@@ -2086,7 +2047,7 @@ def save_error_histogram_and_dual_orientation_heatmaps(
             edgecolors="#8fd3ff",
             linewidths=1.2,
             zorder=4,
-            label="Predicted reference points",
+            label="Reference points",
         )
 
         for p_ref, p_meas in zip(refs, pts):
@@ -2287,7 +2248,7 @@ def main():
     ap.add_argument("--link_mode", type=str, default="symlink", choices=["symlink", "copy"])
     ap.add_argument("--save_analysis_config", action="store_true")
 
-    ap.add_argument("--tip_refine_mode", type=str, default="none",
+    ap.add_argument("--tip_refine_mode", type=str, default="parallel_centerline",
                     choices=["none", "edge_dt", "edge_grad", "mainray", "parallel_centerline"],
                     help="Refine tip position using the same distal tip analysis modes as offline_run_calibration.py.")
     ap.add_argument("--tip_refine_dt_step_px", type=float, default=1.0)
@@ -2345,8 +2306,15 @@ def main():
         add_date=False,
     )
     cal.calibration_data_folder = str(project_dir)
+    cal.tip_parallel_section_near_r = float(args.tip_refine_parallel_section_near_r)
+    cal.tip_parallel_section_far_r = float(args.tip_refine_parallel_section_far_r)
+    cal.tip_parallel_scan_half_r = float(args.tip_refine_parallel_scan_half_r)
+    cal.tip_parallel_num_sections = int(args.tip_refine_parallel_num_sections)
+    cal.tip_parallel_cross_step_px = float(args.tip_refine_parallel_cross_step_px)
+    cal.tip_parallel_ray_step_px = float(args.tip_refine_parallel_ray_step_px)
+    cal.tip_parallel_ray_max_len_r = float(args.tip_refine_parallel_ray_max_len_r)
 
-    if args.tip_refine_mode != "none":
+    if args.tip_refine_mode not in ("none", "parallel_centerline"):
         patch_analyze_data_for_tip_refinement(
             cal,
             refine_mode=str(args.tip_refine_mode),
@@ -2368,6 +2336,11 @@ def main():
             parallel_ray_max_len_r=float(args.tip_refine_parallel_ray_max_len_r),
         )
         print(f"[INFO] Tip refinement enabled: {args.tip_refine_mode}")
+    else:
+        print(
+            "[INFO] Using native shadow_calibration analyze_data image processing "
+            f"and annotation flow ({args.tip_refine_mode})."
+        )
 
     imgs = list_images(raw_folder)
     if not imgs:

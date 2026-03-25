@@ -1164,9 +1164,24 @@ def patch_analyze_data_for_tip_refinement(
       - It writes refined pixel coordinates into tip_locations_array_coarse
       - It annotates the returned matplotlib axes with the fitted geometry when available
     """
-    original_analyze_data = cal.analyze_data
     if not hasattr(cal, "tip_refine_debug_records"):
         cal.tip_refine_debug_records = {}
+
+    # Keep the default image processing path identical to shadow_calibration.py.
+    # That file already performs coarse tip detection, parallel-centerline refinement,
+    # and plot annotation inside CTR_Shadow_Calibration.analyze_data().
+    if refine_mode == "parallel_centerline":
+        cal.tip_refine_mode = "parallel_centerline"
+        cal.tip_parallel_section_near_r = float(parallel_section_near_r)
+        cal.tip_parallel_section_far_r = float(parallel_section_far_r)
+        cal.tip_parallel_scan_half_r = float(parallel_scan_half_r)
+        cal.tip_parallel_num_sections = int(parallel_num_sections)
+        cal.tip_parallel_cross_step_px = float(parallel_cross_step_px)
+        cal.tip_parallel_ray_step_px = float(parallel_ray_step_px)
+        cal.tip_parallel_ray_max_len_r = float(parallel_ray_max_len_r)
+        return cal
+
+    original_analyze_data = cal.analyze_data
 
     def analyze_data_patched(
         image_file_name,
@@ -1795,20 +1810,63 @@ def build_desired_grid_coordinates_per_angle(
             continue
         groups[ang].append(rec)
 
+    def infer_axis_sort_descending(
+        grecs: List[Dict[str, Any]],
+        cmd_key: str,
+        measured_key: str,
+    ) -> bool:
+        """
+        Infer whether commanded values should be mapped in descending order so the
+        reconstructed desired grid follows the measured checkerboard axis direction.
+
+        If commanded values increase while measured coordinates decrease, the desired
+        index assignment must be reversed.
+        """
+        pairs = [
+            (float(r[cmd_key]), float(r[measured_key]))
+            for r in grecs
+            if r.get("valid", False)
+            and r.get(cmd_key) is not None
+            and r.get(measured_key) is not None
+        ]
+        if len(pairs) < 2:
+            return False
+
+        cmd_vals = np.asarray([p[0] for p in pairs], dtype=float)
+        measured_vals = np.asarray([p[1] for p in pairs], dtype=float)
+
+        if np.allclose(cmd_vals, cmd_vals[0]) or np.allclose(measured_vals, measured_vals[0]):
+            return False
+
+        corr = np.corrcoef(cmd_vals, measured_vals)[0, 1]
+        if not np.isfinite(corr):
+            return False
+        return bool(corr < 0.0)
+
     group_grid_meta = {}
 
     for ang, grecs in groups.items():
-        x_vals = sorted({float(r["tip_x_cmd"]) for r in grecs if r.get("tip_x_cmd") is not None})
-        z_vals = sorted({float(r["tip_z_cmd"]) for r in grecs if r.get("tip_z_cmd") is not None})
+        x_vals_raw = sorted({float(r["tip_x_cmd"]) for r in grecs if r.get("tip_x_cmd") is not None})
+        z_vals_raw = sorted({float(r["tip_z_cmd"]) for r in grecs if r.get("tip_z_cmd") is not None})
+
+        reverse_x = infer_axis_sort_descending(grecs, "tip_x_cmd", "u_mm")
+        reverse_z = infer_axis_sort_descending(grecs, "tip_z_cmd", "z_mm")
+
+        x_vals = sorted(x_vals_raw, reverse=reverse_x)
+        z_vals = sorted(z_vals_raw, reverse=reverse_z)
 
         x_map = {x: ix * float(x_step_mm) for ix, x in enumerate(x_vals)}
         z_map = {z: iz * float(z_step_mm) for iz, z in enumerate(z_vals)}
 
         group_grid_meta[ang] = {
-            "raw_tip_x_values": x_vals,
-            "raw_tip_z_values": z_vals,
+            "raw_tip_x_values": x_vals_raw,
+            "raw_tip_z_values": z_vals_raw,
+            "ordered_tip_x_values": x_vals,
+            "ordered_tip_z_values": z_vals,
             "desired_grid_x_map": x_map,
             "desired_grid_z_map": z_map,
+            "desired_grid_x_descending": bool(reverse_x),
+            "desired_grid_z_descending": bool(reverse_z),
             "num_x": len(x_vals),
             "num_z": len(z_vals),
             "x_step_mm": float(x_step_mm),
@@ -2406,12 +2464,17 @@ def main():
         save_debug_path=str(checkerboard_debug_path),
     )
     board_reference_debug_image = board_result.get("debug_image")
+    board_type = str(board_result.get("board_type", getattr(cal, "camera_calib_meta", {}).get("board_type", "checkerboard"))).lower()
 
+    print(f"[INFO] Applying checkerboard-style reference correction to board_type={board_type}")
     apply_checkerboard_reference_corrections(
         cal,
         mm_scale=float(args.checkerboard_mm_scale_correction),
         flip_planar_x=(not bool(args.checkerboard_no_flip_planar_x)),
     )
+    if isinstance(board_result, dict):
+        board_result["board_reference_correction_meta"] = getattr(cal, "board_reference_correction_meta", None)
+        board_result["board_reference_correction_source_board_type"] = board_type
 
     print(f"[INFO] Checkerboard reference estimated from: {board_ref_path}")
 

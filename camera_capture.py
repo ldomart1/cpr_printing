@@ -49,12 +49,35 @@ RAW_DIR.mkdir(exist_ok=True)
 MIN_FREE_GB = 5.0
 
 # -----------------------
-# Calibration configuration (unchanged)
+# Calibration configuration
 # -----------------------
-CHESSBOARD_INNER_CORNERS = (11, 7)
-SQUARE_SIZE_M = 0.020
+CHARUCO_SQUARES_X = 12
+CHARUCO_SQUARES_Y = 8
+CHARUCO_SQUARE_SIZE_M = 0.015
+CHARUCO_MARKER_SIZE_M = 0.011
+CHARUCO_DICT_NAME = "DICT_4X4_50"
 MIN_CALIB_FRAMES = 12
-USE_SB_DETECTOR = False
+
+aruco = cv2.aruco
+ARUCO_DICT = aruco.getPredefinedDictionary(getattr(aruco, CHARUCO_DICT_NAME))
+
+def make_charuco_board(use_legacy_pattern=False):
+    board = aruco.CharucoBoard(
+        (CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y),
+        CHARUCO_SQUARE_SIZE_M,
+        CHARUCO_MARKER_SIZE_M,
+        ARUCO_DICT,
+    )
+    if use_legacy_pattern and hasattr(board, "setLegacyPattern"):
+        board.setLegacyPattern(True)
+    return board
+
+CHARUCO_BOARD = make_charuco_board(use_legacy_pattern=False)
+CHARUCO_BOARD_LEGACY = make_charuco_board(use_legacy_pattern=True)
+CHARUCO_BOARD_LEGACY_SIZE = (CHARUCO_SQUARES_X - 1, CHARUCO_SQUARES_Y - 1)
+ACTIVE_CHARUCO_BOARD = CHARUCO_BOARD
+ACTIVE_CHARUCO_USE_LEGACY = False
+legacy_pattern_notice_printed = False
 
 # ---- Choose backend ----
 cap = cv2.VideoCapture(PORT, cv2.CAP_AVFOUNDATION)
@@ -183,20 +206,113 @@ def apply_focus_controls_every_frame():
     except Exception:
         last_focus_set_ok = None
 
-def try_detect_checkerboard(gray):
-    if USE_SB_DETECTOR and hasattr(cv2, "findChessboardCornersSB"):
-        found, corners = cv2.findChessboardCornersSB(gray, CHESSBOARD_INNER_CORNERS, None)
-        if found:
-            corners = corners.reshape(-1, 1, 2).astype(np.float32)
-        return found, corners
+def try_detect_charuco(gray):
+    global ACTIVE_CHARUCO_BOARD, ACTIVE_CHARUCO_USE_LEGACY, legacy_pattern_notice_printed
+
+    if hasattr(aruco, "DetectorParameters"):
+        try:
+            detector_params = aruco.DetectorParameters()
+        except Exception:
+            detector_params = aruco.DetectorParameters_create() if hasattr(aruco, "DetectorParameters_create") else None
+    elif hasattr(aruco, "DetectorParameters_create"):
+        detector_params = aruco.DetectorParameters_create()
     else:
-        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
-        found, corners = cv2.findChessboardCorners(gray, CHESSBOARD_INNER_CORNERS, flags)
-        if not found:
-            return False, None
-        subpix_criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6)
-        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), subpix_criteria)
-        return True, corners
+        detector_params = None
+
+    if hasattr(aruco, "ArucoDetector"):
+        aruco_detector = aruco.ArucoDetector(ARUCO_DICT, detector_params) if detector_params is not None else aruco.ArucoDetector(ARUCO_DICT)
+        marker_corners, marker_ids, _ = aruco_detector.detectMarkers(gray)
+    else:
+        marker_corners, marker_ids, _ = aruco.detectMarkers(gray, ARUCO_DICT, parameters=detector_params)
+
+    if marker_ids is None or len(marker_ids) == 0:
+        return False, None, None, marker_corners, marker_ids, ACTIVE_CHARUCO_BOARD
+
+    candidate_boards = [(ACTIVE_CHARUCO_BOARD, ACTIVE_CHARUCO_USE_LEGACY)]
+    if ACTIVE_CHARUCO_USE_LEGACY:
+        candidate_boards.append((CHARUCO_BOARD, False))
+    else:
+        candidate_boards.append((CHARUCO_BOARD_LEGACY, True))
+
+    for board, use_legacy_pattern in candidate_boards:
+        charuco_corners = None
+        charuco_ids = None
+
+        if hasattr(aruco, "CharucoDetector"):
+            try:
+                charuco_detector = aruco.CharucoDetector(board)
+                charuco_corners, charuco_ids, marker_corners, marker_ids = charuco_detector.detectBoard(gray)
+            except Exception:
+                charuco_corners = None
+                charuco_ids = None
+
+        if (charuco_ids is None or charuco_corners is None or len(charuco_ids) < 4) and hasattr(aruco, "interpolateCornersCharuco"):
+            interp = aruco.interpolateCornersCharuco(marker_corners, marker_ids, gray, board)
+            if interp is not None and len(interp) >= 3:
+                _, charuco_corners, charuco_ids = interp[:3]
+
+        if charuco_ids is None or charuco_corners is None or len(charuco_ids) < 4:
+            continue
+
+        ACTIVE_CHARUCO_BOARD = board
+        ACTIVE_CHARUCO_USE_LEGACY = use_legacy_pattern
+        if use_legacy_pattern and not legacy_pattern_notice_printed:
+            print("[INFO] Charuco detection required legacy board pattern mode.")
+            legacy_pattern_notice_printed = True
+        return True, charuco_corners, charuco_ids, marker_corners, marker_ids, board
+
+    return False, None, None, marker_corners, marker_ids, ACTIVE_CHARUCO_BOARD
+
+def get_charuco_object_points(board, charuco_ids, charuco_corners):
+    if hasattr(board, "getChessboardCorners"):
+        all_obj_points = board.getChessboardCorners()
+    elif hasattr(board, "chessboardCorners"):
+        all_obj_points = board.chessboardCorners
+    else:
+        raise RuntimeError("Could not extract Charuco chessboard corners from board object.")
+
+    all_obj_points = np.asarray(all_obj_points, dtype=np.float32).reshape(-1, 3)
+    ids_flat = np.asarray(charuco_ids, dtype=np.int32).reshape(-1)
+    img_points = np.asarray(charuco_corners, dtype=np.float32).reshape(-1, 2)
+
+    if ids_flat.shape[0] != img_points.shape[0]:
+        raise RuntimeError("Charuco ids/corners size mismatch.")
+
+    obj_points = all_obj_points[ids_flat]
+    return obj_points, img_points
+
+def calibrate_charuco_camera(charuco_ids_list, charuco_corners_list, image_size, board):
+    if hasattr(aruco, "calibrateCameraCharuco"):
+        return aruco.calibrateCameraCharuco(
+            charucoCorners=charuco_corners_list,
+            charucoIds=charuco_ids_list,
+            board=board,
+            imageSize=image_size,
+            cameraMatrix=None,
+            distCoeffs=None,
+        )
+
+    calib_objpoints = []
+    calib_imgpoints = []
+    for charuco_ids, charuco_corners in zip(charuco_ids_list, charuco_corners_list):
+        obj_pts, img_pts = get_charuco_object_points(board, charuco_ids, charuco_corners)
+        if obj_pts.shape[0] < 4:
+            continue
+        calib_objpoints.append(obj_pts.astype(np.float32))
+        calib_imgpoints.append(img_pts.astype(np.float32).reshape(-1, 1, 2))
+
+    if len(calib_objpoints) < MIN_CALIB_FRAMES:
+        raise RuntimeError(
+            f"Only {len(calib_objpoints)} valid Charuco frames remained for calibration; need at least {MIN_CALIB_FRAMES}."
+        )
+
+    return cv2.calibrateCamera(
+        calib_objpoints,
+        calib_imgpoints,
+        image_size,
+        None,
+        None,
+    )
 
 def save_calibration(K, dist, rms):
     filename = datetime.now().strftime("calibration_webcam_%Y%m%d_%H%M%S.npz")
@@ -206,14 +322,18 @@ def save_calibration(K, dist, rms):
         K=K,
         dist=dist,
         rms=rms,
-        inner_corners=np.array(CHESSBOARD_INNER_CORNERS),
-        square_size_m=SQUARE_SIZE_M,
+        inner_corners=np.array(CHARUCO_BOARD_LEGACY_SIZE),
+        square_size_m=CHARUCO_SQUARE_SIZE_M,
+        board_type="charuco",
+        charuco_squares_xy=np.array((CHARUCO_SQUARES_X, CHARUCO_SQUARES_Y)),
+        charuco_squares_x=CHARUCO_SQUARES_X,
+        charuco_squares_y=CHARUCO_SQUARES_Y,
+        charuco_square_size_m=CHARUCO_SQUARE_SIZE_M,
+        charuco_marker_size_m=CHARUCO_MARKER_SIZE_M,
+        aruco_dictionary=CHARUCO_DICT_NAME,
+        charuco_legacy_pattern=bool(ACTIVE_CHARUCO_USE_LEGACY),
     )
     return str(path)
-
-objp = np.zeros((CHESSBOARD_INNER_CORNERS[0] * CHESSBOARD_INNER_CORNERS[1], 3), np.float32)
-objp[:, :2] = np.mgrid[0:CHESSBOARD_INNER_CORNERS[0], 0:CHESSBOARD_INNER_CORNERS[1]].T.reshape(-1, 2)
-objp *= SQUARE_SIZE_M
 
 LEFT_KEYS  = {81, 2424832, 65361}
 RIGHT_KEYS = {83, 2555904, 65363}
@@ -236,11 +356,13 @@ try:
             apply_focus_controls_every_frame()
 
         # Calibration overlay
-        found, corners = (False, None)
+        found, charuco_corners, charuco_ids, marker_corners, marker_ids, detected_board = (False, None, None, None, None, ACTIVE_CHARUCO_BOARD)
         if calib_mode:
-            found, corners = try_detect_checkerboard(gray)
+            found, charuco_corners, charuco_ids, marker_corners, marker_ids, detected_board = try_detect_charuco(gray)
+            if marker_ids is not None and len(marker_ids) > 0:
+                aruco.drawDetectedMarkers(display, marker_corners, marker_ids)
             if found:
-                cv2.drawChessboardCorners(display, CHESSBOARD_INNER_CORNERS, corners, found)
+                aruco.drawDetectedCornersCharuco(display, charuco_corners, charuco_ids)
 
             status = f"CALIB MODE  frames={calib_images}  found={found}"
             cv2.putText(display, status, (20, 40),
@@ -326,24 +448,24 @@ try:
                 calib_mode = True
                 print("Calibration mode ON")
             else:
-                if found and corners is not None:
-                    objpoints.append(objp.copy())
-                    imgpoints.append(corners.copy())
+                if found and charuco_corners is not None and charuco_ids is not None:
+                    objpoints.append(charuco_ids.copy())
+                    imgpoints.append(charuco_corners.copy())
                     calib_images += 1
                     print(f"Captured calibration frame {calib_images}")
                 else:
-                    print("Checkerboard not found; move/tilt board and try again.")
+                    print("Charuco board not found; move/tilt board and try again.")
 
         # Capture calibration frame with SPACE
         elif key == 32:
             if calib_mode:
-                if found and corners is not None:
-                    objpoints.append(objp.copy())
-                    imgpoints.append(corners.copy())
+                if found and charuco_corners is not None and charuco_ids is not None:
+                    objpoints.append(charuco_ids.copy())
+                    imgpoints.append(charuco_corners.copy())
                     calib_images += 1
                     print(f"Captured calibration frame {calib_images}")
                 else:
-                    print("Checkerboard not found; move/tilt board and try again.")
+                    print("Charuco board not found; move/tilt board and try again.")
 
         # Compute calibration
         elif key == ord('k'):
@@ -351,8 +473,11 @@ try:
                 print(f"Need at least {MIN_CALIB_FRAMES} good frames; currently have {len(objpoints)}.")
             else:
                 img_size = (frame.shape[1], frame.shape[0])
-                rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-                    objpoints, imgpoints, img_size, None, None
+                rms, K, dist, rvecs, tvecs = calibrate_charuco_camera(
+                    charuco_ids_list=objpoints,
+                    charuco_corners_list=imgpoints,
+                    image_size=img_size,
+                    board=ACTIVE_CHARUCO_BOARD,
                 )
                 path = save_calibration(K, dist, rms)
                 print("🎯 Calibration complete")

@@ -161,6 +161,8 @@ class Calibration:
     z_model: dict
     y_off_model: Optional[dict]
     tip_angle_model: Optional[dict]
+    phase_models: dict
+    default_motion_phase: str
 
     b_min: float
     b_max: float
@@ -188,6 +190,7 @@ class TrajectoryPoint:
     cycle_phase_01: Optional[float] = None
     leg_phase_01: Optional[float] = None
     leg_name: Optional[str] = None
+    motion_phase: Optional[str] = None
 
 
 # =========================
@@ -251,6 +254,36 @@ def legacy_poly_model(coeffs: Any, equation: Optional[str], value_name: str) -> 
     }
 
 
+def _normalize_motion_phase_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _extract_phase_models(data: dict) -> Tuple[dict, str]:
+    phase_payload = data.get("fit_models_by_phase") or {}
+    phase_models: dict = {}
+    for raw_phase_name, models in phase_payload.items():
+        phase_name = _normalize_motion_phase_name(raw_phase_name)
+        if phase_name is None or not isinstance(models, dict):
+            continue
+        phase_models[phase_name] = dict(models)
+
+    default_phase = _normalize_motion_phase_name(
+        data.get("default_phase_for_legacy_access")
+    )
+    if default_phase is None or default_phase not in phase_models:
+        if "pull" in phase_models:
+            default_phase = "pull"
+        elif phase_models:
+            default_phase = next(iter(phase_models))
+        else:
+            default_phase = "pull"
+
+    return phase_models, default_phase
+
+
 def load_calibration(json_path: str) -> Calibration:
     p = Path(json_path)
     if not p.exists():
@@ -259,25 +292,27 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r") as f:
         data = json.load(f)
 
+    phase_models, default_phase = _extract_phase_models(data)
     fit_models = data.get("fit_models", {})
     cubic = data.get("cubic_coefficients", {})
+    default_phase_models = phase_models.get(default_phase, {})
 
-    r_model = fit_models.get("r") or legacy_poly_model(
+    r_model = fit_models.get("r") or default_phase_models.get("r") or legacy_poly_model(
         cubic.get("r_coeffs"),
         cubic.get("r_equation"),
         "r",
     )
-    z_model = fit_models.get("z") or legacy_poly_model(
+    z_model = fit_models.get("z") or default_phase_models.get("z") or legacy_poly_model(
         cubic.get("z_coeffs"),
         cubic.get("z_equation"),
         "z",
     )
-    y_off_model = fit_models.get("offplane_y") or legacy_poly_model(
+    y_off_model = fit_models.get("offplane_y") or default_phase_models.get("offplane_y") or legacy_poly_model(
         cubic.get("offplane_y_coeffs"),
         cubic.get("offplane_y_equation"),
         "y_offplane_mm",
     )
-    tip_angle_model = fit_models.get("tip_angle") or legacy_poly_model(
+    tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
         cubic.get("tip_angle_coeffs"),
         cubic.get("tip_angle_equation"),
         "tip_angle_deg",
@@ -306,6 +341,8 @@ def load_calibration(json_path: str) -> Calibration:
         z_model=z_model,
         y_off_model=y_off_model,
         tip_angle_model=tip_angle_model,
+        phase_models=phase_models,
+        default_motion_phase=default_phase,
         b_min=b_min,
         b_max=b_max,
         x_axis=x_axis,
@@ -322,32 +359,62 @@ def load_calibration(json_path: str) -> Calibration:
     )
 
 
-def eval_r(cal: Calibration, b: Any, flip_rz_sign: bool = False) -> np.ndarray:
+def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Any:
+    phase_name = _normalize_motion_phase_name(motion_phase) or cal.default_motion_phase
+    phase_model = cal.phase_models.get(phase_name, {}).get(model_name)
+    if phase_model is not None:
+        return phase_model
+
+    fallback_attr = {
+        "r": cal.r_model,
+        "z": cal.z_model,
+        "offplane_y": cal.y_off_model,
+        "tip_angle": cal.tip_angle_model,
+    }.get(model_name)
+    return fallback_attr
+
+
+def eval_r(
+    cal: Calibration,
+    b: Any,
+    flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
+    s = -1.0 * (-1.0 if bool(flip_rz_sign) else 1.0)
+    return s * evaluate_fit_model(_select_fit_model(cal, "r", motion_phase=motion_phase), b)
+
+
+def eval_z(
+    cal: Calibration,
+    b: Any,
+    flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
     s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * evaluate_fit_model(cal.r_model, b)
+    return s * evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
 
 
-def eval_z(cal: Calibration, b: Any, flip_rz_sign: bool = False) -> np.ndarray:
-    s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * evaluate_fit_model(cal.z_model, b)
+def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    return OFFPLANE_SIGN * evaluate_fit_model(
+        _select_fit_model(cal, "offplane_y", motion_phase=motion_phase),
+        b,
+        default_if_none=0.0,
+    )
 
 
-def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
-    return OFFPLANE_SIGN * evaluate_fit_model(cal.y_off_model, b, default_if_none=0.0)
-
-
-def eval_tip_angle_deg(cal: Calibration, b: Any) -> np.ndarray:
-    return evaluate_fit_model(cal.tip_angle_model, b)
+def eval_tip_angle_deg(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    return evaluate_fit_model(_select_fit_model(cal, "tip_angle", motion_phase=motion_phase), b)
 
 
 def predict_r_z_offplane(
     cal: Calibration,
     b: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> Tuple[float, float, float]:
-    r = float(eval_r(cal, b, flip_rz_sign=flip_rz_sign))
-    z = float(eval_z(cal, b, flip_rz_sign=flip_rz_sign))
-    y_off = float(eval_offplane_y(cal, b))
+    r = float(eval_r(cal, b, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase))
+    z = float(eval_z(cal, b, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase))
+    y_off = float(eval_offplane_y(cal, b, motion_phase=motion_phase))
     return r, z, y_off
 
 
@@ -356,8 +423,14 @@ def predict_tip_xyz_from_bc(
     b: float,
     c_deg: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    r, z, y_off = predict_r_z_offplane(cal, b, flip_rz_sign=flip_rz_sign)
+    r, z, y_off = predict_r_z_offplane(
+        cal,
+        b,
+        flip_rz_sign=flip_rz_sign,
+        motion_phase=motion_phase,
+    )
     c = math.radians(float(c_deg))
     x = r * math.cos(c) - y_off * math.sin(c)
     y = r * math.sin(c) + y_off * math.cos(c)
@@ -369,8 +442,15 @@ def tip_offset_xyz_physical(
     b: float,
     c_deg: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    return predict_tip_xyz_from_bc(cal, b, c_deg, flip_rz_sign=flip_rz_sign)
+    return predict_tip_xyz_from_bc(
+        cal,
+        b,
+        c_deg,
+        flip_rz_sign=flip_rz_sign,
+        motion_phase=motion_phase,
+    )
 
 
 def stage_xyz_for_fixed_tip(
@@ -379,8 +459,15 @@ def stage_xyz_for_fixed_tip(
     b: float,
     c_deg: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    return p_tip_xyz - tip_offset_xyz_physical(cal, b, c_deg, flip_rz_sign=flip_rz_sign)
+    return p_tip_xyz - tip_offset_xyz_physical(
+        cal,
+        b,
+        c_deg,
+        flip_rz_sign=flip_rz_sign,
+        motion_phase=motion_phase,
+    )
 
 
 # =========================
@@ -533,6 +620,26 @@ def _capture_allowed(
     return False
 
 
+def infer_motion_phase_for_b(
+    cal: Calibration,
+    prev_b: Optional[float],
+    curr_b: float,
+    next_b: Optional[float],
+) -> str:
+    deltas = []
+    if prev_b is not None:
+        deltas.append(float(curr_b) - float(prev_b))
+    if next_b is not None:
+        deltas.append(float(next_b) - float(curr_b))
+
+    for delta in deltas:
+        if abs(delta) <= 1e-9:
+            continue
+        return "pull" if delta < 0.0 else "release"
+
+    return cal.default_motion_phase
+
+
 # =========================
 # Cyclic continuous trajectory
 # =========================
@@ -599,6 +706,7 @@ def _append_leg(
             idx = max(1, min(nmove, idx))
             capture_move_indices.add(idx)
 
+    raw_points = []
     i_start = 0 if include_first_point else 1
     for i in range(i_start, nmove + 1):
         leg_phase = i / float(nmove)
@@ -624,25 +732,48 @@ def _append_leg(
             boundary_ease_frac=boundary_ease_frac,
         )
 
+        raw_points.append(
+            {
+                "b": float(b_cmd),
+                "c": float(c_cmd),
+                "capture_image": (i in capture_move_indices),
+                "tip_angle_deg": float(used_tip),
+                "cycle_phase_01": float(cycle_phase),
+                "leg_phase_01": float(leg_phase),
+                "leg_name": str(leg_name),
+            }
+        )
+
+    for idx, point in enumerate(raw_points):
+        prev_b = None if idx == 0 else raw_points[idx - 1]["b"]
+        next_b = None if idx + 1 >= len(raw_points) else raw_points[idx + 1]["b"]
+        motion_phase = infer_motion_phase_for_b(
+            cal=cal,
+            prev_b=prev_b,
+            curr_b=point["b"],
+            next_b=next_b,
+        )
         p_stage = stage_xyz_for_fixed_tip(
             cal,
             p_tip_fixed,
-            b_cmd,
-            c_cmd,
+            point["b"],
+            point["c"],
             flip_rz_sign=flip_rz_sign,
+            motion_phase=motion_phase,
         )
 
         traj.append(
             TrajectoryPoint(
-                b=float(b_cmd),
-                c=float(c_cmd),
+                b=point["b"],
+                c=point["c"],
                 stage_xyz=p_stage,
                 segment_kind="cycle",
-                capture_image=(i in capture_move_indices),
-                tip_angle_deg=float(used_tip),
-                cycle_phase_01=float(cycle_phase),
-                leg_phase_01=float(leg_phase),
-                leg_name=str(leg_name),
+                capture_image=bool(point["capture_image"]),
+                tip_angle_deg=point["tip_angle_deg"],
+                cycle_phase_01=point["cycle_phase_01"],
+                leg_phase_01=point["leg_phase_01"],
+                leg_name=point["leg_name"],
+                motion_phase=motion_phase,
             )
         )
 
@@ -709,6 +840,7 @@ def generate_cyclic_visibility_gated_trajectory(
             cycle_phase_01=0.0,
             leg_phase_01=0.0,
             leg_name="forward",
+            motion_phase=cal.default_motion_phase,
         )
     )
 
@@ -771,6 +903,23 @@ def generate_cyclic_visibility_gated_trajectory(
 
         # End of one cycle already lands exactly back at the next cycle start state
         # for integer oscillations-per-sweep and chosen phase offset.
+
+    if len(traj) > 1:
+        start_motion_phase = infer_motion_phase_for_b(
+            cal=cal,
+            prev_b=None,
+            curr_b=traj[0].b,
+            next_b=traj[1].b,
+        )
+        traj[0].motion_phase = start_motion_phase
+        traj[0].stage_xyz = stage_xyz_for_fixed_tip(
+            cal,
+            p_tip_fixed,
+            traj[0].b,
+            traj[0].c,
+            flip_rz_sign=flip_rz_sign,
+            motion_phase=start_motion_phase,
+        )
 
     n_captures = int(sum(1 for pt in traj if pt.capture_image))
     meta = {
@@ -1098,6 +1247,7 @@ class FixedTipPointTracker:
         tip_angle_deg: Optional[float] = None,
         cycle_phase_01: Optional[float] = None,
         leg_name: Optional[str] = None,
+        motion_phase: Optional[str] = None,
     ) -> Optional[str]:
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1118,6 +1268,8 @@ class FixedTipPointTracker:
             extra += f"_TIP{float(tip_angle_deg):.3f}"
         if cycle_phase_01 is not None:
             extra += f"_CPH{float(cycle_phase_01):.5f}"
+        if motion_phase is not None:
+            extra += f"_DIR{str(motion_phase)}"
 
         filename = (
             f"{sample_idx:05d}"
@@ -1301,6 +1453,7 @@ class FixedTipPointTracker:
                     tip_angle_deg=p0.tip_angle_deg,
                     cycle_phase_01=p0.cycle_phase_01,
                     leg_name=p0.leg_name,
+                    motion_phase=p0.motion_phase,
                 )
             else:
                 print("Start point not captured.")
@@ -1350,6 +1503,7 @@ class FixedTipPointTracker:
                         tip_angle_deg=point.tip_angle_deg,
                         cycle_phase_01=point.cycle_phase_01,
                         leg_name=point.leg_name,
+                        motion_phase=point.motion_phase,
                     )
 
             if int(dwell_after_ms) > 0:

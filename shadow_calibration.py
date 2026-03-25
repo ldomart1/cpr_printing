@@ -149,6 +149,73 @@ def _multisource_bfs_geodesic(skel_u8: np.ndarray, seeds_yx: np.ndarray) -> np.n
     return dist
 
 
+def _extract_main_trunk_skeleton(skel_u8: np.ndarray, seeds_yx: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Keep only the dominant base-to-tip trunk of a skeleton.
+    This suppresses side branches in both debug plots and distal-pose estimation.
+    """
+    sk = (np.asarray(skel_u8, dtype=np.uint8) > 0).astype(np.uint8)
+    if sk.sum() == 0:
+        return sk, -np.ones_like(sk, dtype=np.int32)
+
+    dist = _multisource_bfs_geodesic(sk, np.asarray(seeds_yx, dtype=int).reshape(-1, 2))
+    valid = (sk == 1) & (dist >= 0)
+    if not np.any(valid):
+        return sk, dist
+
+    endpoints = _endpoints_8(sk)
+    if endpoints.size > 0:
+        ep_dist = dist[endpoints[:, 0], endpoints[:, 1]]
+        valid_ep = ep_dist >= 0
+        if np.any(valid_ep):
+            tip_y, tip_x = endpoints[valid_ep][int(np.argmax(ep_dist[valid_ep]))]
+        else:
+            ys, xs = np.where(valid)
+            idx = int(np.argmax(dist[ys, xs]))
+            tip_y, tip_x = int(ys[idx]), int(xs[idx])
+    else:
+        ys, xs = np.where(valid)
+        idx = int(np.argmax(dist[ys, xs]))
+        tip_y, tip_x = int(ys[idx]), int(xs[idx])
+
+    trunk = np.zeros_like(sk, dtype=np.uint8)
+    nbr = _neighbor_count_8(sk)
+    dirs = [(-1, -1), (-1, 0), (-1, 1),
+            (0, -1),           (0, 1),
+            (1, -1),  (1, 0),  (1, 1)]
+    cy, cx = int(tip_y), int(tip_x)
+    trunk[cy, cx] = 1
+
+    max_steps = int(sk.sum()) + 5
+    for _ in range(max_steps):
+        d_here = int(dist[cy, cx])
+        if d_here <= 0:
+            break
+
+        best = None
+        best_score = None
+        for dy, dx in dirs:
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < sk.shape[0] and 0 <= nx < sk.shape[1] and sk[ny, nx] == 1:
+                nd = int(dist[ny, nx])
+                if nd < 0 or nd >= d_here:
+                    continue
+                score = (nd, -int(nbr[ny, nx]))
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best = (ny, nx)
+
+        if best is None:
+            break
+
+        cy, cx = best
+        trunk[cy, cx] = 1
+
+    trunk = _prune_short_spurs(trunk, min_branch_len=3, max_iters=20)
+    trunk_dist = _multisource_bfs_geodesic(trunk, np.asarray(seeds_yx, dtype=int).reshape(-1, 2))
+    return trunk, trunk_dist
+
+
 def _tip_angle_from_vertical_deg(skel_u8: np.ndarray, dist: np.ndarray, tip_y: int, tip_x: int, path_len: int = 12, return_path: bool = False):
     """
     Estimate local tip tangent angle with respect to vertical (degrees).
@@ -338,8 +405,35 @@ def _tip_pose_from_distal_pca(
     # 0 deg = down, +90 = right, -90 = left, +/-180 = up.
     angle_deg = float(np.degrees(np.arctan2(vx, vy)))
 
-    # Use coarse skeleton tip for coordinates.
-    tip_y, tip_x = tip_y_s, tip_x_s
+    # Start from the coarse skeleton tip, then extend on the foreground mask
+    # along the estimated distal tangent so slight skeleton truncation does not
+    # stop the tip estimate early.
+    tip_xy_seed = np.array([float(tip_x_s), float(tip_y_s)], dtype=np.float64)
+    tip_dir_xy = np.array([vx, vy], dtype=np.float64)
+    tip_dir_norm = float(np.linalg.norm(tip_dir_xy))
+    if tip_dir_norm > 1e-9:
+        tip_dir_xy /= tip_dir_norm
+        tip_xy_in, found_inside, _ = _backtrack_point_inside_fg(
+            mask_u8.astype(np.uint8),
+            tip_xy_seed,
+            tip_dir_xy,
+            max_back_px=max(6.0, 0.5 * max(r_ref, 1.0)),
+            step_px=0.5,
+        )
+        if found_inside:
+            tip_xy_ext = ray_last_inside(
+                mask_u8.astype(np.uint8),
+                tip_xy_in,
+                tip_dir_xy,
+                step_px=0.25,
+                max_len_px=max(float(roi_margin), 8.0 * max(r_ref, 1.0)),
+            )
+            tip_x = int(round(float(tip_xy_ext[0])))
+            tip_y = int(round(float(tip_xy_ext[1])))
+        else:
+            tip_y, tip_x = tip_y_s, tip_x_s
+    else:
+        tip_y, tip_x = tip_y_s, tip_x_s
 
     tip_path = []
     for t in range(int(max(1, tangent_len))):
@@ -404,7 +498,7 @@ def ray_last_inside(mask_fg, p0_xy, dir_xy, step_px=0.5, max_len_px=120.0):
     return last_inside
 
 
-def _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, dir_xy, back_len_px=60.0, step_px=1.0):
+def _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, dir_xy, back_len_px=60.0, step_px=0.5):
     d = np.asarray(dir_xy, dtype=np.float64)
     d /= max(np.linalg.norm(d), 1e-12)
     vals = []
@@ -490,8 +584,8 @@ def refine_tip_parallel_centerline(
     scan_half_r=3.0,
     num_sections=9,
     cross_step_px=0.5,
-    ray_step_px=0.5,
-    ray_max_len_r=8.0,
+    ray_step_px=0.25,
+    ray_max_len_r=12,
 ):
     mask_fg = (binary_image == 0).astype(np.uint8)
     if mask_fg.sum() == 0:
@@ -510,7 +604,7 @@ def refine_tip_parallel_centerline(
         }
 
     dist_img = cv2.distanceTransform(mask_fg, cv2.DIST_L2, 5)
-    r_px = _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, d_xy, back_len_px=80.0, step_px=1.0)
+    r_px = _estimate_radius_along_axis(mask_fg, dist_img, p_in_xy, d_xy, back_len_px=60.0, step_px=1.0)
 
     section_near_px = max(0.5 * r_px, float(section_near_r) * r_px)
     section_far_px = max(section_near_px + 2.0, float(section_far_r) * r_px)
@@ -573,7 +667,7 @@ def refine_tip_parallel_centerline(
 
     tip_xy = ray_last_inside(mask_fg, center_line_start, d_xy, step_px=float(ray_step_px), max_len_px=ray_max_len_px + line_back_px)
 
-    line_forward_px = float(np.linalg.norm(tip_xy - base_center_xy)) + 0.5 * r_px
+    line_forward_px = float(np.linalg.norm(tip_xy - base_center_xy)) + 1.5 * r_px
     left_line_end = base_center_xy + line_forward_px * d_xy + t_left_med * n_xy
     right_line_end = base_center_xy + line_forward_px * d_xy + t_right_med * n_xy
     center_line_end = base_center_xy + line_forward_px * d_xy + t_center * n_xy
@@ -603,38 +697,55 @@ def refine_tip_parallel_centerline(
     return float(tip_xy[1]), float(tip_xy[0]), dbg
 
 
-def _shift_tip_debug_geometry(dbg, x_offset, y_offset):
-    if not isinstance(dbg, dict):
-        return {}
+def _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min: int, zoom_x_max: int, zoom_y_min: int, zoom_y_max: int):
+    """
+    Re-express the lower zoom panels in the same cropped-image pixel coordinates
+    used by the refinement geometry so overlays land on the underlying image.
+    """
+    if axs is None or not isinstance(axs, np.ndarray) or axs.size < 4:
+        return
 
-    shifted = {}
-    pair_keys = {
-        "tip_xy",
-        "tip_guess_xy",
-        "inside_anchor_xy",
-    }
-    line_keys = {
-        "section_centers_xy",
-        "section_left_points_xy",
-        "section_right_points_xy",
-        "parallel_left_line_xy",
-        "parallel_right_line_xy",
-        "center_line_xy",
-        "center_line_full_xy",
-    }
+    zoom_axes = [axs[1, 0], axs[1, 1]]
+    x_offset = float(zoom_x_min)
+    y_offset = float(zoom_y_min)
+    extent = [float(zoom_x_min), float(zoom_x_max + 1), float(zoom_y_max + 1), float(zoom_y_min)]
 
-    for key, value in dbg.items():
-        if key in pair_keys:
-            arr = np.asarray(value, dtype=float).reshape(-1)
-            if arr.size == 2:
-                shifted[key] = [float(arr[0] - x_offset), float(arr[1] - y_offset)]
-                continue
-        if key in line_keys:
-            arr = np.asarray(value, dtype=float).reshape(-1, 2)
-            shifted[key] = (arr - np.array([[float(x_offset), float(y_offset)]])).tolist()
+    for ax in zoom_axes:
+        if ax is None:
             continue
-        shifted[key] = value
-    return shifted
+
+        for image in ax.images:
+            image.set_extent(extent)
+
+        for coll in ax.collections:
+            try:
+                offsets = coll.get_offsets()
+            except Exception:
+                continue
+            if offsets is None:
+                continue
+            offsets = np.asarray(offsets, dtype=float)
+            if offsets.size == 0:
+                continue
+            shifted = offsets.copy()
+            shifted[:, 0] += x_offset
+            shifted[:, 1] += y_offset
+            coll.set_offsets(shifted)
+
+        for line in ax.lines:
+            try:
+                xdata = np.asarray(line.get_xdata(), dtype=float)
+                ydata = np.asarray(line.get_ydata(), dtype=float)
+            except Exception:
+                continue
+            if xdata.size == 0 or ydata.size == 0:
+                continue
+            line.set_xdata(xdata + x_offset)
+            line.set_ydata(ydata + y_offset)
+
+        ax.set_xlim(float(zoom_x_min), float(zoom_x_max + 1))
+        ax.set_ylim(float(zoom_y_max + 1), float(zoom_y_min))
+        ax.set_aspect("equal")
 
 
 def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
@@ -643,7 +754,9 @@ def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
 
     try:
         if isinstance(axs, np.ndarray):
-            target_axes = [axs[1, 0], axs[1, 1]] if axs.size >= 4 else [axs.flat[-1]]
+            target_axes = [axs.flat[-1]]
+            if axs.size >= 3:
+                target_axes.append(axs.flat[-2])
         elif isinstance(axs, (list, tuple)):
             target_axes = [axs[-1]]
         else:
@@ -674,6 +787,14 @@ def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
             _plot_line("center_line_xy", "#ffd400", "center parallel line")
             _plot_line("center_line_full_xy", "#ffaa00", "center line (full)")
 
+            if "path_window_xy" in dbg:
+                pts = np.asarray(dbg["path_window_xy"], dtype=float).reshape(-1, 2)
+                if pts.size > 0:
+                    lbl = "tangent fit window" if "tangent fit window" not in used_labels else None
+                    if lbl is not None:
+                        used_labels.add(lbl)
+                    ax.plot(pts[:, 0], pts[:, 1], color="#00e5ff", linewidth=2.0, label=lbl)
+
             if "section_left_points_xy" in dbg and len(dbg["section_left_points_xy"]) > 0:
                 pts = np.asarray(dbg["section_left_points_xy"], dtype=float).reshape(-1, 2)
                 lbl = "sampled edge points" if "sampled edge points" not in used_labels else None
@@ -698,18 +819,9 @@ def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
                 if lbl is not None:
                     used_labels.add(lbl)
                 ax.scatter([tip_xy[0]], [tip_xy[1]], s=55, c="#ff3b30", edgecolors="#ffffff", label=lbl, zorder=6)
-                ax.annotate(
-                    f"tip{title_suffix}",
-                    (tip_xy[0], tip_xy[1]),
-                    xytext=(6, -8),
-                    textcoords="offset points",
-                    color="white",
-                    fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none", alpha=0.55),
-                )
 
             try:
-                ax.legend(loc="best", fontsize=8)
+                ax.legend(loc="upper right", fontsize=6.5)
             except Exception:
                 pass
     except Exception as e:
@@ -776,10 +888,10 @@ class CTR_Shadow_Calibration:
         self.rrf = None
 
         self.default_analysis_crop = {
-            "crop_width_min": 650,
-            "crop_width_max": 2900,
-            "crop_height_min": 150,
-            "crop_height_max": 1750,
+            "crop_width_min": 910,
+            "crop_width_max": 2850,
+            "crop_height_min": 450,
+            "crop_height_max": 1650,
         }
         self.analysis_crop = dict(self.default_analysis_crop)
 
@@ -797,6 +909,13 @@ class CTR_Shadow_Calibration:
         self.board_planar_x_sign = 1.0
         self.board_reference_correction_meta = None
         self.board_reference_image_path = None
+        self.default_charuco_config = {
+            "squares_x": 12,
+            "squares_y": 8,
+            "square_size_mm": 15.0,
+            "marker_size_mm": 11.0,
+            "aruco_dictionary": "DICT_4X4_50",
+        }
         self.ruler_ref_p1_px = None
         self.ruler_ref_p2_px = None
         self.ruler_ref_distance_mm = None
@@ -808,12 +927,12 @@ class CTR_Shadow_Calibration:
         self.tip_refine_debug_records = {}
         self.tip_refine_mode = "parallel_centerline"
         self.tip_parallel_section_near_r = 1.0
-        self.tip_parallel_section_far_r = 6.0
+        self.tip_parallel_section_far_r = 8.0
         self.tip_parallel_scan_half_r = 3.0
         self.tip_parallel_num_sections = 9
         self.tip_parallel_cross_step_px = 0.5
         self.tip_parallel_ray_step_px = 0.5
-        self.tip_parallel_ray_max_len_r = 8.0
+        self.tip_parallel_ray_max_len_r = 16.0
 
         print("Calibration object initialized successfully!")
 
@@ -821,11 +940,165 @@ class CTR_Shadow_Calibration:
     # sc.load_camera_calibration("/path/to/webcam_calibration.npz")
     # sc.estimate_board_reference_from_image("/path/to/checkerboard_reference.png", draw_debug=True)
     # u_mm, z_mm = sc.pixel_point_to_calibrated_axes(x_px=1800, y_px=900)
+    @staticmethod
+    def _normalize_board_type(board_type):
+        if board_type is None:
+            return "checkerboard"
+        txt = str(board_type).strip().lower().replace("-", "_").replace(" ", "_")
+        if "charuco" in txt:
+            return "charuco"
+        return "checkerboard"
+
+    @staticmethod
+    def _resolve_aruco_dictionary_id(dictionary_spec):
+        if dictionary_spec is None:
+            dictionary_spec = "DICT_4X4_50"
+
+        if isinstance(dictionary_spec, (np.integer, int)):
+            return int(dictionary_spec), str(int(dictionary_spec))
+
+        txt = str(dictionary_spec).strip().upper().replace("-", "_").replace(" ", "_")
+        txt = txt.replace("ARUCO_", "")
+        if txt == "DICT4X4" or txt == "DICT_4X4":
+            txt = "DICT_4X4_50"
+        elif txt == "4X4" or txt == "4X4_50":
+            txt = "DICT_4X4_50"
+        elif txt.startswith("DICT4X4_"):
+            txt = "DICT_" + txt[len("DICT"):]
+        if not txt.startswith("DICT_"):
+            txt = f"DICT_{txt}"
+
+        if not hasattr(cv2, "aruco"):
+            raise RuntimeError("OpenCV ArUco module is unavailable. Install opencv-contrib-python.")
+        if not hasattr(cv2.aruco, txt):
+            raise ValueError(f"Unsupported ArUco dictionary spec: {dictionary_spec}")
+        return int(getattr(cv2.aruco, txt)), txt
+
+    def _get_aruco_dictionary(self, dictionary_spec):
+        dictionary_id, dictionary_name = self._resolve_aruco_dictionary_id(dictionary_spec)
+        if hasattr(cv2.aruco, "getPredefinedDictionary"):
+            return cv2.aruco.getPredefinedDictionary(dictionary_id), dictionary_id, dictionary_name
+        if hasattr(cv2.aruco, "Dictionary_get"):
+            return cv2.aruco.Dictionary_get(dictionary_id), dictionary_id, dictionary_name
+        raise RuntimeError("This OpenCV ArUco build cannot construct predefined dictionaries.")
+
+    def _build_charuco_board(self, squares_x, squares_y, square_length_mm, marker_length_mm, dictionary_spec, use_legacy_pattern=False):
+        if not hasattr(cv2, "aruco"):
+            raise RuntimeError("OpenCV ArUco module is unavailable. Install opencv-contrib-python.")
+
+        aruco_dict, dictionary_id, dictionary_name = self._get_aruco_dictionary(dictionary_spec)
+        sx = int(squares_x)
+        sy = int(squares_y)
+        square_len = float(square_length_mm)
+        marker_len = float(marker_length_mm)
+
+        if sx < 2 or sy < 2:
+            raise ValueError(f"Charuco board squares must each be >= 2, got {(sx, sy)}")
+        if square_len <= 0 or marker_len <= 0:
+            raise ValueError("Charuco square and marker sizes must be positive.")
+        if marker_len >= square_len:
+            raise ValueError("Charuco marker size must be smaller than checker square size.")
+
+        if hasattr(cv2.aruco, "CharucoBoard"):
+            try:
+                board = cv2.aruco.CharucoBoard((sx, sy), square_len, marker_len, aruco_dict)
+            except Exception:
+                board = cv2.aruco.CharucoBoard.create(sx, sy, square_len, marker_len, aruco_dict)
+        elif hasattr(cv2.aruco, "CharucoBoard_create"):
+            board = cv2.aruco.CharucoBoard_create(sx, sy, square_len, marker_len, aruco_dict)
+        else:
+            raise RuntimeError("This OpenCV ArUco build cannot create Charuco boards.")
+
+        if bool(use_legacy_pattern) and hasattr(board, "setLegacyPattern"):
+            board.setLegacyPattern(True)
+
+        return board, {
+            "squares_x": sx,
+            "squares_y": sy,
+            "square_size_mm": square_len,
+            "marker_size_mm": marker_len,
+            "aruco_dictionary_id": dictionary_id,
+            "aruco_dictionary_name": dictionary_name,
+            "legacy_pattern": bool(use_legacy_pattern),
+        }
+
+    def _get_charuco_chessboard_corners(self, board):
+        if hasattr(board, "getChessboardCorners"):
+            corners = board.getChessboardCorners()
+        elif hasattr(board, "chessboardCorners"):
+            corners = board.chessboardCorners
+        else:
+            raise RuntimeError("Could not extract Charuco chessboard corners from board object.")
+        return np.asarray(corners, dtype=np.float64).reshape(-1, 3)
+
+    def _detect_charuco_corners(self, gray, board, dictionary_spec=None):
+        if gray is None or gray.ndim != 2:
+            raise ValueError("gray must be a valid grayscale image.")
+        if not hasattr(cv2, "aruco"):
+            raise RuntimeError("OpenCV ArUco module is unavailable. Install opencv-contrib-python.")
+
+        aruco_dict, _, _ = self._get_aruco_dictionary(dictionary_spec)
+        charuco_corners = None
+        charuco_ids = None
+        marker_corners = None
+        marker_ids = None
+
+        if hasattr(cv2.aruco, "DetectorParameters"):
+            try:
+                detector_params = cv2.aruco.DetectorParameters()
+            except Exception:
+                detector_params = cv2.aruco.DetectorParameters_create()
+        elif hasattr(cv2.aruco, "DetectorParameters_create"):
+            detector_params = cv2.aruco.DetectorParameters_create()
+        else:
+            detector_params = None
+
+        if hasattr(cv2.aruco, "CharucoDetector"):
+            try:
+                charuco_detector = cv2.aruco.CharucoDetector(board)
+                charuco_corners, charuco_ids, marker_corners, marker_ids = charuco_detector.detectBoard(gray)
+            except Exception:
+                charuco_corners = None
+                charuco_ids = None
+                marker_corners = None
+                marker_ids = None
+
+        if charuco_corners is None or charuco_ids is None or len(charuco_ids) < 4:
+            if hasattr(cv2.aruco, "ArucoDetector"):
+                detector = cv2.aruco.ArucoDetector(aruco_dict, detector_params) if detector_params is not None else cv2.aruco.ArucoDetector(aruco_dict)
+                marker_corners, marker_ids, _ = detector.detectMarkers(gray)
+            else:
+                marker_corners, marker_ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=detector_params)
+
+            if marker_ids is not None and len(marker_ids) > 0:
+                if hasattr(cv2.aruco, "interpolateCornersCharuco"):
+                    interp = cv2.aruco.interpolateCornersCharuco(
+                        marker_corners,
+                        marker_ids,
+                        gray,
+                        board,
+                    )
+                    if interp is not None and len(interp) >= 3:
+                        _, charuco_corners, charuco_ids = interp[:3]
+
+        if charuco_corners is None or charuco_ids is None:
+            return False, None, None, marker_corners, marker_ids
+
+        charuco_corners = np.asarray(charuco_corners, dtype=np.float32).reshape(-1, 1, 2)
+        charuco_ids = np.asarray(charuco_ids, dtype=np.int32).reshape(-1, 1)
+        if charuco_ids.shape[0] < 4:
+            return False, None, None, marker_corners, marker_ids
+
+        return True, charuco_corners, charuco_ids, marker_corners, marker_ids
+
     def load_camera_calibration(self, calibration_npz_path):
         """
-        Load camera intrinsics/distortion and checkerboard metadata from a saved .npz file.
+        Load camera intrinsics/distortion and board metadata from a saved .npz file.
 
-        Expected keys: K, dist, rms, inner_corners, square_size_m.
+        Supported metadata:
+        - Checkerboard: inner_corners, square_size_m
+        - Charuco: charuco_squares_x / squares_x, charuco_squares_y / squares_y,
+          marker_size_m / marker_length_m, aruco_dictionary / dictionary
         """
         if calibration_npz_path is None:
             raise ValueError("Calibration file path cannot be None.")
@@ -835,7 +1108,7 @@ class CTR_Shadow_Calibration:
             raise FileNotFoundError(f"Camera calibration file not found: {calib_path}")
 
         with np.load(calib_path, allow_pickle=False) as data:
-            required_keys = ("K", "dist", "rms", "inner_corners", "square_size_m")
+            required_keys = ("K", "dist", "rms")
             missing = [k for k in required_keys if k not in data]
             if missing:
                 raise KeyError(
@@ -846,32 +1119,130 @@ class CTR_Shadow_Calibration:
             K = np.asarray(data["K"], dtype=np.float64)
             dist = np.asarray(data["dist"], dtype=np.float64)
             rms = float(np.asarray(data["rms"]).reshape(-1)[0])
-            inner_corners_arr = np.asarray(data["inner_corners"]).reshape(-1)
-            if inner_corners_arr.size < 2:
-                raise ValueError(
-                    f"inner_corners must have at least 2 values, got {inner_corners_arr}"
-                )
-            inner_corners = (int(inner_corners_arr[0]), int(inner_corners_arr[1]))
-            square_size_m = float(np.asarray(data["square_size_m"]).reshape(-1)[0])
+            board_type = self._normalize_board_type(data["board_type"][()] if "board_type" in data else None)
+            if (
+                "charuco_squares_x" in data or "squares_x" in data
+                or "charuco_squares_y" in data or "squares_y" in data
+                or "marker_size_m" in data or "marker_length_m" in data
+                or "aruco_dictionary" in data or "dictionary" in data or "dictionary_name" in data
+                or "inner_corners" not in data
+            ):
+                board_type = "charuco"
+
+            square_size_m = None
+            square_size_mm = None
+            inner_corners = None
+            squares_x = None
+            squares_y = None
+            marker_size_m = None
+            marker_size_mm = None
+            aruco_dictionary = None
+            charuco_legacy_pattern = False
+
+            if "square_size_m" in data:
+                square_size_m = float(np.asarray(data["square_size_m"]).reshape(-1)[0])
+                square_size_mm = square_size_m * 1000.0
+            elif "square_length_m" in data:
+                square_size_m = float(np.asarray(data["square_length_m"]).reshape(-1)[0])
+                square_size_mm = square_size_m * 1000.0
+            elif board_type == "charuco":
+                square_size_mm = float(self.default_charuco_config["square_size_mm"])
+                square_size_m = square_size_mm / 1000.0
+
+            if board_type == "checkerboard":
+                if "inner_corners" not in data or square_size_m is None:
+                    raise KeyError(
+                        "Checkerboard calibration file must contain inner_corners and square_size_m."
+                    )
+                inner_corners_arr = np.asarray(data["inner_corners"]).reshape(-1)
+                if inner_corners_arr.size < 2:
+                    raise ValueError(
+                        f"inner_corners must have at least 2 values, got {inner_corners_arr}"
+                    )
+                inner_corners = (int(inner_corners_arr[0]), int(inner_corners_arr[1]))
+            else:
+                if "charuco_squares_x" in data:
+                    squares_x = int(np.asarray(data["charuco_squares_x"]).reshape(-1)[0])
+                elif "squares_x" in data:
+                    squares_x = int(np.asarray(data["squares_x"]).reshape(-1)[0])
+                elif "charuco_squares_xy" in data:
+                    squares_xy = np.asarray(data["charuco_squares_xy"]).reshape(-1)
+                    if squares_xy.size >= 2:
+                        squares_x = int(squares_xy[0])
+                if "charuco_squares_y" in data:
+                    squares_y = int(np.asarray(data["charuco_squares_y"]).reshape(-1)[0])
+                elif "squares_y" in data:
+                    squares_y = int(np.asarray(data["squares_y"]).reshape(-1)[0])
+                elif "charuco_squares_xy" in data:
+                    squares_xy = np.asarray(data["charuco_squares_xy"]).reshape(-1)
+                    if squares_xy.size >= 2:
+                        squares_y = int(squares_xy[1])
+                if squares_x is None:
+                    squares_x = int(self.default_charuco_config["squares_x"])
+                if squares_y is None:
+                    squares_y = int(self.default_charuco_config["squares_y"])
+
+                if "marker_size_m" in data:
+                    marker_size_m = float(np.asarray(data["marker_size_m"]).reshape(-1)[0])
+                elif "marker_length_m" in data:
+                    marker_size_m = float(np.asarray(data["marker_length_m"]).reshape(-1)[0])
+                else:
+                    marker_size_mm = float(self.default_charuco_config["marker_size_mm"])
+                    marker_size_m = marker_size_mm / 1000.0
+                if marker_size_mm is None:
+                    marker_size_mm = marker_size_m * 1000.0
+
+                if "aruco_dictionary" in data:
+                    aruco_dictionary = data["aruco_dictionary"][()]
+                elif "dictionary" in data:
+                    aruco_dictionary = data["dictionary"][()]
+                elif "dictionary_name" in data:
+                    aruco_dictionary = data["dictionary_name"][()]
+                else:
+                    aruco_dictionary = self.default_charuco_config["aruco_dictionary"]
+
+                if "charuco_legacy_pattern" in data:
+                    charuco_legacy_pattern = bool(np.asarray(data["charuco_legacy_pattern"]).reshape(-1)[0])
 
         if K.shape != (3, 3):
             raise ValueError(f"K must be shape (3,3), got {K.shape}")
-
-        square_size_mm = square_size_m * 1000.0
 
         self.camera_K = K
         self.camera_dist = dist
         self.camera_calib_path = calib_path
         self.camera_calib_meta = {
+            "board_type": board_type,
             "rms": rms,
-            "inner_corners": inner_corners,
             "square_size_m": square_size_m,
             "square_size_mm": square_size_mm,
         }
+        if inner_corners is not None:
+            self.camera_calib_meta["inner_corners"] = inner_corners
+        if squares_x is not None:
+            self.camera_calib_meta["squares_x"] = squares_x
+        if squares_y is not None:
+            self.camera_calib_meta["squares_y"] = squares_y
+        if marker_size_m is not None:
+            self.camera_calib_meta["marker_size_m"] = marker_size_m
+        if marker_size_mm is not None:
+            self.camera_calib_meta["marker_size_mm"] = marker_size_mm
+        if aruco_dictionary is not None:
+            self.camera_calib_meta["aruco_dictionary"] = str(aruco_dictionary)
+        if board_type == "charuco":
+            self.camera_calib_meta["charuco_legacy_pattern"] = bool(charuco_legacy_pattern)
 
         print(
             "Loaded camera calibration: "
-            f"RMS={rms:.6f}, inner_corners={inner_corners}, square_size={square_size_mm:.3f} mm"
+            f"RMS={rms:.6f}, board_type={board_type}, "
+            + (
+                f"inner_corners={inner_corners}, square_size={square_size_mm:.3f} mm"
+                if board_type == "checkerboard"
+                else (
+                    f"squares=({squares_x},{squares_y}), square_size={square_size_mm:.3f} mm, "
+                    f"marker_size={marker_size_mm:.3f} mm, dictionary={self.camera_calib_meta['aruco_dictionary']}, "
+                    f"legacy_pattern={bool(self.camera_calib_meta['charuco_legacy_pattern'])}"
+                )
+            )
         )
         return dict(self.camera_calib_meta)
 
@@ -953,6 +1324,26 @@ class CTR_Shadow_Calibration:
         S_inv = np.diag([1.0 / float(mm_scale), 1.0 / float(mm_scale), 1.0]).astype(np.float64)
         return H @ S_inv
 
+    def _board_reference_measurement_scale_correction(self):
+        board_type = None
+        if isinstance(self.board_pose, dict):
+            board_type = self.board_pose.get("board_type")
+            if board_type is None and "inner_corners" in self.board_pose:
+                board_type = "checkerboard"
+        if board_type is None and isinstance(self.camera_calib_meta, dict):
+            board_type = self.camera_calib_meta.get("board_type")
+        board_type = self._normalize_board_type(board_type)
+
+        if board_type != "checkerboard":
+            return 1.0
+
+        correction_meta = self.board_reference_correction_meta
+        if isinstance(correction_meta, dict):
+            applied = correction_meta.get("checkerboard_mm_scale_correction")
+            if applied is not None and np.isfinite(applied):
+                return 1.0
+        return 0.5
+
     def apply_checkerboard_reference_corrections(self, mm_scale=0.5, flip_planar_x=True):
         """
         Correct checkerboard-backed reference axes so they match the ruler-backed convention.
@@ -1027,16 +1418,20 @@ class CTR_Shadow_Calibration:
         image_or_path,
         inner_corners=None,
         square_size_mm=None,
+        marker_size_mm=None,
+        squares_x=None,
+        squares_y=None,
+        aruco_dictionary=None,
         use_undistort=True,
         draw_debug=False,
         save_debug_path=None,
     ):
         """
-        Estimate checkerboard pose and calibrated board reference from a single image.
+        Estimate planar board pose and calibrated board reference from a single image.
 
         Convention:
         - Image coordinates are (x, y) = (column, row) in pixels.
-        - Board coordinates are (x_mm, y_mm) in the checkerboard plane.
+        - Board coordinates are (x_mm, y_mm) in the board plane.
         - "True vertical" in image is defined as projection of board +Y axis.
           Therefore +z_mm returned by pixel_point_to_calibrated_axes corresponds to +Y_board.
         """
@@ -1049,9 +1444,7 @@ class CTR_Shadow_Calibration:
             image_path = os.path.abspath(os.path.expanduser(image_or_path))
             image_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
             if image_bgr is None:
-                raise FileNotFoundError(
-                    f"Could not read checkerboard reference image: {image_path}"
-                )
+                raise FileNotFoundError(f"Could not read board reference image: {image_path}")
             self.board_reference_image_path = image_path
         elif isinstance(image_or_path, np.ndarray):
             image_bgr = image_or_path.copy()
@@ -1059,11 +1452,9 @@ class CTR_Shadow_Calibration:
         else:
             raise TypeError("image_or_path must be an image path or a BGR numpy array.")
 
-        if inner_corners is None:
-            if self.camera_calib_meta is None or "inner_corners" not in self.camera_calib_meta:
-                raise ValueError("inner_corners is required when calibration metadata is unavailable.")
-            inner_corners = self.camera_calib_meta["inner_corners"]
-        inner_corners = (int(inner_corners[0]), int(inner_corners[1]))
+        board_type = "checkerboard"
+        if self.camera_calib_meta is not None:
+            board_type = self._normalize_board_type(self.camera_calib_meta.get("board_type"))
 
         if square_size_mm is None:
             if self.camera_calib_meta is None or "square_size_mm" not in self.camera_calib_meta:
@@ -1083,17 +1474,99 @@ class CTR_Shadow_Calibration:
             dist_for_pnp = self.camera_dist
 
         gray = cv2.cvtColor(image_for_detection, cv2.COLOR_BGR2GRAY)
-        found, corners = self._detect_checkerboard_corners(gray, inner_corners=inner_corners, use_sb=True)
-        if not found:
-            raise RuntimeError(
-                f"Checkerboard not found in reference image using inner_corners={inner_corners}."
-            )
+        board_debug_meta = {}
+        corners = None
+        charuco_ids = None
+        marker_corners = None
+        marker_ids = None
 
-        nx, ny = int(inner_corners[0]), int(inner_corners[1])
-        board_xy = np.mgrid[0:nx, 0:ny].T.reshape(-1, 2).astype(np.float64) * square_size_mm
-        obj_points = np.zeros((board_xy.shape[0], 3), dtype=np.float64)
-        obj_points[:, :2] = board_xy
-        img_points = corners.reshape(-1, 2).astype(np.float64)
+        if board_type == "charuco":
+            if squares_x is None:
+                if self.camera_calib_meta is None or "squares_x" not in self.camera_calib_meta:
+                    raise ValueError("squares_x is required for Charuco board reference.")
+                squares_x = int(self.camera_calib_meta["squares_x"])
+            else:
+                squares_x = int(squares_x)
+
+            if squares_y is None:
+                if self.camera_calib_meta is None or "squares_y" not in self.camera_calib_meta:
+                    raise ValueError("squares_y is required for Charuco board reference.")
+                squares_y = int(self.camera_calib_meta["squares_y"])
+            else:
+                squares_y = int(squares_y)
+
+            if marker_size_mm is None:
+                if self.camera_calib_meta is None or "marker_size_mm" not in self.camera_calib_meta:
+                    raise ValueError("marker_size_mm is required for Charuco board reference.")
+                marker_size_mm = float(self.camera_calib_meta["marker_size_mm"])
+            else:
+                marker_size_mm = float(marker_size_mm)
+
+            if aruco_dictionary is None:
+                if self.camera_calib_meta is not None and "aruco_dictionary" in self.camera_calib_meta:
+                    aruco_dictionary = self.camera_calib_meta["aruco_dictionary"]
+                else:
+                    aruco_dictionary = "DICT_4X4_50"
+            preferred_legacy_pattern = False
+            if self.camera_calib_meta is not None and "charuco_legacy_pattern" in self.camera_calib_meta:
+                preferred_legacy_pattern = bool(self.camera_calib_meta["charuco_legacy_pattern"])
+
+            candidate_patterns = [preferred_legacy_pattern]
+            if not preferred_legacy_pattern:
+                candidate_patterns.append(True)
+            else:
+                candidate_patterns.append(False)
+
+            found = False
+            board_obj = None
+            for use_legacy_pattern in candidate_patterns:
+                board_obj, board_debug_meta = self._build_charuco_board(
+                    squares_x=squares_x,
+                    squares_y=squares_y,
+                    square_length_mm=square_size_mm,
+                    marker_length_mm=marker_size_mm,
+                    dictionary_spec=aruco_dictionary,
+                    use_legacy_pattern=use_legacy_pattern,
+                )
+                found, corners, charuco_ids, marker_corners, marker_ids = self._detect_charuco_corners(
+                    gray,
+                    board_obj,
+                    dictionary_spec=aruco_dictionary,
+                )
+                if found:
+                    if self.camera_calib_meta is not None:
+                        self.camera_calib_meta["charuco_legacy_pattern"] = bool(use_legacy_pattern)
+                    break
+            if not found:
+                raise RuntimeError(
+                    "Charuco board not found in reference image "
+                    f"using squares=({squares_x},{squares_y}), square_size_mm={square_size_mm}, "
+                    f"marker_size_mm={marker_size_mm}, dictionary={board_debug_meta['aruco_dictionary_name']}."
+                )
+
+            all_obj_points = self._get_charuco_chessboard_corners(board_obj)
+            ids_flat = np.asarray(charuco_ids, dtype=np.int32).reshape(-1)
+            obj_points = all_obj_points[ids_flat]
+            img_points = corners.reshape(-1, 2).astype(np.float64)
+            board_xy = obj_points[:, :2].astype(np.float64)
+        else:
+            if inner_corners is None:
+                if self.camera_calib_meta is None or "inner_corners" not in self.camera_calib_meta:
+                    raise ValueError("inner_corners is required when calibration metadata is unavailable.")
+                inner_corners = self.camera_calib_meta["inner_corners"]
+            inner_corners = (int(inner_corners[0]), int(inner_corners[1]))
+
+            found, corners = self._detect_checkerboard_corners(gray, inner_corners=inner_corners, use_sb=True)
+            if not found:
+                raise RuntimeError(
+                    f"Checkerboard not found in reference image using inner_corners={inner_corners}."
+                )
+
+            nx, ny = int(inner_corners[0]), int(inner_corners[1])
+            board_xy = np.mgrid[0:nx, 0:ny].T.reshape(-1, 2).astype(np.float64) * square_size_mm
+            obj_points = np.zeros((board_xy.shape[0], 3), dtype=np.float64)
+            obj_points[:, :2] = board_xy
+            img_points = corners.reshape(-1, 2).astype(np.float64)
 
         pnp_ok, rvec, tvec = cv2.solvePnP(
             obj_points,
@@ -1147,13 +1620,38 @@ class CTR_Shadow_Calibration:
             raise RuntimeError("Failed to compute board-plane homography (mm -> px).")
         H_mm_from_px = np.linalg.inv(H_px_from_mm)
 
-        corners_grid = img_points.reshape(ny, nx, 2)
-        d_h = np.linalg.norm(corners_grid[:, 1:, :] - corners_grid[:, :-1, :], axis=2).reshape(-1)
-        d_v = np.linalg.norm(corners_grid[1:, :, :] - corners_grid[:-1, :, :], axis=2).reshape(-1)
-        d_all = np.concatenate([d_h, d_v])
+        d_all = []
+        if board_type == "charuco":
+            ids_flat = np.asarray(charuco_ids, dtype=np.int32).reshape(-1)
+            id_to_img = {
+                int(cid): img_points[idx]
+                for idx, cid in enumerate(ids_flat)
+            }
+            id_to_xy = {
+                int(cid): board_xy[idx]
+                for idx, cid in enumerate(ids_flat)
+            }
+            tol = float(square_size_mm) * 0.25
+            for ida, pxa in id_to_img.items():
+                xya = id_to_xy[ida]
+                for idb, pxb in id_to_img.items():
+                    if idb <= ida:
+                        continue
+                    dxy = id_to_xy[idb] - xya
+                    same_row = abs(float(dxy[1])) <= tol and abs(abs(float(dxy[0])) - square_size_mm) <= tol
+                    same_col = abs(float(dxy[0])) <= tol and abs(abs(float(dxy[1])) - square_size_mm) <= tol
+                    if same_row or same_col:
+                        d_all.append(float(np.linalg.norm(pxb - pxa)))
+            d_all = np.asarray(d_all, dtype=float)
+        else:
+            corners_grid = img_points.reshape(ny, nx, 2)
+            d_h = np.linalg.norm(corners_grid[:, 1:, :] - corners_grid[:, :-1, :], axis=2).reshape(-1)
+            d_v = np.linalg.norm(corners_grid[1:, :, :] - corners_grid[:-1, :, :], axis=2).reshape(-1)
+            d_all = np.concatenate([d_h, d_v])
+        d_all = np.asarray(d_all, dtype=float)
         d_all = d_all[np.isfinite(d_all) & (d_all > 0)]
         if d_all.size == 0:
-            raise RuntimeError("Could not compute local checkerboard px/mm scale from detected corners.")
+            raise RuntimeError("Could not compute local board px/mm scale from detected corners.")
 
         board_px_per_mm_local = float(np.mean(d_all) / square_size_mm)
         board_mm_per_px_local = 1.0 / board_px_per_mm_local
@@ -1166,6 +1664,7 @@ class CTR_Shadow_Calibration:
         self.board_planar_x_sign = 1.0
         self.board_reference_correction_meta = None
         self.board_pose = {
+            "board_type": board_type,
             "rvec": np.asarray(rvec, dtype=np.float64).reshape(3, 1),
             "tvec": np.asarray(tvec, dtype=np.float64).reshape(3, 1),
             "R": np.asarray(R, dtype=np.float64),
@@ -1174,7 +1673,6 @@ class CTR_Shadow_Calibration:
             "x_axis_px": x_axis_px.astype(np.float64),
             "y_axis_px": y_axis_px.astype(np.float64),
             "image_shape": tuple(image_for_detection.shape),
-            "inner_corners": inner_corners,
             "square_size_mm": float(square_size_mm),
             "use_undistort": bool(use_undistort),
             "board_homography_px_from_mm": self.board_homography_px_from_mm.copy(),
@@ -1183,17 +1681,28 @@ class CTR_Shadow_Calibration:
             "board_mm_per_px_local": self.board_mm_per_px_local,
             "board_planar_x_sign": self.board_planar_x_sign,
         }
+        if board_type == "checkerboard":
+            self.board_pose["inner_corners"] = inner_corners
+        else:
+            self.board_pose.update({
+                "squares_x": int(squares_x),
+                "squares_y": int(squares_y),
+                "marker_size_mm": float(marker_size_mm),
+                "aruco_dictionary": board_debug_meta["aruco_dictionary_name"],
+                "charuco_legacy_pattern": bool(board_debug_meta.get("legacy_pattern", False)),
+            })
 
-        # Match checkerboard-backed calibrated axes to the ruler-backed convention
-        # before any downstream post-processing consumes this reference.
-        self.apply_checkerboard_reference_corrections(
-            mm_scale=0.5,
-            flip_planar_x=True,
-        )
+        if board_type == "checkerboard":
+            # Preserve the legacy correction only for the legacy checkerboard path.
+            self.apply_checkerboard_reference_corrections(
+                mm_scale=0.5,
+                flip_planar_x=True,
+            )
 
         result = {
             "camera_calib_path": self.camera_calib_path,
             "board_reference_image_path": self.board_reference_image_path,
+            "board_type": board_type,
             "rvec": self.board_pose["rvec"],
             "tvec": self.board_pose["tvec"],
             "R": self.board_pose["R"],
@@ -1206,16 +1715,31 @@ class CTR_Shadow_Calibration:
             "board_homography_mm_from_px": self.board_homography_mm_from_px,
             "board_px_per_mm_local": self.board_px_per_mm_local,
             "board_mm_per_px_local": self.board_mm_per_px_local,
-            "inner_corners": inner_corners,
             "square_size_mm": float(square_size_mm),
             "image_shape": tuple(image_for_detection.shape),
             "board_planar_x_sign": self.board_planar_x_sign,
             "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
         }
+        if board_type == "checkerboard":
+            result["inner_corners"] = inner_corners
+        else:
+            result.update({
+                "squares_x": int(squares_x),
+                "squares_y": int(squares_y),
+                "marker_size_mm": float(marker_size_mm),
+                "aruco_dictionary": board_debug_meta["aruco_dictionary_name"],
+                "charuco_legacy_pattern": bool(board_debug_meta.get("legacy_pattern", False)),
+            })
 
         if draw_debug:
             debug_img = image_for_detection.copy()
-            cv2.drawChessboardCorners(debug_img, (nx, ny), corners, True)
+            if board_type == "checkerboard":
+                cv2.drawChessboardCorners(debug_img, (nx, ny), corners, True)
+            else:
+                if marker_corners is not None and marker_ids is not None and len(marker_ids) > 0:
+                    cv2.aruco.drawDetectedMarkers(debug_img, marker_corners, marker_ids)
+                if corners is not None and charuco_ids is not None and len(charuco_ids) > 0 and hasattr(cv2.aruco, "drawDetectedCornersCharuco"):
+                    cv2.aruco.drawDetectedCornersCharuco(debug_img, corners, charuco_ids, (255, 0, 255))
 
             o = tuple(np.round(origin_px).astype(int))
             x_end = tuple(np.round(x_axis_px).astype(int))
@@ -1237,11 +1761,19 @@ class CTR_Shadow_Calibration:
             result["debug_image"] = debug_img
 
         print(
-            "Estimated checkerboard reference: "
-            f"inner_corners={inner_corners}, square={square_size_mm:.3f} mm, "
-            f"local scale={self.board_px_per_mm_local:.4f} px/mm"
+            "Estimated board reference: "
+            + (
+                f"checkerboard inner_corners={inner_corners}, square={square_size_mm:.3f} mm, "
+                if board_type == "checkerboard"
+                else (
+                    f"charuco squares=({int(squares_x)},{int(squares_y)}), "
+                    f"square={square_size_mm:.3f} mm, marker={float(marker_size_mm):.3f} mm, "
+                    f"dictionary={board_debug_meta['aruco_dictionary_name']}, "
+                )
+            )
+            + f"local scale={self.board_px_per_mm_local:.4f} px/mm"
         )
-        print("True vertical convention: +Z image-axis is projection of checkerboard +Y.")
+        print("True vertical convention: +Z image-axis is projection of board +Y.")
         return result
 
     def board_mm_to_px(self, x_mm, y_mm):
@@ -1372,12 +1904,14 @@ class CTR_Shadow_Calibration:
         else:
             origin_px_vec = np.asarray(origin_px, dtype=np.float64).reshape(2)
 
+        scale_fix = float(self._board_reference_measurement_scale_correction())
+
         if self.board_homography_mm_from_px is not None:
             pt_mm = self.board_px_to_mm(pt_px[0], pt_px[1])
             origin_mm = self.board_px_to_mm(origin_px_vec[0], origin_px_vec[1])
             delta_mm = pt_mm - origin_mm
-            u_mm = float(delta_mm[0]) * float(self.board_planar_x_sign)
-            z_mm = float(delta_mm[1])
+            u_mm = float(delta_mm[0]) * float(self.board_planar_x_sign) * scale_fix
+            z_mm = float(delta_mm[1]) * scale_fix
             return u_mm, z_mm
 
         if self.true_vertical_img_unit is None or self.board_mm_per_px_local is None:
@@ -1389,8 +1923,8 @@ class CTR_Shadow_Calibration:
         v_hat = self.true_vertical_img_unit.astype(np.float64).reshape(2)
         u_hat = np.array([v_hat[1], -v_hat[0]], dtype=np.float64)
 
-        u_mm = float(np.dot(delta_px, u_hat) * self.board_mm_per_px_local * float(self.board_planar_x_sign))
-        z_mm = float(np.dot(delta_px, v_hat) * self.board_mm_per_px_local)
+        u_mm = float(np.dot(delta_px, u_hat) * self.board_mm_per_px_local * float(self.board_planar_x_sign) * scale_fix)
+        z_mm = float(np.dot(delta_px, v_hat) * self.board_mm_per_px_local * scale_fix)
         return u_mm, z_mm
 
     def setup_analysis_crop(self, enable_manual_adjustment=False, cam_port=None):
@@ -1447,7 +1981,7 @@ class CTR_Shadow_Calibration:
         }
 
         active_corner = {"name": None}
-        drag_threshold_px = 30
+        drag_threshold_px = 70
         window_name = "Manual Crop Setup"
 
         def nearest_corner(mx, my):
@@ -1524,7 +2058,7 @@ class CTR_Shadow_Calibration:
 
                 cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 0), 2)
                 for pt in corners.values():
-                    cv2.circle(display, tuple(pt), 6, (0, 255, 255), -1)
+                    cv2.circle(display, tuple(pt), 10, (0, 100, 255), -1)
 
                 cv2.putText(
                     display,
@@ -1739,8 +2273,7 @@ class CTR_Shadow_Calibration:
 
     def connect_to_camera(self, cam_port=None, show_preview=False, enable_manual_focus=False, manual_focus_val=60):
         """
-        Connects to the camera in the specified port and shows a live preview.
-        Optionally enables manual focus and sets the focus value.
+        Connects to the camera in the specified port and optionally shows a live preview.
         """
         if cam_port is None:
             cam_port = 0
@@ -1749,24 +2282,8 @@ class CTR_Shadow_Calibration:
         # Removed cv2.CAP_DSHOW for Mac compatibility
         self.cam = cv2.VideoCapture(self.cam_port)
 
-        # Optional: configure manual focus immediately on connect
-        if enable_manual_focus:
-            try:
-                self.cam.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-                self.cam.set(cv2.CAP_PROP_FOCUS, float(manual_focus_val))
-                print(f"Manual focus enabled (FOCUS={manual_focus_val}).")
-            except Exception as e:
-                print(f"Warning: could not enable manual focus on connect: {e}")
-
         # display showing preview
         if show_preview:
-            # For preview, autofocus can help the user frame the shot; keep as-is
-            try:
-                if not enable_manual_focus:
-                    self.cam.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-            except Exception:
-                pass
-
             self.cam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -1852,7 +2369,7 @@ class CTR_Shadow_Calibration:
 
     def calibrate(self,
                   manual_focus_val=60,
-                  jogging_feedrate=1000,
+                  jogging_feedrate=500,
                   # Axis names
                   robot_front_axis_name="X",
                   robot_stage_y_axis_name="Y",
@@ -1866,25 +2383,25 @@ class CTR_Shadow_Calibration:
                   b_step_size=-0.2,
                   # Probe points
                   probe_points=None,
-                  # Camera focus control
-                  enable_manual_focus=True):
+                  enable_manual_focus=True,
+                  # New: capture release images after pull sequence
+                  enable_release_imaging=True):
         """
         Probes at 5 XYZ locations and for each location:
-        - Capture orientation 0 pull at C=0 deg
-        - Capture orientation 1 pull at C=180 deg
-        - Capture orientation 2 pull at C=+90 deg
-        - Capture orientation 3 pull at C=-90 deg
+        - Capture pull images while moving B from b_start toward the pulled state.
+        - Optionally capture release images while moving B back toward b_start.
+        - Repeat for all 4 camera orientations.
 
-        Filenames begin with: "{orientation}_{X}_{B}_..." so downstream processing can parse orientation/X/B,
-        while extra suffix tokens avoid overwriting between different Z points.
+        Filenames begin with numeric tokens compatible with the downstream parser:
+            "{orientation}_{X}_{B}_..."
+        and now also include a phase token:
+            DIRpull  or  DIRrelease
         """
-        # --- connectivity checks ---
         if self.cam is None or self.rrf is None or self.cam_port is None:
             print("Not connected to camera or robot. Please run connect_to_camera followed by connect_to_robot.")
             print("Exiting...")
             return
 
-        # Default probe points per your request
         if probe_points is None:
             probe_points = [
                 (30.0, 0.0, -80.0),
@@ -1894,23 +2411,17 @@ class CTR_Shadow_Calibration:
                 (75.0, 0.0, -90.0),
             ]
 
-        # Validate calibration folder
         if not hasattr(self, 'calibration_data_folder') or not os.path.exists(self.calibration_data_folder):
             print("Error: Calibration data folder not found. Make sure the class was initialized properly.")
             return
 
         os.chdir(self.calibration_data_folder)
 
-        # Timing parameters
-        large_move_safety = 0.0
-        small_move_safety = 0.3
-        rotation_safety = 0.0
         settling_time_large = 5.0
-        settling_time_small = 0.5
+        settling_time_small = 0.2
         rotation_settling_time = 2.0
-        small_move_threshold = 0.5
+        small_move_threshold = 2.0
 
-        # Prepare output folder
         if not os.path.isdir("raw_image_data_folder"):
             os.mkdir("raw_image_data_folder")
         else:
@@ -1918,39 +2429,21 @@ class CTR_Shadow_Calibration:
 
         os.chdir("raw_image_data_folder")
 
-        # Camera setup
         cam = self.cam if self.cam is not None else cv2.VideoCapture(self.cam_port if self.cam_port is not None else 0)
         cam.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
         cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
 
-        # Manual focus (re-enabled)
-        if enable_manual_focus:
-            try:
-                cam.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-                cam.set(cv2.CAP_PROP_FOCUS, float(manual_focus_val))
-                print(f"Camera manual focus enabled: FOCUS={manual_focus_val}")
-            except Exception as e:
-                print(f"Warning: could not set manual focus (FOCUS={manual_focus_val}): {e}")
-        else:
-            try:
-                cam.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-            except Exception:
-                pass
-
-        def capture_and_save(orientation: int, x: float, y: float, z: float, b: float, probe_idx: int, step_idx: int):
-            # Minimal buffer flush
+        def capture_and_save(orientation: int, x: float, y: float, z: float, b: float,
+                             probe_idx: int, step_idx: int, motion_phase: str):
             _ = cam.read()
             ret, image = cam.read()
             if not ret:
                 ret, image = cam.read()
 
-            # IMPORTANT: first 3 underscore tokens are numeric: orientation, X, B
-            # Suffix avoids overwriting between different Y/Z/probe/step
             filename = (
                 f"{orientation}_{x:.2f}_{b:.2f}"
-                f"_Y{y:.2f}_Z{z:.2f}_P{probe_idx:02d}_S{step_idx:02d}.png"
+                f"_Y{y:.2f}_Z{z:.2f}_P{probe_idx:02d}_S{step_idx:02d}_DIR{motion_phase}.png"
             )
-
             if ret:
                 cv2.imwrite(filename, image)
                 print(f" ✓ Saved {filename}")
@@ -1958,16 +2451,10 @@ class CTR_Shadow_Calibration:
                 print(f" ✗ ERROR: Could not save {filename}")
 
         def wait_for_duet_motion_complete(extra_settle: float = 0.0):
-            """
-            Block until Duet reports queued motion is complete, then optionally settle.
-            Uses M400 (wait for moves to finish) rather than estimating a sleep duration.
-            """
             try:
                 self.rrf.send_code("M400")
             except Exception as e:
-                # Fallback keeps acquisition working if M400/API call fails unexpectedly.
                 print(f" Warning: M400 wait failed ({e}); falling back to timed settle only.")
-
             if extra_settle > 0:
                 time.sleep(extra_settle)
 
@@ -1976,11 +2463,9 @@ class CTR_Shadow_Calibration:
             for ax in tgt:
                 if ax in cur and tgt[ax] is not None and cur[ax] is not None and tgt[ax] != cur[ax]:
                     diffs.append(tgt[ax] - cur[ax])
-
             if not diffs:
                 time.sleep(settling_time_small)
                 return
-
             distance = math.sqrt(sum(d * d for d in diffs))
             is_small = distance <= small_move_threshold
             move_type = "small" if is_small else "large"
@@ -1991,13 +2476,11 @@ class CTR_Shadow_Calibration:
         def move_abs(fr: float, cur: dict, **axes_targets):
             cmd = ["G90", "G1"]
             tgt = dict(cur)
-
             for ax, val in axes_targets.items():
                 if val is None:
                     continue
                 cmd.append(f"{ax}{val}")
                 tgt[ax] = float(val)
-
             cmd.append(f"F{fr}")
             g = " ".join(cmd)
             print(f" Command: {g}")
@@ -2007,39 +2490,46 @@ class CTR_Shadow_Calibration:
 
         def rotate_rel(axis_name: str, c_units: float, fr=None):
             if fr is None:
-                fr = jogging_feedrate / 0.025  # faster rotation
-
+                fr = jogging_feedrate / 0.025
             g = f"G91 G1 {axis_name}{c_units} F{fr}"
             print(f" Command: {g}")
             self.rrf.send_code(g)
             angle_deg = (c_units / robot_rotation_axis_180_deg) * 180.0 if robot_rotation_axis_180_deg else 0.0
             print(f" Rotating {angle_deg:.1f}° - waiting for Duet (M400) + {rotation_settling_time:.1f}s settle")
             wait_for_duet_motion_complete(extra_settle=rotation_settling_time)
-
             self.rrf.send_code("G90")
 
-        def run_pull_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float, probe_idx: int, max_pull_steps=None):
+        def run_pull_release_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float,
+                                                      probe_idx: int, max_pull_steps=None):
             nonlocal pos, total_images
-            # Baseline at B start
-            print(f" Baseline capture: {robot_rear_axis_name}={b_start:.2f}")
-            pos = move_abs(0.3*jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-            capture_and_save(orientation_id, x, y, z, b_start, probe_idx, 0)
-            total_images += 1
 
-            # Pull sequence
             steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
             steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
+
+            print(f" Baseline pull capture: {robot_rear_axis_name}={b_start:.2f}")
+            pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            capture_and_save(orientation_id, x, y, z, b_start, probe_idx, 0, "pull")
+            total_images += 1
+
+            pulled_b_values = [b_start]
             for step_idx in range(1, steps_to_run + 1):
                 b_val = b_start + step_idx * b_step_size
-                print(f" Step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
-                pos = move_abs(0.3*jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
-                capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx)
+                pulled_b_values.append(b_val)
+                print(f" Pull step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
+                pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
+                capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx, "pull")
                 total_images += 1
 
-            # Return B to start
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            if enable_release_imaging and len(pulled_b_values) > 1:
+                release_values = list(reversed(pulled_b_values[:-1]))
+                for rel_idx, b_val in enumerate(release_values, start=1):
+                    print(f" Release step {rel_idx:02d}/{len(release_values):02d}: {robot_rear_axis_name}={b_val:.2f}")
+                    pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
+                    capture_and_save(orientation_id, x, y, z, b_val, probe_idx, rel_idx, "release")
+                    total_images += 1
+            else:
+                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-        # Track current robot position on relevant axes
         pos = {
             robot_front_axis_name: 0.0,
             robot_stage_y_axis_name: 0.0,
@@ -2051,12 +2541,12 @@ class CTR_Shadow_Calibration:
         print(f"Probe points (X,Y,Z): {probe_points}")
         print(f"Pull axis: {robot_rear_axis_name} | steps={b_steps} | step_size={b_step_size}mm | start={b_start}mm")
         print(f"Rotation axis: {robot_rotation_axis_name} | 180deg={robot_rotation_axis_180_deg} axis units")
+        print(f"Release imaging enabled: {enable_release_imaging}")
 
-        # Set pull axis to start
         print("\nMoving pull axis to start position...")
         pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-        n_partial_steps = max(1, int(np.floor(0.4 * b_steps)))
+        n_partial_steps = max(1, int(np.floor(0.5 * b_steps)))
         print(f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps (40%) due to tip detectability limits")
 
         total_images = 0
@@ -2065,7 +2555,6 @@ class CTR_Shadow_Calibration:
             print(f"PROBE {probe_idx}/{len(probe_points)}: X={x}, Y={y}, Z={z}")
             print(f"{'=' * 70}")
 
-            # Move to probe XYZ
             print(" Moving to probe XYZ...")
             pos = move_abs(
                 jogging_feedrate,
@@ -2077,39 +2566,31 @@ class CTR_Shadow_Calibration:
                 }
             )
 
-            # Ensure B at start
             print(f" Setting {robot_rear_axis_name} to start ({b_start:.2f})...")
             pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-            # ---- Orientation 0: C = 0 deg ----
             print(" Phase 1: orientation 0 (C = 0 deg)")
-            run_pull_sequence_for_orientation(0, x, y, z, probe_idx)
+            run_pull_release_sequence_for_orientation(0, x, y, z, probe_idx)
 
-            # ---- Orientation 1: C = +180 deg ----
             print(" Rotating to orientation 1 (C = 180 deg)...")
             rotate_rel(robot_rotation_axis_name, robot_rotation_axis_180_deg)
             print(" Phase 2: orientation 1 (C = 180 deg)")
-            run_pull_sequence_for_orientation(1, x, y, z, probe_idx)
+            run_pull_release_sequence_for_orientation(1, x, y, z, probe_idx)
 
-            # Return to C = 0 before going to +90/-90 for deterministic pathing
             print(" Rotating back to C = 0 deg...")
             rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
 
-            # ---- Orientation 2: C = +90 deg ----
             c_quarter = robot_rotation_axis_180_deg / 2.0
             print(" Rotating to orientation 2 (C = +90 deg)...")
             rotate_rel(robot_rotation_axis_name, +c_quarter)
             print(" Phase 3: orientation 2 (C = +90 deg)")
-            run_pull_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+            run_pull_release_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
 
-            # ---- Orientation 3: C = -90 deg ----
-            # from +90 to -90 is a -180 move
             print(" Rotating to orientation 3 (C = -90 deg)...")
             rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
             print(" Phase 4: orientation 3 (C = -90 deg)")
-            run_pull_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+            run_pull_release_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
 
-            # Return to C = 0 (from -90 to 0 is +90)
             print(" Rotating back to C = 0 deg...")
             rotate_rel(robot_rotation_axis_name, +c_quarter)
 
@@ -2122,7 +2603,7 @@ class CTR_Shadow_Calibration:
         os.chdir(self.calibration_data_folder)
         return 1
 
-    def find_ctr_tip_skeleton(self, binary_image, base_band_frac=0.05, do_erosion_break=False, prune_spurs=True, min_spur_len=15, return_tip_angle=False, tip_angle_path_len=40, return_debug=False):
+    def find_ctr_tip_skeleton(self, binary_image, base_band_frac=0.05, do_erosion_break=False, prune_spurs=True, min_spur_len=20, return_tip_angle=False, tip_angle_path_len=75, return_debug=False):
         """
         binary_image: uint8 0/255 where tube is dark (0) and background is white (255)
 
@@ -2170,10 +2651,26 @@ class CTR_Shadow_Calibration:
             y0 = ys.min()
             base_pixels = np.column_stack(np.where((skel == 1) & (np.arange(h)[:, None] == y0)))
 
-        # Multi-source BFS from base band -> robust against wrong single base endpoint.
-        dist = _multisource_bfs_geodesic(skel, base_pixels)
-        if (dist >= 0).sum() == 0:
+        # Keep the full skeleton available so tip detection can still reach the distal end.
+        full_skel = skel.copy()
+        full_dist = _multisource_bfs_geodesic(full_skel, base_pixels)
+        if (full_dist >= 0).sum() == 0:
             raise ValueError("Geodesic BFS failed (disconnected skeleton?)")
+
+        skel_trunk, trunk_dist = _extract_main_trunk_skeleton(full_skel, base_pixels)
+        if skel_trunk.sum() > 0 and (trunk_dist >= 0).sum() > 0:
+            full_max = float(np.max(full_dist))
+            trunk_max = float(np.max(trunk_dist))
+            # Only trust the pruned trunk if it still reaches most of the distal extent.
+            if full_max <= 0 or trunk_max >= 0.88 * full_max:
+                skel = skel_trunk
+                dist = trunk_dist
+            else:
+                skel = full_skel
+                dist = full_dist
+        else:
+            skel = full_skel
+            dist = full_dist
 
         # Robust distal pose from dominant PCA axis near tip (avoids Y-split branch issues).
         if return_tip_angle:
@@ -2181,12 +2678,12 @@ class CTR_Shadow_Calibration:
                 skel_u8=skel,
                 dist=dist,
                 mask_u8=mask,
-                distal_window=50,
+                distal_window=70,
                 roi_margin=25,
                 tangent_len=tip_angle_path_len,
-                radius_frac=0.30,
-                tip_keep_frac=0.65,
-                weight_power=0.5,
+                radius_frac=0.18,
+                tip_keep_frac=0.40,
+                weight_power=0.35,
             )
             if return_debug:
                 debug_data = {
@@ -2201,12 +2698,12 @@ class CTR_Shadow_Calibration:
             skel_u8=skel,
             dist=dist,
             mask_u8=mask,
-            distal_window=50,
+            distal_window=45,
             roi_margin=25,
             tangent_len=tip_angle_path_len,
-            radius_frac=0.30,
-            tip_keep_frac=0.65,
-            weight_power=0.5,
+            radius_frac=0.25,
+            tip_keep_frac=0.50,
+            weight_power=0.35,
         )
         if return_debug:
             debug_data = {
@@ -2217,70 +2714,77 @@ class CTR_Shadow_Calibration:
             return tip_y, tip_x, debug_data
         return tip_y, tip_x
 
-    def analyze_data(self, image_file_name, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, ):
-        """ Analyzes the data for the calibrations. Only analyzes one image. """
 
-        def get_pos_from_file_name(file_name):
-            base = os.path.splitext(os.path.basename(file_name))[0]
-            parts = base.split("_")
+    @staticmethod
+    def _parse_capture_context_from_filename(file_name):
+        """Return parsed filename metadata for calibration images."""
+        base = os.path.splitext(os.path.basename(file_name))[0]
+        parts = base.split("_")
 
-            orientation = 0
-            if len(parts) > 0:
-                try:
-                    candidate = int(parts[0])
-                    if candidate in (0, 1, 2, 3):
-                        orientation = candidate
-                    else:
-                        orientation = 0
-                except Exception:
-                    orientation = 0
+        orientation = 0
+        if len(parts) > 0:
+            try:
+                candidate = int(parts[0])
+                if candidate in (0, 1, 2, 3):
+                    orientation = candidate
+            except Exception:
+                pass
 
-            values = {}
-            for p in parts:
-                matched_prefixed = False
-                for key in ("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA"):
-                    if p.startswith(key):
-                        try:
-                            values[key] = float(p[len(key):])
-                            matched_prefixed = True
-                        except Exception:
-                            pass
-                        break
-                if matched_prefixed:
-                    continue
-                if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
+        values = {}
+        motion_phase = "pull"
+        for p in parts:
+            matched_prefixed = False
+            if p.startswith("DIR"):
+                phase_val = p[3:].strip().lower()
+                if phase_val in ("pull", "release"):
+                    motion_phase = phase_val
+                continue
+            for key in ("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA"):
+                if p.startswith(key):
                     try:
-                        values[p[0]] = float(p[1:])
+                        values[key] = float(p[len(key):])
+                        matched_prefixed = True
                     except Exception:
                         pass
-
-            # Support both filename styles:
-            # 1) legacy positional:  0_100.00_-3.20_Y25.00_...
-            # 2) prefixed tokens:    00187_left_X100.000_..._B-2.092_...
-            # 3) Cartesian tokens:   00043_pass01_reqA0.0_useA15.653_tipX100.000_..._B-0.095_...
-            x_value = values["tipX"] if "tipX" in values else values.get("X")
-            if x_value is not None and "B" in values:
-                ntnl_pos = float(x_value)
-                ss_pos = float(values["B"])
-                return [orientation, ntnl_pos, ss_pos]
-
-            if len(parts) >= 3:
+                    break
+            if matched_prefixed:
+                continue
+            if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
                 try:
-                    ntnl_pos = float(parts[1])
-                    ss_pos = float(parts[2])
-                    return [orientation, ntnl_pos, ss_pos]
+                    values[p[0]] = float(p[1:])
                 except Exception:
                     pass
 
+        x_value = values["tipX"] if "tipX" in values else values.get("X")
+        if x_value is not None and "B" in values:
+            ntnl_pos = float(x_value)
+            ss_pos = float(values["B"])
+        elif len(parts) >= 3:
+            ntnl_pos = float(parts[1])
+            ss_pos = float(parts[2])
+        else:
             raise ValueError(
                 "Could not parse X/B values from filename: "
                 f"{file_name}. Expected either '<ori>_<X>_<B>_...' or tokens like 'X...' and 'B...'."
             )
 
+        return {
+            "orientation": int(orientation),
+            "ntnl_pos": ntnl_pos,
+            "ss_pos": ss_pos,
+            "motion_phase": motion_phase,
+            "motion_phase_code": 0 if motion_phase == "pull" else 1,
+        }
+
+    def analyze_data(self, image_file_name, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, ):
+        """ Analyzes the data for the calibrations. Only analyzes one image. """
+
+        file_ctx = self._parse_capture_context_from_filename(image_file_name)
+
         # Fixed path handling for Mac
         raw_data_folder = os.path.join(self.calibration_data_folder, "raw_image_data_folder")
-        tip_locations_array_coarse = np.zeros((len(os.listdir(raw_data_folder)), 6))
-        tip_locations_array_fine = np.zeros((len(os.listdir(raw_data_folder)), 6))
+        tip_locations_array_coarse = np.zeros((len(os.listdir(raw_data_folder)), 7))
+        tip_locations_array_fine = np.zeros((len(os.listdir(raw_data_folder)), 7))
         i = 0
 
         # Fixed path handling for Mac
@@ -2302,19 +2806,16 @@ class CTR_Shadow_Calibration:
 
         cropped_image = image[crop_y_min_img:crop_y_max_img, crop_x_min_img:crop_x_max_img, :]
         grayscale_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
-        _, binary_image = cv2.threshold(grayscale_image, threshold, 255, cv2.THRESH_BINARY)
-
-        # # finding the approximate tip for a vertical tube, scanning from the bottom
-        # for x in np.linspace(np.shape(binary_image)[0] - 1, 0, np.shape(binary_image)[0]).astype(int):
-        # current_row = binary_image[x, :]
-        # current_range = np.max(current_row) - np.min(current_row)
-        # if current_range > 128:
-        # tip_row = x
-        # break
-        # tip_column = np.average(np.where(binary_image[tip_row, :] <= 128)).astype(int)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        grayscale_eq = clahe.apply(grayscale_image)
+        grayscale_blur = cv2.GaussianBlur(grayscale_eq, (3, 3), 0)
+        _, binary_image = cv2.threshold(
+            grayscale_blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
 
         tip_row, tip_column, tip_angle_deg, tip_debug = self.find_ctr_tip_skeleton(
             binary_image,
+            min_spur_len=25,
             return_tip_angle=True,
             return_debug=True,
         )
@@ -2323,8 +2824,6 @@ class CTR_Shadow_Calibration:
         dist = tip_debug["dist"]
         tip_path = tip_debug["tip_path"]
 
-        # Keep current PCA-based angle logic, but use legacy geodesic/endpoints
-        # selection for coarse XY tip coordinates.
         ys, xs = np.where(skel == 1)
         dvals = dist[ys, xs]
         idx = int(np.argmax(dvals))
@@ -2341,10 +2840,18 @@ class CTR_Shadow_Calibration:
         tip_row = tip_row_legacy
         tip_column = tip_col_legacy
 
+        tip_y = float(np.clip(tip_row, 0, binary_image.shape[0] - 1))
+        tip_x = float(np.clip(tip_column, 0, binary_image.shape[1] - 1))
+
+        zoom_x_min = int(max(int(round(tip_x)) - 75, 0))
+        zoom_x_max = int(min(int(round(tip_x)) + 75, binary_image.shape[1] - 1))
+        zoom_y_min = int(max(int(round(tip_y)) - 75, 0))
+        zoom_y_max = int(min(int(round(tip_y)) + 75, binary_image.shape[0] - 1))
+
         yy_refined, xx_refined, tip_refine_dbg = refine_tip_parallel_centerline(
             grayscale=grayscale_image,
             binary_image=binary_image,
-            tip_yx=(int(round(tip_row)), int(round(tip_column))),
+            tip_yx=(int(round(tip_y)), int(round(tip_x))),
             tip_angle_deg=tip_angle_deg,
             section_near_r=float(self.tip_parallel_section_near_r),
             section_far_r=float(self.tip_parallel_section_far_r),
@@ -2355,7 +2862,10 @@ class CTR_Shadow_Calibration:
             ray_max_len_r=float(self.tip_parallel_ray_max_len_r),
         )
 
-        orientation, ntnl_pos, ss_pos = get_pos_from_file_name(image_file_name)
+        orientation = int(file_ctx['orientation'])
+        ntnl_pos = float(file_ctx['ntnl_pos'])
+        ss_pos = float(file_ctx['ss_pos'])
+        motion_phase_code = float(file_ctx['motion_phase_code'])
 
         tip_locations_array_coarse[i, :] = np.array(
             [
@@ -2365,13 +2875,14 @@ class CTR_Shadow_Calibration:
                 float(ss_pos),
                 float(ntnl_pos),
                 float(tip_angle_deg),
+                motion_phase_code,
             ]
         )
 
-        crop_x_min = int(max(tip_column - 75, 0))
-        crop_x_max = int(min(tip_column + 75, np.shape(binary_image)[1] - 1))
-        crop_y_min = int(max(tip_row - 75, 0))
-        crop_y_max = int(min(tip_row + 75, np.shape(binary_image)[0] - 1))
+        crop_x_min = zoom_x_min
+        crop_x_max = zoom_x_max
+        crop_y_min = zoom_y_min
+        crop_y_max = zoom_y_max
 
         # Use inclusive max indices when slicing, then compute a clamped seed point.
         zoomed_tip = binary_image[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1]
@@ -2496,8 +3007,8 @@ class CTR_Shadow_Calibration:
         axs[0, 1].scatter(skel_xs, skel_ys, s=2, c='cyan', alpha=0.7)
         axs[0, 1].set_title('thresholded image')
 
-        axs[1, 0].imshow(binary_image[crop_y_min:crop_y_max, crop_x_min:crop_x_max])
-        skel_in_zoom = (skel[crop_y_min:crop_y_max, crop_x_min:crop_x_max] == 1)
+        axs[1, 0].imshow(binary_image[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1])
+        skel_in_zoom = (skel[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1] == 1)
         zys, zxs = np.where(skel_in_zoom)
         axs[1, 0].scatter(zxs, zys, s=3, c='cyan', alpha=0.8)
         axs[1, 0].scatter([tip_column - crop_x_min], [tip_row - crop_y_min])
@@ -2526,30 +3037,26 @@ class CTR_Shadow_Calibration:
         # axs[1, 1].legend(["coarse tip", "fit 1", "fit 2", "fine tip"])
         # axs[1, 1].set_title('Identified fine tip')
 
-        if len(tip_path) >= 2:
-            axs[1, 1].legend(["skeleton", "tip tangent path", "coarse tip"])
-        else:
-            axs[1, 1].legend(["skeleton", "coarse tip"])
-
         tip_locations_array_fine[i, :] = np.array(
             [tip_location[1] + crop_y_min_img + crop_y_min,
              tip_location[0] + crop_x_min_img + crop_x_min,
              float(orientation),
              float(ss_pos),
              float(ntnl_pos),
-             float(tip_angle_deg)]
+             float(tip_angle_deg),
+             motion_phase_code]
         )
 
         dbg_local = dict(tip_refine_dbg) if isinstance(tip_refine_dbg, dict) else {}
         dbg_local["image_file_name"] = image_file_name
         dbg_local["tip_angle_deg"] = float(tip_angle_deg)
-        dbg_local["coarse_tip_before_local_xy"] = [float(tip_column), float(tip_row)]
+        dbg_local["coarse_tip_before_local_xy"] = [float(tip_x), float(tip_y)]
         dbg_local["coarse_tip_after_local_xy"] = [float(xx_refined), float(yy_refined)]
         dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
         self.tip_refine_debug_records[image_file_name] = dbg_local
 
-        dbg_zoom = _shift_tip_debug_geometry(dbg_local, crop_x_min, crop_y_min)
-        annotate_tip_geometry_on_axes(axs, dbg_zoom, title_suffix=" (parallel_centerline)")
+        _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
+        annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=" (parallel_centerline)")
 
         calibrated_tip_axes = None
         if (
@@ -2678,7 +3185,7 @@ class CTR_Shadow_Calibration:
             return
 
         num_images = len(image_files)
-        self.tip_locations_array_coarse = np.zeros((num_images, 6))
+        self.tip_locations_array_coarse = np.zeros((num_images, 7))
         # self.tip_locations_array_fine = np.zeros((num_images, 5))
 
         successful_analyses = 0
@@ -2702,7 +3209,8 @@ class CTR_Shadow_Calibration:
 
                 output_filename = f"{os.path.splitext(image_file)[0]}_analysis.png"
                 output_path = os.path.join(analysis_output_folder, output_filename)
-                fig.savefig(output_path, dpi=150, bbox_inches='tight')
+                self._apply_dark_theme_to_figure(fig)
+                fig.savefig(output_path, dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
                 plt.close(fig)
 
                 successful_analyses += 1
@@ -2722,7 +3230,7 @@ class CTR_Shadow_Calibration:
             # print(f"✓ Saved fine tip locations to: {fine_file}")
 
             try:
-                columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg']
+                columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code']
                 df_coarse = pd.DataFrame(self.tip_locations_array_coarse, columns=columns)
                 df_coarse['image_file'] = image_files
                 coarse_csv = os.path.join(processed_folder, "tip_locations_coarse.csv")
@@ -2854,6 +3362,23 @@ class CTR_Shadow_Calibration:
                 "fit_x_range": [float(np.min(x_use)), float(np.max(x_use))],
             }
 
+        if model_kind == "linear":
+            min_required = 2 if min_points is None else max(2, int(min_points))
+            if x_use.size < min_required:
+                return None
+            coeffs = np.polyfit(x_use, y_use, 1)
+            return {
+                "model_type": "polynomial",
+                "basis": "monomial",
+                "degree": 1,
+                "input_axis": "b_motor",
+                "value_name": str(value_name),
+                "coefficients": coeffs.tolist(),
+                "equation": cls._format_polynomial_equation(coeffs, str(value_name)),
+                "sample_count": int(x_use.size),
+                "fit_x_range": [float(np.min(x_use)), float(np.max(x_use))],
+            }
+
         if model_kind == "pchip":
             min_required = 2 if min_points is None else max(2, int(min_points))
             if x_use.size < min_required:
@@ -2889,6 +3414,73 @@ class CTR_Shadow_Calibration:
                     term += f"^{power}"
             pieces.append(f"{sign} {term}".strip())
         return " ".join(pieces)
+
+    @classmethod
+    def _build_polynomial_model_descriptor(cls, coeffs, value_name, fit_x_range=None, sample_count=None):
+        coeffs = np.asarray(coeffs, dtype=float).ravel()
+        return {
+            "model_type": "polynomial",
+            "basis": "monomial",
+            "degree": int(coeffs.size - 1),
+            "input_axis": "b_motor",
+            "value_name": str(value_name),
+            "coefficients": coeffs.tolist(),
+            "equation": cls._format_polynomial_equation(coeffs, str(value_name)),
+            "sample_count": None if sample_count is None else int(sample_count),
+            "fit_x_range": None if fit_x_range is None else [float(fit_x_range[0]), float(fit_x_range[1])],
+        }
+
+    @classmethod
+    def _average_polynomial_models(cls, model_descriptors, value_name):
+        valid_models = [
+            m for m in model_descriptors
+            if m is not None and str(m.get("model_type", "")).lower() == "polynomial"
+        ]
+        if not valid_models:
+            return None
+
+        coeff_arrays = [np.asarray(m.get("coefficients", []), dtype=float).ravel() for m in valid_models]
+        coeff_len = coeff_arrays[0].size
+        if coeff_len == 0 or any(arr.size != coeff_len for arr in coeff_arrays):
+            raise ValueError(f"Cannot average incompatible polynomial models for {value_name}.")
+
+        avg_coeffs = np.mean(np.vstack(coeff_arrays), axis=0)
+        fit_ranges = [m.get("fit_x_range") for m in valid_models if m.get("fit_x_range") is not None]
+        fit_x_range = None
+        if fit_ranges:
+            fit_x_range = (
+                float(np.min([fr[0] for fr in fit_ranges])),
+                float(np.max([fr[1] for fr in fit_ranges])),
+            )
+        sample_count = sum(int(m.get("sample_count") or 0) for m in valid_models)
+        return cls._build_polynomial_model_descriptor(
+            avg_coeffs,
+            value_name=value_name,
+            fit_x_range=fit_x_range,
+            sample_count=sample_count if sample_count > 0 else None,
+        )
+
+    @staticmethod
+    def _apply_dark_theme_to_figure(fig):
+        fig.patch.set_facecolor('none')
+        fig.patch.set_alpha(0.0)
+
+        for ax in fig.axes:
+            ax.set_facecolor('none')
+            ax.title.set_color('white')
+            ax.xaxis.label.set_color('white')
+            ax.yaxis.label.set_color('white')
+            ax.tick_params(colors='white')
+            for spine in ax.spines.values():
+                spine.set_color((1.0, 1.0, 1.0, 0.7))
+            ax.grid(True, color=(1.0, 1.0, 1.0, 0.18))
+
+            legend = ax.get_legend()
+            if legend is not None:
+                legend.get_frame().set_facecolor((0.05, 0.05, 0.05, 0.55))
+                legend.get_frame().set_edgecolor((1.0, 1.0, 1.0, 0.25))
+                for text in legend.get_texts():
+                    text.set_color('white')
 
     @classmethod
     def _legacy_curve_model_from_calibration_json(cls, cal_json, curve_key):
@@ -3306,1535 +3898,947 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
         return param_path, py_path, stl_path, gcode_json_path
 
     def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic"):
-        """ Postprocesses calibration data starting from step 3 (assumes pixel data already exists). This method starts from converting pixel coordinates to physical coordinates and continues with all subsequent steps. """
-        # Check if we have the required data in memory, if not try to load from files
-        # if not hasattr(self, 'tip_locations_array_fine') or not hasattr(self, 'tip_locations_array_coarse'):
+        """Postprocess calibration data and export separate pull/release fits."""
         if not hasattr(self, 'tip_locations_array_coarse'):
             print("Tip location data not found in memory, attempting to load from saved files...")
-
-            # Find the processed data folder
             processed_folder = os.path.join(self.calibration_data_folder, "processed_image_data_folder")
-            if not os.path.exists(processed_folder):
-                print("Error: Processed data folder not found. Run analyze_data_batch() first.")
-                return None
-
-            # Try to load the numpy arrays
             coarse_file = os.path.join(processed_folder, "tip_locations_coarse.npy")
-            # fine_file = os.path.join(processed_folder, "tip_locations_fine.npy")
-
-            try:
-                if os.path.exists(coarse_file):
-                    self.tip_locations_array_coarse = np.load(coarse_file)
-                    # self.tip_locations_array_fine = np.load(fine_file)
-                    print(f"✓ Loaded existing data from {coarse_file}")
-                    print(f" Coarse data shape: {self.tip_locations_array_coarse.shape}")
-                    # print(f" Fine data shape: {self.tip_locations_array_fine.shape}")
-                else:
-                    print("Error: Required .npy files not found. Run analyze_data_batch() first.")
-                    print(f"Looking for: {coarse_file}")
-                    # print(f"Looking for: {fine_file}")
-                    return None
-            except Exception as e:
-                print(f"Error loading saved data: {e}")
-                print("Run analyze_data_batch() first to generate the required data.")
+            if not os.path.exists(coarse_file):
+                print("Error: Required .npy files not found. Run analyze_data_batch() first.")
                 return None
+            self.tip_locations_array_coarse = np.load(coarse_file)
+            print(f"✓ Loaded existing data from {coarse_file}")
+            print(f" Coarse data shape: {self.tip_locations_array_coarse.shape}")
 
-        # Work in the processed data folder
         processed_folder = os.path.join(self.calibration_data_folder, "processed_image_data_folder")
-        if not os.path.exists(processed_folder):
-            print("Error: Processed data folder not found. Run analyze_data_batch() first.")
-            return None
-
+        os.makedirs(processed_folder, exist_ok=True)
         original_dir = os.getcwd()
         os.chdir(processed_folder)
 
         try:
-            print(f"\n" + "=" * 50)
-            print("Starting calibration data postprocessing from step 3...")
+            print("\n" + "=" * 50)
+            print("Starting calibration data postprocessing...")
 
-            if self.tip_locations_array_coarse.shape[1] < 5:
-                print("Error: tip_locations_coarse must have at least 5 columns.")
-                return None
+            arr = np.asarray(self.tip_locations_array_coarse, dtype=float)
+            if arr.ndim != 2 or arr.shape[1] < 5:
+                raise ValueError("tip_locations_coarse must have at least 5 columns.")
 
-            has_tip_angle = self.tip_locations_array_coarse.shape[1] >= 6
-            if has_tip_angle:
-                print("Tip-angle data detected and will be included in calibration fitting.")
-            else:
-                print("Warning: Tip-angle data not found. Re-run analyze_data_batch() to enable angle fitting.")
+            has_tip_angle = arr.shape[1] >= 6
+            has_phase = arr.shape[1] >= 7
+            if not has_phase:
+                arr = np.column_stack([arr, np.zeros((arr.shape[0],), dtype=float)])
+                print("Motion phase column not found; assuming all images are pull-phase.")
 
-            # ---------- Step 3: Convert to physical coordinates + canonicalize axes ----------
-            conversion_mode = "legacy_linear_scale"
-            pixel_to_mm_scale = float(width_in_mm) / float(width_in_pixels)
-            tip_locations_array_fine_mm = self.tip_locations_array_coarse.copy()
+            ORI_COL = 2
+            B_PULL_COL = 3
+            ANGLE_COL = 5
+            PHASE_COL = 6
+
             has_calibrated_axes = (
                 self.board_homography_mm_from_px is not None
-                or (
-                    self.true_vertical_img_unit is not None
-                    and self.board_mm_per_px_local is not None
-                )
+                or (self.true_vertical_img_unit is not None and self.board_mm_per_px_local is not None)
             )
+            board_type = self._normalize_board_type(
+                None if self.board_pose is None else self.board_pose.get("board_type", None)
+            )
+            if board_type is None and isinstance(self.camera_calib_meta, dict):
+                board_type = self._normalize_board_type(self.camera_calib_meta.get("board_type"))
+
+            conversion_mode = "legacy_linear_scale"
+            pixel_to_mm_scale = float(width_in_mm) / float(width_in_pixels)
+            board_measurement_scale = 0.5 if (has_calibrated_axes and board_type == "checkerboard") else 0.5
+            tip_mm = arr.copy()
 
             if has_calibrated_axes:
                 conversion_mode = "board_reference_calibrated"
                 if self.board_mm_per_px_local is not None:
-                    pixel_to_mm_scale = float(self.board_mm_per_px_local)
-                print(
-                    "Converting to physical coordinates using board-reference calibration "
-                    "(homography/true-vertical)."
-                )
-
+                    pixel_to_mm_scale = float(self.board_mm_per_px_local) * board_measurement_scale
                 if self.board_pose is not None and "origin_px" in self.board_pose:
                     origin_px = np.asarray(self.board_pose["origin_px"], dtype=float).reshape(2)
                 else:
                     origin_px = None
-
-                u_mm = np.zeros((tip_locations_array_fine_mm.shape[0],), dtype=float)
-                z_mm = np.zeros((tip_locations_array_fine_mm.shape[0],), dtype=float)
-
-                for idx, row in enumerate(self.tip_locations_array_coarse):
-                    row_px = float(row[0])
-                    col_px = float(row[1])
+                u_mm = np.zeros((tip_mm.shape[0],), dtype=float)
+                z_mm = np.zeros((tip_mm.shape[0],), dtype=float)
+                for idx, row in enumerate(arr):
                     uu, zz = self.pixel_point_to_calibrated_axes(
-                        x_px=col_px,
-                        y_px=row_px,
-                        origin_px=origin_px,
+                        x_px=float(row[1]), y_px=float(row[0]), origin_px=origin_px
                     )
-                    u_mm[idx] = uu
-                    z_mm[idx] = zz
+                    u_mm[idx] = uu * board_measurement_scale
+                    z_mm[idx] = zz * board_measurement_scale
             elif self.ruler_mm_per_px is not None:
                 conversion_mode = "ruler_reference_scale"
                 pixel_to_mm_scale = float(self.ruler_mm_per_px)
-                print(
-                    "Converting to physical coordinates using ruler-reference scale "
-                    "(100 mm user-picked reference)."
-                )
-                u_mm = self.tip_locations_array_coarse[:, 1].astype(float) * pixel_to_mm_scale
-                z_mm = -self.tip_locations_array_coarse[:, 0].astype(float) * pixel_to_mm_scale
+                u_mm = arr[:, 1].astype(float) * pixel_to_mm_scale
+                z_mm = -arr[:, 0].astype(float) * pixel_to_mm_scale
             else:
-                print(
-                    f"Converting to physical coordinates using legacy scale "
-                    f"({width_in_pixels} px = {width_in_mm} mm)"
-                )
-                tip_locations_array_fine_mm[:, 0:2] = (
-                    self.tip_locations_array_coarse[:, 0:2] / width_in_pixels * width_in_mm
-                )
+                u_mm = arr[:, 1].astype(float) / float(width_in_pixels) * float(width_in_mm)
+                z_mm = -arr[:, 0].astype(float) / float(width_in_pixels) * float(width_in_mm)
 
-                # Canonical camera frame (legacy):
-                # X = image column (mm) = original col1
-                # Z = -image row (mm)   = -original col0
-                u_mm = tip_locations_array_fine_mm[:, 1].copy()
-                z_mm = -tip_locations_array_fine_mm[:, 0].copy()
+            tip_mm[:, 0] = u_mm
+            tip_mm[:, 1] = z_mm
+            pd.DataFrame(tip_mm).to_excel('tip_locations_coarse_mm.xlsx', index=False, header=False)
+            print(f"Physical conversion mode: {conversion_mode} | representative mm/px={pixel_to_mm_scale:.6f}")
 
-            # Overwrite first two columns so the rest of the pipeline is consistent:
-            # col0 := transverse coordinate (u), col1 := vertical coordinate (z)
-            tip_locations_array_fine_mm[:, 0] = u_mm
-            tip_locations_array_fine_mm[:, 1] = z_mm
-
-            print(
-                f"Physical conversion mode: {conversion_mode} | "
-                f"representative mm/px={pixel_to_mm_scale:.6f}"
-            )
-
-            # Optional: save mm data
-            df_mm = pd.DataFrame(tip_locations_array_fine_mm)
-            df_mm.to_excel('tip_locations_coarse_mm.xlsx', index=False, header=False)
-
-            # ---------- Step 4/5: X-Z alignment (disabled) ----------
-            print("Skipping X-Z alignment (line fitting + rotation disabled).")
-            arr_rot = tip_locations_array_fine_mm.copy()
-
-            # # ---------- Step 4: Fit line and plot (in canonical Z-X) ----------
-            # print("Fitting alignment line (X as a function of Z)...")
-            # # Fit X = mZ + b so the reference alignment line is vertical (along Z axis).
-            # coefficients = np.polyfit(tip_locations_array_fine_mm[:, 1], tip_locations_array_fine_mm[:, 0], 1)  # X = mZ + b
-            # p = np.poly1d(coefficients)
-            #
-            # if save_plots:
-            #     z_sorted = np.sort(tip_locations_array_fine_mm[:, 1])
-            #     plt.figure(figsize=(10, 8))
-            #     plt.scatter(tip_locations_array_fine_mm[:, 0], tip_locations_array_fine_mm[:, 1], alpha=0.7)
-            #     plt.plot(p(z_sorted), z_sorted, 'r-', linewidth=2)
-            #     plt.axis("equal")
-            #     plt.title(f"Tip Locations with Fitted Vertical Alignment Line (dX/dZ slope: {coefficients[0]:.4f})")
-            #     plt.xlabel("X (mm)")
-            #     plt.ylabel("Z (mm) [flipped]")
-            #     plt.savefig("02_tip_locations_with_line_fitted.png", dpi=150, bbox_inches='tight')
-            #     plt.close()
-            #
-            # # ---------- Step 5: Change of basis (rotate to align) ----------
-            # print("Performing coordinate alignment (rotate to align with Z axis)...")
-            #
-            # arr0 = tip_locations_array_fine_mm.copy()
-            # arr0[:, 0] -= np.mean(arr0[:, 0])  # X
-            # arr0[:, 1] -= np.mean(arr0[:, 1])  # Z
-            #
-            # # If slope = dX/dZ, rotate by +atan(slope) to align fitted line with Z axis.
-            # theta = math.atan(coefficients[0])
-            # print(f"Rotation angle: {theta:.4f} rad ({theta * 180 / math.pi:.2f} deg)")
-            #
-            # R = np.array([[math.cos(theta), -math.sin(theta)],
-            #             [math.sin(theta),  math.cos(theta)]])
-            #
-            # arr_rot = arr0.copy()
-            # arr_rot[:, 0:2] = (R @ arr0[:, 0:2].T).T
-            #
-            # if save_plots:
-            #     plt.figure(figsize=(12, 6))
-            #     plt.subplot(1, 2, 1)
-            #     plt.scatter(arr0[:, 0], arr0[:, 1], alpha=0.7)
-            #     plt.title("03: Before Alignment (Canonical X-Z)")
-            #     plt.axis("equal")
-            #     plt.xlabel("X (mm)")
-            #     plt.ylabel("Z (mm) [flipped]")
-            #     plt.subplot(1, 2, 2)
-            #     plt.scatter(arr_rot[:, 0], arr_rot[:, 1], alpha=0.7)
-            #     plt.title("03: After Alignment (Aligned X-Z)")
-            #     plt.axis("equal")
-            #     plt.xlabel("X (mm)")
-            #     plt.ylabel("Z (mm) [flipped]")
-            #     plt.tight_layout()
-            #     plt.savefig("03_tip_locations_alignment.png", dpi=150, bbox_inches='tight')
-            #     plt.close()
-
-            # ---------- Step 6: Orientation processing ----------
-            # Mirror + average the X component between orientations 0/1, paired by b_pull.
-            print("Processing orientations: mirror + average X components by paired b_pull values...")
-
-            # Aliases for columns (rotated array keeps original extra columns)
-            # arr_rot columns:
-            #   0 X_mm, 1 Z_mm, 2 orientation, 3 b_pull (was ss_pos), 4 ntnl_pos (unused), 5 tip_angle_deg
-            ORI_COL = 2
-            B_PULL_COL = 3
-            ANGLE_COL = 5
-
-            unique_oris = np.unique(arr_rot[:, ORI_COL][np.isfinite(arr_rot[:, ORI_COL])]).astype(int)
-            unexpected_oris = [o for o in unique_oris if o not in (0, 1, 2, 3)]
-            if unexpected_oris:
-                print(f"Warning: Unexpected orientation IDs found: {unexpected_oris}")
-
-            arr_valid_rows = arr_rot[np.isfinite(arr_rot[:, 0])].copy()
-            if arr_valid_rows.size == 0:
-                raise ValueError("No valid X values found in arr_rot to compute planar mirror-line reference.")
-
-            x_ref_mirror_line = float(np.mean(arr_valid_rows[:, 0]))
-            b_ref_mirror_line_mean = float(np.mean(arr_valid_rows[:, B_PULL_COL]))
-            b_ref_mirror_line_min = float(np.min(arr_valid_rows[:, B_PULL_COL]))
-            b_ref_mirror_line_max = float(np.max(arr_valid_rows[:, B_PULL_COL]))
-
-            print(
-                "Planar radial zero (mirror line) from unmirrored data (all B, all orientations): "
-                f"samples={arr_valid_rows.shape[0]}, X_ref_mirror_line={x_ref_mirror_line:.6f} mm, "
-                f"B range=[{b_ref_mirror_line_min:.6f}, {b_ref_mirror_line_max:.6f}], "
-                f"B mean={b_ref_mirror_line_mean:.6f}"
-            )
-
-            o0 = arr_rot[arr_rot[:, ORI_COL] == 0].copy()
-            o1 = arr_rot[arr_rot[:, ORI_COL] == 1].copy()
-            o2 = arr_rot[arr_rot[:, ORI_COL] == 2].copy()  # +90 deg
-            o3 = arr_rot[arr_rot[:, ORI_COL] == 3].copy()  # -90 deg
-            if o0.size == 0 or o1.size == 0:
-                raise ValueError("Missing orientation 0 or 1 data; cannot mirror/average X between orientations.")
-            has_offplane_pair = (o2.size > 0 and o3.size > 0)
-            if has_offplane_pair:
-                print("Off-plane ±90 orientation data detected (orientations 2 and 3).")
-            else:
-                print("Off-plane ±90 orientation data not found; skipping off-plane linear fitting.")
+            valid_rows = tip_mm[np.all(np.isfinite(tip_mm[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL]]), axis=1)].copy()
+            if valid_rows.size == 0:
+                raise ValueError("No valid calibration rows after filtering NaNs.")
 
             def circular_mean_deg(a):
                 a = np.asarray(a, dtype=float)
-                valid = np.isfinite(a)
-                if not np.any(valid):
-                    return float("nan")
-                rad = np.deg2rad(a[valid])
-                s = np.mean(np.sin(rad))
-                c = np.mean(np.cos(rad))
-                return float((np.rad2deg(np.arctan2(s, c)) + 360.0) % 360.0)
+                a = a[np.isfinite(a)]
+                if a.size == 0:
+                    return float('nan')
+                rad = np.deg2rad(a)
+                return float(np.rad2deg(np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))))
 
-            def collapse_by_bpull(arr):
-                b = arr[:, B_PULL_COL]
-                uniq = np.unique(b)
+            def collapse_by_bpull(arr_phase):
+                if arr_phase.size == 0:
+                    return arr_phase
+                uniq = np.unique(arr_phase[:, B_PULL_COL])
                 out = []
-                for bu in uniq:
-                    m = (b == bu)
-                    row = arr[m].copy()
-                    r = row[0].copy()
-                    r[0] = np.mean(row[:, 0])  # X
-                    r[1] = np.mean(row[:, 1])  # Z
+                for bu in np.sort(uniq):
+                    m = np.isclose(arr_phase[:, B_PULL_COL], bu, atol=1e-12)
+                    row = arr_phase[m]
+                    r = np.nanmean(row, axis=0)
                     r[B_PULL_COL] = bu
                     if has_tip_angle and row.shape[1] > ANGLE_COL:
                         r[ANGLE_COL] = circular_mean_deg(row[:, ANGLE_COL])
                     out.append(r)
-                out = np.vstack(out)
-                return out[np.argsort(out[:, B_PULL_COL])]
+                return np.vstack(out) if out else np.zeros((0, arr_phase.shape[1]))
 
-            o0c = collapse_by_bpull(o0)
-            o1c = collapse_by_bpull(o1)
-
-            b0 = o0c[:, B_PULL_COL]
-            b1 = o1c[:, B_PULL_COL]
-            common_b = np.intersect1d(b0, b1)
-            if common_b.size == 0:
-                raise ValueError("No matching b_pull values between orientations 0 and 1.")
-
-            idx0 = np.searchsorted(b0, common_b)
-            idx1 = np.searchsorted(b1, common_b)
-            o0p = o0c[idx0].copy()
-            o1p = o1c[idx1].copy()
-
-            # Mirror orientation-1 around the computed mirror line, not around x=0.
-            # This keeps the radial zero reference tied to x_ref_mirror_line.
-            o1_x_mirrored = (2.0 * x_ref_mirror_line) - o1p[:, 0]
-            avg_x = (o0p[:, 0] + o1_x_mirrored) / 2.0
-
-            # Keep a single paired trajectory for fitting.
-            avg_z = (o0p[:, 1] + o1p[:, 1]) / 2.0
-            if has_tip_angle and o0p.shape[1] > ANGLE_COL and o1p.shape[1] > ANGLE_COL:
-                # Mirror the orientation-1 angle consistently with X reflection, then circular-average.
-                o1_ang_mirrored = (360.0 - o1p[:, ANGLE_COL]) % 360.0
-                avg_ang = np.array(
-                    [circular_mean_deg([a0, a1]) for a0, a1 in zip(o0p[:, ANGLE_COL], o1_ang_mirrored)],
-                    dtype=float
-                )
-            else:
-                avg_ang = np.full_like(common_b, np.nan, dtype=float)
-
-            # [X_mm, Z_mm, b_pull, tip_angle_deg]
-            tip_locations_final = np.column_stack([avg_x, avg_z, common_b, avg_ang])
-
-            # ---------- Step 6b: Off-plane processing using orientations 2 (+90) and 3 (-90) ----------
-            offplane_tip_locations_final = None  # [Y_offplane_mm, b_pull]
-            y_off_coefficients = None
-            y_off_predicted_meas = None
-            y_off_full_predicted = None
-            y_off_r2 = float("nan")
-            y_off_equation = None
-
-            # Raw pre-mirroring points for plotting (YZ before mirroring)
-            o2p_raw_plot = None
-            o3p_raw_plot = None
-            y_ref_offplane_mirror_line = None
-            b_ref_offplane_mirror_line_mean = float("nan")
-            b_ref_offplane_mirror_line_min = float("nan")
-            b_ref_offplane_mirror_line_max = float("nan")
-            o2p = None
-            o3p = None
-            o3_y_mirrored = None
-
-            if has_offplane_pair:
-                o2c = collapse_by_bpull(o2)
-                o3c = collapse_by_bpull(o3)
-
-                b2 = o2c[:, B_PULL_COL]
-                b3 = o3c[:, B_PULL_COL]
-                common_b_off = np.intersect1d(b2, b3)
-
-                if common_b_off.size == 0:
-                    print("Warning: No matching b_pull values between orientations 2 and 3; skipping off-plane fit.")
+            def build_phase_dataset(phase_code):
+                phase_rows = valid_rows[np.isclose(valid_rows[:, PHASE_COL], phase_code)]
+                if phase_rows.size == 0:
+                    return None
+                o0 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 0)])
+                o1 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 1)])
+                if o0.size == 0 or o1.size == 0:
+                    return None
+                common_b = np.intersect1d(o0[:, B_PULL_COL], o1[:, B_PULL_COL])
+                if common_b.size == 0:
+                    return None
+                idx0 = np.searchsorted(o0[:, B_PULL_COL], common_b)
+                idx1 = np.searchsorted(o1[:, B_PULL_COL], common_b)
+                o0p = o0[idx0].copy()
+                o1p = o1[idx1].copy()
+                mirror_source = np.vstack([o0, o1])
+                x_ref_mirror_line = float(np.mean(mirror_source[:, 0]))
+                o1_x_mirrored = (2.0 * x_ref_mirror_line) - o1p[:, 0]
+                avg_x_raw = 0.5 * (o0p[:, 0] + o1_x_mirrored)
+                avg_z_raw = 0.5 * (o0p[:, 1] + o1p[:, 1])
+                if has_tip_angle and o0p.shape[1] > ANGLE_COL and o1p.shape[1] > ANGLE_COL:
+                    o1_ang_mirrored = -o1p[:, ANGLE_COL]
+                    avg_ang = np.array([circular_mean_deg([a0, a1]) for a0, a1 in zip(o0p[:, ANGLE_COL], o1_ang_mirrored)], dtype=float)
                 else:
-                    idx2 = np.searchsorted(b2, common_b_off)
-                    idx3 = np.searchsorted(b3, common_b_off)
-                    o2p = o2c[idx2].copy()
-                    o3p = o3c[idx3].copy()
-
-                    # Save raw paired points for plotting before mirroring
-                    o2p_raw_plot = o2p.copy()
-                    o3p_raw_plot = o3p.copy()
-
-                    if common_b_off.shape != common_b.shape or not np.allclose(common_b_off, common_b):
-                        print("Warning: common_b for off-plane pair differs from planar common_b (non-fatal).")
-
-                    # Off-plane mirror line from unmirrored ±90 data.
-                    arr_off_valid = np.vstack([o2, o3])
-                    arr_off_valid = arr_off_valid[np.isfinite(arr_off_valid[:, 0])]
-                    if arr_off_valid.size > 0:
-                        y_ref_offplane_mirror_line = float(np.mean(arr_off_valid[:, 0]))
-                        b_ref_offplane_mirror_line_mean = float(np.mean(arr_off_valid[:, B_PULL_COL]))
-                        b_ref_offplane_mirror_line_min = float(np.min(arr_off_valid[:, B_PULL_COL]))
-                        b_ref_offplane_mirror_line_max = float(np.max(arr_off_valid[:, B_PULL_COL]))
-                    else:
-                        y_ref_offplane_mirror_line = 0.0
-
-                    # Mirror orientation 3 around off-plane mirror line
-                    o3_y_mirrored = (2.0 * y_ref_offplane_mirror_line) - o3p[:, 0]
-                    avg_y_off_raw = (o2p[:, 0] + o3_y_mirrored) / 2.0
-
-                    # Neglect ±90 Z values by design for off-plane fitting.
-                    offplane_tip_locations_final = np.column_stack([avg_y_off_raw, common_b_off])
-
-                    print("After off-plane orientation mirroring/averaging (±90 pair):")
-                    print(f"  Y_off raw range: {offplane_tip_locations_final[:,0].min():.3f} to {offplane_tip_locations_final[:,0].max():.3f} mm")
-                    print(f"  b_pull range: {offplane_tip_locations_final[:,1].min():.3f} to {offplane_tip_locations_final[:,1].max():.3f}")
-                    print(
-                        "  Off-plane mirror line from unmirrored ±90 data: "
-                        f"Y_ref={y_ref_offplane_mirror_line:.6f} mm, "
-                        f"B range=[{b_ref_offplane_mirror_line_min:.6f}, {b_ref_offplane_mirror_line_max:.6f}], "
-                        f"B mean={b_ref_offplane_mirror_line_mean:.6f}"
-                    )
-
-            print("After orientation X mirroring/averaging (current frame):")
-            print(f"X range: {tip_locations_final[:, 0].min():.3f} to {tip_locations_final[:, 0].max():.3f} mm")
-            print(f"Z range: {tip_locations_final[:, 1].min():.3f} to {tip_locations_final[:, 1].max():.3f} mm")
-            print(f"b_pull range: {tip_locations_final[:, 2].min():.3f} to {tip_locations_final[:, 2].max():.3f}")
-            if np.all(np.isfinite(tip_locations_final[:, 3])):
-                print(f"tip_angle range: {tip_locations_final[:, 3].min():.3f} to {tip_locations_final[:, 3].max():.3f} deg")
-            else:
-                print("tip_angle range: unavailable")
-
-            if save_plots:
-                # Plot paired pre-averaging trajectories side by side:
-                # planar XZ (O0 vs mirrored O1) and off-plane Y(proxy)Z (O2 vs mirrored O3).
-                fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(15, 6))
-
-                ax_left.scatter(o0p[:, 0], o0p[:, 1], c='tab:blue', alpha=0.85, label='Orientation 0')
-                ax_left.scatter(o1_x_mirrored, o1p[:, 1], c='tab:orange', alpha=0.85, label='Orientation 1 (mirrored)')
-                ax_left.plot(
-                    avg_x,
-                    (o0p[:, 1] + o1p[:, 1]) / 2.0,
-                    'o-',
-                    color='tab:green',
-                    linewidth=2,
-                    markersize=6,
-                    label='Averaged trajectory'
-                )
-                ax_left.axvline(x=x_ref_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
-                ax_left.set_xlabel("X (mm)")
-                ax_left.set_ylabel("Z (mm) [flipped]")
-                ax_left.set_title("XZ Before Trajectory Averaging (O0 vs O1 Mirrored)")
-                ax_left.axis("equal")
-                ax_left.grid(True, alpha=0.3)
-                ax_left.legend()
-
-                if o2p is not None and o3p is not None and y_ref_offplane_mirror_line is not None and o3_y_mirrored is not None:
-                    ax_right.scatter(o2p[:, 0], o2p[:, 1], c='tab:blue', alpha=0.85, label='Orientation 2')
-                    ax_right.scatter(o3_y_mirrored, o3p[:, 1], c='tab:orange', alpha=0.85, label='Orientation 3 (mirrored)')
-                    ax_right.plot(
-                        (o2p[:, 0] + o3_y_mirrored) / 2.0,
-                        (o2p[:, 1] + o3p[:, 1]) / 2.0,
-                        'o-',
-                        color='tab:green',
-                        linewidth=2,
-                        markersize=6,
-                        label='Averaged trajectory'
-                    )
-                    ax_right.axvline(x=y_ref_offplane_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
-                    ax_right.set_xlabel("Y proxy (mm)")
-                    ax_right.set_ylabel("Z (mm) [flipped]")
-                    ax_right.set_title("Y(proxy)Z Before Trajectory Averaging (O2 vs O3 Mirrored)")
-                    ax_right.axis("equal")
-                    ax_right.grid(True, alpha=0.3)
-                    ax_right.legend()
-                else:
-                    ax_right.text(0.5, 0.5, "Y(proxy)Z data unavailable", ha='center', va='center', transform=ax_right.transAxes)
-                    ax_right.set_title("Y(proxy)Z Before Trajectory Averaging (O2 vs O3 Mirrored)")
-                    ax_right.grid(True, alpha=0.3)
-
-                fig.suptitle("03c: Pre-Averaging Trajectories (Mirrored Orientation Pairs)")
-                fig.tight_layout()
-                fig.savefig("03c_pre_averaging_trajectories.png", dpi=150, bbox_inches='tight')
-                plt.close(fig)
-
-            if save_plots:
-                plt.figure(figsize=(10, 8))
-                plt.scatter(tip_locations_final[:, 0], tip_locations_final[:, 1], alpha=0.7)
-                plt.xlabel("X (mm)")
-                plt.ylabel("Z (mm) [flipped]")
-                plt.title("03b: After Orientation X Mirroring + Averaging")
-                plt.axis("equal")
-                plt.grid(True, alpha=0.3)
-                plt.savefig("03b_after_orientation_processing.png", dpi=150, bbox_inches='tight')
-                plt.close()
-
-            # ---------- Step 7: Physical scaling correction (still skipped) ----------
-            print("Skipping physical scaling correction (disabled for current setup).")
-
-            # ---------- Step 8: Simplified calibration data for fitting ----------
-            # Since ntnl_pos is irrelevant now, simplified data is sorted by b_pull.
-            print("Creating simplified calibration data (sorted by b_pull only)...")
-
-            # tip_locations_final columns: [X_mm, Z_mm, b_pull, tip_angle_deg]
-            sort_idx = np.argsort(tip_locations_final[:, 2])
-            tip_locations_final_simplified = tip_locations_final[sort_idx].copy()
-
-            print(f"Simplified data shape: {tip_locations_final_simplified.shape}")
-            print(f"b_pull unique count: {len(np.unique(tip_locations_final_simplified[:, 2]))}")
-
-            # Step 8.5: Convert to planar bending coordinates and fit selected equations
-            fit_model = str(fit_model).strip().lower()
-            if fit_model not in {"cubic", "pchip"}:
-                raise ValueError(f"Unsupported fit_model '{fit_model}'. Use 'cubic' or 'pchip'.")
-            fit_model_display = "cubic polynomial" if fit_model == "cubic" else "PCHIP"
-            print(f"\nConverting to planar bending coordinates and fitting {fit_model_display} equations...")
-
-            # --- Bridge for Step 8.5 (NEW pipeline: b_pull only) ---
-            # tip_locations_final_simplified columns: [X_mm, Z_mm, b_pull, tip_angle_deg]
-            x_avg_raw = tip_locations_final_simplified[:, 0].copy()
-            z_avg_raw = tip_locations_final_simplified[:, 1].copy()
-            delta_motor = tip_locations_final_simplified[:, 2].copy()  # b_pull
-            tip_angle_avg = tip_locations_final_simplified[:, 3].copy() if has_tip_angle else None
-            # Wrap high-angle values before fitting so 300deg -> -60deg, etc.
-            # This prevents the cubic fit from "jumping" across the 0/360 boundary.
-            if has_tip_angle and tip_angle_avg is not None and tip_angle_avg.size > 0:
+                    avg_ang = np.full((common_b.shape[0],), np.nan, dtype=float)
+                zero_mask = np.isclose(common_b, 0.0, atol=1e-9)
+                zero_idx = int(np.where(zero_mask)[0][0]) if np.any(zero_mask) else int(np.argmin(np.abs(common_b)))
+                x0_ref = float(x_ref_mirror_line)
+                z0_ref = float(avg_z_raw[zero_idx])
+                x_avg = avg_x_raw - x0_ref
+                z_avg = avg_z_raw - z0_ref
+                tip_angle_avg = avg_ang.copy()
                 finite_mask = np.isfinite(tip_angle_avg)
                 if np.any(finite_mask):
-                    tip_angle_avg[finite_mask] = np.where(
-                        tip_angle_avg[finite_mask] > 250.0,
-                        tip_angle_avg[finite_mask] - 360.0,
-                        tip_angle_avg[finite_mask]
-                    )
-
-            # -------------------------------------------------------------------------
-            # ZERO REFERENCE (requested):
-            # Use the FIRST measured tip location at B = 0.0 as the zero reference for x, z, and r.
-            # If exact 0.0 is not present (floating-point), use np.isclose and fall back to nearest B.
-            # -------------------------------------------------------------------------
-            b_zero_target = 0.0
-            zero_mask = np.isclose(delta_motor, b_zero_target, atol=1e-9)
-
-            if np.any(zero_mask):
-                # "first measured" among the rows that match B=0.0 in current ordering
-                zero_idx = np.where(zero_mask)[0][0]
-            else:
-                # Fallback: nearest B to 0.0
-                zero_idx = int(np.argmin(np.abs(delta_motor - b_zero_target)))
-                print(f"Warning: No exact B=0.0 found; using nearest point at B={delta_motor[zero_idx]:.6f} as zero reference.")
-
-            # Keep mirror-line X as the radial zero reference (even with alignment disabled).
-            x0_ref = float(x_ref_mirror_line)
-            z0_ref = float(z_avg_raw[zero_idx])
-
-            # Re-reference cartesian trajectory so first B=0 point is (0,0)
-            x_avg = x_avg_raw - x0_ref
-            z_avg = z_avg_raw - z0_ref
-
-            # Strict planar bending definition:
-            # r is the signed transverse/radial deflection, i.e. r = x (not Euclidean radius).
-            # Radial zero is defined by the mirror line (mean unmirrored X across all B and both orientations).
-            r_coords_raw = x_avg_raw.copy()
-            r_coords = x_avg.copy()
-
-            # Axial coordinate for fitting/plots (re-referenced)
-            z_coords = z_avg.copy()
-
-            # Off-plane coordinate (from ±90 mirrored pair), referenced to the ±90 mirror line.
-            y_off_coords_meas = None
-            delta_motor_off_meas = None
-            y0_off_ref = None  # deprecated: off-plane is no longer B=0 referenced
-
-            if offplane_tip_locations_final is not None:
-                # columns: [Y_off_raw_mm, b_pull]
-                y_off_raw_meas = offplane_tip_locations_final[:, 0].copy()
-                delta_motor_off_meas = offplane_tip_locations_final[:, 1].copy()
-
-                y_off_coords_meas = y_off_raw_meas - float(y_ref_offplane_mirror_line)
-
-                print("Off-plane coordinate reference:")
-                print(f"  y_ref_offplane_mirror_line = {float(y_ref_offplane_mirror_line):.6f} mm")
-                print("  Off-plane Y is referenced to the ±90 Y-proxy mirror line (not B=0).")
-                print(f"  Y_off referenced range: {y_off_coords_meas.min():.3f} to {y_off_coords_meas.max():.3f} mm")
-
-            if save_plots:
-                # Referenced X/Z plot for simplified trajectory
-                plt.figure(figsize=(10, 8))
-                plt.plot(x_avg, z_avg, 'o-', alpha=0.8, linewidth=2, markersize=6)
-                plt.xlabel("X (mm, referenced to first B=0 point)")
-                plt.ylabel("Z (mm, referenced to first B=0 point)")
-                plt.title("04: Final Calibrated Locations (Referenced to first B=0 tip)")
-                plt.axis("equal")
-                plt.grid(True, alpha=0.3)
-                plt.savefig("04_final_calibrated_locations.png", dpi=150, bbox_inches='tight')
-                plt.close()
-
-            print(f"Using {len(x_avg)} averaged data points for planar-coordinate conversion and {fit_model_display} fitting")
-            print(f"Zero reference index: {zero_idx} | B_ref = {delta_motor[zero_idx]:.6f}")
-            print(f"Reference tip (raw): x_ref_mirror_line = {x0_ref:.6f} mm, z0 = {z0_ref:.6f} mm")
-            print(
-                "Radial reference source: mirror line = mean unmirrored X across all measured B values "
-                f"and both orientations (B range {b_ref_mirror_line_min:.6f} to {b_ref_mirror_line_max:.6f}, "
-                f"B mean {b_ref_mirror_line_mean:.6f})"
-            )
-            print("Reference tip (shifted): x=0.000000 mm, z=0.000000 mm, r=0.000000 mm")
-            print("Referenced ranges:")
-            print(f"  X range: {x_avg.min():.3f} to {x_avg.max():.3f} mm")
-            print(f"  Z range: {z_coords.min():.3f} to {z_coords.max():.3f} mm")
-            print(f"  R (signed planar X deflection) range: {r_coords.min():.3f} to {r_coords.max():.3f} mm")
-            print(f"  b_pull range: {delta_motor.min():.3f} to {delta_motor.max():.3f}")
-
-            # Fit planar curve models: r = f(B_motor) and z = f(B_motor)
-            print(f"\nFitting {fit_model_display} equations:")
-            print("r = f(B_motor) - signed planar transverse deflection (r = x) as function of B-axis translation")
-            print("z = f(B_motor) - axial position as function of B-axis translation")
-
-            r_model_descriptor = self._fit_curve_model(delta_motor, r_coords, fit_model, "r")
-            if r_model_descriptor is None:
-                raise ValueError(f"Insufficient points for planar R {fit_model} fit.")
-            r_predicted = self._evaluate_curve_model(r_model_descriptor, delta_motor)
-
-            z_model_descriptor = self._fit_curve_model(delta_motor, z_coords, fit_model, "z")
-            if z_model_descriptor is None:
-                raise ValueError(f"Insufficient points for axial Z {fit_model} fit.")
-            z_predicted = self._evaluate_curve_model(z_model_descriptor, delta_motor)
-
-            # Preserve legacy cubic coefficients for backward-compatible exports.
-            r_legacy_cubic_descriptor = self._fit_curve_model(delta_motor, r_coords, "cubic", "r")
-            z_legacy_cubic_descriptor = self._fit_curve_model(delta_motor, z_coords, "cubic", "z")
-            if r_legacy_cubic_descriptor is None or z_legacy_cubic_descriptor is None:
-                raise ValueError("Insufficient points for legacy cubic export.")
-            r_coefficients = np.asarray(r_legacy_cubic_descriptor["coefficients"], dtype=float)
-            z_coefficients = np.asarray(z_legacy_cubic_descriptor["coefficients"], dtype=float)
-
-            tip_angle_coefficients = None
-            tip_angle_model_descriptor = None
-            tip_angle_predicted = None
-            tip_angle_r2 = float("nan")
-            tip_angle_equation = None
-            y_off_model_descriptor = None
-
-            if has_tip_angle and np.all(np.isfinite(tip_angle_avg)):
-                tip_angle_model_descriptor = self._fit_curve_model(delta_motor, tip_angle_avg, fit_model, "tip_angle_deg")
-                tip_angle_legacy_cubic_descriptor = self._fit_curve_model(delta_motor, tip_angle_avg, "cubic", "tip_angle_deg")
-                if tip_angle_model_descriptor is not None:
-                    tip_angle_predicted = self._evaluate_curve_model(tip_angle_model_descriptor, delta_motor)
-                if tip_angle_legacy_cubic_descriptor is not None:
-                    tip_angle_coefficients = np.asarray(tip_angle_legacy_cubic_descriptor["coefficients"], dtype=float)
-
-            # Fit linear polynomial for off-plane coordinate (if available)
-            if y_off_coords_meas is not None and delta_motor_off_meas is not None:
-                x_off = np.asarray(delta_motor_off_meas, dtype=float).ravel()
-                y_off = np.asarray(y_off_coords_meas, dtype=float).ravel()
-                valid_off = np.isfinite(x_off) & np.isfinite(y_off)
-                x_off_use = x_off[valid_off]
-                y_off_use = y_off[valid_off]
-                if x_off_use.size < 2:
-                    print(f"Warning: Need at least 2 valid points for off-plane Y linear fit. Found {x_off_use.size}; skipping.")
+                    tip_angle_avg[finite_mask] = np.where(tip_angle_avg[finite_mask] > 250.0, tip_angle_avg[finite_mask] - 360.0, tip_angle_avg[finite_mask])
+                dataset = {
+                    'phase_code': int(phase_code),
+                    'phase_name': 'pull' if int(phase_code) == 0 else 'release',
+                    'common_b': common_b.astype(float),
+                    'x_raw': avg_x_raw.astype(float),
+                    'z_raw': avg_z_raw.astype(float),
+                    'r_coords': x_avg.astype(float),
+                    'z_coords': z_avg.astype(float),
+                    'tip_angle': tip_angle_avg.astype(float),
+                    'zero_idx': zero_idx,
+                    'x_ref_mirror_line_mm': x_ref_mirror_line,
+                    'z0_ref_mm': z0_ref,
+                    'x0_ref_mm': x0_ref,
+                    'raw_planar_trajectories': {
+                        'C0': {
+                            'b': o0[:, B_PULL_COL].astype(float).tolist(),
+                            'x': o0[:, 0].astype(float).tolist(),
+                            'z': o0[:, 1].astype(float).tolist(),
+                        },
+                        'C180': {
+                            'b': o1[:, B_PULL_COL].astype(float).tolist(),
+                            'x': o1[:, 0].astype(float).tolist(),
+                            'z': o1[:, 1].astype(float).tolist(),
+                        },
+                    },
+                }
+                o2 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 2)])
+                o3 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 3)])
+                if o2.size > 0 and o3.size > 0:
+                    common_b_off = np.intersect1d(o2[:, B_PULL_COL], o3[:, B_PULL_COL])
+                    if common_b_off.size > 0:
+                        idx2 = np.searchsorted(o2[:, B_PULL_COL], common_b_off)
+                        idx3 = np.searchsorted(o3[:, B_PULL_COL], common_b_off)
+                        o2p = o2[idx2].copy()
+                        o3p = o3[idx3].copy()
+                        y_ref_offplane = float(np.mean(np.vstack([o2, o3])[:, 0]))
+                        o3_y_mirrored = (2.0 * y_ref_offplane) - o3p[:, 0]
+                        y_off_raw = 0.5 * (o2p[:, 0] + o3_y_mirrored)
+                        dataset['offplane_b'] = common_b_off.astype(float)
+                        dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
+                        dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
+                        dataset['raw_offplane_trajectories'] = {
+                            'C90': {
+                                'b': o2[:, B_PULL_COL].astype(float).tolist(),
+                                'y_proxy': o2[:, 0].astype(float).tolist(),
+                                'z': o2[:, 1].astype(float).tolist(),
+                            },
+                            'C-90': {
+                                'b': o3[:, B_PULL_COL].astype(float).tolist(),
+                                'y_proxy': o3[:, 0].astype(float).tolist(),
+                                'z': o3[:, 1].astype(float).tolist(),
+                            },
+                        }
+                    else:
+                        dataset['offplane_b'] = None
+                        dataset['offplane_y'] = None
+                        dataset['y_ref_offplane_mirror_line_mm'] = None
+                        dataset['raw_offplane_trajectories'] = None
                 else:
-                    y_off_coefficients = np.polyfit(x_off_use, y_off_use, 1)
-                    y_off_predicted_meas = np.polyval(y_off_coefficients, delta_motor_off_meas)
-                    y_off_full_predicted = np.polyval(y_off_coefficients, delta_motor)
-                    y_off_model_descriptor = {
-                        "model_type": "polynomial",
-                        "basis": "monomial",
-                        "degree": 1,
-                        "input_axis": "b_motor",
-                        "value_name": "y_offplane_mm",
-                        "coefficients": y_off_coefficients.tolist(),
-                        "equation": None,
-                        "sample_count": int(x_off_use.size),
-                        "fit_x_range": [float(np.min(x_off_use)), float(np.max(x_off_use))],
-                    }
+                    dataset['offplane_b'] = None
+                    dataset['offplane_y'] = None
+                    dataset['y_ref_offplane_mirror_line_mm'] = None
+                    dataset['raw_offplane_trajectories'] = None
+                return dataset
 
-            # Calculate R² scores
+            datasets = {}
+            for phase_code in sorted(np.unique(valid_rows[:, PHASE_COL]).astype(int)):
+                ds = build_phase_dataset(phase_code)
+                if ds is not None:
+                    datasets[ds['phase_name']] = ds
+
+            if not datasets:
+                raise ValueError("Could not construct any valid pull/release paired datasets.")
+
+            fit_model = str(fit_model).strip().lower()
+            if fit_model not in {'cubic', 'pchip'}:
+                raise ValueError(f"Unsupported fit_model '{fit_model}'. Use 'cubic' or 'pchip'.")
+
             def r2_score_safe(y_true, y_pred):
-                """Calculate R² score with safety checks for edge cases"""
+                y_true = np.asarray(y_true, dtype=float)
+                y_pred = np.asarray(y_pred, dtype=float)
                 ss_res = np.sum((y_true - y_pred) ** 2)
                 ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
                 if ss_tot == 0:
                     return 1.0 if ss_res == 0 else float('-inf')
-                return 1 - (ss_res / ss_tot)
+                return float(1.0 - (ss_res / ss_tot))
 
-            r_r2 = r2_score_safe(r_coords, r_predicted)
-            z_r2 = r2_score_safe(z_coords, z_predicted)
+            def pretty_model_name(model_descriptor):
+                if model_descriptor is None:
+                    return "Fit"
+                model_type = str(model_descriptor.get('model_type', fit_model)).strip().lower()
+                return {
+                    'pchip': 'PCHIP',
+                    'polynomial': 'Cubic',
+                    'linear': 'Linear',
+                }.get(model_type, model_type.upper())
 
-            if tip_angle_predicted is not None:
-                tip_angle_r2 = r2_score_safe(tip_angle_avg, tip_angle_predicted)
-            if y_off_predicted_meas is not None:
-                y_off_r2 = r2_score_safe(y_off_coords_meas, y_off_predicted_meas)
+            fit_results = {}
+            legacy_phase = 'pull' if 'pull' in datasets else list(datasets.keys())[0]
 
-            print(f"\nSelected fit results ({fit_model_display}):")
-            print(f"R-coordinate (signed planar X deflection) R² score: {r_r2:.6f}")
-            print(f"Z-coordinate R² score: {z_r2:.6f}")
-            if tip_angle_predicted is not None:
-                print(f"Tip-angle R² score: {tip_angle_r2:.6f}")
-            if y_off_predicted_meas is not None:
-                print(f"Off-plane coordinate R² score: {y_off_r2:.6f}")
-
-            def format_linear_equation(coeffs, var_name):
-                """Format linear polynomial coefficients into readable equation"""
-                m, c = coeffs
-                equation = f"{var_name} = {m:.6f}*b"
-                if c >= 0:
-                    equation += f" + {c:.6f}"
-                else:
-                    equation += f" - {abs(c):.6f}"
-                return equation
-
-            r_equation = r_model_descriptor.get("equation")
-            z_equation = z_model_descriptor.get("equation")
-            if tip_angle_model_descriptor is not None:
-                tip_angle_equation = tip_angle_model_descriptor.get("equation")
-            if y_off_coefficients is not None:
-                y_off_equation = format_linear_equation(y_off_coefficients, "y_offplane_mm")
-                if y_off_model_descriptor is not None:
-                    y_off_model_descriptor["equation"] = y_off_equation
-
-            print(f"\nSelected fit equations:")
-            print(f"R: {r_equation}")
-            print(f"Z: {z_equation}")
-            if tip_angle_equation is not None:
-                print(f"Tip angle: {tip_angle_equation}")
-            if y_off_equation is not None:
-                print(f"Off-plane Y: {y_off_equation}")
-
-            # Create comprehensive results DataFrame
-            coefficients_data = []
-
-            # R-coordinate coefficients (signed planar X deflection, r = x)
-            for i, (power, coef) in enumerate(zip(['b^3', 'b^2', 'b^1', 'b^0'], r_coefficients)):
-                coefficients_data.append({
-                    'Coordinate': 'R (signed planar X deflection, r=x)',
-                    'Term': power,
-                    'Coefficient': coef,
-                    'Description': f'Coefficient for {power} term in planar transverse-deflection equation (r=x)'
-                })
-
-            # Z-coordinate coefficients
-            for i, (power, coef) in enumerate(zip(['b^3', 'b^2', 'b^1', 'b^0'], z_coefficients)):
-                coefficients_data.append({
-                    'Coordinate': 'Z (axial)',
-                    'Term': power,
-                    'Coefficient': coef,
-                    'Description': f'Coefficient for {power} term in axial equation'
-                })
-
-            if tip_angle_coefficients is not None:
-                for i, (power, coef) in enumerate(zip(['b^3', 'b^2', 'b^1', 'b^0'], tip_angle_coefficients)):
-                    coefficients_data.append({
-                        'Coordinate': 'Tip angle (deg vs vertical)',
-                        'Term': power,
-                        'Coefficient': coef,
-                        'Description': f'Coefficient for {power} term in tip-angle equation'
-                    })
-            if y_off_coefficients is not None:
-                for power, coef in zip(['b^1', 'b^0'], y_off_coefficients):
-                    coefficients_data.append({
-                        'Coordinate': 'Off-plane Y (from ±90 mirrored pair)',
-                        'Term': power,
-                        'Coefficient': coef,
-                        'Description': f'Coefficient for {power} term in off-plane transverse displacement linear equation (±90 views, mirrored/averaged, mirror-line referenced)'
-                    })
-
-            df_coefficients = pd.DataFrame(coefficients_data)
-
-            # Create fit quality DataFrame
-            fit_info_data = [
-                {'Metric': 'R_coordinate_R_squared', 'Value': r_r2, 'Description': 'R² score for planar transverse-deflection coordinate fit (r=x)'},
-                {'Metric': 'Z_coordinate_R_squared', 'Value': z_r2, 'Description': 'R² score for axial coordinate fit'},
-                {'Metric': 'Max_R_Error', 'Value': np.max(np.abs(r_predicted - r_coords)), 'Description': 'Maximum absolute error in planar transverse-deflection prediction (r=x)'},
-                {'Metric': 'Max_Z_Error', 'Value': np.max(np.abs(z_predicted - z_coords)), 'Description': 'Maximum absolute error in axial prediction'},
-                {'Metric': 'Mean_R_Error', 'Value': np.mean(np.abs(r_predicted - r_coords)), 'Description': 'Mean absolute error in planar transverse-deflection prediction (r=x)'},
-                {'Metric': 'Mean_Z_Error', 'Value': np.mean(np.abs(z_predicted - z_coords)), 'Description': 'Mean absolute error in axial prediction'}
-            ]
-            if tip_angle_predicted is not None:
-                fit_info_data.extend([
-                    {'Metric': 'Tip_Angle_R_squared', 'Value': tip_angle_r2, 'Description': 'R² score for tip-angle fit'},
-                    {'Metric': 'Max_Tip_Angle_Error_deg', 'Value': np.max(np.abs(tip_angle_predicted - tip_angle_avg)), 'Description': 'Maximum absolute tip-angle prediction error'},
-                    {'Metric': 'Mean_Tip_Angle_Error_deg', 'Value': np.mean(np.abs(tip_angle_predicted - tip_angle_avg)), 'Description': 'Mean absolute tip-angle prediction error'},
-                ])
-            if y_off_predicted_meas is not None:
-                fit_info_data.extend([
-                    {'Metric': 'Offplane_Y_R_squared', 'Value': y_off_r2, 'Description': 'R² score for off-plane displacement fit from ±90 mirrored pair (mirror-line referenced)'},
-                    {'Metric': 'Max_Offplane_Y_Error', 'Value': np.max(np.abs(y_off_predicted_meas - y_off_coords_meas)), 'Description': 'Maximum absolute error in off-plane displacement prediction'},
-                    {'Metric': 'Mean_Offplane_Y_Error', 'Value': np.mean(np.abs(y_off_predicted_meas - y_off_coords_meas)), 'Description': 'Mean absolute error in off-plane displacement prediction'},
-                ])
-            df_fit_info = pd.DataFrame(fit_info_data)
-
-            # Create equations DataFrame
-            equations_data = [
-                {'Coordinate': 'R (signed planar X deflection, r=x)', 'Cubic_Equation': r_equation},
-                {'Coordinate': 'Z (axial)', 'Cubic_Equation': z_equation}
-            ]
-            if tip_angle_equation is not None:
-                equations_data.append({'Coordinate': 'Tip angle (deg vs vertical)', 'Cubic_Equation': tip_angle_equation})
-            if y_off_equation is not None:
-                equations_data.append({'Coordinate': 'Off-plane Y (from ±90 mirrored pair)', 'Cubic_Equation': y_off_equation})
-            df_equations = pd.DataFrame(equations_data)
-
-            # Plotting
-            if save_plots:
-                plt.figure(figsize=(18, 14))
-
-                # Plot 1: Referenced X,Z trajectory
-                plt.subplot(3, 3, 1)
-                plt.plot(x_avg, z_avg, 'o-', linewidth=2, markersize=6)
-                plt.xlabel('X transverse deflection (mm, ref. B=0)')
-                plt.ylabel('Z axial position (mm, ref. B=0)')
-                plt.title('Referenced Planar Trajectory (X vs Z)')
-                plt.axis('equal')
-                plt.grid(True, alpha=0.3)
-
-                # Plot 2: Planar bending coordinates (r = x, z)
-                plt.subplot(3, 3, 2)
-                plt.plot(r_coords, z_coords, 'o-', linewidth=2, markersize=6, color='green')
-                plt.xlabel('R = X (signed transverse deflection, mm)')
-                plt.ylabel('Z (axial) Position (mm)')
-                plt.title('Planar Bending Coordinates (r=x, z)')
-                plt.grid(True, alpha=0.3)
-
-                # Plot 3: R vs B Motor
-                plt.subplot(3, 3, 3)
-                plt.plot(delta_motor, r_coords, 'o', linewidth=2, markersize=6, label='Measured')
-                plt.plot(delta_motor, r_predicted, 's-', linewidth=2, markersize=4, color='red', label=self._curve_fit_label(r_model_descriptor))
-                plt.xlabel('B Motor Position')
-                plt.ylabel('R = X (signed transverse deflection, mm)')
-                plt.title(f'Planar X Deflection vs Motor (R² = {r_r2:.4f})')
-                plt.grid(True, alpha=0.3)
-                plt.legend()
-
-                # Plot 4: Z vs B Motor
-                plt.subplot(3, 3, 4)
-                plt.plot(delta_motor, z_coords, 'o', linewidth=2, markersize=6, label='Measured')
-                plt.plot(delta_motor, z_predicted, 's-', linewidth=2, markersize=4, color='red', label=self._curve_fit_label(z_model_descriptor))
-                plt.xlabel('B Motor Position')
-                plt.ylabel('Z (axial) Position (mm)')
-                plt.title(f'Axial Position vs Motor (R² = {z_r2:.4f})')
-                plt.grid(True, alpha=0.3)
-                plt.legend()
-
-                # Plot 5: Residuals for R (planar X deflection)
-                plt.subplot(3, 3, 5)
-                r_residuals = r_coords - r_predicted
-                plt.plot(delta_motor, r_residuals, 'o-', linewidth=2, markersize=6, color='purple')
-                plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
-                plt.xlabel('B Motor Position')
-                plt.ylabel('R = X Residuals (mm)')
-                plt.title('Planar X Deflection Fit Residuals')
-                plt.grid(True, alpha=0.3)
-
-                # Plot 6: Residuals for Z
-                plt.subplot(3, 3, 6)
-                z_residuals = z_coords - z_predicted
-                plt.plot(delta_motor, z_residuals, 'o-', linewidth=2, markersize=6, color='orange')
-                plt.axhline(y=0, color='k', linestyle='--', alpha=0.5)
-                plt.xlabel('B Motor Position')
-                plt.ylabel('Z Residuals (mm)')
-                plt.title('Axial Fit Residuals')
-                plt.grid(True, alpha=0.3)
-
-                # Plot 7: Tip angle vs B (selected fit)
-                plt.subplot(3, 3, 7)
-                if tip_angle_predicted is not None:
-                    sort_idx_ang = np.argsort(delta_motor)
-                    plt.plot(delta_motor[sort_idx_ang], tip_angle_avg[sort_idx_ang], 'o', markersize=6, label='Measured')
-                    plt.plot(delta_motor[sort_idx_ang], tip_angle_predicted[sort_idx_ang], 's-', linewidth=2, markersize=4, color='red', label=self._curve_fit_label(tip_angle_model_descriptor))
-                    plt.xlabel('B Motor Position')
-                    plt.ylabel('Tip Angle vs Vertical (deg)')
-                    plt.title(f'Tip Angle {self._curve_fit_label(tip_angle_model_descriptor)} (R² = {tip_angle_r2:.4f})')
-                    plt.grid(True, alpha=0.3)
-                    plt.legend()
-                else:
-                    plt.text(0.5, 0.5, 'Tip angle fit unavailable', ha='center', va='center', transform=plt.gca().transAxes)
-                    plt.title('Tip Angle Fit')
-                    plt.grid(True, alpha=0.3)
-
-                # Plot 8: Off-plane Y vs B (from ±90 pair)
-                plt.subplot(3, 3, 8)
-                if y_off_predicted_meas is not None and y_off_coords_meas is not None and delta_motor_off_meas is not None and y_off_full_predicted is not None:
-                    sort_idx_off_meas = np.argsort(delta_motor_off_meas)
-                    sort_idx_off_full = np.argsort(delta_motor)
-                    plt.plot(delta_motor_off_meas[sort_idx_off_meas], y_off_coords_meas[sort_idx_off_meas], 'o', markersize=6, label='Measured (±90 partial)')
-                    plt.plot(delta_motor[sort_idx_off_full], y_off_full_predicted[sort_idx_off_full], '-', linewidth=2, color='red', label='Linear Fit (full B)')
-                    plt.xlabel('B Motor Position')
-                    plt.ylabel('Off-plane Y (mm, ref.)')
-                    plt.title(f'Off-plane Linear Fit (partial ±90 data, extrapolated) (R² = {y_off_r2:.4f})')
-                    plt.grid(True, alpha=0.3)
-                    plt.legend()
-                else:
-                    plt.text(0.5, 0.5, 'Off-plane ±90 fit unavailable', ha='center', va='center', transform=plt.gca().transAxes)
-                    plt.title('Off-plane Linear Fit')
-                    plt.grid(True, alpha=0.3)
-
-                # Plot 9: Raw pre-mirroring points in XZ and YZ with mirror lines
-                ax9 = plt.subplot(3, 3, 9)
-                ax9.axis('off')
-                ax9.set_title('Raw Pre-mirroring Trajectories (XZ / YZ)')
-
-                # Left mini-axis: XZ before mirroring (orientations 0 and 1)
-                left = ax9.inset_axes([0.02, 0.08, 0.46, 0.82])
-                if o0p is not None and o1p is not None:
-                    left.plot(o0p[:, 0], o0p[:, 1], 'o-', markersize=4, label='Ori 0 (C=0°)')
-                    left.plot(o1p[:, 0], o1p[:, 1], 'o-', markersize=4, label='Ori 1 (C=180°)')
-                    left.axvline(x=x_ref_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
-                    left.set_xlabel('X (mm)')
-                    left.set_ylabel('Z (mm)')
-                    left.set_title('XZ before mirroring', fontsize=9)
-                    left.grid(True, alpha=0.3)
-                    left.legend(fontsize=7)
-                else:
-                    left.text(0.5, 0.5, 'XZ data unavailable', ha='center', va='center', transform=left.transAxes)
-                    left.set_title('XZ before mirroring', fontsize=9)
-
-                # Right mini-axis: YZ before mirroring from ±90 pair.
-                right = ax9.inset_axes([0.52, 0.08, 0.46, 0.82])
-                if o2p_raw_plot is not None and o3p_raw_plot is not None and y_ref_offplane_mirror_line is not None:
-                    right.plot(o2p_raw_plot[:, 0], o2p_raw_plot[:, 1], 'o-', markersize=4, label='Ori 2 (C=+90°)')
-                    right.plot(o3p_raw_plot[:, 0], o3p_raw_plot[:, 1], 'o-', markersize=4, label='Ori 3 (C=-90°)')
-                    right.axvline(x=y_ref_offplane_mirror_line, color='k', linestyle='--', alpha=0.7, label='Mirror line')
-                    right.set_xlabel('Y proxy (mm)')
-                    right.set_ylabel('Z (mm)')
-                    right.set_title('YZ before mirroring (±90)', fontsize=9)
-                    right.grid(True, alpha=0.3)
-                    right.legend(fontsize=7)
-                else:
-                    right.text(0.5, 0.5, 'YZ ±90 data unavailable', ha='center', va='center', transform=right.transAxes)
-                    right.set_title('YZ before mirroring (±90)', fontsize=9)
-
-                plt.tight_layout()
-                plt.savefig("10_polar_cubic_fits.png", dpi=150, bbox_inches='tight')
-                plt.close()
-                print("Added plot: 10_polar_cubic_fits.png")
-
-                if tip_angle_predicted is not None:
-                    sort_idx = np.argsort(delta_motor)
-                    plt.figure(figsize=(9, 6))
-                    plt.plot(delta_motor[sort_idx], tip_angle_avg[sort_idx], 'o', markersize=6, label='Measured')
-                    plt.plot(delta_motor[sort_idx], tip_angle_predicted[sort_idx], 's-', linewidth=2, markersize=4, color='red', label='Cubic Fit')
-                    plt.xlabel('B Motor Position')
-                    plt.ylabel('Tip Angle vs Vertical (deg)')
-                    plt.title(f'Tip Angle vs B Pull (R² = {tip_angle_r2:.4f})')
-                    plt.grid(True, alpha=0.3)
-                    plt.legend()
-                    plt.tight_layout()
-                    plt.savefig("11_tip_angle_vs_b_pull.png", dpi=150, bbox_inches='tight')
-                    plt.close()
-                    print("Added plot: 11_tip_angle_vs_b_pull.png")
-
-            # Save to Excel
-            excel_filename = f"{robot_name}_cubic_polar_coefficients.xlsx"
-            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
-                df_coefficients.to_excel(writer, sheet_name='Cubic_Coefficients', index=False)
-                df_fit_info.to_excel(writer, sheet_name='Fit_Quality', index=False)
-                df_equations.to_excel(writer, sheet_name='Equations', index=False)
-
-                df_raw_data = pd.DataFrame({
-                    'X_mm_raw': x_avg_raw,
-                    'Z_mm_raw': z_avg_raw,
-                    'R_planarX_mm_raw': r_coords_raw,
-                    'X_mm_ref_B0': x_avg,
-                    'Z_mm_ref_B0': z_avg,
-                    'R_planarX_mm_ref_B0': r_coords,
-                    'X_ref_mirror_line_mm': np.full_like(delta_motor, x_ref_mirror_line, dtype=float),
-                    'B_Pull': delta_motor,
-                    'Tip_Angle_deg': tip_angle_avg if tip_angle_avg is not None else np.full_like(delta_motor, np.nan, dtype=float)
-                })
-                df_raw_data.to_excel(writer, sheet_name='Raw_Data', index=False)
-
-                df_validation = pd.DataFrame({
-                    'B_Pull': delta_motor,
-                    'Actual_R_planarX_ref_B0': r_coords,
-                    'Predicted_R_planarX_ref_B0': r_predicted,
-                    'R_Error': r_predicted - r_coords,
-                    'X_ref_mirror_line_mm': np.full_like(delta_motor, x_ref_mirror_line, dtype=float),
-                    'Actual_Z_ref_B0': z_coords,
-                    'Predicted_Z_ref_B0': z_predicted,
-                    'Z_Error': z_predicted - z_coords,
-                    'Actual_Tip_Angle_deg': tip_angle_avg if tip_angle_avg is not None else np.full_like(delta_motor, np.nan, dtype=float),
-                    'Predicted_Tip_Angle_deg': tip_angle_predicted if tip_angle_predicted is not None else np.full_like(delta_motor, np.nan, dtype=float),
-                    'Tip_Angle_Error_deg': (tip_angle_predicted - tip_angle_avg) if tip_angle_predicted is not None else np.full_like(delta_motor, np.nan, dtype=float)
-                })
-                df_validation.to_excel(writer, sheet_name='Validation', index=False)
-
-                if y_off_coords_meas is not None and delta_motor_off_meas is not None:
-                    df_offplane_raw = pd.DataFrame({
-                        'B_Pull': delta_motor_off_meas,
-                        'Offplane_Y_mm_ref_mirrorline': y_off_coords_meas,
-                        'Offplane_Y_mm_raw_avg': offplane_tip_locations_final[:, 0] if offplane_tip_locations_final is not None else np.nan,
-                        'Y_ref_offplane_mirror_line_mm': np.full_like(delta_motor_off_meas, y_ref_offplane_mirror_line, dtype=float),
-                    })
-                    df_offplane_raw.to_excel(writer, sheet_name='Offplane_Raw', index=False)
-
-                    df_offplane_validation = pd.DataFrame({
-                        'B_Pull': delta_motor_off_meas,
-                        'Actual_Offplane_Y_mm_ref_mirrorline': y_off_coords_meas,
-                        'Predicted_Offplane_Y_mm_ref_mirrorline': y_off_predicted_meas if y_off_predicted_meas is not None else np.full_like(delta_motor_off_meas, np.nan, dtype=float),
-                        'Offplane_Y_Error': (y_off_predicted_meas - y_off_coords_meas) if y_off_predicted_meas is not None else np.full_like(delta_motor_off_meas, np.nan, dtype=float),
-                    })
-                    df_offplane_validation.to_excel(writer, sheet_name='Offplane_Validation', index=False)
-
-            print(f"\nCubic polar coefficients saved to: {excel_filename}")
-            print("Excel file contains base sheets: Cubic_Coefficients, Fit_Quality, Equations, Raw_Data, Validation")
-            if y_off_coords_meas is not None and delta_motor_off_meas is not None:
-                print("Additional sheets added: Offplane_Raw, Offplane_Validation")
-
-            # Save coefficients as numpy arrays
-            np.save(f"{robot_name}_r_cubic_coefficients.npy", r_coefficients)
-            np.save(f"{robot_name}_z_cubic_coefficients.npy", z_coefficients)
-            print(f"R cubic coefficients saved to: {robot_name}_r_cubic_coefficients.npy")
-            print(f"Z cubic coefficients saved to: {robot_name}_z_cubic_coefficients.npy")
-
-            if tip_angle_coefficients is not None:
-                np.save(f"{robot_name}_tip_angle_cubic_coefficients.npy", tip_angle_coefficients)
-                print(f"Tip-angle cubic coefficients saved to: {robot_name}_tip_angle_cubic_coefficients.npy")
-            if y_off_coefficients is not None:
-                np.save(f"{robot_name}_offplane_y_cubic_coefficients.npy", y_off_coefficients)
-                print(f"Off-plane Y linear-fit coefficients saved to: {robot_name}_offplane_y_cubic_coefficients.npy")
-
-            # Save the cubic model data
-            cubic_model_data = {
-                'selected_fit_model': fit_model,
-                'fit_models': {
-                    'r': r_model_descriptor,
-                    'z': z_model_descriptor,
-                    'tip_angle': tip_angle_model_descriptor,
-                    'offplane_y': y_off_model_descriptor,
-                },
-                'r_coefficients': r_coefficients,
-                'z_coefficients': z_coefficients,
-                'r_r2': r_r2,
-                'z_r2': z_r2,
-                'b_motor_range': [float(np.min(delta_motor)), float(np.max(delta_motor))],
-                'r_equation': r_equation,
-                'r_definition': 'signed planar transverse deflection in strict planar bending calibration (r = x referenced to the planar X mirror line)',
-                'z_equation': z_equation,
-                'tip_angle_coefficients': tip_angle_coefficients,
-                'tip_angle_r2': tip_angle_r2,
-                'tip_angle_equation': tip_angle_equation,
-                'offplane_y_coefficients': y_off_coefficients,
-                'offplane_y_r2': y_off_r2,
-                'offplane_y_equation': y_off_equation,
-                'reference_point': {
-                    'b_ref': float(delta_motor[zero_idx]),
-                    'x0_ref_mm': x0_ref,
-                    'z0_ref_mm': z0_ref,
-                    'radial_reference_b_mean_mm': b_ref_mirror_line_mean,
-                    'radial_reference_b_min_mm': b_ref_mirror_line_min,
-                    'radial_reference_b_max_mm': b_ref_mirror_line_max,
-                    'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'offplane_reference_b_mean_mm': b_ref_offplane_mirror_line_mean if np.isfinite(b_ref_offplane_mirror_line_mean) else None,
-                    'offplane_reference_b_min_mm': b_ref_offplane_mirror_line_min if np.isfinite(b_ref_offplane_mirror_line_min) else None,
-                    'offplane_reference_b_max_mm': b_ref_offplane_mirror_line_max if np.isfinite(b_ref_offplane_mirror_line_max) else None,
-                    'y_ref_offplane_mirror_line_mm': y_ref_offplane_mirror_line if y_ref_offplane_mirror_line is not None else None,
-                    'offplane_zero_point_offset_mm': None,
-                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); planar radial r is signed planar transverse deflection (r=x) referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations); off-plane y is referenced to the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate).'
+            for phase_name, ds in datasets.items():
+                b = ds['common_b']
+                r_coords = ds['r_coords']
+                z_coords = ds['z_coords']
+                tip_ang = ds['tip_angle']
+                r_model = self._fit_curve_model(b, r_coords, fit_model, f"r_{phase_name}")
+                z_model = self._fit_curve_model(b, z_coords, fit_model, f"z_{phase_name}")
+                r_cubic_model = self._fit_curve_model(b, r_coords, 'cubic', f"r_{phase_name}_avg_cubic")
+                z_cubic_model = self._fit_curve_model(b, z_coords, 'cubic', f"z_{phase_name}_avg_cubic")
+                if r_model is None or z_model is None:
+                    raise ValueError(f"Insufficient points for {phase_name} planar fit.")
+                r_pred = self._evaluate_curve_model(r_model, b)
+                z_pred = self._evaluate_curve_model(z_model, b)
+                angle_model = None
+                angle_pred = None
+                angle_r2 = None
+                angle_cubic_model = None
+                if has_tip_angle and np.any(np.isfinite(tip_ang)):
+                    valid_ang = np.isfinite(tip_ang)
+                    if np.sum(valid_ang) >= 4:
+                        angle_model = self._fit_curve_model(b[valid_ang], tip_ang[valid_ang], fit_model, f"tip_angle_{phase_name}")
+                        if angle_model is not None:
+                            angle_pred = self._evaluate_curve_model(angle_model, b[valid_ang])
+                            angle_r2 = r2_score_safe(tip_ang[valid_ang], angle_pred)
+                        angle_cubic_model = self._fit_curve_model(b[valid_ang], tip_ang[valid_ang], 'cubic', f"tip_angle_{phase_name}_avg_cubic")
+                off_model = None
+                off_pred = None
+                off_r2 = None
+                off_plot_b = None
+                off_plot_pred = None
+                if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
+                    off_b = ds['offplane_b']
+                    off_y = ds['offplane_y']
+                    if off_b.size >= 2:
+                        off_model = self._fit_curve_model(off_b, off_y, 'linear', f"offplane_y_{phase_name}")
+                        if off_model is not None:
+                            off_pred = self._evaluate_curve_model(off_model, off_b)
+                            off_r2 = r2_score_safe(off_y, off_pred)
+                            off_plot_b = ds['common_b']
+                            off_plot_pred = self._evaluate_curve_model(off_model, off_plot_b)
+                fit_results[phase_name] = {
+                    'dataset': ds,
+                    'r_model': r_model,
+                    'z_model': z_model,
+                    'r_cubic_model': r_cubic_model,
+                    'z_cubic_model': z_cubic_model,
+                    'tip_angle_model': angle_model,
+                    'tip_angle_cubic_model': angle_cubic_model,
+                    'offplane_y_model': off_model,
+                    'r_pred': r_pred,
+                    'z_pred': z_pred,
+                    'tip_angle_pred': angle_pred,
+                    'r_r2': r2_score_safe(r_coords, r_pred),
+                    'z_r2': r2_score_safe(z_coords, z_pred),
+                    'tip_angle_r2': angle_r2,
+                    'offplane_y_r2': off_r2,
+                    'offplane_plot_b': off_plot_b,
+                    'offplane_plot_pred': off_plot_pred,
                 }
-            }
-            with open(f"{robot_name}_cubic_polar_calibration.pkl", "wb") as f:
-                pickle.dump(cubic_model_data, f)
-            print(f"Complete cubic model saved to: {robot_name}_cubic_polar_calibration.pkl")
 
-            tip_angle_coeffs_list = tip_angle_coefficients.tolist() if tip_angle_coefficients is not None else None
-            y_off_coeffs_list = y_off_coefficients.tolist() if y_off_coefficients is not None else None
+            shared_tip_angle_model = self._average_polynomial_models(
+                [fr['tip_angle_cubic_model'] for fr in fit_results.values()],
+                value_name='tip_angle_avg',
+            )
+            shared_r_cubic_model = self._average_polynomial_models(
+                [fr['r_cubic_model'] for fr in fit_results.values()],
+                value_name='r_avg',
+            )
+            shared_z_cubic_model = self._average_polynomial_models(
+                [fr['z_cubic_model'] for fr in fit_results.values()],
+                value_name='z_avg',
+            )
+            shared_offplane_y_model = self._average_polynomial_models(
+                [fr['offplane_y_model'] for fr in fit_results.values()],
+                value_name='offplane_y_avg',
+            )
 
-            # Create prediction functions
-            def predict_tip_position(b_motor_pos):
-                """
-                Predict tip position in planar bending coordinates (r=x, z) given B motor position.
-                Parameters:
-                    b_motor_pos: float or array-like, B motor position(s)
-                Returns:
-                    r, z: predicted planar coordinates where r is signed transverse deflection (r=x) and z is axial position, referenced to the first measured B=0.0 tip location
-                """
-                b_motor = np.atleast_1d(b_motor_pos)
-                r_pred = self._evaluate_curve_model(r_model_descriptor, b_motor)
-                z_pred = self._evaluate_curve_model(z_model_descriptor, b_motor)
-                return r_pred, z_pred
+            shared_r_cubic_r2 = None
+            shared_z_cubic_r2 = None
+            shared_tip_angle_r2 = None
+            shared_offplane_y_r2 = None
+            if shared_r_cubic_model is not None:
+                r_b_all = []
+                r_y_all = []
+                for fr in fit_results.values():
+                    ds = fr['dataset']
+                    r_b_all.append(np.asarray(ds['common_b'], dtype=float))
+                    r_y_all.append(np.asarray(ds['r_coords'], dtype=float))
+                if r_b_all:
+                    r_b_all = np.concatenate(r_b_all)
+                    r_y_all = np.concatenate(r_y_all)
+                    shared_r_cubic_r2 = r2_score_safe(
+                        r_y_all,
+                        self._evaluate_curve_model(shared_r_cubic_model, r_b_all),
+                    )
 
-            def predict_tip_angle(b_motor_pos):
-                """Predict tip angle (deg vs vertical) from B motor position."""
-                if tip_angle_model_descriptor is None:
-                    return None
-                b_motor = np.atleast_1d(b_motor_pos)
-                return self._evaluate_curve_model(tip_angle_model_descriptor, b_motor)
+            if shared_z_cubic_model is not None:
+                z_b_all = []
+                z_y_all = []
+                for fr in fit_results.values():
+                    ds = fr['dataset']
+                    z_b_all.append(np.asarray(ds['common_b'], dtype=float))
+                    z_y_all.append(np.asarray(ds['z_coords'], dtype=float))
+                if z_b_all:
+                    z_b_all = np.concatenate(z_b_all)
+                    z_y_all = np.concatenate(z_y_all)
+                    shared_z_cubic_r2 = r2_score_safe(
+                        z_y_all,
+                        self._evaluate_curve_model(shared_z_cubic_model, z_b_all),
+                    )
 
-            def predict_offplane_y(b_motor_pos):
-                """Predict off-plane transverse displacement from ±90 mirrored-pair calibration."""
-                if y_off_coefficients is None:
-                    return None
-                b_motor = np.atleast_1d(b_motor_pos)
-                return self._evaluate_curve_model(y_off_model_descriptor, b_motor)
+            if shared_tip_angle_model is not None:
+                tip_b_all = []
+                tip_y_all = []
+                for fr in fit_results.values():
+                    ds = fr['dataset']
+                    valid_ang = np.isfinite(ds['tip_angle'])
+                    if np.any(valid_ang):
+                        tip_b_all.append(ds['common_b'][valid_ang])
+                        tip_y_all.append(ds['tip_angle'][valid_ang])
+                if tip_b_all:
+                    tip_b_all = np.concatenate(tip_b_all)
+                    tip_y_all = np.concatenate(tip_y_all)
+                    shared_tip_angle_r2 = r2_score_safe(
+                        tip_y_all,
+                        self._evaluate_curve_model(shared_tip_angle_model, tip_b_all),
+                    )
 
-            def predict_tip_position_cartesian(b_motor_pos):
-                """
-                Predict tip position in Cartesian coordinates given B motor position.
-                Parameters:
-                    b_motor_pos: float or array-like, B motor position(s)
-                Returns:
-                    x, y: predicted Cartesian coordinates referenced to the first measured B=0.0 tip location
-                """
-                r_pred, z_pred = predict_tip_position(b_motor_pos)
-                # For this application, assuming x = r and y = z
-                # (adjust this conversion based on your coordinate system)
-                x_pred = r_pred
-                y_pred = z_pred
-                return x_pred, y_pred
+            if shared_offplane_y_model is not None:
+                off_b_all = []
+                off_y_all = []
+                for fr in fit_results.values():
+                    ds = fr['dataset']
+                    if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
+                        off_b_all.append(np.asarray(ds['offplane_b'], dtype=float))
+                        off_y_all.append(np.asarray(ds['offplane_y'], dtype=float))
+                if off_b_all:
+                    off_b_all = np.concatenate(off_b_all)
+                    off_y_all = np.concatenate(off_y_all)
+                    shared_offplane_y_r2 = r2_score_safe(
+                        off_y_all,
+                        self._evaluate_curve_model(shared_offplane_y_model, off_b_all),
+                    )
 
-            # Save prediction functions
-            function_code = f'''import numpy as np
-# Cubic polynomial coefficients
-r_coefficients = {r_coefficients.tolist()}
-z_coefficients = {z_coefficients.tolist()}
-tip_angle_coefficients = {tip_angle_coeffs_list}
-offplane_y_coefficients = {y_off_coeffs_list}
+            legacy_ds = fit_results[legacy_phase]['dataset']
+            r_legacy_cubic_descriptor = self._fit_curve_model(legacy_ds['common_b'], legacy_ds['r_coords'], 'cubic', 'r')
+            z_legacy_cubic_descriptor = self._fit_curve_model(legacy_ds['common_b'], legacy_ds['z_coords'], 'cubic', 'z')
+            r_coefficients = np.asarray(r_legacy_cubic_descriptor['coefficients'], dtype=float)
+            z_coefficients = np.asarray(z_legacy_cubic_descriptor['coefficients'], dtype=float)
+            shared_r_cubic_coefficients = None
+            shared_z_cubic_coefficients = None
+            tip_angle_coefficients = None
+            y_off_coefficients = None
+            if shared_r_cubic_model is not None:
+                shared_r_cubic_coefficients = np.asarray(shared_r_cubic_model['coefficients'], dtype=float)
+            if shared_z_cubic_model is not None:
+                shared_z_cubic_coefficients = np.asarray(shared_z_cubic_model['coefficients'], dtype=float)
+            if shared_tip_angle_model is not None:
+                tip_angle_coefficients = np.asarray(shared_tip_angle_model['coefficients'], dtype=float)
+            if shared_offplane_y_model is not None:
+                y_off_coefficients = np.asarray(shared_offplane_y_model['coefficients'], dtype=float)
 
-def predict_tip_position(b_motor_pos):
-    """
-    Predict tip position in planar bending coordinates (r=x, z) given B motor position.
+            phase_metrics_rows = []
+            for phase_name, fr in fit_results.items():
+                phase_metrics_rows.extend([
+                    {'Phase': phase_name, 'Channel': 'r', 'R2': fr['r_r2'], 'Equation': fr['r_model'].get('equation')},
+                    {'Phase': phase_name, 'Channel': 'z', 'R2': fr['z_r2'], 'Equation': fr['z_model'].get('equation')},
+                    {'Phase': phase_name, 'Channel': 'tip_angle', 'R2': fr['tip_angle_r2'], 'Equation': None if fr['tip_angle_model'] is None else fr['tip_angle_model'].get('equation')},
+                ])
+            phase_metrics_rows.extend([
+                {'Phase': 'averaged', 'Channel': 'r_cubic', 'R2': shared_r_cubic_r2, 'Equation': None if shared_r_cubic_model is None else shared_r_cubic_model.get('equation')},
+                {'Phase': 'averaged', 'Channel': 'z_cubic', 'R2': shared_z_cubic_r2, 'Equation': None if shared_z_cubic_model is None else shared_z_cubic_model.get('equation')},
+                {'Phase': 'averaged', 'Channel': 'tip_angle', 'R2': shared_tip_angle_r2, 'Equation': None if shared_tip_angle_model is None else shared_tip_angle_model.get('equation')},
+                {'Phase': 'averaged', 'Channel': 'offplane_y', 'R2': shared_offplane_y_r2, 'Equation': None if shared_offplane_y_model is None else shared_offplane_y_model.get('equation')},
+            ])
+            pd.DataFrame(phase_metrics_rows).to_excel(f"{robot_name}_phase_fit_summary.xlsx", index=False)
 
-    Parameters:
-        b_motor_pos: float or array-like, B motor position(s)
+            if save_plots:
+                fig = plt.figure(figsize=(20, 15))
+                gs = fig.add_gridspec(3, 3)
+                ax_ref = fig.add_subplot(gs[0, 0])
+                ax_planar = fig.add_subplot(gs[0, 1])
+                ax_r_fit = fig.add_subplot(gs[0, 2])
+                ax_z_fit = fig.add_subplot(gs[1, 0])
+                ax_r_res = fig.add_subplot(gs[1, 1])
+                ax_z_res = fig.add_subplot(gs[1, 2])
+                ax_angle = fig.add_subplot(gs[2, 0])
+                ax_off = fig.add_subplot(gs[2, 1])
+                raw_subgs = gs[2, 2].subgridspec(1, 2, wspace=0.18)
+                ax_raw_xz = fig.add_subplot(raw_subgs[0, 0])
+                ax_raw_yz = fig.add_subplot(raw_subgs[0, 1])
 
-    Returns:
-        r, z: predicted planar coordinates where r is signed transverse deflection (r=x) and z is axial position, referenced to the first measured B=0.0 tip location
+                phase_colors = {
+                    'pull': '#79c7ff',
+                    'release': '#ffb38a',
+                }
+                phase_markers = {
+                    'pull': 'o',
+                    'release': 's',
+                }
+                avg_cubic_colors = {
+                    'r': '#8ef0d2',
+                    'z': '#c6f36b',
+                    'angle': '#ff8fb1',
+                    'offplane': '#9fd6ff',
+                }
 
-    Equations:
-        {r_equation}
-        {z_equation}
-    """
-    b_motor = np.atleast_1d(b_motor_pos)
-    # Calculate r and z using cubic polynomials
-    r_pred = np.polyval(r_coefficients, b_motor)
-    z_pred = np.polyval(z_coefficients, b_motor)
-    return r_pred, z_pred
+                all_b_ranges = []
+                all_tip_b = []
+                all_off_b = []
+                all_off_y = []
+                all_tip_y = []
+                for phase_name, fr in fit_results.items():
+                    ds = fr['dataset']
+                    color = phase_colors.get(phase_name, None)
+                    marker = phase_markers.get(phase_name, 'o')
+                    all_b_ranges.extend(ds['common_b'].astype(float).tolist())
 
-def predict_tip_angle(b_motor_pos):
-    """
-    Predict tip angle (deg vs vertical) given B motor position.
-    Returns None if angle calibration is unavailable.
-    """
-    if tip_angle_coefficients is None:
-        return None
-    b_motor = np.atleast_1d(b_motor_pos)
-    return np.polyval(tip_angle_coefficients, b_motor)
+                    ax_ref.plot(
+                        ds['x_raw'],
+                        ds['z_raw'],
+                        marker=marker,
+                        linestyle='-',
+                        color=color,
+                        linewidth=1.8,
+                        markersize=4,
+                        label=f"{phase_name} referenced",
+                    )
+                    ax_planar.plot(
+                        ds['r_coords'],
+                        ds['z_coords'],
+                        marker=marker,
+                        linestyle='-',
+                        color=color,
+                        linewidth=1.8,
+                        markersize=4,
+                        label=f"{phase_name} measured",
+                    )
+                    ax_planar.plot(
+                        fr['r_pred'],
+                        fr['z_pred'],
+                        '--',
+                        color=color,
+                        linewidth=2.0,
+                        label=f"{phase_name} fit",
+                    )
+                    ax_r_fit.plot(
+                        ds['common_b'],
+                        ds['r_coords'],
+                        marker=marker,
+                        linestyle='None',
+                        color=color,
+                        markersize=5,
+                        label=f"{phase_name} measured",
+                    )
+                    ax_r_fit.plot(
+                        ds['common_b'],
+                        fr['r_pred'],
+                        color=color,
+                        linewidth=2.0,
+                        marker=marker,
+                        markersize=3.5,
+                        label=f"{phase_name} {pretty_model_name(fr['r_model'])} fit",
+                    )
+                    ax_z_fit.plot(
+                        ds['common_b'],
+                        ds['z_coords'],
+                        marker=marker,
+                        linestyle='None',
+                        color=color,
+                        markersize=5,
+                        label=f"{phase_name} measured",
+                    )
+                    ax_z_fit.plot(
+                        ds['common_b'],
+                        fr['z_pred'],
+                        color=color,
+                        linewidth=2.0,
+                        marker=marker,
+                        markersize=3.5,
+                        label=f"{phase_name} {pretty_model_name(fr['z_model'])} fit",
+                    )
+                    ax_r_res.plot(
+                        ds['common_b'],
+                        ds['r_coords'] - fr['r_pred'],
+                        marker=marker,
+                        color=color,
+                        linewidth=1.6,
+                        label=f"{phase_name} residuals",
+                    )
+                    ax_z_res.plot(
+                        ds['common_b'],
+                        ds['z_coords'] - fr['z_pred'],
+                        marker=marker,
+                        color=color,
+                        linewidth=1.6,
+                        label=f"{phase_name} residuals",
+                    )
 
-def predict_offplane_y(b_motor_pos):
-    """
-    Predict off-plane transverse displacement (from ±90 mirrored-pair calibration) vs B motor position.
-    Returns None if off-plane calibration is unavailable.
-    """
-    if offplane_y_coefficients is None:
-        return None
-    b_motor = np.atleast_1d(b_motor_pos)
-    return np.polyval(offplane_y_coefficients, b_motor)
+                    raw_planar = ds.get('raw_planar_trajectories') or {}
+                    if 'C0' in raw_planar:
+                        ax_raw_xz.plot(
+                            raw_planar['C0']['x'],
+                            raw_planar['C0']['z'],
+                            marker='o',
+                            linestyle='-',
+                            linewidth=1.5,
+                            markersize=3.5,
+                            label=f"{phase_name} C=0",
+                        )
+                    if 'C180' in raw_planar:
+                        ax_raw_xz.plot(
+                            raw_planar['C180']['x'],
+                            raw_planar['C180']['z'],
+                            marker='o',
+                            linestyle='-',
+                            linewidth=1.5,
+                            markersize=3.5,
+                            label=f"{phase_name} C=180",
+                        )
 
-def predict_tip_position_cartesian(b_motor_pos):
-    """
-    Predict tip position in Cartesian coordinates given B motor position.
+                    raw_offplane = ds.get('raw_offplane_trajectories') or {}
+                    if 'C90' in raw_offplane:
+                        ax_raw_yz.plot(
+                            raw_offplane['C90']['y_proxy'],
+                            raw_offplane['C90']['z'],
+                            marker='o',
+                            linestyle='-',
+                            linewidth=1.5,
+                            markersize=3.5,
+                            label=f"{phase_name} C=+90",
+                        )
+                    if 'C-90' in raw_offplane:
+                        ax_raw_yz.plot(
+                            raw_offplane['C-90']['y_proxy'],
+                            raw_offplane['C-90']['z'],
+                            marker='o',
+                            linestyle='-',
+                            linewidth=1.5,
+                            markersize=3.5,
+                            label=f"{phase_name} C=-90",
+                        )
+                    if np.any(np.isfinite(ds['tip_angle'])):
+                        valid_ang = np.isfinite(ds['tip_angle'])
+                        all_tip_b.extend(ds['common_b'][valid_ang].astype(float).tolist())
+                        all_tip_y.extend(ds['tip_angle'][valid_ang].astype(float).tolist())
+                        ax_angle.plot(
+                            ds['common_b'][valid_ang],
+                            ds['tip_angle'][valid_ang],
+                            marker=marker,
+                            linestyle='None',
+                            color=color,
+                            markersize=5,
+                            label=f"{phase_name} measured",
+                        )
+                        if fr['tip_angle_model'] is not None and fr.get('tip_angle_pred') is not None:
+                            ax_angle.plot(
+                                ds['common_b'][valid_ang],
+                                fr['tip_angle_pred'],
+                                color=color,
+                                linewidth=2.0,
+                                marker=marker,
+                                markersize=3.5,
+                                label=f"{phase_name} {pretty_model_name(fr['tip_angle_model'])} fit",
+                            )
+                    if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
+                        off_b = np.asarray(ds['offplane_b'], dtype=float)
+                        off_y = np.asarray(ds['offplane_y'], dtype=float)
+                        all_off_b.extend(off_b.tolist())
+                        all_off_y.extend(off_y.tolist())
+                        ax_off.plot(
+                            off_b,
+                            off_y,
+                            marker=marker,
+                            linestyle='None',
+                            color=color,
+                            markersize=5,
+                            label=f"{phase_name} measured",
+                        )
 
-    Parameters:
-        b_motor_pos: float or array-like, B motor position(s)
+                if shared_tip_angle_model is not None and all_tip_b:
+                    tip_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
+                    ax_angle.plot(
+                        tip_plot_b,
+                        self._evaluate_curve_model(shared_tip_angle_model, tip_plot_b),
+                        color=avg_cubic_colors['angle'],
+                        linewidth=2.2,
+                        marker='s',
+                        markersize=3.0,
+                        markevery=max(1, len(tip_plot_b) // 22),
+                        label='Averaged cubic fit',
+                    )
 
-    Returns:
-        x, y: predicted Cartesian coordinates referenced to the first measured B=0.0 tip location
-    """
-    r_pred, z_pred = predict_tip_position(b_motor_pos)
-    # In strict planar bending calibration, r is already the referenced X deflection.
-    x_pred = r_pred  # or r_pred * cos(theta) if you have angular component
-    y_pred = z_pred  # axial coordinate
-    return x_pred, y_pred
+                if shared_r_cubic_model is not None and all_b_ranges:
+                    fit_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
+                    ax_r_fit.plot(
+                        fit_plot_b,
+                        self._evaluate_curve_model(shared_r_cubic_model, fit_plot_b),
+                        color=avg_cubic_colors['r'],
+                        linewidth=2.4,
+                        alpha=0.95,
+                        label='Averaged cubic fit',
+                    )
 
-# Example usage:
-# r, z = predict_tip_position(-1.2)           # Predict planar coordinates (r=x, z)
-# x, y = predict_tip_position_cartesian(-1.2) # Predict Cartesian coordinates
-# angle_deg = predict_tip_angle(-1.2)
-# y_off = predict_offplane_y(-1.2)
-'''
-            with open(f"{robot_name}_cubic_prediction_functions.py", "w") as f:
-                f.write(function_code)
-            print(f"Prediction functions saved to: {robot_name}_cubic_prediction_functions.py")
+                if shared_z_cubic_model is not None and all_b_ranges:
+                    fit_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
+                    ax_z_fit.plot(
+                        fit_plot_b,
+                        self._evaluate_curve_model(shared_z_cubic_model, fit_plot_b),
+                        color=avg_cubic_colors['z'],
+                        linewidth=2.4,
+                        alpha=0.95,
+                        label='Averaged cubic fit',
+                    )
 
-            print("\n" + "="*60)
-            print("PLANAR-BENDING FITTING COMPLETE!")
-            print("="*60)
-            print(f"Planar transverse-deflection equation (r=x) R² score: {r_r2:.6f}")
-            print(f"Axial equation R² score: {z_r2:.6f}")
-            if tip_angle_equation is not None:
-                print(f"Tip-angle equation R² score: {tip_angle_r2:.6f}")
-            if y_off_equation is not None:
-                print(f"Off-plane equation R² score: {y_off_r2:.6f}")
-            print(f"B motor fit range: {float(np.min(delta_motor)):.6f} to {float(np.max(delta_motor)):.6f}")
+                if shared_offplane_y_model is not None and all_b_ranges:
+                    off_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
+                    ax_off.plot(
+                        off_plot_b,
+                        self._evaluate_curve_model(shared_offplane_y_model, off_plot_b),
+                        color=avg_cubic_colors['offplane'],
+                        linewidth=2.2,
+                        label='Averaged linear fit (full B)',
+                    )
 
-            print(f"\nSelected equations fitted:")
-            print(f"R: {r_equation}")
-            print(f"Z: {z_equation}")
-            if tip_angle_equation is not None:
-                print(f"Tip angle: {tip_angle_equation}")
-            if y_off_equation is not None:
-                print(f"Off-plane Y: {y_off_equation}")
+                mirror_x_vals = [
+                    float(fr['dataset']['x_ref_mirror_line_mm'])
+                    for fr in fit_results.values()
+                    if fr['dataset'].get('x_ref_mirror_line_mm') is not None
+                ]
+                if mirror_x_vals:
+                    ax_raw_xz.axvline(float(np.mean(mirror_x_vals)), color='white', linestyle='--', linewidth=1.5, alpha=0.8, label='Mirror line')
+                mirror_y_vals = [
+                    float(fr['dataset']['y_ref_offplane_mirror_line_mm'])
+                    for fr in fit_results.values()
+                    if fr['dataset'].get('y_ref_offplane_mirror_line_mm') is not None
+                ]
+                if mirror_y_vals:
+                    ax_raw_yz.axvline(float(np.mean(mirror_y_vals)), color='white', linestyle='--', linewidth=1.5, alpha=0.8, label='Mirror line')
 
-            print(f"\nSaved files:")
-            print(f" - {robot_name}_cubic_polar_calibration.pkl (complete model)")
-            print(f" - {robot_name}_cubic_prediction_functions.py (ready-to-use functions)")
-            print(f" - {robot_name}_r_cubic_coefficients.npy & {robot_name}_z_cubic_coefficients.npy")
-            print(f" - {robot_name}_cubic_polar_coefficients.xlsx (detailed Excel file)")
-            print(f" - 10_polar_cubic_fits.png (comprehensive plots)")
-            if tip_angle_equation is not None:
-                print(f" - {robot_name}_tip_angle_cubic_coefficients.npy")
-                print(f" - 11_tip_angle_vs_b_pull.png")
-            if y_off_equation is not None:
-                print(f" - {robot_name}_offplane_y_cubic_coefficients.npy")
+                max_r_r2 = max(fr['r_r2'] for fr in fit_results.values()) if fit_results else float('nan')
+                max_z_r2 = max(fr['z_r2'] for fr in fit_results.values()) if fit_results else float('nan')
+                ax_ref.set_title('Referenced Planar Trajectory (X vs Z)')
+                ax_planar.set_title('Planar Bending Coordinates (r=x, z)')
+                ax_r_fit.set_title(f'Planar X Deflection vs Motor (phase fit max R² = {max_r_r2:.4f}; avg cubic R² = {0.0 if shared_r_cubic_r2 is None else shared_r_cubic_r2:.4f})')
+                ax_z_fit.set_title(f'Axial Position vs Motor (phase fit max R² = {max_z_r2:.4f}; avg cubic R² = {0.0 if shared_z_cubic_r2 is None else shared_z_cubic_r2:.4f})')
+                ax_r_res.set_title('Planar X Deflection Fit Residuals')
+                ax_z_res.set_title('Axial Fit Residuals')
+                max_angle_r2 = max(
+                    (fr['tip_angle_r2'] for fr in fit_results.values() if fr['tip_angle_r2'] is not None),
+                    default=float('nan'),
+                )
+                ax_angle.set_title(f'Attack Angle vs Motor (phase fit max R² = {0.0 if not np.isfinite(max_angle_r2) else max_angle_r2:.4f}; avg cubic R² = {0.0 if shared_tip_angle_r2 is None else shared_tip_angle_r2:.4f})')
+                ax_off.set_title(f'B-offset Linear Fit (full B, averaged) (R² = {0.0 if shared_offplane_y_r2 is None else shared_offplane_y_r2:.4f})')
+                ax_raw_xz.set_title('XZ before mirroring', fontsize=11)
+                ax_raw_yz.set_title('YZ before mirroring (±90)', fontsize=11)
 
-            # Step 9: Save final results
-            print("Saving final calibration results...")
+                for ax in [ax_ref, ax_planar, ax_raw_xz, ax_raw_yz]:
+                    ax.axis('equal')
+                for ax in [ax_ref, ax_planar, ax_r_fit, ax_z_fit, ax_r_res, ax_z_res, ax_angle, ax_off, ax_raw_xz, ax_raw_yz]:
+                    ax.legend(fontsize=8)
+                ax_r_res.axhline(0.0, color='white', linestyle='--', linewidth=1.2, alpha=0.55)
+                ax_z_res.axhline(0.0, color='white', linestyle='--', linewidth=1.2, alpha=0.55)
 
-            # Save the cubic model and function
+                ax_ref.set_xlabel('X transverse deflection (mm, ref. B=0)')
+                ax_ref.set_ylabel('Z axial position (mm, ref. B=0)')
+                ax_planar.set_xlabel('R = X (signed transverse deflection, mm)')
+                ax_planar.set_ylabel('Z (axial) Position (mm)')
+                ax_r_fit.set_xlabel('B Motor Position')
+                ax_r_fit.set_ylabel('R = X (signed transverse deflection, mm)')
+                ax_z_fit.set_xlabel('B Motor Position')
+                ax_z_fit.set_ylabel('Z (axial) Position (mm)')
+                ax_r_res.set_xlabel('B Motor Position')
+                ax_r_res.set_ylabel('R = X Residuals (mm)')
+                ax_z_res.set_xlabel('B Motor Position')
+                ax_z_res.set_ylabel('Z Residuals (mm)')
+                ax_angle.set_xlabel('B Motor Position')
+                ax_angle.set_ylabel('Tip Angle vs Vertical (deg)')
+                ax_off.set_xlabel('B Motor Position')
+                ax_off.set_ylabel("Off-plane Y' (mm, ref.)")
+                ax_raw_xz.set_xlabel('X (mm)')
+                ax_raw_xz.set_ylabel('Z (mm)')
+                ax_raw_yz.set_xlabel('Y proxy (mm)')
+                ax_raw_yz.set_ylabel('Z (mm)')
+                fig.tight_layout()
+                self._apply_dark_theme_to_figure(fig)
+                fig.savefig('10_dual_phase_fits.png', dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
+                plt.close(fig)
+
+                xz_fig, xz_ax = plt.subplots(figsize=(8, 8))
+                for phase_name, fr in fit_results.items():
+                    ds = fr['dataset']
+                    color = phase_colors.get(phase_name, None)
+                    xz_ax.plot(
+                        ds['r_coords'],
+                        ds['z_coords'],
+                        'o-',
+                        color=color,
+                        linewidth=1.8,
+                        markersize=4,
+                        label=f"{phase_name} measured",
+                    )
+                    xz_ax.plot(
+                        fr['r_pred'],
+                        fr['z_pred'],
+                        '--',
+                        color=color,
+                        linewidth=2.0,
+                        label=f"{phase_name} fit",
+                    )
+                    xz_ax.scatter(
+                        ds['r_coords'][0],
+                        ds['z_coords'][0],
+                        color=color,
+                        marker='s',
+                        s=45,
+                        zorder=3,
+                    )
+                xz_ax.set_title('X-Z trajectory hysteresis')
+                xz_ax.set_xlabel('X / R (mm)')
+                xz_ax.set_ylabel('Z (mm)')
+                xz_ax.axis('equal')
+                xz_ax.legend(fontsize=8)
+                xz_fig.tight_layout()
+                self._apply_dark_theme_to_figure(xz_fig)
+                xz_fig.savefig('11_xz_trajectory_hysteresis.png', dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
+                plt.close(xz_fig)
+
+            fit_models_by_phase = {}
+            for phase, fr in fit_results.items():
+                fit_models_by_phase[phase] = {
+                    'r': fr['r_model'],
+                    'z': fr['z_model'],
+                    'tip_angle': fr['tip_angle_model'],
+                    'tip_angle_avg_cubic': shared_tip_angle_model,
+                    'offplane_y': shared_offplane_y_model,
+                    'r_avg_cubic': shared_r_cubic_model,
+                    'z_avg_cubic': shared_z_cubic_model,
+                }
+            default_fit_models = fit_models_by_phase[legacy_phase]
+
             cubic_calibration_data = {
                 'selected_fit_model': fit_model,
-                'fit_models': {
-                    'r': r_model_descriptor,
-                    'z': z_model_descriptor,
-                    'tip_angle': tip_angle_model_descriptor,
-                    'offplane_y': y_off_model_descriptor,
+                'default_phase_for_legacy_access': legacy_phase,
+                'fit_models': default_fit_models,
+                'fit_models_by_phase': fit_models_by_phase,
+                'shared_aux_fit_models': {
+                    'r_avg_cubic': shared_r_cubic_model,
+                    'z_avg_cubic': shared_z_cubic_model,
+                    'tip_angle_avg_cubic': shared_tip_angle_model,
+                    'offplane_y': shared_offplane_y_model,
+                },
+                'phase_fit_metrics': {
+                    phase: {
+                        'r_r2': fr['r_r2'],
+                        'z_r2': fr['z_r2'],
+                        'r_avg_cubic_r2': shared_r_cubic_r2,
+                        'z_avg_cubic_r2': shared_z_cubic_r2,
+                        'tip_angle_r2': fr['tip_angle_r2'],
+                        'tip_angle_avg_cubic_r2': shared_tip_angle_r2,
+                        'offplane_y_r2': shared_offplane_y_r2,
+                    }
+                    for phase, fr in fit_results.items()
                 },
                 'r_coefficients': r_coefficients,
                 'z_coefficients': z_coefficients,
-                'r_r2': r_r2,
-                'z_r2': z_r2,
-                'b_motor_range': [float(np.min(delta_motor)), float(np.max(delta_motor))],
-                'r_equation': r_equation,
-                'r_definition': 'signed planar transverse deflection in strict planar bending calibration (r = x referenced to the planar X mirror line)',
-                'z_equation': z_equation,
+                'shared_r_cubic_coefficients': shared_r_cubic_coefficients,
+                'shared_z_cubic_coefficients': shared_z_cubic_coefficients,
                 'tip_angle_coefficients': tip_angle_coefficients,
-                'tip_angle_r2': tip_angle_r2,
-                'tip_angle_equation': tip_angle_equation,
                 'offplane_y_coefficients': y_off_coefficients,
-                'offplane_y_r2': y_off_r2,
-                'offplane_y_equation': y_off_equation,
-                'reference_point': {
-                    'b_ref': float(delta_motor[zero_idx]),
-                    'x0_ref_mm': x0_ref,
-                    'z0_ref_mm': z0_ref,
-                    'radial_reference_b_mean_mm': b_ref_mirror_line_mean,
-                    'radial_reference_b_min_mm': b_ref_mirror_line_min,
-                    'radial_reference_b_max_mm': b_ref_mirror_line_max,
-                    'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'offplane_reference_b_mean_mm': b_ref_offplane_mirror_line_mean if np.isfinite(b_ref_offplane_mirror_line_mean) else None,
-                    'offplane_reference_b_min_mm': b_ref_offplane_mirror_line_min if np.isfinite(b_ref_offplane_mirror_line_min) else None,
-                    'offplane_reference_b_max_mm': b_ref_offplane_mirror_line_max if np.isfinite(b_ref_offplane_mirror_line_max) else None,
-                    'y_ref_offplane_mirror_line_mm': y_ref_offplane_mirror_line if y_ref_offplane_mirror_line is not None else None,
-                    'offplane_zero_point_offset_mm': None,
-                    'reference_definition': 'z is referenced using the first averaged B=0.0 point (or nearest B in averaged data); planar radial r is signed planar transverse deflection (r=x) referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations); off-plane y is referenced to the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate).'
-                }
             }
             with open(f"{robot_name}_cubic_calibration.pkl", "wb") as f:
                 pickle.dump(cubic_calibration_data, f)
-            print(f"\nCubic calibration saved to {robot_name}_cubic_calibration.pkl")
 
-            # Create prediction functions that can be called with B motor positions
-            def predict_tip_position_from_b(b_motor_pos):
-                """
-                Predict tip position in planar bending coordinates (r=x, z) given B motor position.
-                Parameters:
-                    b_motor_pos: float or array-like, B motor position(s)
-                Returns:
-                    r, z: predicted planar coordinates where r is signed transverse deflection (r=x) and z is axial position, referenced to the first measured B=0.0 tip location
-                """
-                # Ensure inputs are arrays
-                b_motor = np.atleast_1d(b_motor_pos)
-                r_pred = self._evaluate_curve_model(r_model_descriptor, b_motor)
-                z_pred = self._evaluate_curve_model(z_model_descriptor, b_motor)
-                return r_pred, z_pred
-
-            def predict_tip_angle_from_b(b_motor_pos):
-                if tip_angle_model_descriptor is None:
-                    return None
-                b_motor = np.atleast_1d(b_motor_pos)
-                return self._evaluate_curve_model(tip_angle_model_descriptor, b_motor)
-
-            def predict_offplane_y_from_b(b_motor_pos):
-                if y_off_model_descriptor is None:
-                    return None
-                b_motor = np.atleast_1d(b_motor_pos)
-                return self._evaluate_curve_model(y_off_model_descriptor, b_motor)
-
-            def predict_cartesian_from_b(b_motor_pos):
-                """
-                Predict tip position in Cartesian coordinates given B motor position.
-                Parameters:
-                    b_motor_pos: float or array-like, B motor position(s)
-                Returns:
-                    x, y: predicted Cartesian coordinates referenced to the first measured B=0.0 tip location
-                """
-                r_pred, z_pred = predict_tip_position_from_b(b_motor_pos)
-                # Convert to Cartesian (adjust based on your coordinate system)
-                x_pred = r_pred  # or use trigonometric conversion if needed
-                y_pred = z_pred
-                return x_pred, y_pred
-
-            # Save the function definition as a string
-            function_code = f'''import numpy as np
+            predictor_code = """import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-R_MODEL = {json.dumps(r_model_descriptor, indent=12)}
-Z_MODEL = {json.dumps(z_model_descriptor, indent=12)}
-TIP_ANGLE_MODEL = {json.dumps(tip_angle_model_descriptor, indent=12)}
-OFFPLANE_Y_MODEL = {json.dumps(y_off_model_descriptor, indent=12)}
+FIT_MODELS_BY_PHASE = {fit_models_json}
+DEFAULT_PHASE = {default_phase_json}
 
-def _polyval(coeffs, b_vals):
-    return np.polyval(np.asarray(coeffs, dtype=float), np.asarray(b_vals, dtype=float))
+def _polyval(c, b):
+    return np.polyval(np.asarray(c, dtype=float), np.asarray(b, dtype=float))
 
 def _evaluate_curve_model(model_descriptor, b_vals):
     if model_descriptor is None:
         return None
     b_arr = np.asarray(b_vals, dtype=float)
-    model_type = str(model_descriptor.get("model_type", "polynomial")).lower()
-    if model_type == "polynomial":
-        coeffs = model_descriptor.get("coefficients")
-        if coeffs is None:
-            raise ValueError("Polynomial model descriptor missing coefficients.")
-        return _polyval(coeffs, b_arr)
-    if model_type == "pchip":
-        x_knots = model_descriptor.get("x_knots")
-        y_knots = model_descriptor.get("y_knots")
-        if x_knots is None or y_knots is None:
-            raise ValueError("PCHIP model descriptor missing knots.")
-        interp = PchipInterpolator(np.asarray(x_knots, dtype=float), np.asarray(y_knots, dtype=float), extrapolate=True)
-        return interp(b_arr)
-    raise ValueError(f"Unsupported model_type: {{model_type}}")
+    model_type = str(model_descriptor.get('model_type', 'polynomial')).lower()
+    if model_type == 'polynomial':
+        return _polyval(model_descriptor.get('coefficients'), b_arr)
+    if model_type == 'pchip':
+        return PchipInterpolator(np.asarray(model_descriptor['x_knots'], dtype=float), np.asarray(model_descriptor['y_knots'], dtype=float), extrapolate=True)(b_arr)
+    raise ValueError(f'Unsupported model_type: {{model_type}}')
 
-def predict_tip_position_from_b(b_motor_pos):
+def _get_phase_models(phase=None):
+    phase_key = DEFAULT_PHASE if phase is None else str(phase).lower()
+    if phase_key not in FIT_MODELS_BY_PHASE:
+        raise KeyError(f'Unknown phase {{phase_key}}. Available: {{list(FIT_MODELS_BY_PHASE)}}')
+    return FIT_MODELS_BY_PHASE[phase_key]
+
+def predict_tip_position_from_b(b_motor_pos, phase=None):
+    m = _get_phase_models(phase)
     b_motor = np.atleast_1d(b_motor_pos)
-    r_pred = _evaluate_curve_model(R_MODEL, b_motor)
-    z_pred = _evaluate_curve_model(Z_MODEL, b_motor)
-    return r_pred, z_pred
+    return _evaluate_curve_model(m['r'], b_motor), _evaluate_curve_model(m['z'], b_motor)
 
-def predict_tip_angle_from_b(b_motor_pos):
-    if TIP_ANGLE_MODEL is None:
+def predict_avg_cubic_tip_position_from_b(b_motor_pos, phase=None):
+    m = _get_phase_models(phase)
+    b_motor = np.atleast_1d(b_motor_pos)
+    return _evaluate_curve_model(m['r_avg_cubic'], b_motor), _evaluate_curve_model(m['z_avg_cubic'], b_motor)
+
+def predict_tip_angle_from_b(b_motor_pos, phase=None):
+    m = _get_phase_models(phase)
+    if m.get('tip_angle') is None:
         return None
-    b_motor = np.atleast_1d(b_motor_pos)
-    return _evaluate_curve_model(TIP_ANGLE_MODEL, b_motor)
+    return _evaluate_curve_model(m['tip_angle'], np.atleast_1d(b_motor_pos))
 
-def predict_offplane_y_from_b(b_motor_pos):
-    if OFFPLANE_Y_MODEL is None:
+def predict_avg_cubic_tip_angle_from_b(b_motor_pos, phase=None):
+    m = _get_phase_models(phase)
+    if m.get('tip_angle_avg_cubic') is None:
         return None
-    b_motor = np.atleast_1d(b_motor_pos)
-    return _evaluate_curve_model(OFFPLANE_Y_MODEL, b_motor)
+    return _evaluate_curve_model(m['tip_angle_avg_cubic'], np.atleast_1d(b_motor_pos))
 
-def predict_cartesian_from_b(b_motor_pos):
-    r_pred, z_pred = predict_tip_position_from_b(b_motor_pos)
-    x_pred = r_pred
-    y_pred = z_pred
-    return x_pred, y_pred
+def predict_offplane_y_from_b(b_motor_pos, phase=None):
+    m = _get_phase_models(phase)
+    if m.get('offplane_y') is None:
+        return None
+    return _evaluate_curve_model(m['offplane_y'], np.atleast_1d(b_motor_pos))
 
-def predict_tip_position_from_delta(delta_motor_pos):
-    return predict_tip_position_from_b(delta_motor_pos)
-
-def predict_cartesian_from_delta(delta_motor_pos):
-    return predict_cartesian_from_b(delta_motor_pos)
-
-def predict_tip_angle_from_delta(delta_motor_pos):
-    return predict_tip_angle_from_b(delta_motor_pos)
-
-def predict_offplane_y_from_delta(delta_motor_pos):
-    return predict_offplane_y_from_b(delta_motor_pos)
-'''
+def predict_cartesian_from_b(b_motor_pos, phase=None):
+    return predict_tip_position_from_b(b_motor_pos, phase=phase)
+""".format(
+                fit_models_json=json.dumps(fit_models_by_phase, indent=2),
+                default_phase_json=json.dumps(legacy_phase),
+            )
             with open(f"{robot_name}_cubic_prediction_functions.py", "w") as f:
-                f.write(function_code)
-            print(f"Prediction function saved to {robot_name}_cubic_prediction_functions.py")
-
-            # Save coefficient arrays for easy loading
-            np.save(f"{robot_name}_r_cubic_coefficients.npy", r_coefficients)
-            np.save(f"{robot_name}_z_cubic_coefficients.npy", z_coefficients)
-            if tip_angle_coefficients is not None:
-                np.save(f"{robot_name}_tip_angle_cubic_coefficients.npy", tip_angle_coefficients)
-            if y_off_coefficients is not None:
-                np.save(f"{robot_name}_offplane_y_cubic_coefficients.npy", y_off_coefficients)
-
-            print(f"Cubic coefficients saved to {robot_name}_r_cubic_coefficients.npy and {robot_name}_z_cubic_coefficients.npy")
-
-            print("\n" + "="*60)
-            print("POSTPROCESSING COMPLETE!")
-            print("="*60)
-            print(f"Final cubic calibration completed")
-            print(f"Planar transverse-deflection fit (r=x) R² score: {r_r2:.6f}")
-            print(f"Axial fit R² score: {z_r2:.6f}")
-            if tip_angle_equation is not None:
-                print(f"Tip-angle fit R² score: {tip_angle_r2:.6f}")
-            if y_off_equation is not None:
-                print(f"Off-plane fit R² score: {y_off_r2:.6f}")
-            print(f"B motor fit range: {float(np.min(delta_motor)):.6f} to {float(np.max(delta_motor)):.6f}")
-
-            print(f"\nSaved files:")
-            print(f" - {robot_name}_cubic_calibration.pkl (complete calibration data)")
-            print(f" - {robot_name}_cubic_prediction_functions.py (ready-to-use Python functions)")
-            print(f" - {robot_name}_r_cubic_coefficients.npy & {robot_name}_z_cubic_coefficients.npy")
-            print(f" - {robot_name}_cubic_polar_coefficients.xlsx (Excel file with detailed data)")
-            print(f" - 10_polar_cubic_fits.png (comprehensive visualization)")
-            if tip_angle_equation is not None:
-                print(f" - {robot_name}_tip_angle_cubic_coefficients.npy")
-                print(f" - 11_tip_angle_vs_b_pull.png")
-            if y_off_equation is not None:
-                print(f" - {robot_name}_offplane_y_cubic_coefficients.npy")
-
-            # Print the cubic equations for reference
-            print(f"\nCubic equations fitted:")
-            print(f"Planar transverse deflection (r=x): {r_equation}")
-            print(f"Axial: {z_equation}")
-            if tip_angle_equation is not None:
-                print(f"Tip angle: {tip_angle_equation}")
-            if y_off_equation is not None:
-                print(f"Off-plane Y: {y_off_equation}")
-
-            # Print ready-to-use function example
-            print(f"\nReady-to-use functions:")
-            print("# Load the calibration:")
-            print(f"# import pickle")
-            print(f"# with open('{robot_name}_cubic_calibration.pkl', 'rb') as f:")
-            print(f"# calibration = pickle.load(f)")
-            print("# ")
-            print("# Use the functions:")
-            print("# r, z = predict_tip_position_from_b(-1.2)")
-            print("# x, y = predict_cartesian_from_b(-1.2)")
-            print("# angle_deg = predict_tip_angle_from_b(-1.2)")
-            print("# y_off = predict_offplane_y_from_b(-1.2)")
-
-            # Step 10: Export calibration data for G-code generation
-            print("Exporting calibration data for G-code generation...")
-
-            # Create comprehensive Excel export
-            offplane_coeff_rows = []
-            if y_off_coefficients is not None:
-                # Off-plane is currently linear (order 1), but keep generic handling by length.
-                off_powers = list(range(len(y_off_coefficients) - 1, -1, -1))
-                for pwr, coef in zip(off_powers, y_off_coefficients):
-                    offplane_coeff_rows.append(
-                        {'Coordinate': 'Offplane_Y_mm', 'Power': int(pwr), 'Coefficient': float(coef)}
-                    )
-            else:
-                offplane_coeff_rows.extend([
-                    {'Coordinate': 'Offplane_Y_mm', 'Power': 1, 'Coefficient': np.nan},
-                    {'Coordinate': 'Offplane_Y_mm', 'Power': 0, 'Coefficient': np.nan},
-                ])
-
-            calibration_summary = {
-                'Calibration_Info': pd.DataFrame([
-                    {'Parameter': 'Robot_Name', 'Value': robot_name},
-                    {'Parameter': 'Calibration_Date', 'Value': pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')},
-                    {'Parameter': 'R_Equation_R_Squared', 'Value': r_r2},
-                    {'Parameter': 'Z_Equation_R_Squared', 'Value': z_r2},
-                    {'Parameter': 'Tip_Angle_Equation_R_Squared', 'Value': tip_angle_r2},
-                    {'Parameter': 'Offplane_Y_Equation_R_Squared', 'Value': y_off_r2},
-                    {'Parameter': 'B_Motor_Min', 'Value': float(np.min(delta_motor))},
-                    {'Parameter': 'B_Motor_Max', 'Value': float(np.max(delta_motor))},
-                    {'Parameter': 'Pixel_to_MM_Scale', 'Value': pixel_to_mm_scale},
-                ]),
-                'Cubic_Coefficients': pd.DataFrame([
-                    {'Coordinate': 'R (signed planar X deflection, r=x)', 'Power': 3, 'Coefficient': r_coefficients[0]},
-                    {'Coordinate': 'R (signed planar X deflection, r=x)', 'Power': 2, 'Coefficient': r_coefficients[1]},
-                    {'Coordinate': 'R (signed planar X deflection, r=x)', 'Power': 1, 'Coefficient': r_coefficients[2]},
-                    {'Coordinate': 'R (signed planar X deflection, r=x)', 'Power': 0, 'Coefficient': r_coefficients[3]},
-                    {'Coordinate': 'Z', 'Power': 3, 'Coefficient': z_coefficients[0]},
-                    {'Coordinate': 'Z', 'Power': 2, 'Coefficient': z_coefficients[1]},
-                    {'Coordinate': 'Z', 'Power': 1, 'Coefficient': z_coefficients[2]},
-                    {'Coordinate': 'Z', 'Power': 0, 'Coefficient': z_coefficients[3]},
-                    {'Coordinate': 'Tip_Angle_deg', 'Power': 3, 'Coefficient': tip_angle_coefficients[0] if tip_angle_coefficients is not None else np.nan},
-                    {'Coordinate': 'Tip_Angle_deg', 'Power': 2, 'Coefficient': tip_angle_coefficients[1] if tip_angle_coefficients is not None else np.nan},
-                    {'Coordinate': 'Tip_Angle_deg', 'Power': 1, 'Coefficient': tip_angle_coefficients[2] if tip_angle_coefficients is not None else np.nan},
-                    {'Coordinate': 'Tip_Angle_deg', 'Power': 0, 'Coefficient': tip_angle_coefficients[3] if tip_angle_coefficients is not None else np.nan},
-                    *offplane_coeff_rows,
-                ]),
-                'Working_Ranges': pd.DataFrame([
-                    {'Parameter': 'B_Motor_Min', 'Value': delta_motor.min()},
-                    {'Parameter': 'B_Motor_Max', 'Value': delta_motor.max()},
-                    {'Parameter': 'R_planarX_Min_mm', 'Value': r_coords.min()},
-                    {'Parameter': 'R_planarX_Max_mm', 'Value': r_coords.max()},
-                    {'Parameter': 'Z_Min_mm', 'Value': z_coords.min()},
-                    {'Parameter': 'Z_Max_mm', 'Value': z_coords.max()},
-                    {'Parameter': 'Tip_Angle_Min_deg', 'Value': tip_angle_avg.min() if tip_angle_avg is not None else np.nan},
-                    {'Parameter': 'Tip_Angle_Max_deg', 'Value': tip_angle_avg.max() if tip_angle_avg is not None else np.nan},
-                    {'Parameter': 'Offplane_Y_Min_mm', 'Value': (y_off_full_predicted.min() if y_off_full_predicted is not None else (y_off_coords_meas.min() if y_off_coords_meas is not None else np.nan))},
-                    {'Parameter': 'Offplane_Y_Max_mm', 'Value': (y_off_full_predicted.max() if y_off_full_predicted is not None else (y_off_coords_meas.max() if y_off_coords_meas is not None else np.nan))},
-                ])
-            }
-
-            # Export to Excel
-            excel_filename = f"{robot_name}_calibration_for_gcode.xlsx"
-            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
-                for sheet_name, df in calibration_summary.items():
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-            # Export JSON for easy Python loading
-            b_min = float(np.min(delta_motor))
-            b_max = float(np.max(delta_motor))
-            b_cmd_min = min(b_min, b_max)
-            b_cmd_max = max(b_min, b_max)
+                f.write(predictor_code)
 
             gcode_calibration_data = {
                 'robot_name': robot_name,
                 'calibration_date': pd.Timestamp.now().isoformat(),
                 'selected_fit_model': fit_model,
-                'orientation_map': {
-                    '0': 'C=0 deg',
-                    '1': 'C=180 deg',
-                    '2': 'C=+90 deg',
-                    '3': 'C=-90 deg'
+                'default_phase_for_legacy_access': legacy_phase,
+                'orientation_map': {'0': 'C=0 deg', '1': 'C=180 deg', '2': 'C=+90 deg', '3': 'C=-90 deg'},
+                'motion_phase_map': {'0': 'pull', '1': 'release'},
+                'fit_models': default_fit_models,
+                'fit_models_by_phase': fit_models_by_phase,
+                'shared_aux_fit_models': {
+                    'r_avg_cubic': shared_r_cubic_model,
+                    'z_avg_cubic': shared_z_cubic_model,
+                    'tip_angle_avg_cubic': shared_tip_angle_model,
+                    'offplane_y': shared_offplane_y_model,
                 },
-                'reference_frame': {
-                    'type': 'B0_tip_referenced',
-                    'b_reference': float(delta_motor[zero_idx]),
-                    'x0_ref_mm': x0_ref,
-                    'z0_ref_mm': z0_ref,
-                    'radial_reference_b_mean_mm': b_ref_mirror_line_mean,
-                    'radial_reference_b_min_mm': b_ref_mirror_line_min,
-                    'radial_reference_b_max_mm': b_ref_mirror_line_max,
-                    'x_ref_mirror_line_mm': x_ref_mirror_line,
-                    'offplane_reference_b_mean_mm': b_ref_offplane_mirror_line_mean if np.isfinite(b_ref_offplane_mirror_line_mean) else None,
-                    'offplane_reference_b_min_mm': b_ref_offplane_mirror_line_min if np.isfinite(b_ref_offplane_mirror_line_min) else None,
-                    'offplane_reference_b_max_mm': b_ref_offplane_mirror_line_max if np.isfinite(b_ref_offplane_mirror_line_max) else None,
-                    'y_ref_offplane_mirror_line_mm': y_ref_offplane_mirror_line if y_ref_offplane_mirror_line is not None else None,
-                    'offplane_zero_point_offset_mm': None,
-                    'r_definition': 'signed planar transverse deflection (r = x) in strict planar bending calibration',
-                    'notes': 'Z is shifted so the first averaged B=0.0 tip is z=0 (or nearest B fallback). Planar radial r is defined as signed planar transverse deflection (r=x) and referenced to the planar X mirror line (mean unmirrored X across all measured B values and both orientations).',
-                    'offplane_notes': 'Off-plane displacement is derived from ±90° rotations using mirrored/averaged transverse coordinate only; tip Z from ±90° orientations is intentionally neglected. Off-plane Y zero is the ±90 Y-proxy mirror line (mean unmirrored ±90 transverse coordinate), not B=0.',
-                    'offplane_fit_notes': '±90 data acquired over first 40% of B pull steps; off-plane linear fit evaluated over full B range.'
+                'phase_fit_metrics': {
+                    phase: {
+                        'r_r_squared': fr['r_r2'],
+                        'z_r_squared': fr['z_r2'],
+                        'r_avg_cubic_r_squared': shared_r_cubic_r2,
+                        'z_avg_cubic_r_squared': shared_z_cubic_r2,
+                        'tip_angle_r_squared': fr['tip_angle_r2'],
+                        'tip_angle_avg_cubic_r_squared': shared_tip_angle_r2,
+                        'offplane_y_r_squared': shared_offplane_y_r2,
+                    }
+                    for phase, fr in fit_results.items()
                 },
                 'cubic_coefficients': {
-                    'r_coeffs': r_coefficients.tolist(),  # [u³, u², u¹, u⁰]
+                    'default_phase': legacy_phase,
+                    'r_coeffs': r_coefficients.tolist(),
                     'z_coeffs': z_coefficients.tolist(),
+                    'r_avg_coeffs': shared_r_cubic_coefficients.tolist() if shared_r_cubic_coefficients is not None else None,
+                    'z_avg_coeffs': shared_z_cubic_coefficients.tolist() if shared_z_cubic_coefficients is not None else None,
                     'tip_angle_coeffs': tip_angle_coefficients.tolist() if tip_angle_coefficients is not None else None,
                     'offplane_y_coeffs': y_off_coefficients.tolist() if y_off_coefficients is not None else None,
-                    'r_equation': r_equation,
-                    'r_definition': 'signed planar transverse deflection (r = x), referenced to the planar X mirror line = mean unmirrored X across all measured B values and both orientations in the current frame',
-                    'z_equation': z_equation,
-                    'tip_angle_equation': tip_angle_equation,
-                    'offplane_y_equation': y_off_equation,
-                    'offplane_y_definition': 'off-plane transverse displacement from ±90 mirrored pair, referenced to ±90 Y-proxy mirror line = mean unmirrored ±90 transverse coordinate',
-                    'offplane_y_fit_data_fraction': 0.4,
-                    'offplane_y_fit_order': 1,
-                    'r_r_squared': float(r_r2),
-                    'z_r_squared': float(z_r2),
-                    'tip_angle_r_squared': float(tip_angle_r2) if np.isfinite(tip_angle_r2) else None,
-                    'offplane_y_r_squared': float(y_off_r2) if np.isfinite(y_off_r2) else None
-                },
-                'fit_models': {
-                    'r': r_model_descriptor,
-                    'z': z_model_descriptor,
-                    'tip_angle': tip_angle_model_descriptor,
-                    'offplane_y': y_off_model_descriptor,
+                    'r_avg_equation': None if shared_r_cubic_model is None else shared_r_cubic_model.get('equation'),
+                    'z_avg_equation': None if shared_z_cubic_model is None else shared_z_cubic_model.get('equation'),
+                    'tip_angle_equation': None if shared_tip_angle_model is None else shared_tip_angle_model.get('equation'),
+                    'offplane_y_equation': None if shared_offplane_y_model is None else shared_offplane_y_model.get('equation'),
                 },
                 'motor_setup': {
-                    # Current machine setup: single pull motor on B axis, homed at 0.
                     'b_motor_axis': 'B',
                     'b_motor_home_position': 0.0,
-                    'b_motor_position_range': [b_cmd_min, b_cmd_max],
+                    'b_motor_position_range': [float(np.min(legacy_ds['common_b'])), float(np.max(legacy_ds['common_b']))],
                     'rotation_axis': 'C',
                     'rotation_axis_180_deg': 180.0,
                     'horizontal_axis': 'X',
                     'vertical_axis': 'Z',
                     'depth_axis': 'Y',
                 },
-                'working_envelope': {
-                    'radius_range_mm': [float(r_coords.min()), float(r_coords.max())],
-                    'radius_range_definition': 'signed planar transverse deflection range (r = x), not Euclidean radius',
-                    'z_range_mm': [float(z_coords.min()), float(z_coords.max())],
-                    'tip_angle_range_deg': [float(tip_angle_avg.min()), float(tip_angle_avg.max())] if tip_angle_avg is not None else None,
-                    'offplane_y_range_mm': [float(np.min(y_off_full_predicted)), float(np.max(y_off_full_predicted))] if y_off_full_predicted is not None else ([float(y_off_coords_meas.min()), float(y_off_coords_meas.max())] if y_off_coords_meas is not None else None),
-                    'max_radius_mm': float(r_coords.max())
-                },
-                'duet_axis_mapping': {
-                    # Canonical mapping for current setup
-                    'horizontal_axis': 'X',
-                    'vertical_axis': 'Z',
-                    'depth_axis': 'Y',
-                    'pull_axis': 'B',
-                    'rotation_axis': 'C',
-                    'extruder_axis': 'U',
-                }
             }
-
             with open(f"{robot_name}_gcode_calibration.json", "w") as f:
                 json.dump(gcode_calibration_data, f, indent=2)
 
-            print(f"\nCalibration data exported for G-code generation:")
-            print(f" - {excel_filename} (human-readable)")
-            print(f" - {robot_name}_gcode_calibration.json (for Python G-code class)")
+            print("\nDual-phase calibration export complete:")
+            print(f" - {robot_name}_cubic_calibration.pkl")
+            print(f" - {robot_name}_cubic_prediction_functions.py")
+            print(f" - {robot_name}_gcode_calibration.json")
+            print(" - 10_dual_phase_fits.png")
+            print(" - 11_xz_trajectory_hysteresis.png")
+            print(f" - {robot_name}_phase_fit_summary.xlsx")
 
             if export_skeleton:
                 param_path, py_path, stl_path, _patched_json = self.export_parametric_skeleton_model(
@@ -4843,13 +4847,17 @@ def predict_offplane_y_from_delta(delta_motor_pos):
                     diameter_mm=float(skeleton_diameter_mm),
                     stl_reference_pose=bool(skeleton_reference_stl),
                 )
-                print(f"\nParametric skeleton export complete:")
+                print("\nParametric skeleton export complete:")
                 print(f" - {param_path.name}")
                 print(f" - {py_path.name}")
                 if stl_path is not None:
                     print(f" - {stl_path.name}")
 
+            return {
+                'fit_models_by_phase': fit_models_by_phase,
+                'default_phase': legacy_phase,
+                'phase_fit_metrics': gcode_calibration_data['phase_fit_metrics'],
+                'json_path': os.path.join(processed_folder, f"{robot_name}_gcode_calibration.json"),
+            }
         finally:
-            # Return to original directory
             os.chdir(original_dir)
-            

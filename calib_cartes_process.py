@@ -76,6 +76,13 @@ _NEI8_W = [
     (0, -1, 1.0),                             (0, 1, 1.0),
     (1, -1, 2 ** 0.5),  (1, 0, 1.0),  (1, 1, 2 ** 0.5),
 ]
+DEFAULT_CHARUCO_BOARD = {
+    "squares_x": 10,
+    "squares_y": 14,
+    "square_size_mm": 15.0,
+    "marker_size_mm": 11.0,
+    "aruco_dictionary": "DICT_4X4",
+}
 
 
 # -----------------------------
@@ -144,6 +151,27 @@ def _parse_inner_corners_arg(value):
             f"Expected checkerboard inner corners as 'Nx,Ny' or 'NxXNy', got: {value}"
         )
     return int(parts[0]), int(parts[1])
+
+
+def _board_reference_kwargs(cal: CTR_Shadow_Calibration, args) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "inner_corners": args.checkerboard_inner_corners,
+        "square_size_mm": args.checkerboard_square_size_mm,
+        "use_undistort": (not args.checkerboard_no_undistort),
+        "draw_debug": True,
+    }
+    meta = getattr(cal, "camera_calib_meta", None) or {}
+    board_type = str(meta.get("board_type", "checkerboard")).strip().lower()
+    if board_type == "charuco":
+        kwargs.update({
+            "squares_x": int(meta.get("squares_x", DEFAULT_CHARUCO_BOARD["squares_x"])),
+            "squares_y": int(meta.get("squares_y", DEFAULT_CHARUCO_BOARD["squares_y"])),
+            "marker_size_mm": float(meta.get("marker_size_mm", DEFAULT_CHARUCO_BOARD["marker_size_mm"])),
+            "aruco_dictionary": str(meta.get("aruco_dictionary", DEFAULT_CHARUCO_BOARD["aruco_dictionary"])),
+        })
+        if kwargs["square_size_mm"] is None:
+            kwargs["square_size_mm"] = float(meta.get("square_size_mm", DEFAULT_CHARUCO_BOARD["square_size_mm"]))
+    return kwargs
 
 
 def _undistort_points_to_image(points_xy: np.ndarray, camera_K: np.ndarray, camera_dist: np.ndarray) -> np.ndarray:
@@ -1083,7 +1111,7 @@ def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = 
                 )
 
             try:
-                ax.legend(loc="best", fontsize=8)
+                ax.legend(loc="upper right", fontsize=8)
             except Exception:
                 pass
     except Exception as e:
@@ -2173,6 +2201,10 @@ def save_desired_vs_actual_plot(
     metrics: Dict[str, Any],
     title_prefix: str = "",
 ):
+    def make_single_plot_path(base_path: Path, angle_deg: float) -> Path:
+        angle_label = f"{angle_deg:.3f}".replace("-", "neg").replace(".", "p")
+        return base_path.with_name(f"{base_path.stem}_angle_{angle_label}{base_path.suffix}")
+
     def style_ax(ax, title: str):
         ax.set_title(title, color="#f4f8fb")
         ax.set_xlabel("Horizontal / u (mm)", color="#e5f1fb")
@@ -2183,31 +2215,7 @@ def save_desired_vs_actual_plot(
         ax.grid(True, alpha=0.14, color="#b7d3eb", linewidth=0.8)
         ax.set_facecolor((0.0, 0.0, 0.0, 0.0))
 
-    grouped = defaultdict(list)
-    for rec in records:
-        ang = angle_group_key(rec.get("used_tip_angle_deg"))
-        if ang is not None:
-            grouped[ang].append(rec)
-
-    angle_keys = sorted(grouped.keys())
-    if not angle_keys:
-        raise RuntimeError("No angle groups available for plotting.")
-
-    # Stack vertically as requested
-    n = len(angle_keys)
-    ncols = 1
-    nrows = n
-
-    fig, axs = plt.subplots(nrows, ncols, figsize=(8.2, 5.2 * nrows), squeeze=False)
-    fig.patch.set_alpha(0.0)
-
-    for ax in axs.flat:
-        ax.set_visible(False)
-
-    for idx, ang in enumerate(angle_keys):
-        ax = axs.flat[idx]
-        ax.set_visible(True)
-
+    def draw_angle_subplot(ax, ang: float):
         grecs = grouped[ang]
         valid = [
             r for r in grecs
@@ -2219,7 +2227,7 @@ def save_desired_vs_actual_plot(
         ]
         if not valid:
             style_ax(ax, f"Used tip angle {ang:.3f}°\n(no valid data)")
-            continue
+            return
 
         desired_u = np.asarray([float(r["aligned_desired_u_mm"]) for r in valid], dtype=float)
         desired_z = np.asarray([float(r["aligned_desired_z_mm"]) for r in valid], dtype=float)
@@ -2290,7 +2298,7 @@ def save_desired_vs_actual_plot(
             f"RMSE = {rmse_txt}  |  n = {len(valid)}",
         )
         ax.set_aspect("equal", adjustable="box")
-        leg = ax.legend(loc="best", frameon=True)
+        leg = ax.legend(loc="upper right", frameon=True)
         leg.get_frame().set_facecolor((0.04, 0.09, 0.14, 0.72))
         leg.get_frame().set_edgecolor((0.72, 0.84, 0.94, 0.35))
         for txt in leg.get_texts():
@@ -2302,6 +2310,39 @@ def save_desired_vs_actual_plot(
         pad_z = max(2.0, 0.06 * max(1.0, np.ptp(all_z)))
         ax.set_xlim(float(np.min(all_u) - pad_u), float(np.max(all_u) + pad_u))
         ax.set_ylim(float(np.min(all_z) - pad_z), float(np.max(all_z) + pad_z))
+
+    grouped = defaultdict(list)
+    for rec in records:
+        ang = angle_group_key(rec.get("used_tip_angle_deg"))
+        if ang is not None:
+            grouped[ang].append(rec)
+
+    angle_keys = sorted(grouped.keys())
+    if not angle_keys:
+        raise RuntimeError("No angle groups available for plotting.")
+
+    # Stack vertically as requested
+    n = len(angle_keys)
+    ncols = 1
+    nrows = n
+
+    fig, axs = plt.subplots(nrows, ncols, figsize=(8.2, 5.2 * nrows), squeeze=False)
+    fig.patch.set_alpha(0.0)
+
+    for ax in axs.flat:
+        ax.set_visible(False)
+
+    for idx, ang in enumerate(angle_keys):
+        ax = axs.flat[idx]
+        ax.set_visible(True)
+        draw_angle_subplot(ax, ang)
+
+        single_fig, single_ax = plt.subplots(1, 1, figsize=(8.2, 5.2))
+        single_fig.patch.set_alpha(0.0)
+        draw_angle_subplot(single_ax, ang)
+        single_fig.tight_layout()
+        single_fig.savefig(make_single_plot_path(plot_path, ang), dpi=220, transparent=True)
+        plt.close(single_fig)
 
     global_rmse = float(metrics["global_rmse_mm"])
     fig.suptitle(
@@ -2455,13 +2496,11 @@ def main():
     processed_dir.mkdir(parents=True, exist_ok=True)
     checkerboard_debug_path = processed_dir / "checkerboard_reference_debug.png"
 
+    board_ref_kwargs = _board_reference_kwargs(cal, args)
     board_result = cal.estimate_board_reference_from_image(
         str(board_ref_path),
-        inner_corners=args.checkerboard_inner_corners,
-        square_size_mm=args.checkerboard_square_size_mm,
-        use_undistort=(not args.checkerboard_no_undistort),
-        draw_debug=True,
         save_debug_path=str(checkerboard_debug_path),
+        **board_ref_kwargs,
     )
     board_reference_debug_image = board_result.get("debug_image")
     board_type = str(board_result.get("board_type", getattr(cal, "camera_calib_meta", {}).get("board_type", "checkerboard"))).lower()

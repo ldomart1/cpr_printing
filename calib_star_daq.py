@@ -52,6 +52,11 @@ except Exception:
     )
 
 try:
+    from scipy.interpolate import PchipInterpolator  # type: ignore
+except Exception:
+    PchipInterpolator = None
+
+try:
     from scipy.optimize import brentq  # type: ignore
 except Exception:
     def brentq(f, a, b, maxiter=100, xtol=1e-10, rtol=4*np.finfo(float).eps):
@@ -94,10 +99,10 @@ DEFAULT_CAMERA_WIDTH = 3840
 DEFAULT_CAMERA_HEIGHT = 2160
 DEFAULT_CAMERA_FLUSH_FRAMES = 1
 
-DEFAULT_TRAVEL_FEED = 1200.0
-DEFAULT_PRINT_FEED = 200.0
-DEFAULT_PRINT_FEED_B = 500.0
-DEFAULT_PRINT_FEED_C = 1000.0
+DEFAULT_TRAVEL_FEED = 2000.0
+DEFAULT_PRINT_FEED = 2000.0
+DEFAULT_PRINT_FEED_B = 900.0
+DEFAULT_PRINT_FEED_C = 10000.0
 
 DEFAULT_DWELL_BEFORE_MS = 0
 DEFAULT_DWELL_AFTER_MS = 0
@@ -105,17 +110,17 @@ DEFAULT_TRACKED_MOVE_SETTLE_S = 0.0
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
 DEFAULT_CAPTURE_AT_START = False
 
-DEFAULT_SAFE_APPROACH_Z = -145.0
+DEFAULT_SAFE_APPROACH_Z = -135.0
 
 DEFAULT_START_X = 100.0
-DEFAULT_START_Y = 20.0
-DEFAULT_START_Z = -145.0
+DEFAULT_START_Y = 52.0
+DEFAULT_START_Z = -135.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
-DEFAULT_END_Y = 20.0
-DEFAULT_END_Z = -145.0
+DEFAULT_END_Y = 52.0
+DEFAULT_END_Z = -135.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
@@ -127,8 +132,8 @@ DEFAULT_BBOX_Z_MIN = -200.0
 DEFAULT_BBOX_Z_MAX = 0.0
 
 STAR_CENTER_X = 100.0
-STAR_CENTER_Y = 20.0
-STAR_CENTER_Z = -145.0
+STAR_CENTER_Y = 52.0
+STAR_CENTER_Z = -135.0
 
 DESIRED_STAR_OUTER_RADIUS = 18.0
 INNER_RADIUS_RATIO = 0.38196601125
@@ -139,7 +144,7 @@ DEFAULT_CAPTURE_EVERY_N_STAR_MOVES = 1
 DEFAULT_SAFETY_MARGIN = 0.5
 DEFAULT_C0_DEG = 0.0
 
-OFFPLANE_SIGN = -1.0
+OFFPLANE_SIGN = 1.0
 C_HARD_MIN_DEG = -360.0
 C_HARD_MAX_DEG = 360.0
 
@@ -150,10 +155,12 @@ C_HARD_MAX_DEG = 360.0
 
 @dataclass
 class Calibration:
-    pr: np.ndarray
-    pz: np.ndarray
-    py_off: Optional[np.ndarray]
-    pa: Optional[np.ndarray]
+    r_model: dict
+    z_model: dict
+    y_off_model: Optional[dict]
+    tip_angle_model: Optional[dict]
+    phase_models: dict
+    default_motion_phase: str
 
     b_min: float
     b_max: float
@@ -261,6 +268,79 @@ def poly_eval(coeffs: Any, u: Any, default_if_none: Optional[float] = None) -> n
     return np.polyval(arr, u)
 
 
+def evaluate_fit_model(model: Any, u: Any, default_if_none: Optional[float] = None) -> np.ndarray:
+    u_arr = np.asarray(u, dtype=float)
+    if model is None:
+        if default_if_none is None:
+            raise ValueError("Missing required fit model.")
+        return np.full_like(u_arr, float(default_if_none), dtype=float)
+
+    model_type = str(model.get("model_type", "polynomial")).lower()
+    if model_type == "polynomial":
+        return poly_eval(model.get("coefficients"), u_arr, default_if_none=default_if_none)
+
+    if model_type == "pchip":
+        if PchipInterpolator is None:
+            raise ImportError("PCHIP calibration model requires scipy.interpolate.PchipInterpolator.")
+        x_knots = model.get("x_knots")
+        y_knots = model.get("y_knots")
+        if x_knots is None or y_knots is None:
+            raise ValueError("PCHIP fit model is missing knots.")
+        interp = PchipInterpolator(
+            np.asarray(x_knots, dtype=float),
+            np.asarray(y_knots, dtype=float),
+            extrapolate=True,
+        )
+        return np.asarray(interp(u_arr), dtype=float)
+
+    raise ValueError(f"Unsupported fit model type: {model_type}")
+
+
+def legacy_poly_model(coeffs: Any, equation: Optional[str], value_name: str) -> Optional[dict]:
+    if coeffs is None:
+        return None
+    coeff_list = np.asarray(coeffs, dtype=float).reshape(-1).tolist()
+    return {
+        "model_type": "polynomial",
+        "basis": "monomial",
+        "degree": len(coeff_list) - 1,
+        "input_axis": "b_motor",
+        "value_name": value_name,
+        "coefficients": coeff_list,
+        "equation": equation,
+    }
+
+
+def _normalize_motion_phase_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _extract_phase_models(data: dict) -> Tuple[dict, str]:
+    phase_payload = data.get("fit_models_by_phase") or {}
+    phase_models: dict = {}
+    for raw_phase_name, models in phase_payload.items():
+        phase_name = _normalize_motion_phase_name(raw_phase_name)
+        if phase_name is None or not isinstance(models, dict):
+            continue
+        phase_models[phase_name] = dict(models)
+
+    default_phase = _normalize_motion_phase_name(
+        data.get("default_phase_for_legacy_access")
+    )
+    if default_phase is None or default_phase not in phase_models:
+        if "pull" in phase_models:
+            default_phase = "pull"
+        elif phase_models:
+            default_phase = next(iter(phase_models))
+        else:
+            default_phase = "pull"
+
+    return phase_models, default_phase
+
+
 def load_calibration(json_path: str) -> Calibration:
     p = Path(json_path)
     if not p.exists():
@@ -269,15 +349,34 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r") as f:
         data = json.load(f)
 
-    cubic = data["cubic_coefficients"]
-    pr = np.array(cubic["r_coeffs"], dtype=float)
-    pz = np.array(cubic["z_coeffs"], dtype=float)
+    phase_models, default_phase = _extract_phase_models(data)
+    fit_models = data.get("fit_models", {})
+    cubic = data.get("cubic_coefficients", {})
+    default_phase_models = phase_models.get(default_phase, {})
 
-    py_off_raw = cubic.get("offplane_y_coeffs", None)
-    py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
+    r_model = fit_models.get("r") or default_phase_models.get("r") or legacy_poly_model(
+        cubic.get("r_coeffs"),
+        cubic.get("r_equation"),
+        "r",
+    )
+    z_model = fit_models.get("z") or default_phase_models.get("z") or legacy_poly_model(
+        cubic.get("z_coeffs"),
+        cubic.get("z_equation"),
+        "z",
+    )
+    y_off_model = fit_models.get("offplane_y") or default_phase_models.get("offplane_y") or legacy_poly_model(
+        cubic.get("offplane_y_coeffs"),
+        cubic.get("offplane_y_equation"),
+        "y_offplane_mm",
+    )
+    tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
+        cubic.get("tip_angle_coeffs"),
+        cubic.get("tip_angle_equation"),
+        "tip_angle_deg",
+    )
 
-    pa_raw = cubic.get("tip_angle_coeffs", None)
-    pa = None if pa_raw is None else np.array(pa_raw, dtype=float)
+    if r_model is None or z_model is None:
+        raise ValueError("Calibration JSON is missing usable r/z fit models.")
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -295,10 +394,12 @@ def load_calibration(json_path: str) -> Calibration:
     c_180 = float(motor_setup.get("rotation_axis_180_deg", 180.0))
 
     return Calibration(
-        pr=pr,
-        pz=pz,
-        py_off=py_off,
-        pa=pa,
+        r_model=r_model,
+        z_model=z_model,
+        y_off_model=y_off_model,
+        tip_angle_model=tip_angle_model,
+        phase_models=phase_models,
+        default_motion_phase=default_phase,
         b_min=b_min,
         b_max=b_max,
         x_axis=x_axis,
@@ -315,19 +416,80 @@ def load_calibration(json_path: str) -> Calibration:
     )
 
 
-def eval_r(cal: Calibration, b: Any, signs: KinematicSignConfig) -> np.ndarray:
-    return float(signs.r_sign) * poly_eval(cal.pr, b)
+def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Any:
+    phase_name = _normalize_motion_phase_name(motion_phase) or cal.default_motion_phase
+    phase_model = cal.phase_models.get(phase_name, {}).get(model_name)
+    if phase_model is not None:
+        return phase_model
+
+    fallback_attr = {
+        "r": cal.r_model,
+        "z": cal.z_model,
+        "offplane_y": cal.y_off_model,
+        "tip_angle": cal.tip_angle_model,
+    }.get(model_name)
+    return fallback_attr
 
 
-def eval_z(cal: Calibration, b: Any, signs: KinematicSignConfig) -> np.ndarray:
-    return float(signs.z_sign) * poly_eval(cal.pz, b)
+def eval_r(
+    cal: Calibration,
+    b: Any,
+    signs: KinematicSignConfig,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
+    return float(signs.r_sign) * evaluate_fit_model(
+        _select_fit_model(cal, "r", motion_phase=motion_phase),
+        b,
+    )
 
 
-def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
-    return OFFPLANE_SIGN * poly_eval(cal.py_off, b, default_if_none=0.0)
+def eval_z(
+    cal: Calibration,
+    b: Any,
+    signs: KinematicSignConfig,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
+    return float(signs.z_sign) * evaluate_fit_model(
+        _select_fit_model(cal, "z", motion_phase=motion_phase),
+        b,
+    )
 
 
-def tip_offset_xyz_physical(cal: Calibration, b: float, c_deg: float, signs: KinematicSignConfig) -> np.ndarray:
+def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    return OFFPLANE_SIGN * evaluate_fit_model(
+        _select_fit_model(cal, "offplane_y", motion_phase=motion_phase),
+        b,
+        default_if_none=0.0,
+    )
+
+
+def infer_motion_phase_for_b(
+    cal: Calibration,
+    prev_b: Optional[float],
+    curr_b: float,
+    next_b: Optional[float],
+) -> str:
+    deltas = []
+    if prev_b is not None:
+        deltas.append(float(curr_b) - float(prev_b))
+    if next_b is not None:
+        deltas.append(float(next_b) - float(curr_b))
+
+    for delta in deltas:
+        if abs(delta) <= 1e-9:
+            continue
+        return "pull" if delta < 0.0 else "release"
+
+    return cal.default_motion_phase
+
+
+def tip_offset_xyz_physical(
+    cal: Calibration,
+    b: float,
+    c_deg: float,
+    signs: KinematicSignConfig,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
     """
     Full 3D tip offset in world/stage axes due to B and C.
 
@@ -336,9 +498,9 @@ def tip_offset_xyz_physical(cal: Calibration, b: float, c_deg: float, signs: Kin
     """
     c_deg = assert_c_in_safe_range("tip_offset C", c_deg)
 
-    r = float(eval_r(cal, b, signs))
-    z = float(eval_z(cal, b, signs))
-    y_off = float(eval_offplane_y(cal, b))
+    r = float(eval_r(cal, b, signs, motion_phase=motion_phase))
+    z = float(eval_z(cal, b, signs, motion_phase=motion_phase))
+    y_off = float(eval_offplane_y(cal, b, motion_phase=motion_phase))
 
     c = math.radians(float(c_deg))
     x = r * math.cos(c) - y_off * math.sin(c)
@@ -352,8 +514,15 @@ def stage_xyz_for_tip_target(
     b: float,
     c_deg: float,
     signs: KinematicSignConfig,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    return p_tip_xyz - tip_offset_xyz_physical(cal, b, c_deg, signs)
+    return p_tip_xyz - tip_offset_xyz_physical(
+        cal,
+        b,
+        c_deg,
+        signs,
+        motion_phase=motion_phase,
+    )
 
 
 def sampled_r_abs_range(
@@ -368,33 +537,8 @@ def sampled_r_abs_range(
     if lo > hi:
         lo, hi = hi, lo
     bb = np.linspace(lo, hi, n)
-    rr = eval_r(cal, bb, signs)
+    rr = eval_r(cal, bb, signs, motion_phase=cal.default_motion_phase)
     return float(np.min(np.abs(rr))), float(np.max(np.abs(rr)))
-
-
-def _find_roots_for_target(coeffs: np.ndarray, target: float, b_min: float, b_max: float) -> List[float]:
-    f = lambda b: float(np.polyval(coeffs, b) - target)
-    bs = np.linspace(b_min, b_max, 1200)
-    fs = np.array([f(b) for b in bs], dtype=float)
-    fs = np.where(np.isfinite(fs), fs, 1e9)
-
-    roots: List[float] = []
-    for a, b, fa, fb in zip(bs[:-1], bs[1:], fs[:-1], fs[1:]):
-        if fa == 0.0:
-            roots.append(float(a))
-            continue
-        if np.sign(fa) != np.sign(fb):
-            try:
-                roots.append(float(brentq(f, float(a), float(b), maxiter=100)))
-            except Exception:
-                roots.append(float(0.5 * (float(a) + float(b))))
-
-    roots = sorted(roots)
-    dedup: List[float] = []
-    for r in roots:
-        if not dedup or abs(r - dedup[-1]) > 1e-6:
-            dedup.append(r)
-    return dedup
 
 
 def invert_r_to_b(
@@ -404,25 +548,31 @@ def invert_r_to_b(
     b_hi: float,
     b_prev: Optional[float] = None,
 ) -> float:
-    """
-    Solve raw calibration polynomial r_raw(B)=r_target_abs.
+    ns = 20001
+    bb = np.linspace(float(b_lo), float(b_hi), ns, dtype=float)
+    rr = np.abs(
+        np.asarray(
+            evaluate_fit_model(
+                _select_fit_model(cal, "r", motion_phase=cal.default_motion_phase),
+                bb,
+            ),
+            dtype=float,
+        )
+    )
+    err = np.abs(rr - float(r_target_abs))
+    if not np.any(np.isfinite(err)):
+        raise RuntimeError("Could not invert r(B): sampled calibration values are not finite.")
 
-    Note:
-    - root finding is done against the stored calibration polynomial itself
-    - sign flips are applied later when computing the physical tip offset
-    - this is correct because the planning target is based on |r|
-    """
-    roots = _find_roots_for_target(cal.pr, r_target_abs, b_lo, b_hi)
-    f = lambda b: float(np.polyval(cal.pr, b) - r_target_abs)
+    best_err = float(np.nanmin(err))
+    candidate_idx = np.flatnonzero(np.isfinite(err) & (err <= best_err + 1e-6))
+    if candidate_idx.size == 0:
+        candidate_idx = np.asarray([int(np.nanargmin(err))], dtype=int)
 
-    if not roots:
-        return float(b_lo if abs(f(b_lo)) <= abs(f(b_hi)) else b_hi)
+    candidate_b = bb[candidate_idx]
+    if b_prev is None or candidate_b.size == 1:
+        return float(candidate_b[0])
 
-    if b_prev is None or len(roots) == 1:
-        return float(roots[0])
-
-    arr = np.array(roots, dtype=float)
-    return float(arr[np.argmin(np.abs(arr - float(b_prev)))])
+    return float(candidate_b[np.argmin(np.abs(candidate_b - float(b_prev)))])
 
 
 # =========================
@@ -587,10 +737,45 @@ def local_star_points_to_command_points_tip_priority(
         b_cmd[i] = b_i
         b_prev = b_i
 
-        tip_target = np.array([x_tip_target, y_tip_target, z_tip_target], dtype=float)
-        stage_xyz = stage_xyz_for_tip_target(cal, tip_target, float(b_i), float(c_state), signs)
+    motion_phases: List[str] = []
+    for i in range(N):
+        prev_b = None if i == 0 else float(b_cmd[i - 1])
+        next_b = None if i + 1 >= N else float(b_cmd[i + 1])
+        motion_phases.append(
+            infer_motion_phase_for_b(
+                cal=cal,
+                prev_b=prev_b,
+                curr_b=float(b_cmd[i]),
+                next_b=next_b,
+            )
+        )
 
-        tip_check = stage_xyz + tip_offset_xyz_physical(cal, float(b_i), float(c_state), signs)
+    for i in range(N):
+        x_local = float(local_pts_xz[i, 0])
+        z_local = float(local_pts_xz[i, 1])
+        b_i = float(b_cmd[i])
+        motion_phase = motion_phases[i]
+
+        x_tip_target = float(center_x + x_local)
+        y_tip_target = float(center_y)
+        z_tip_target = float(center_z + z_local)
+        tip_target = np.array([x_tip_target, y_tip_target, z_tip_target], dtype=float)
+        stage_xyz = stage_xyz_for_tip_target(
+            cal,
+            tip_target,
+            b_i,
+            float(c_state),
+            signs,
+            motion_phase=motion_phase,
+        )
+
+        tip_check = stage_xyz + tip_offset_xyz_physical(
+            cal,
+            b_i,
+            float(c_state),
+            signs,
+            motion_phase=motion_phase,
+        )
         if not np.allclose(tip_check, tip_target, atol=1e-9, rtol=0.0):
             raise RuntimeError("Internal tip-tracking consistency check failed.")
 
@@ -621,6 +806,7 @@ def local_star_points_to_command_points_tip_priority(
         "n_outer_clamped": int(n_outer_clamped),
         "max_abs_x_offset_from_nominal": float(max_abs_x_offset_from_nominal),
         "max_abs_y_offset_from_nominal": float(max_abs_y_offset_from_nominal),
+        "motion_phases": motion_phases,
     }
     return pts, meta, b_cmd
 
@@ -710,12 +896,30 @@ def build_star_command_sequence(
     assert_all_command_c_safe(sequence)
     assert_c_is_piecewise_constant_with_single_flip(sequence, c0_deg=float(c0_deg), c180_deg=float(c180_deg))
 
-    rr_right = eval_r(cal, b_right, signs)
-    rr_left = eval_r(cal, b_left, signs)
-    zz_right = eval_z(cal, b_right, signs)
-    zz_left = eval_z(cal, b_left, signs)
-    yy_right = eval_offplane_y(cal, b_right)
-    yy_left = eval_offplane_y(cal, b_left)
+    rr_right = np.asarray(
+        [eval_r(cal, b, signs, motion_phase=phase) for b, phase in zip(b_right, meta_right["motion_phases"])],
+        dtype=float,
+    )
+    rr_left = np.asarray(
+        [eval_r(cal, b, signs, motion_phase=phase) for b, phase in zip(b_left, meta_left["motion_phases"])],
+        dtype=float,
+    )
+    zz_right = np.asarray(
+        [eval_z(cal, b, signs, motion_phase=phase) for b, phase in zip(b_right, meta_right["motion_phases"])],
+        dtype=float,
+    )
+    zz_left = np.asarray(
+        [eval_z(cal, b, signs, motion_phase=phase) for b, phase in zip(b_left, meta_left["motion_phases"])],
+        dtype=float,
+    )
+    yy_right = np.asarray(
+        [eval_offplane_y(cal, b, motion_phase=phase) for b, phase in zip(b_right, meta_right["motion_phases"])],
+        dtype=float,
+    )
+    yy_left = np.asarray(
+        [eval_offplane_y(cal, b, motion_phase=phase) for b, phase in zip(b_left, meta_left["motion_phases"])],
+        dtype=float,
+    )
 
     meta = {
         "outer_radius_requested": float(outer_radius),

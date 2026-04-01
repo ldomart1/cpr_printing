@@ -42,7 +42,7 @@ Optional sweep-range override:
   0 to 90 degrees.
 
 New sign correction option:
-- Use --flip-rz-sign if your calibration file has r and z polynomial signs flipped.
+- Use --flip-rz-sign if your calibration file has a flipped planar X sign.
 """
 
 import argparse
@@ -79,11 +79,11 @@ DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
 DEFAULT_POINT_X = 100.0
-DEFAULT_POINT_Y = 20.0
-DEFAULT_POINT_Z = -155.0
+DEFAULT_POINT_Y = 52.0
+DEFAULT_POINT_Z = -145.0
 
-DEFAULT_TRAVEL_FEED = 1500.0
-DEFAULT_PROBE_FEED = 500.0
+DEFAULT_TRAVEL_FEED = 1000.0
+DEFAULT_PROBE_FEED = 1000.0
 DEFAULT_C_FEED = 15000.0
 DEFAULT_C_MAX_FEED = 15000.0
 DEFAULT_C_ACCEL_TIME_S = 0.2
@@ -92,7 +92,7 @@ DEFAULT_C_DECEL_TIME_S = 0.2
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
 DEFAULT_CYCLE_REPEATS = 1
-DEFAULT_LEG_MOVE_STEPS = 1200
+DEFAULT_LEG_MOVE_STEPS = 2400
 DEFAULT_LEG_CAPTURE_STEPS = 120
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
@@ -112,18 +112,18 @@ DEFAULT_C_VISIBLE_WIN2_MAX = 255.0
 DEFAULT_C_BOUNDARY_EASE_FRAC = 0.04
 
 DEFAULT_START_X = 100.0
-DEFAULT_START_Y = 20.0
-DEFAULT_START_Z = -155.0
+DEFAULT_START_Y = 52.0
+DEFAULT_START_Z = -145.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
-DEFAULT_END_Y = 20.0
-DEFAULT_END_Z = -155.0
+DEFAULT_END_Y = 52.0
+DEFAULT_END_Z = -145.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
-DEFAULT_SAFE_APPROACH_Z = -155.0
+DEFAULT_SAFE_APPROACH_Z = -145.0
 
 DEFAULT_DWELL_BEFORE_MS = 0.3
 DEFAULT_DWELL_AFTER_MS = 0
@@ -144,11 +144,12 @@ DEFAULT_CAMERA_FLUSH_FRAMES = 1
 DEFAULT_ROTATION_SETTLE_S = 0.0
 DEFAULT_TRACKED_MOVE_SETTLE_S = 0.0
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
+DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_CAPTURE_AT_START = False
 
 DEFAULT_FLIP_RZ_SIGN = True
 
-OFFPLANE_SIGN = -1.0
+OFFPLANE_SIGN = 1.0
 
 
 # =========================
@@ -390,8 +391,7 @@ def eval_z(
     flip_rz_sign: bool = False,
     motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
+    return evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
 
 
 def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
@@ -1348,6 +1348,7 @@ class FixedTipPointTracker:
         use_segment_feed_scheduler: bool = True,
         tracked_move_settle_s: float = 0.0,
         travel_move_settle_s: float = 0.0,
+        b_extra_settle_s: float = 0.0,
         rotation_settle_s: float = 0.0,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
@@ -1488,6 +1489,8 @@ class FixedTipPointTracker:
                     }
                 )
                 self.wait_for_duet_motion_complete(extra_settle=tracked_move_settle_s)
+                if float(b_extra_settle_s) > 0:
+                    time.sleep(float(b_extra_settle_s))
 
                 if point.capture_image:
                     sample_counter += 1
@@ -1699,6 +1702,7 @@ def main(args):
             use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
             tracked_move_settle_s=float(args.tracked_move_settle_s),
             travel_move_settle_s=float(args.travel_move_settle_s),
+            b_extra_settle_s=float(args.b_extra_settle_s),
             rotation_settle_s=float(args.rotation_settle_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
@@ -1760,7 +1764,7 @@ if __name__ == "__main__":
         "--flip-rz-sign",
         action="store_true",
         default=DEFAULT_FLIP_RZ_SIGN,
-        help="Multiply the polynomial-derived r and z offsets by -1. Use this if your calibration file has flipped r/z signs.",
+        help="Multiply only the planar r/X offset by -1. Use this if your calibration file has a flipped X sign.",
     )
 
     # Cyclic sweep controls
@@ -1816,6 +1820,8 @@ if __name__ == "__main__":
                     help="Extra settle time after each tracked move, before capture.")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
+    ap.add_argument("--b-extra-settle-s", type=float, default=DEFAULT_B_EXTRA_SETTLE_S,
+                    help="Additional hold after each tracked move to let the B-axis mechanically settle.")
     ap.add_argument("--rotation-settle-s", type=float, default=DEFAULT_ROTATION_SETTLE_S,
                     help="Extra settle time after any rotation-related move.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,

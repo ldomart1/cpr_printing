@@ -574,6 +574,65 @@ def _cross_section_boundaries(mask_fg, center_xy, normal_xy, scan_half_width_px=
     }
 
 
+def _trace_centerline_midpoints(
+    mask_fg,
+    start_xy,
+    dir_xy,
+    normal_xy,
+    scan_half_width_px=20.0,
+    cross_step_px=0.5,
+    forward_step_px=1.0,
+    max_len_px=120.0,
+    min_width_px=2.0,
+):
+    d = np.asarray(dir_xy, dtype=np.float64)
+    d /= max(np.linalg.norm(d), 1e-12)
+    n = np.asarray(normal_xy, dtype=np.float64)
+    n /= max(np.linalg.norm(n), 1e-12)
+
+    cur_xy = np.asarray(start_xy, dtype=np.float64).copy()
+    samples = []
+    n_steps = int(max_len_px / max(forward_step_px, 1e-6))
+
+    for _ in range(max(1, n_steps + 1)):
+        res = _cross_section_boundaries(
+            mask_fg,
+            center_xy=cur_xy,
+            normal_xy=n,
+            scan_half_width_px=scan_half_width_px,
+            step_px=float(cross_step_px),
+        )
+        if res is None:
+            break
+
+        t_left = float(res["t_left"])
+        t_right = float(res["t_right"])
+        if t_left > t_right:
+            t_left, t_right = t_right, t_left
+
+        width_px = float(t_right - t_left)
+        if width_px < float(min_width_px):
+            break
+
+        p_left = np.asarray(res["p_left_xy"], dtype=np.float64)
+        p_right = np.asarray(res["p_right_xy"], dtype=np.float64)
+        center_offset_px = 0.5 * (t_left + t_right)
+        mid_xy = 0.5 * (p_left + p_right)
+        samples.append(
+            {
+                "center_xy": cur_xy.copy(),
+                "mid_xy": mid_xy.copy(),
+                "left_xy": p_left.copy(),
+                "right_xy": p_right.copy(),
+                "center_offset_px": float(center_offset_px),
+                "width_px": width_px,
+            }
+        )
+        cur_xy = mid_xy + float(forward_step_px) * d
+
+    return samples
+
+
 def refine_tip_parallel_centerline(
     grayscale,
     binary_image,
@@ -665,7 +724,43 @@ def refine_tip_parallel_centerline(
         if not ok_center:
             center_line_start = p_in_xy + t_center * n_xy
 
-    tip_xy = ray_last_inside(mask_fg, center_line_start, d_xy, step_px=float(ray_step_px), max_len_px=ray_max_len_px + line_back_px)
+    centerline_samples = _trace_centerline_midpoints(
+        mask_fg,
+        start_xy=center_line_start,
+        dir_xy=d_xy,
+        normal_xy=n_xy,
+        scan_half_width_px=scan_half_px,
+        cross_step_px=float(cross_step_px),
+        forward_step_px=max(0.75, float(ray_step_px)),
+        max_len_px=ray_max_len_px + line_back_px,
+        min_width_px=max(1.5, 0.15 * width_px),
+    )
+
+    if centerline_samples:
+        ref_count = min(6, len(centerline_samples))
+        center_offset_ref = float(np.median([centerline_samples[i]["center_offset_px"] for i in range(ref_count)]))
+        center_offset_limit = max(1.5, 0.12 * width_px)
+        stable_samples = []
+        for sample in centerline_samples:
+            if abs(float(sample["center_offset_px"]) - center_offset_ref) > center_offset_limit:
+                break
+            stable_samples.append(sample)
+        if stable_samples:
+            centerline_samples = stable_samples
+
+        center_trace_xy = [s["mid_xy"].tolist() for s in centerline_samples]
+        tip_center_seed_xy = np.asarray(centerline_samples[-1]["mid_xy"], dtype=np.float64)
+    else:
+        center_trace_xy = [center_line_start.tolist()]
+        tip_center_seed_xy = center_line_start
+
+    tip_xy = ray_last_inside(
+        mask_fg,
+        tip_center_seed_xy,
+        d_xy,
+        step_px=float(ray_step_px),
+        max_len_px=max(2.0, 1.5 * r_px),
+    )
 
     line_forward_px = float(np.linalg.norm(tip_xy - base_center_xy)) + 1.5 * r_px
     left_line_end = base_center_xy + line_forward_px * d_xy + t_left_med * n_xy
@@ -688,6 +783,8 @@ def refine_tip_parallel_centerline(
         "section_centers_xy": section_centers,
         "section_left_points_xy": left_points,
         "section_right_points_xy": right_points,
+        "centerline_trace_xy": center_trace_xy,
+        "centerline_center_offset_px": [float(s["center_offset_px"]) for s in centerline_samples],
         "parallel_left_line_xy": [left_line_start.tolist(), left_line_end.tolist()],
         "parallel_right_line_xy": [right_line_start.tolist(), right_line_end.tolist()],
         "center_line_xy": [center_line_start.tolist(), tip_xy.tolist()],
@@ -910,11 +1007,11 @@ class CTR_Shadow_Calibration:
         self.board_reference_correction_meta = None
         self.board_reference_image_path = None
         self.default_charuco_config = {
-            "squares_x": 12,
-            "squares_y": 8,
+            "squares_x": 10,
+            "squares_y": 14,
             "square_size_mm": 15.0,
             "marker_size_mm": 11.0,
-            "aruco_dictionary": "DICT_4X4_50",
+            "aruco_dictionary": "DICT_4X4",
         }
         self.ruler_ref_p1_px = None
         self.ruler_ref_p2_px = None
@@ -926,13 +1023,13 @@ class CTR_Shadow_Calibration:
         self.ruler_calib_meta = None
         self.tip_refine_debug_records = {}
         self.tip_refine_mode = "parallel_centerline"
-        self.tip_parallel_section_near_r = 1.0
-        self.tip_parallel_section_far_r = 8.0
-        self.tip_parallel_scan_half_r = 3.0
-        self.tip_parallel_num_sections = 9
+        self.tip_parallel_section_near_r = 0.75
+        self.tip_parallel_section_far_r = 5.0
+        self.tip_parallel_scan_half_r = 2.5
+        self.tip_parallel_num_sections = 7
         self.tip_parallel_cross_step_px = 0.5
         self.tip_parallel_ray_step_px = 0.5
-        self.tip_parallel_ray_max_len_r = 16.0
+        self.tip_parallel_ray_max_len_r = 10.0
 
         print("Calibration object initialized successfully!")
 
@@ -1693,9 +1790,8 @@ class CTR_Shadow_Calibration:
             })
 
         if board_type == "checkerboard":
-            # Preserve the legacy correction only for the legacy checkerboard path.
             self.apply_checkerboard_reference_corrections(
-                mm_scale=0.5,
+                mm_scale=self._board_reference_measurement_scale_correction(),
                 flip_planar_x=True,
             )
 
@@ -1719,6 +1815,7 @@ class CTR_Shadow_Calibration:
             "image_shape": tuple(image_for_detection.shape),
             "board_planar_x_sign": self.board_planar_x_sign,
             "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
+            "undistorted_image": image_for_detection.copy(),
         }
         if board_type == "checkerboard":
             result["inner_corners"] = inner_corners
@@ -1757,6 +1854,10 @@ class CTR_Shadow_Calibration:
                 save_debug_path = os.path.abspath(os.path.expanduser(str(save_debug_path)))
                 cv2.imwrite(save_debug_path, debug_img)
                 print(f"Saved board reference debug image: {save_debug_path}")
+                debug_root, debug_ext = os.path.splitext(save_debug_path)
+                undistorted_debug_path = f"{debug_root}_undistorted{debug_ext if debug_ext else '.png'}"
+                cv2.imwrite(undistorted_debug_path, image_for_detection)
+                print(f"Saved board reference undistorted image: {undistorted_debug_path}")
 
             result["debug_image"] = debug_img
 
@@ -2385,7 +2486,12 @@ class CTR_Shadow_Calibration:
                   probe_points=None,
                   enable_manual_focus=True,
                   # New: capture release images after pull sequence
-                  enable_release_imaging=True):
+                  enable_release_imaging=True,
+                  num_curl_uncurl_cycles=1,
+                  capture_dwell_s=0.5,
+                  combine_redundant_passes=True,
+                  redundant_pass_combination="average",
+                  save_pass_index_in_filename=True):
         """
         Probes at 5 XYZ locations and for each location:
         - Capture pull images while moving B from b_start toward the pulled state.
@@ -2396,6 +2502,7 @@ class CTR_Shadow_Calibration:
             "{orientation}_{X}_{B}_..."
         and now also include a phase token:
             DIRpull  or  DIRrelease
+        Optional redundant capture cycles append PASS1 / PASS2.
         """
         if self.cam is None or self.rrf is None or self.cam_port is None:
             print("Not connected to camera or robot. Please run connect_to_camera followed by connect_to_robot.")
@@ -2417,6 +2524,18 @@ class CTR_Shadow_Calibration:
 
         os.chdir(self.calibration_data_folder)
 
+        num_curl_uncurl_cycles = int(num_curl_uncurl_cycles)
+        if num_curl_uncurl_cycles not in (1, 2):
+            raise ValueError("num_curl_uncurl_cycles must be 1 or 2.")
+        capture_dwell_s = max(0.0, float(capture_dwell_s))
+        redundant_pass_combination = str(redundant_pass_combination).strip().lower()
+        if redundant_pass_combination not in {"average", "keep_separate"}:
+            raise ValueError("redundant_pass_combination must be 'average' or 'keep_separate'.")
+        combine_redundant_passes = bool(combine_redundant_passes)
+        save_pass_index_in_filename = bool(save_pass_index_in_filename)
+        self._combine_redundant_passes = combine_redundant_passes
+        self._redundant_pass_combination = redundant_pass_combination
+
         settling_time_large = 5.0
         settling_time_small = 0.2
         rotation_settling_time = 2.0
@@ -2434,7 +2553,7 @@ class CTR_Shadow_Calibration:
         cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
 
         def capture_and_save(orientation: int, x: float, y: float, z: float, b: float,
-                             probe_idx: int, step_idx: int, motion_phase: str):
+                             probe_idx: int, step_idx: int, motion_phase: str, pass_idx: int = 1):
             _ = cam.read()
             ret, image = cam.read()
             if not ret:
@@ -2442,8 +2561,11 @@ class CTR_Shadow_Calibration:
 
             filename = (
                 f"{orientation}_{x:.2f}_{b:.2f}"
-                f"_Y{y:.2f}_Z{z:.2f}_P{probe_idx:02d}_S{step_idx:02d}_DIR{motion_phase}.png"
+                f"_Y{y:.2f}_Z{z:.2f}_P{probe_idx:02d}_S{step_idx:02d}_DIR{motion_phase}"
             )
+            if save_pass_index_in_filename:
+                filename += f"_PASS{int(pass_idx)}"
+            filename += ".png"
             if ret:
                 cv2.imwrite(filename, image)
                 print(f" ✓ Saved {filename}")
@@ -2499,35 +2621,59 @@ class CTR_Shadow_Calibration:
             wait_for_duet_motion_complete(extra_settle=rotation_settling_time)
             self.rrf.send_code("G90")
 
-        def run_pull_release_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float,
-                                                      probe_idx: int, max_pull_steps=None):
+        def build_phase_schedule():
+            phases = []
+            for cycle_idx in range(1, num_curl_uncurl_cycles + 1):
+                phases.append(("pull", cycle_idx))
+                if enable_release_imaging:
+                    phases.append(("release", cycle_idx))
+            return phases
+
+        def run_motion_pass(orientation_id: int, x: float, y: float, z: float, probe_idx: int,
+                            motion_phase: str, pass_idx: int, b_values, label_total: int):
             nonlocal pos, total_images
-
-            steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
-            steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
-
-            print(f" Baseline pull capture: {robot_rear_axis_name}={b_start:.2f}")
-            pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-            capture_and_save(orientation_id, x, y, z, b_start, probe_idx, 0, "pull")
-            total_images += 1
-
-            pulled_b_values = [b_start]
-            for step_idx in range(1, steps_to_run + 1):
-                b_val = b_start + step_idx * b_step_size
-                pulled_b_values.append(b_val)
-                print(f" Pull step {step_idx:02d}/{b_steps}: {robot_rear_axis_name}={b_val:.2f}")
+            motion_phase = str(motion_phase).strip().lower()
+            if motion_phase == "pull":
+                print(f" Starting pull pass {pass_idx}/{label_total}")
+            else:
+                print(f" Starting release pass {pass_idx}/{label_total}")
+            for step_idx, b_val in enumerate(b_values):
+                print(
+                    f" {motion_phase.capitalize()} step {step_idx:02d}/{len(b_values) - 1:02d}: "
+                    f"{robot_rear_axis_name}={b_val:.2f}"
+                )
                 pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
-                capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx, "pull")
+                wait_for_duet_motion_complete(extra_settle=capture_dwell_s)
+                capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx, motion_phase, pass_idx=pass_idx)
                 total_images += 1
 
-            if enable_release_imaging and len(pulled_b_values) > 1:
-                release_values = list(reversed(pulled_b_values[:-1]))
-                for rel_idx, b_val in enumerate(release_values, start=1):
-                    print(f" Release step {rel_idx:02d}/{len(release_values):02d}: {robot_rear_axis_name}={b_val:.2f}")
-                    pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
-                    capture_and_save(orientation_id, x, y, z, b_val, probe_idx, rel_idx, "release")
-                    total_images += 1
-            else:
+        def run_pull_release_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float,
+                                                      probe_idx: int, max_pull_steps=None):
+            steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
+            steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
+            pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            pull_b_values = [b_start + step_idx * b_step_size for step_idx in range(0, steps_to_run + 1)]
+            release_b_values = list(reversed(pull_b_values))
+            if len(release_b_values) > 1:
+                release_b_values = release_b_values[1:]
+
+            total_pull_passes = num_curl_uncurl_cycles
+            total_release_passes = num_curl_uncurl_cycles if enable_release_imaging else 0
+            for motion_phase, pass_idx in build_phase_schedule():
+                if motion_phase == "pull":
+                    run_motion_pass(
+                        orientation_id, x, y, z, probe_idx,
+                        motion_phase="pull", pass_idx=pass_idx,
+                        b_values=pull_b_values, label_total=total_pull_passes,
+                    )
+                elif len(release_b_values) > 0:
+                    run_motion_pass(
+                        orientation_id, x, y, z, probe_idx,
+                        motion_phase="release", pass_idx=pass_idx,
+                        b_values=release_b_values, label_total=total_release_passes,
+                    )
+
+            if not enable_release_imaging:
                 pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
         pos = {
@@ -2542,12 +2688,19 @@ class CTR_Shadow_Calibration:
         print(f"Pull axis: {robot_rear_axis_name} | steps={b_steps} | step_size={b_step_size}mm | start={b_start}mm")
         print(f"Rotation axis: {robot_rotation_axis_name} | 180deg={robot_rotation_axis_180_deg} axis units")
         print(f"Release imaging enabled: {enable_release_imaging}")
+        print(f"Redundant curl/uncurl cycles: {num_curl_uncurl_cycles}")
+        print(f"Capture dwell after M400: {capture_dwell_s:.2f}s")
+        print(f"Combine redundant passes: {combine_redundant_passes} ({redundant_pass_combination})")
 
         print("\nMoving pull axis to start position...")
         pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-        n_partial_steps = max(1, int(np.floor(0.5 * b_steps)))
-        print(f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps (40%) due to tip detectability limits")
+        offplane_step_fraction = 0.7
+        n_partial_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
+        print(
+            f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps "
+            f"({100.0 * offplane_step_fraction:.0f}%) due to tip detectability limits"
+        )
 
         total_images = 0
         for probe_idx, (x, y, z) in enumerate(probe_points, start=1):
@@ -2732,12 +2885,19 @@ class CTR_Shadow_Calibration:
 
         values = {}
         motion_phase = "pull"
+        pass_idx = 1
         for p in parts:
             matched_prefixed = False
             if p.startswith("DIR"):
                 phase_val = p[3:].strip().lower()
                 if phase_val in ("pull", "release"):
                     motion_phase = phase_val
+                continue
+            if p.startswith("PASS"):
+                try:
+                    pass_idx = max(1, int(float(p[4:])))
+                except Exception:
+                    pass
                 continue
             for key in ("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA"):
                 if p.startswith(key):
@@ -2774,6 +2934,7 @@ class CTR_Shadow_Calibration:
             "ss_pos": ss_pos,
             "motion_phase": motion_phase,
             "motion_phase_code": 0 if motion_phase == "pull" else 1,
+            "pass_idx": int(pass_idx),
         }
 
     def analyze_data(self, image_file_name, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, ):
@@ -2783,8 +2944,8 @@ class CTR_Shadow_Calibration:
 
         # Fixed path handling for Mac
         raw_data_folder = os.path.join(self.calibration_data_folder, "raw_image_data_folder")
-        tip_locations_array_coarse = np.zeros((len(os.listdir(raw_data_folder)), 7))
-        tip_locations_array_fine = np.zeros((len(os.listdir(raw_data_folder)), 7))
+        tip_locations_array_coarse = np.zeros((len(os.listdir(raw_data_folder)), 8))
+        tip_locations_array_fine = np.zeros((len(os.listdir(raw_data_folder)), 8))
         i = 0
 
         # Fixed path handling for Mac
@@ -2837,9 +2998,6 @@ class CTR_Shadow_Calibration:
                 tip_row_legacy = int(endpoints[eidx, 0])
                 tip_col_legacy = int(endpoints[eidx, 1])
 
-        tip_row = tip_row_legacy
-        tip_column = tip_col_legacy
-
         tip_y = float(np.clip(tip_row, 0, binary_image.shape[0] - 1))
         tip_x = float(np.clip(tip_column, 0, binary_image.shape[1] - 1))
 
@@ -2866,6 +3024,7 @@ class CTR_Shadow_Calibration:
         ntnl_pos = float(file_ctx['ntnl_pos'])
         ss_pos = float(file_ctx['ss_pos'])
         motion_phase_code = float(file_ctx['motion_phase_code'])
+        pass_idx = float(file_ctx.get('pass_idx', 1))
 
         tip_locations_array_coarse[i, :] = np.array(
             [
@@ -2876,6 +3035,7 @@ class CTR_Shadow_Calibration:
                 float(ntnl_pos),
                 float(tip_angle_deg),
                 motion_phase_code,
+                pass_idx,
             ]
         )
 
@@ -3044,7 +3204,8 @@ class CTR_Shadow_Calibration:
              float(ss_pos),
              float(ntnl_pos),
              float(tip_angle_deg),
-             motion_phase_code]
+             motion_phase_code,
+             pass_idx]
         )
 
         dbg_local = dict(tip_refine_dbg) if isinstance(tip_refine_dbg, dict) else {}
@@ -3052,6 +3213,7 @@ class CTR_Shadow_Calibration:
         dbg_local["tip_angle_deg"] = float(tip_angle_deg)
         dbg_local["coarse_tip_before_local_xy"] = [float(tip_x), float(tip_y)]
         dbg_local["coarse_tip_after_local_xy"] = [float(xx_refined), float(yy_refined)]
+        dbg_local["legacy_tip_xy"] = [float(tip_col_legacy), float(tip_row_legacy)]
         dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
         self.tip_refine_debug_records[image_file_name] = dbg_local
 
@@ -3185,7 +3347,7 @@ class CTR_Shadow_Calibration:
             return
 
         num_images = len(image_files)
-        self.tip_locations_array_coarse = np.zeros((num_images, 7))
+        self.tip_locations_array_coarse = np.zeros((num_images, 8))
         # self.tip_locations_array_fine = np.zeros((num_images, 5))
 
         successful_analyses = 0
@@ -3230,7 +3392,7 @@ class CTR_Shadow_Calibration:
             # print(f"✓ Saved fine tip locations to: {fine_file}")
 
             try:
-                columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code']
+                columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code', 'pass_idx']
                 df_coarse = pd.DataFrame(self.tip_locations_array_coarse, columns=columns)
                 df_coarse['image_file'] = image_files
                 coarse_csv = os.path.join(processed_folder, "tip_locations_coarse.csv")
@@ -3297,6 +3459,78 @@ class CTR_Shadow_Calibration:
             y_use = y_sum / np.maximum(counts, 1.0)
 
         return x_use, y_use
+
+    @staticmethod
+    def _enforce_phase_endpoint_continuity(datasets, value_keys=None, atol=1e-9):
+        """
+        Force all phase branches to share the same endpoint knot values on the
+        overlapping B-domain. This gives exact C0 continuity for interpolating
+        fits such as PCHIP when traversing the hysteresis loop.
+        """
+        if not isinstance(datasets, dict) or len(datasets) < 2:
+            return datasets
+
+        phase_names = list(datasets.keys())
+        shared_b = None
+        for phase_name in phase_names:
+            ds = datasets.get(phase_name)
+            if ds is None or ds.get("common_b") is None:
+                return datasets
+            b_vals = np.asarray(ds["common_b"], dtype=float).ravel()
+            if b_vals.size == 0:
+                return datasets
+            shared_b = b_vals if shared_b is None else np.intersect1d(shared_b, b_vals)
+            if shared_b.size == 0:
+                return datasets
+
+        endpoint_b = [float(shared_b[0])]
+        if shared_b.size > 1 and not np.isclose(shared_b[-1], shared_b[0], atol=atol):
+            endpoint_b.append(float(shared_b[-1]))
+
+        coord_keys = ("r_coords", "z_coords", "x_raw", "z_raw")
+        angle_keys = ("tip_angle",)
+        keys_to_use = tuple(value_keys) if value_keys is not None else coord_keys + angle_keys
+
+        for b_target in endpoint_b:
+            phase_indices = {}
+            for phase_name in phase_names:
+                b_vals = np.asarray(datasets[phase_name]["common_b"], dtype=float).ravel()
+                match = np.where(np.isclose(b_vals, b_target, atol=atol))[0]
+                if match.size == 0:
+                    phase_indices = {}
+                    break
+                phase_indices[phase_name] = int(match[0])
+
+            if len(phase_indices) != len(phase_names):
+                continue
+
+            for key in keys_to_use:
+                samples = []
+                for phase_name, idx in phase_indices.items():
+                    arr = datasets[phase_name].get(key)
+                    if arr is None:
+                        continue
+                    arr = np.asarray(arr, dtype=float).ravel()
+                    if idx >= arr.size:
+                        continue
+                    val = float(arr[idx])
+                    if np.isfinite(val):
+                        samples.append(val)
+
+                if not samples:
+                    continue
+
+                shared_val = float(np.mean(samples))
+                for phase_name, idx in phase_indices.items():
+                    arr = datasets[phase_name].get(key)
+                    if arr is None:
+                        continue
+                    arr = np.asarray(arr, dtype=float).copy().ravel()
+                    if idx < arr.size:
+                        arr[idx] = shared_val
+                        datasets[phase_name][key] = arr
+
+        return datasets
 
     @staticmethod
     def _curve_fit_label(model_descriptor):
@@ -3459,6 +3693,41 @@ class CTR_Shadow_Calibration:
             fit_x_range=fit_x_range,
             sample_count=sample_count if sample_count > 0 else None,
         )
+
+    def get_pass_dataset(self, phase, pass_idx=None, combined=False):
+        datasets = getattr(self, "_postprocessed_datasets", None)
+        if not isinstance(datasets, dict) or not datasets:
+            raise ValueError("No postprocessed datasets are available. Run postprocess_calibration_data() first.")
+        phase_key = str(phase).strip().lower()
+        if combined:
+            lookup_key = f"{phase_key}_combined"
+        elif pass_idx is not None:
+            lookup_key = f"{phase_key}_{int(pass_idx)}"
+        else:
+            lookup_key = phase_key
+        if lookup_key not in datasets:
+            raise KeyError(f"Unknown dataset '{lookup_key}'. Available: {list(datasets.keys())}")
+        return datasets[lookup_key]
+
+    def get_fit_model(self, phase, fit_family="pchip", pass_idx=None, combined=False):
+        fit_models_by_phase = getattr(self, "_postprocessed_fit_models_by_phase", None)
+        if not isinstance(fit_models_by_phase, dict) or not fit_models_by_phase:
+            raise ValueError("No postprocessed fit models are available. Run postprocess_calibration_data() first.")
+        dataset = self.get_pass_dataset(phase=phase, pass_idx=pass_idx, combined=combined)
+        dataset_key = str(dataset.get("phase_name", phase)).strip().lower()
+        fit_family = str(fit_family).strip().lower()
+        if fit_family not in {"pchip", "cubic"}:
+            raise ValueError("fit_family must be 'pchip' or 'cubic'.")
+        key_map = {
+            "pchip": {"r": "r", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y"},
+            "cubic": {"r": "r_cubic", "z": "z_cubic", "tip_angle": "tip_angle_cubic", "offplane_y": "offplane_y"},
+        }
+        if dataset_key not in fit_models_by_phase:
+            raise KeyError(f"Unknown fit model group '{dataset_key}'. Available: {list(fit_models_by_phase.keys())}")
+        return {
+            quantity: fit_models_by_phase[dataset_key].get(model_key)
+            for quantity, model_key in key_map[fit_family].items()
+        }
 
     @staticmethod
     def _apply_dark_theme_to_figure(fig):
@@ -3925,14 +4194,19 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
             has_tip_angle = arr.shape[1] >= 6
             has_phase = arr.shape[1] >= 7
+            has_pass_idx = arr.shape[1] >= 8
             if not has_phase:
                 arr = np.column_stack([arr, np.zeros((arr.shape[0],), dtype=float)])
                 print("Motion phase column not found; assuming all images are pull-phase.")
+            if not has_pass_idx:
+                arr = np.column_stack([arr, np.ones((arr.shape[0],), dtype=float)])
+                print("Pass index column not found; assuming PASS1 for all images.")
 
             ORI_COL = 2
             B_PULL_COL = 3
             ANGLE_COL = 5
             PHASE_COL = 6
+            PASS_COL = 7
 
             has_calibrated_axes = (
                 self.board_homography_mm_from_px is not None
@@ -3946,7 +4220,10 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
             conversion_mode = "legacy_linear_scale"
             pixel_to_mm_scale = float(width_in_mm) / float(width_in_pixels)
-            board_measurement_scale = 0.5 if (has_calibrated_axes and board_type == "checkerboard") else 0.5
+            # Board-reference corrections are already applied at the calibration
+            # layer. Do not rescale the calibrated mm coordinates again before
+            # fitting, or all exported mm-valued fits end up 2x too small.
+            board_measurement_scale = 1.0
             tip_mm = arr.copy()
 
             if has_calibrated_axes:
@@ -3979,9 +4256,10 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             pd.DataFrame(tip_mm).to_excel('tip_locations_coarse_mm.xlsx', index=False, header=False)
             print(f"Physical conversion mode: {conversion_mode} | representative mm/px={pixel_to_mm_scale:.6f}")
 
-            valid_rows = tip_mm[np.all(np.isfinite(tip_mm[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL]]), axis=1)].copy()
+            valid_rows = tip_mm[np.all(np.isfinite(tip_mm[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL, PASS_COL]]), axis=1)].copy()
             if valid_rows.size == 0:
                 raise ValueError("No valid calibration rows after filtering NaNs.")
+            print("Applying orientation processing (two-capture averaging) for rotation/runout compensation...")
 
             def circular_mean_deg(a):
                 a = np.asarray(a, dtype=float)
@@ -4006,30 +4284,110 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     out.append(r)
                 return np.vstack(out) if out else np.zeros((0, arr_phase.shape[1]))
 
-            def build_phase_dataset(phase_code):
-                phase_rows = valid_rows[np.isclose(valid_rows[:, PHASE_COL], phase_code)]
-                if phase_rows.size == 0:
+            def process_orientation_pair(
+                arr_a,
+                arr_b,
+                *,
+                primary_col=0,
+                secondary_col=1,
+                angle_col=None,
+                primary_mirror_sign=-1.0,
+                angle_mirror_sign=-1.0,
+                pair_name="orientation_pair",
+            ):
+                """
+                Run the two-capture orientation-processing step used for machine
+                rotation/runout compensation:
+                1. collapse each orientation by B position
+                2. align them on the common B grid
+                3. mirror one orientation into the other's frame
+                4. average the mirrored pair
+                """
+                arr_a = collapse_by_bpull(arr_a)
+                arr_b = collapse_by_bpull(arr_b)
+                if arr_a.size == 0 or arr_b.size == 0:
                     return None
-                o0 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 0)])
-                o1 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 1)])
-                if o0.size == 0 or o1.size == 0:
-                    return None
-                common_b = np.intersect1d(o0[:, B_PULL_COL], o1[:, B_PULL_COL])
+
+                common_b = np.intersect1d(arr_a[:, B_PULL_COL], arr_b[:, B_PULL_COL])
                 if common_b.size == 0:
                     return None
-                idx0 = np.searchsorted(o0[:, B_PULL_COL], common_b)
-                idx1 = np.searchsorted(o1[:, B_PULL_COL], common_b)
-                o0p = o0[idx0].copy()
-                o1p = o1[idx1].copy()
-                mirror_source = np.vstack([o0, o1])
-                x_ref_mirror_line = float(np.mean(mirror_source[:, 0]))
-                o1_x_mirrored = (2.0 * x_ref_mirror_line) - o1p[:, 0]
-                avg_x_raw = 0.5 * (o0p[:, 0] + o1_x_mirrored)
-                avg_z_raw = 0.5 * (o0p[:, 1] + o1p[:, 1])
-                if has_tip_angle and o0p.shape[1] > ANGLE_COL and o1p.shape[1] > ANGLE_COL:
-                    o1_ang_mirrored = -o1p[:, ANGLE_COL]
-                    avg_ang = np.array([circular_mean_deg([a0, a1]) for a0, a1 in zip(o0p[:, ANGLE_COL], o1_ang_mirrored)], dtype=float)
-                else:
+
+                idx_a = np.searchsorted(arr_a[:, B_PULL_COL], common_b)
+                idx_b = np.searchsorted(arr_b[:, B_PULL_COL], common_b)
+                arr_ap = arr_a[idx_a].copy()
+                arr_bp = arr_b[idx_b].copy()
+
+                mirror_line = float(np.mean(np.vstack([arr_a[:, primary_col], arr_b[:, primary_col]])))
+                arr_b_primary_mirrored = mirror_line + (
+                    primary_mirror_sign * (arr_bp[:, primary_col] - mirror_line)
+                )
+                avg_primary = 0.5 * (arr_ap[:, primary_col] + arr_b_primary_mirrored)
+                avg_secondary = 0.5 * (arr_ap[:, secondary_col] + arr_bp[:, secondary_col])
+
+                avg_angle = None
+                arr_b_angle_mirrored = None
+                if (
+                    angle_col is not None
+                    and arr_ap.shape[1] > angle_col
+                    and arr_bp.shape[1] > angle_col
+                ):
+                    arr_b_angle_mirrored = angle_mirror_sign * arr_bp[:, angle_col]
+                    avg_angle = np.array(
+                        [
+                            circular_mean_deg([a0, a1])
+                            for a0, a1 in zip(arr_ap[:, angle_col], arr_b_angle_mirrored)
+                        ],
+                        dtype=float,
+                    )
+
+                return {
+                    'pair_name': pair_name,
+                    'common_b': common_b.astype(float),
+                    'mirror_line': mirror_line,
+                    'primary_mirror_sign': float(primary_mirror_sign),
+                    'a_collapsed': arr_a,
+                    'b_collapsed': arr_b,
+                    'a_aligned': arr_ap,
+                    'b_aligned': arr_bp,
+                    'b_primary_mirrored': arr_b_primary_mirrored.astype(float),
+                    'avg_primary': avg_primary.astype(float),
+                    'avg_secondary': avg_secondary.astype(float),
+                    'b_angle_mirrored': None if arr_b_angle_mirrored is None else arr_b_angle_mirrored.astype(float),
+                    'avg_angle': None if avg_angle is None else avg_angle.astype(float),
+                }
+
+            phase_name_map = {0: "pull", 1: "release"}
+
+            def build_phase_dataset(phase_code, pass_idx=1):
+                phase_rows = valid_rows[
+                    np.isclose(valid_rows[:, PHASE_COL], phase_code)
+                    & np.isclose(valid_rows[:, PASS_COL], pass_idx)
+                ]
+                if phase_rows.size == 0:
+                    return None
+                planar_pair = process_orientation_pair(
+                    phase_rows[np.isclose(phase_rows[:, ORI_COL], 0)],
+                    phase_rows[np.isclose(phase_rows[:, ORI_COL], 1)],
+                    primary_col=0,
+                    secondary_col=1,
+                    angle_col=ANGLE_COL if has_tip_angle else None,
+                    primary_mirror_sign=-1.0,
+                    angle_mirror_sign=-1.0,
+                    pair_name='C0_C180',
+                )
+                if planar_pair is None:
+                    return None
+                o0 = planar_pair['a_collapsed']
+                o1 = planar_pair['b_collapsed']
+                o0p = planar_pair['a_aligned']
+                o1p = planar_pair['b_aligned']
+                common_b = planar_pair['common_b']
+                x_ref_mirror_line = float(planar_pair['mirror_line'])
+                o1_x_mirrored = planar_pair['b_primary_mirrored']
+                avg_x_raw = planar_pair['avg_primary']
+                avg_z_raw = planar_pair['avg_secondary']
+                avg_ang = planar_pair['avg_angle']
+                if avg_ang is None:
                     avg_ang = np.full((common_b.shape[0],), np.nan, dtype=float)
                 zero_mask = np.isclose(common_b, 0.0, atol=1e-9)
                 zero_idx = int(np.where(zero_mask)[0][0]) if np.any(zero_mask) else int(np.argmin(np.abs(common_b)))
@@ -4043,7 +4401,9 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     tip_angle_avg[finite_mask] = np.where(tip_angle_avg[finite_mask] > 250.0, tip_angle_avg[finite_mask] - 360.0, tip_angle_avg[finite_mask])
                 dataset = {
                     'phase_code': int(phase_code),
-                    'phase_name': 'pull' if int(phase_code) == 0 else 'release',
+                    'pass_idx': int(pass_idx),
+                    'phase_base_name': phase_name_map.get(int(phase_code), f"phase_{int(phase_code)}"),
+                    'phase_name': f"{phase_name_map.get(int(phase_code), f'phase_{int(phase_code)}')}_{int(pass_idx)}",
                     'common_b': common_b.astype(float),
                     'x_raw': avg_x_raw.astype(float),
                     'z_raw': avg_z_raw.astype(float),
@@ -4054,6 +4414,17 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     'x_ref_mirror_line_mm': x_ref_mirror_line,
                     'z0_ref_mm': z0_ref,
                     'x0_ref_mm': x0_ref,
+                    'orientation_processing_planar': {
+                        'pair_name': planar_pair['pair_name'],
+                        'common_b': common_b.astype(float),
+                        'mirror_line_mm': x_ref_mirror_line,
+                        'orientation_0_x_mm': o0p[:, 0].astype(float),
+                        'orientation_0_z_mm': o0p[:, 1].astype(float),
+                        'orientation_180_x_mirrored_mm': o1_x_mirrored.astype(float),
+                        'orientation_180_z_mm': o1p[:, 1].astype(float),
+                        'avg_x_mm': avg_x_raw.astype(float),
+                        'avg_z_mm': avg_z_raw.astype(float),
+                    },
                     'raw_planar_trajectories': {
                         'C0': {
                             'b': o0[:, B_PULL_COL].astype(float).tolist(),
@@ -4066,58 +4437,251 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                             'z': o1[:, 1].astype(float).tolist(),
                         },
                     },
+                    'mirrored_planar_overlay': {
+                        'b': common_b.astype(float),
+                        'C0_x': o0p[:, 0].astype(float),
+                        'C0_z': o0p[:, 1].astype(float),
+                        'C180_x_mirrored': o1_x_mirrored.astype(float),
+                        'C180_z': o1p[:, 1].astype(float),
+                        'avg_x': avg_x_raw.astype(float),
+                        'avg_z': avg_z_raw.astype(float),
+                    },
                 }
-                o2 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 2)])
-                o3 = collapse_by_bpull(phase_rows[np.isclose(phase_rows[:, ORI_COL], 3)])
-                if o2.size > 0 and o3.size > 0:
-                    common_b_off = np.intersect1d(o2[:, B_PULL_COL], o3[:, B_PULL_COL])
-                    if common_b_off.size > 0:
-                        idx2 = np.searchsorted(o2[:, B_PULL_COL], common_b_off)
-                        idx3 = np.searchsorted(o3[:, B_PULL_COL], common_b_off)
-                        o2p = o2[idx2].copy()
-                        o3p = o3[idx3].copy()
-                        y_ref_offplane = float(np.mean(np.vstack([o2, o3])[:, 0]))
-                        o3_y_mirrored = (2.0 * y_ref_offplane) - o3p[:, 0]
-                        y_off_raw = 0.5 * (o2p[:, 0] + o3_y_mirrored)
-                        dataset['offplane_b'] = common_b_off.astype(float)
-                        dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
-                        dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
-                        dataset['raw_offplane_trajectories'] = {
-                            'C90': {
-                                'b': o2[:, B_PULL_COL].astype(float).tolist(),
-                                'y_proxy': o2[:, 0].astype(float).tolist(),
-                                'z': o2[:, 1].astype(float).tolist(),
-                            },
-                            'C-90': {
-                                'b': o3[:, B_PULL_COL].astype(float).tolist(),
-                                'y_proxy': o3[:, 0].astype(float).tolist(),
-                                'z': o3[:, 1].astype(float).tolist(),
-                            },
-                        }
-                    else:
-                        dataset['offplane_b'] = None
-                        dataset['offplane_y'] = None
-                        dataset['y_ref_offplane_mirror_line_mm'] = None
-                        dataset['raw_offplane_trajectories'] = None
+                offplane_pair = process_orientation_pair(
+                    phase_rows[np.isclose(phase_rows[:, ORI_COL], 2)],
+                    phase_rows[np.isclose(phase_rows[:, ORI_COL], 3)],
+                    primary_col=0,
+                    secondary_col=1,
+                    angle_col=None,
+                    primary_mirror_sign=-1.0,
+                    angle_mirror_sign=-1.0,
+                    pair_name='C90_C-90',
+                )
+                if offplane_pair is not None:
+                    o2 = offplane_pair['a_collapsed']
+                    o3 = offplane_pair['b_collapsed']
+                    o2p = offplane_pair['a_aligned']
+                    o3p = offplane_pair['b_aligned']
+                    common_b_off = offplane_pair['common_b']
+                    y_ref_offplane = float(offplane_pair['mirror_line'])
+                    o3_y_mirrored = offplane_pair['b_primary_mirrored']
+                    y_off_raw = offplane_pair['avg_primary']
+                    dataset['offplane_b'] = common_b_off.astype(float)
+                    dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
+                    dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
+                    dataset['orientation_processing_offplane'] = {
+                        'pair_name': offplane_pair['pair_name'],
+                        'common_b': common_b_off.astype(float),
+                        'mirror_line_mm': y_ref_offplane,
+                        'orientation_pos90_y_mm': o2p[:, 0].astype(float),
+                        'orientation_pos90_z_mm': o2p[:, 1].astype(float),
+                        'orientation_neg90_y_mirrored_mm': o3_y_mirrored.astype(float),
+                        'orientation_neg90_z_mm': o3p[:, 1].astype(float),
+                        'avg_y_mm': y_off_raw.astype(float),
+                    }
+                    dataset['raw_offplane_trajectories'] = {
+                        'C90': {
+                            'b': o2[:, B_PULL_COL].astype(float).tolist(),
+                            'y_proxy': o2[:, 0].astype(float).tolist(),
+                            'z': o2[:, 1].astype(float).tolist(),
+                        },
+                        'C-90': {
+                            'b': o3[:, B_PULL_COL].astype(float).tolist(),
+                            'y_proxy': o3[:, 0].astype(float).tolist(),
+                            'z': o3[:, 1].astype(float).tolist(),
+                        },
+                    }
                 else:
                     dataset['offplane_b'] = None
                     dataset['offplane_y'] = None
                     dataset['y_ref_offplane_mirror_line_mm'] = None
+                    dataset['orientation_processing_offplane'] = None
                     dataset['raw_offplane_trajectories'] = None
                 return dataset
 
             datasets = {}
-            for phase_code in sorted(np.unique(valid_rows[:, PHASE_COL]).astype(int)):
-                ds = build_phase_dataset(phase_code)
-                if ds is not None:
-                    datasets[ds['phase_name']] = ds
+            available_phase_codes = sorted(np.unique(valid_rows[:, PHASE_COL]).astype(int))
+            available_pass_indices = sorted(np.unique(valid_rows[:, PASS_COL]).astype(int))
+            for phase_code in available_phase_codes:
+                for pass_idx in available_pass_indices:
+                    ds = build_phase_dataset(phase_code, pass_idx=pass_idx)
+                    if ds is not None:
+                        datasets[ds['phase_name']] = ds
 
             if not datasets:
                 raise ValueError("Could not construct any valid pull/release paired datasets.")
 
+            combine_redundant_passes = bool(getattr(self, "_combine_redundant_passes", True))
+            redundant_pass_combination = str(getattr(self, "_redundant_pass_combination", "average")).strip().lower()
+            if redundant_pass_combination not in {"average", "keep_separate"}:
+                redundant_pass_combination = "average"
+
+            def clone_dataset_with_updates(base_ds, updates):
+                merged = dict(base_ds)
+                merged.update(updates)
+                return merged
+
+            def combine_phase_pair(base_phase_name):
+                ds_1 = datasets.get(f"{base_phase_name}_1")
+                ds_2 = datasets.get(f"{base_phase_name}_2")
+                if ds_1 is None or ds_2 is None:
+                    return None
+                common_b = np.intersect1d(np.asarray(ds_1['common_b'], dtype=float), np.asarray(ds_2['common_b'], dtype=float))
+                if common_b.size == 0:
+                    return None
+                idx_1 = np.searchsorted(np.asarray(ds_1['common_b'], dtype=float), common_b)
+                idx_2 = np.searchsorted(np.asarray(ds_2['common_b'], dtype=float), common_b)
+
+                def avg_or_none(key, use_common_b=True):
+                    a = ds_1.get(key)
+                    b = ds_2.get(key)
+                    if a is None or b is None:
+                        return None
+                    a = np.asarray(a, dtype=float)
+                    b = np.asarray(b, dtype=float)
+                    if use_common_b:
+                        a = a[idx_1]
+                        b = b[idx_2]
+                    if key == 'tip_angle':
+                        return np.array([circular_mean_deg([va, vb]) for va, vb in zip(a, b)], dtype=float)
+                    return 0.5 * (a + b)
+
+                combined = clone_dataset_with_updates(
+                    ds_1,
+                    {
+                        'phase_base_name': base_phase_name,
+                        'phase_name': f"{base_phase_name}_combined",
+                        'pass_idx': None,
+                        'combined_from_passes': [1, 2],
+                        'common_b': common_b.astype(float),
+                        'x_raw': avg_or_none('x_raw'),
+                        'z_raw': avg_or_none('z_raw'),
+                        'r_coords': avg_or_none('r_coords'),
+                        'z_coords': avg_or_none('z_coords'),
+                        'tip_angle': avg_or_none('tip_angle'),
+                        'offplane_b': None,
+                        'offplane_y': None,
+                    },
+                )
+                zero_mask = np.isclose(common_b, 0.0, atol=1e-9)
+                combined['zero_idx'] = int(np.where(zero_mask)[0][0]) if np.any(zero_mask) else int(np.argmin(np.abs(common_b)))
+                combined['x_ref_mirror_line_mm'] = float(np.nanmean([ds_1.get('x_ref_mirror_line_mm'), ds_2.get('x_ref_mirror_line_mm')]))
+                combined['z0_ref_mm'] = float(np.nanmean([ds_1.get('z0_ref_mm'), ds_2.get('z0_ref_mm')]))
+                combined['x0_ref_mm'] = float(np.nanmean([ds_1.get('x0_ref_mm'), ds_2.get('x0_ref_mm')]))
+                if ds_1.get('offplane_b') is not None and ds_2.get('offplane_b') is not None:
+                    common_b_off = np.intersect1d(np.asarray(ds_1['offplane_b'], dtype=float), np.asarray(ds_2['offplane_b'], dtype=float))
+                    if common_b_off.size > 0:
+                        id1 = np.searchsorted(np.asarray(ds_1['offplane_b'], dtype=float), common_b_off)
+                        id2 = np.searchsorted(np.asarray(ds_2['offplane_b'], dtype=float), common_b_off)
+                        combined['offplane_b'] = common_b_off.astype(float)
+                        combined['offplane_y'] = 0.5 * (
+                            np.asarray(ds_1['offplane_y'], dtype=float)[id1]
+                            + np.asarray(ds_2['offplane_y'], dtype=float)[id2]
+                        )
+                combined['orientation_processing_planar'] = None
+                combined['orientation_processing_offplane'] = None
+                combined['raw_planar_trajectories'] = {
+                    'source_passes': [ds_1.get('phase_name'), ds_2.get('phase_name')]
+                }
+                combined['raw_offplane_trajectories'] = {
+                    'source_passes': [ds_1.get('phase_name'), ds_2.get('phase_name')]
+                } if combined.get('offplane_b') is not None else None
+                combined['mirrored_planar_overlay'] = None
+                return combined
+
+            def compute_redundancy_diagnostics(base_phase_name):
+                ds_1 = datasets.get(f"{base_phase_name}_1")
+                ds_2 = datasets.get(f"{base_phase_name}_2")
+                if ds_1 is None or ds_2 is None:
+                    return None
+                common_b = np.intersect1d(np.asarray(ds_1['common_b'], dtype=float), np.asarray(ds_2['common_b'], dtype=float))
+                if common_b.size == 0:
+                    return None
+                idx_1 = np.searchsorted(np.asarray(ds_1['common_b'], dtype=float), common_b)
+                idx_2 = np.searchsorted(np.asarray(ds_2['common_b'], dtype=float), common_b)
+
+                def diff_for(key):
+                    a = ds_1.get(key)
+                    b = ds_2.get(key)
+                    if a is None or b is None:
+                        return None
+                    return np.asarray(a, dtype=float)[idx_1] - np.asarray(b, dtype=float)[idx_2]
+
+                diffs = {
+                    'b': common_b.astype(float),
+                    'x': None if diff_for('x_raw') is None else diff_for('x_raw').astype(float).tolist(),
+                    'z': None if diff_for('z_raw') is None else diff_for('z_raw').astype(float).tolist(),
+                    'r_coords': None if diff_for('r_coords') is None else diff_for('r_coords').astype(float).tolist(),
+                    'z_coords': None if diff_for('z_coords') is None else diff_for('z_coords').astype(float).tolist(),
+                    'tip_angle': None if diff_for('tip_angle') is None else diff_for('tip_angle').astype(float).tolist(),
+                }
+                if ds_1.get('offplane_b') is not None and ds_2.get('offplane_b') is not None:
+                    common_off_b = np.intersect1d(np.asarray(ds_1['offplane_b'], dtype=float), np.asarray(ds_2['offplane_b'], dtype=float))
+                    if common_off_b.size > 0:
+                        id1 = np.searchsorted(np.asarray(ds_1['offplane_b'], dtype=float), common_off_b)
+                        id2 = np.searchsorted(np.asarray(ds_2['offplane_b'], dtype=float), common_off_b)
+                        diffs['offplane_b'] = common_off_b.astype(float).tolist()
+                        diffs['offplane_y'] = (
+                            np.asarray(ds_1['offplane_y'], dtype=float)[id1]
+                            - np.asarray(ds_2['offplane_y'], dtype=float)[id2]
+                        ).astype(float).tolist()
+
+                rms_terms = []
+                for key in ('r_coords', 'z_coords', 'tip_angle'):
+                    d = diff_for(key)
+                    if d is not None and d.size > 0:
+                        rms_terms.append(np.square(d))
+                rms_mismatch = None
+                if rms_terms:
+                    rms_mismatch = float(np.sqrt(np.mean(np.concatenate([x.ravel() for x in rms_terms]))))
+                return {
+                    'phase': base_phase_name,
+                    'shared_b': common_b.astype(float).tolist(),
+                    'differences': diffs,
+                    'rms_mismatch': rms_mismatch,
+                }
+
+            redundancy_diagnostics = {}
+            if 'pull_2' in datasets:
+                redundancy_diagnostics['pull'] = compute_redundancy_diagnostics('pull')
+            if 'release_2' in datasets:
+                redundancy_diagnostics['release'] = compute_redundancy_diagnostics('release')
+
+            combined_datasets = {}
+            if combine_redundant_passes and redundant_pass_combination == "average":
+                if 'pull_2' in datasets:
+                    print("Combining redundant pull passes by averaging")
+                    combined_ds = combine_phase_pair('pull')
+                    if combined_ds is not None:
+                        combined_datasets[combined_ds['phase_name']] = combined_ds
+                if 'release_2' in datasets:
+                    print("Combining redundant release passes by averaging")
+                    combined_ds = combine_phase_pair('release')
+                    if combined_ds is not None:
+                        combined_datasets[combined_ds['phase_name']] = combined_ds
+
+            datasets_for_fitting = dict(datasets)
+            datasets_for_fitting.update(combined_datasets)
+            dataset_aliases = {}
+            if 'pull_combined' in combined_datasets:
+                dataset_aliases['pull'] = 'pull_combined'
+            elif 'pull_1' in datasets:
+                dataset_aliases['pull'] = 'pull_1'
+            if 'release_combined' in combined_datasets:
+                dataset_aliases['release'] = 'release_combined'
+            elif 'release_1' in datasets:
+                dataset_aliases['release'] = 'release_1'
+
             fit_model = str(fit_model).strip().lower()
             if fit_model not in {'cubic', 'pchip'}:
                 raise ValueError(f"Unsupported fit_model '{fit_model}'. Use 'cubic' or 'pchip'.")
+
+            if fit_model == 'pchip':
+                datasets = self._enforce_phase_endpoint_continuity(
+                    {k: v for k, v in datasets_for_fitting.items() if isinstance(v, dict) and v.get('common_b') is not None},
+                    value_keys=('r_coords', 'z_coords', 'tip_angle'),
+                )
+                datasets_for_fitting.update(datasets)
 
             def r2_score_safe(y_true, y_pred):
                 y_true = np.asarray(y_true, dtype=float)
@@ -4139,9 +4703,9 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 }.get(model_type, model_type.upper())
 
             fit_results = {}
-            legacy_phase = 'pull' if 'pull' in datasets else list(datasets.keys())[0]
+            legacy_phase = dataset_aliases.get('pull', list(datasets_for_fitting.keys())[0])
 
-            for phase_name, ds in datasets.items():
+            for phase_name, ds in datasets_for_fitting.items():
                 b = ds['common_b']
                 r_coords = ds['r_coords']
                 z_coords = ds['z_coords']
@@ -4185,9 +4749,12 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     'dataset': ds,
                     'r_model': r_model,
                     'z_model': z_model,
+                    'r_pchip_model': self._fit_curve_model(b, r_coords, 'pchip', f"r_{phase_name}_pchip"),
+                    'z_pchip_model': self._fit_curve_model(b, z_coords, 'pchip', f"z_{phase_name}_pchip"),
                     'r_cubic_model': r_cubic_model,
                     'z_cubic_model': z_cubic_model,
                     'tip_angle_model': angle_model,
+                    'tip_angle_pchip_model': self._fit_curve_model(b[np.isfinite(tip_ang)], tip_ang[np.isfinite(tip_ang)], 'pchip', f"tip_angle_{phase_name}_pchip") if has_tip_angle and np.any(np.isfinite(tip_ang)) and np.sum(np.isfinite(tip_ang)) >= 2 else None,
                     'tip_angle_cubic_model': angle_cubic_model,
                     'offplane_y_model': off_model,
                     'r_pred': r_pred,
@@ -4202,19 +4769,19 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 }
 
             shared_tip_angle_model = self._average_polynomial_models(
-                [fr['tip_angle_cubic_model'] for fr in fit_results.values()],
+                [fr['tip_angle_cubic_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
                 value_name='tip_angle_avg',
             )
             shared_r_cubic_model = self._average_polynomial_models(
-                [fr['r_cubic_model'] for fr in fit_results.values()],
+                [fr['r_cubic_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
                 value_name='r_avg',
             )
             shared_z_cubic_model = self._average_polynomial_models(
-                [fr['z_cubic_model'] for fr in fit_results.values()],
+                [fr['z_cubic_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
                 value_name='z_avg',
             )
             shared_offplane_y_model = self._average_polynomial_models(
-                [fr['offplane_y_model'] for fr in fit_results.values()],
+                [fr['offplane_y_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
                 value_name='offplane_y_avg',
             )
 
@@ -4669,24 +5236,292 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 xz_fig.savefig('11_xz_trajectory_hysteresis.png', dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
                 plt.close(xz_fig)
 
+                overlay_fig, overlay_axes = plt.subplots(1, 3, figsize=(19, 6.5))
+                ax_overlay_xz, ax_overlay_x, ax_overlay_z = overlay_axes
+                orientation_colors = {
+                    'C0': '#6ec5ff',
+                    'C180_mirrored': '#ff9f68',
+                }
+                phase_markers_overlay = {
+                    'pull': 'o',
+                    'release': 's',
+                }
+                avg_measured_style = {
+                    'color': '#f2f2f2',
+                    'linestyle': '-',
+                    'linewidth': 2.8,
+                    'alpha': 0.95,
+                }
+                avg_pred_style = {
+                    'color': '#d7ff70',
+                    'linestyle': ':',
+                    'linewidth': 3.0,
+                    'alpha': 1.0,
+                }
+
+                for phase_name, fr in fit_results.items():
+                    ds = fr['dataset']
+                    phase_marker = phase_markers_overlay.get(phase_name, 'o')
+                    overlay = ds.get('mirrored_planar_overlay') or {}
+                    if not overlay:
+                        continue
+
+                    b_common = np.asarray(overlay.get('b', []), dtype=float)
+                    x0 = np.asarray(overlay.get('C0_x', []), dtype=float)
+                    z0 = np.asarray(overlay.get('C0_z', []), dtype=float)
+                    x180m = np.asarray(overlay.get('C180_x_mirrored', []), dtype=float)
+                    z180 = np.asarray(overlay.get('C180_z', []), dtype=float)
+                    xavg = np.asarray(overlay.get('avg_x', []), dtype=float)
+                    zavg = np.asarray(overlay.get('avg_z', []), dtype=float)
+
+                    if b_common.size == 0:
+                        continue
+
+                    x_ref = float(ds['x_ref_mirror_line_mm'])
+                    z_ref = float(ds['z0_ref_mm'])
+                    c0_x_defl = x0 - x_ref
+                    c180_x_defl = x180m - x_ref
+                    c0_z_defl = z0 - z_ref
+                    c180_z_defl = z180 - z_ref
+                    avg_x_defl = xavg - x_ref
+                    avg_z_defl = zavg - z_ref
+
+                    ax_overlay_xz.plot(
+                        x0,
+                        z0,
+                        color=orientation_colors['C0'],
+                        linewidth=1.8,
+                        linestyle='-',
+                        alpha=0.92,
+                        marker=phase_marker,
+                        markersize=3.8,
+                        label=f"{phase_name} C=0",
+                    )
+                    ax_overlay_xz.plot(
+                        x180m,
+                        z180,
+                        color=orientation_colors['C180_mirrored'],
+                        linewidth=1.8,
+                        linestyle='-',
+                        alpha=0.92,
+                        marker=phase_marker,
+                        markersize=3.8,
+                        label=f"{phase_name} C=180 mirrored",
+                    )
+                    ax_overlay_xz.plot(
+                        xavg,
+                        zavg,
+                        color=avg_measured_style['color'],
+                        linewidth=avg_measured_style['linewidth'],
+                        linestyle=avg_measured_style['linestyle'],
+                        alpha=avg_measured_style['alpha'],
+                        marker=phase_marker,
+                        markersize=3.6,
+                        label=f"{phase_name} averaged",
+                    )
+
+                    phase_x_pred = x_ref + np.asarray(fr['r_pred'], dtype=float)
+                    phase_z_pred = z_ref + np.asarray(fr['z_pred'], dtype=float)
+                    ax_overlay_xz.plot(
+                        phase_x_pred,
+                        phase_z_pred,
+                        color=avg_pred_style['color'],
+                        linewidth=avg_pred_style['linewidth'],
+                        linestyle=avg_pred_style['linestyle'],
+                        alpha=avg_pred_style['alpha'],
+                        marker=phase_marker,
+                        markersize=3.2,
+                        label=f"{phase_name} predicted",
+                    )
+
+                    ax_overlay_x.plot(
+                        b_common,
+                        c0_x_defl,
+                        color=orientation_colors['C0'],
+                        linewidth=1.6,
+                        linestyle='-',
+                        alpha=0.92,
+                        marker=phase_marker,
+                        markersize=3.6,
+                        label=f"{phase_name} C=0",
+                    )
+                    ax_overlay_x.plot(
+                        b_common,
+                        c180_x_defl,
+                        color=orientation_colors['C180_mirrored'],
+                        linewidth=1.6,
+                        linestyle='-',
+                        alpha=0.92,
+                        marker=phase_marker,
+                        markersize=3.6,
+                        label=f"{phase_name} C=180 mirrored",
+                    )
+                    ax_overlay_x.plot(
+                        b_common,
+                        avg_x_defl,
+                        color=avg_measured_style['color'],
+                        linewidth=avg_measured_style['linewidth'],
+                        linestyle=avg_measured_style['linestyle'],
+                        alpha=avg_measured_style['alpha'],
+                        marker=phase_marker,
+                        markersize=3.4,
+                        label=f"{phase_name} averaged",
+                    )
+                    ax_overlay_x.plot(
+                        b_common,
+                        np.asarray(fr['r_pred'], dtype=float),
+                        color=avg_pred_style['color'],
+                        linewidth=avg_pred_style['linewidth'],
+                        linestyle=avg_pred_style['linestyle'],
+                        alpha=avg_pred_style['alpha'],
+                        marker=phase_marker,
+                        markersize=3.0,
+                        label=f"{phase_name} predicted",
+                    )
+
+                    ax_overlay_z.plot(
+                        b_common,
+                        c0_z_defl,
+                        color=orientation_colors['C0'],
+                        linewidth=1.6,
+                        linestyle='-',
+                        alpha=0.92,
+                        marker=phase_marker,
+                        markersize=3.6,
+                        label=f"{phase_name} C=0",
+                    )
+                    ax_overlay_z.plot(
+                        b_common,
+                        c180_z_defl,
+                        color=orientation_colors['C180_mirrored'],
+                        linewidth=1.6,
+                        linestyle='-',
+                        alpha=0.92,
+                        marker=phase_marker,
+                        markersize=3.6,
+                        label=f"{phase_name} C=180 mirrored",
+                    )
+                    ax_overlay_z.plot(
+                        b_common,
+                        avg_z_defl,
+                        color=avg_measured_style['color'],
+                        linewidth=avg_measured_style['linewidth'],
+                        linestyle=avg_measured_style['linestyle'],
+                        alpha=avg_measured_style['alpha'],
+                        marker=phase_marker,
+                        markersize=3.4,
+                        label=f"{phase_name} averaged",
+                    )
+                    ax_overlay_z.plot(
+                        b_common,
+                        np.asarray(fr['z_pred'], dtype=float),
+                        color=avg_pred_style['color'],
+                        linewidth=avg_pred_style['linewidth'],
+                        linestyle=avg_pred_style['linestyle'],
+                        alpha=avg_pred_style['alpha'],
+                        marker=phase_marker,
+                        markersize=3.0,
+                        label=f"{phase_name} predicted",
+                    )
+
+                if shared_r_cubic_model is not None and shared_z_cubic_model is not None and all_b_ranges:
+                    overlay_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
+                    shared_r_pred = self._evaluate_curve_model(shared_r_cubic_model, overlay_b)
+                    shared_z_pred = self._evaluate_curve_model(shared_z_cubic_model, overlay_b)
+                    shared_x_refs = [
+                        float(fr['dataset']['x_ref_mirror_line_mm'])
+                        for fr in fit_results.values()
+                        if fr['dataset'].get('x_ref_mirror_line_mm') is not None
+                    ]
+                    shared_z_refs = [
+                        float(fr['dataset']['z0_ref_mm'])
+                        for fr in fit_results.values()
+                        if fr['dataset'].get('z0_ref_mm') is not None
+                    ]
+                    if shared_x_refs and shared_z_refs:
+                        ax_overlay_xz.plot(
+                            float(np.mean(shared_x_refs)) + shared_r_pred,
+                            float(np.mean(shared_z_refs)) + shared_z_pred,
+                            color=avg_pred_style['color'],
+                            linewidth=3.0,
+                            linestyle='--',
+                            alpha=0.95,
+                            label='Shared averaged prediction',
+                        )
+                    ax_overlay_x.plot(
+                        overlay_b,
+                        shared_r_pred,
+                        color=avg_pred_style['color'],
+                        linewidth=3.0,
+                        linestyle='--',
+                        alpha=0.95,
+                        label='Shared averaged prediction',
+                    )
+                    ax_overlay_z.plot(
+                        overlay_b,
+                        shared_z_pred,
+                        color=avg_pred_style['color'],
+                        linewidth=3.0,
+                        linestyle='--',
+                        alpha=0.95,
+                        label='Shared averaged prediction',
+                    )
+
+                ax_overlay_xz.set_title('Mirrored C=0 / C=180 Overlay in XZ')
+                ax_overlay_x.set_title('Mirrored Planar X Deflection vs Motor')
+                ax_overlay_z.set_title('Mirrored Axial Z Deflection vs Motor')
+                ax_overlay_xz.set_xlabel('X (mm)')
+                ax_overlay_xz.set_ylabel('Z (mm)')
+                ax_overlay_x.set_xlabel('B Motor Position')
+                ax_overlay_x.set_ylabel('Planar X Deflection (mm)')
+                ax_overlay_z.set_xlabel('B Motor Position')
+                ax_overlay_z.set_ylabel('Axial Z Deflection (mm)')
+                ax_overlay_xz.axis('equal')
+                ax_overlay_x.axhline(0.0, color='white', linestyle='--', linewidth=1.1, alpha=0.45)
+                ax_overlay_z.axhline(0.0, color='white', linestyle='--', linewidth=1.1, alpha=0.45)
+                for ax in overlay_axes:
+                    ax.legend(fontsize=8)
+                overlay_fig.tight_layout()
+                self._apply_dark_theme_to_figure(overlay_fig)
+                overlay_fig.savefig('12_mirrored_phase_overlays.png', dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
+                plt.close(overlay_fig)
+
             fit_models_by_phase = {}
             for phase, fr in fit_results.items():
                 fit_models_by_phase[phase] = {
                     'r': fr['r_model'],
                     'z': fr['z_model'],
+                    'r_pchip': fr['r_pchip_model'],
+                    'z_pchip': fr['z_pchip_model'],
+                    'r_cubic': fr['r_cubic_model'],
+                    'z_cubic': fr['z_cubic_model'],
                     'tip_angle': fr['tip_angle_model'],
+                    'tip_angle_pchip': fr['tip_angle_pchip_model'],
+                    'tip_angle_cubic': fr['tip_angle_cubic_model'],
                     'tip_angle_avg_cubic': shared_tip_angle_model,
-                    'offplane_y': shared_offplane_y_model,
+                    'offplane_y': fr['offplane_y_model'],
                     'r_avg_cubic': shared_r_cubic_model,
                     'z_avg_cubic': shared_z_cubic_model,
                 }
-            default_fit_models = fit_models_by_phase[legacy_phase]
+            datasets_with_aliases = dict(datasets_for_fitting)
+            fit_models_with_aliases = dict(fit_models_by_phase)
+            for alias_name, canonical_name in dataset_aliases.items():
+                if canonical_name in datasets_for_fitting:
+                    datasets_with_aliases[alias_name] = datasets_for_fitting[canonical_name]
+                if canonical_name in fit_models_by_phase:
+                    fit_models_with_aliases[alias_name] = fit_models_by_phase[canonical_name]
+            default_fit_models = fit_models_with_aliases[legacy_phase]
+            self._postprocessed_datasets = datasets_with_aliases
+            self._postprocessed_fit_models_by_phase = fit_models_with_aliases
+            self._postprocessed_redundancy_diagnostics = redundancy_diagnostics
 
             cubic_calibration_data = {
                 'selected_fit_model': fit_model,
                 'default_phase_for_legacy_access': legacy_phase,
                 'fit_models': default_fit_models,
-                'fit_models_by_phase': fit_models_by_phase,
+                'fit_models_by_phase': fit_models_with_aliases,
+                'datasets_by_phase': datasets_with_aliases,
+                'redundancy_diagnostics': redundancy_diagnostics,
                 'shared_aux_fit_models': {
                     'r_avg_cubic': shared_r_cubic_model,
                     'z_avg_cubic': shared_z_cubic_model,
@@ -4741,6 +5576,28 @@ def _get_phase_models(phase=None):
         raise KeyError(f'Unknown phase {{phase_key}}. Available: {{list(FIT_MODELS_BY_PHASE)}}')
     return FIT_MODELS_BY_PHASE[phase_key]
 
+def get_fit_model(phase, fit_family='pchip'):
+    phase_key = str(phase).lower()
+    if phase_key not in FIT_MODELS_BY_PHASE:
+        raise KeyError(f'Unknown phase {{phase_key}}. Available: {{list(FIT_MODELS_BY_PHASE)}}')
+    m = FIT_MODELS_BY_PHASE[phase_key]
+    fit_family = str(fit_family).lower()
+    if fit_family == 'pchip':
+        return {{
+            'r': m.get('r_pchip') or m.get('r'),
+            'z': m.get('z_pchip') or m.get('z'),
+            'tip_angle': m.get('tip_angle_pchip') or m.get('tip_angle'),
+            'offplane_y': m.get('offplane_y'),
+        }}
+    if fit_family == 'cubic':
+        return {{
+            'r': m.get('r_cubic') or m.get('r_avg_cubic'),
+            'z': m.get('z_cubic') or m.get('z_avg_cubic'),
+            'tip_angle': m.get('tip_angle_cubic') or m.get('tip_angle_avg_cubic'),
+            'offplane_y': m.get('offplane_y'),
+        }}
+    raise ValueError(f'Unsupported fit_family: {{fit_family}}')
+
 def predict_tip_position_from_b(b_motor_pos, phase=None):
     m = _get_phase_models(phase)
     b_motor = np.atleast_1d(b_motor_pos)
@@ -4772,7 +5629,7 @@ def predict_offplane_y_from_b(b_motor_pos, phase=None):
 def predict_cartesian_from_b(b_motor_pos, phase=None):
     return predict_tip_position_from_b(b_motor_pos, phase=phase)
 """.format(
-                fit_models_json=json.dumps(fit_models_by_phase, indent=2),
+                fit_models_json=json.dumps(fit_models_with_aliases, indent=2),
                 default_phase_json=json.dumps(legacy_phase),
             )
             with open(f"{robot_name}_cubic_prediction_functions.py", "w") as f:
@@ -4785,8 +5642,11 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                 'default_phase_for_legacy_access': legacy_phase,
                 'orientation_map': {'0': 'C=0 deg', '1': 'C=180 deg', '2': 'C=+90 deg', '3': 'C=-90 deg'},
                 'motion_phase_map': {'0': 'pull', '1': 'release'},
+                'redundant_pass_combination': redundant_pass_combination,
                 'fit_models': default_fit_models,
-                'fit_models_by_phase': fit_models_by_phase,
+                'fit_models_by_phase': fit_models_with_aliases,
+                'datasets_by_phase': datasets_with_aliases,
+                'redundancy_diagnostics': redundancy_diagnostics,
                 'shared_aux_fit_models': {
                     'r_avg_cubic': shared_r_cubic_model,
                     'z_avg_cubic': shared_z_cubic_model,
@@ -4838,6 +5698,7 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
             print(f" - {robot_name}_gcode_calibration.json")
             print(" - 10_dual_phase_fits.png")
             print(" - 11_xz_trajectory_hysteresis.png")
+            print(" - 12_mirrored_phase_overlays.png")
             print(f" - {robot_name}_phase_fit_summary.xlsx")
 
             if export_skeleton:
@@ -4854,8 +5715,10 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                     print(f" - {stl_path.name}")
 
             return {
-                'fit_models_by_phase': fit_models_by_phase,
+                'fit_models_by_phase': fit_models_with_aliases,
+                'datasets_by_phase': datasets_with_aliases,
                 'default_phase': legacy_phase,
+                'redundancy_diagnostics': redundancy_diagnostics,
                 'phase_fit_metrics': gcode_calibration_data['phase_fit_metrics'],
                 'json_path': os.path.join(processed_folder, f"{robot_name}_gcode_calibration.json"),
             }

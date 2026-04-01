@@ -14,7 +14,7 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-03-24_06',
+    project_name='Test_Calibration_2026-03-31_03',
     allow_existing= True,
     add_date=False
 )
@@ -23,17 +23,17 @@ print("Calibration object created!")
 # --- CONFIG ---
 MANUAL_CROP_ADJUSTMENT = True
 THRESHOLD = 200
-PULL_B_START = -0.5
-PULL_B_STEPS = 12
-PULL_B_STEP_SIZE = -0.5
-CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260324_132727.npz")
-BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260324_132737.png")
+PULL_B_START = 0.3
+PULL_B_STEPS = 22
+PULL_B_STEP_SIZE = -0.25
+CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260331_100557.npz")
+BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260331_100553.png")
 
 PROBE_MODE = "middle"  # "middle" | "five"
 FIT_MODEL = "pchip"  # "pchip" | "cubic"
 
 if PROBE_MODE == "middle":
-    probe_points = [(100.0, 45.0, -185.0)]
+    probe_points = [(100.0, 52.0, -155.0)]
 elif PROBE_MODE == "five":
     probe_points = [
         (30.0, 0.0, -70.0),

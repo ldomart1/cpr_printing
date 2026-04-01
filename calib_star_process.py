@@ -75,10 +75,10 @@ _NEI8_W = [
     (1, -1, 2 ** 0.5),  (1, 0, 1.0),  (1, 1, 2 ** 0.5),
 ]
 STAR_CENTER_X_DEFAULT = 100.0
-STAR_CENTER_Z_DEFAULT = -145.0
+STAR_CENTER_Z_DEFAULT = -135.0
 STAR_OUTER_RADIUS_DEFAULT = 18.0
 STAR_INNER_RATIO_DEFAULT = 0.38196601125
-STAR_ROTATION_DEG_DEFAULT = 90.0
+STAR_ROTATION_DEG_DEFAULT = 270.0
 STAR_SAMPLES_PER_EDGE_DEFAULT = 30
 _TRACKED_SAMPLE_RE = re.compile(r"(?:^|_)(\d{5})_(right_start|right|mirror_flip|left|tracked)(?:_|$)")
 
@@ -357,6 +357,8 @@ def build_star_tip_lookup(
     inner_ratio: float,
     rotation_deg: float,
     samples_per_edge: int,
+    capture_at_start: bool = False,
+    capture_every_n_star_moves: int = 1,
 ) -> Dict[int, Dict[str, float]]:
     vertices = build_star_vertices(
         outer_radius=float(outer_radius),
@@ -368,10 +370,33 @@ def build_star_tip_lookup(
     left_half_pts = right_half_pts.copy()
     left_half_pts[:, 0] *= -1.0
 
-    sequence = np.vstack([right_half_pts, left_half_pts])
     lookup: Dict[int, Dict[str, float]] = {}
-    for idx_1based, pt in enumerate(sequence, start=1):
-        lookup[idx_1based] = {
+    command_sequence: List[Tuple[str, np.ndarray]] = []
+    for idx, pt in enumerate(right_half_pts):
+        command_sequence.append(("right_start" if idx == 0 else "right", pt))
+    for idx, pt in enumerate(left_half_pts):
+        command_sequence.append(("mirror_flip" if idx == 0 else "left", pt))
+
+    sample_idx = 0
+    star_move_counter = 0
+    capture_every_n_star_moves = max(1, int(capture_every_n_star_moves))
+
+    if command_sequence and bool(capture_at_start):
+        sample_idx += 1
+        pt0 = command_sequence[0][1]
+        lookup[sample_idx] = {
+            "desired_tip_x_mm": float(center_x + pt0[0]),
+            "desired_tip_z_mm": float(center_z + pt0[1]),
+        }
+
+    for phase, pt in command_sequence[1:]:
+        if phase not in {"right", "left"}:
+            continue
+        star_move_counter += 1
+        if (star_move_counter % capture_every_n_star_moves) != 0:
+            continue
+        sample_idx += 1
+        lookup[sample_idx] = {
             "desired_tip_x_mm": float(center_x + pt[0]),
             "desired_tip_z_mm": float(center_z + pt[1]),
         }
@@ -2016,6 +2041,8 @@ def save_metrics_json(
             "star_inner_ratio": float(args.star_inner_ratio),
             "star_rotation_deg": float(args.star_rotation_deg),
             "star_samples_per_edge": int(args.star_samples_per_edge),
+            "capture_at_start": bool(args.capture_at_start),
+            "capture_every_n_star_moves": int(args.capture_every_n_star_moves),
             "hist_bins": int(args.hist_bins),
         },
     }
@@ -2080,6 +2107,10 @@ def main():
     ap.add_argument("--star_inner_ratio", type=float, default=STAR_INNER_RATIO_DEFAULT)
     ap.add_argument("--star_rotation_deg", type=float, default=STAR_ROTATION_DEG_DEFAULT)
     ap.add_argument("--star_samples_per_edge", type=int, default=STAR_SAMPLES_PER_EDGE_DEFAULT)
+    ap.add_argument("--capture_at_start", action="store_true",
+                    help="Match acquisition runs that also captured the initial right_start point.")
+    ap.add_argument("--capture_every_n_star_moves", type=int, default=1,
+                    help="Match acquisition subsampling: one saved image every N right/left star moves.")
 
     ap.add_argument("--hist_bins", type=int, default=20,
                     help="Number of histogram bins.")
@@ -2136,6 +2167,8 @@ def main():
         inner_ratio=float(args.star_inner_ratio),
         rotation_deg=float(args.star_rotation_deg),
         samples_per_edge=int(args.star_samples_per_edge),
+        capture_at_start=bool(args.capture_at_start),
+        capture_every_n_star_moves=int(args.capture_every_n_star_moves),
     )
 
     if args.tip_refine_mode != "none":

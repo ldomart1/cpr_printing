@@ -42,6 +42,7 @@ Optional sign correction:
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -75,13 +76,13 @@ DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
 DEFAULT_POINT_X = 100.0
-DEFAULT_POINT_Y = 20.0
-DEFAULT_POINT_Z = -155.0
+DEFAULT_POINT_Y = 52.0
+DEFAULT_POINT_Z = -130.0
 
-DEFAULT_TRAVEL_FEED = 2000.0
-DEFAULT_FINE_APPROACH_FEED = 500.0
-DEFAULT_PROBE_FEED = 500.0
-DEFAULT_B_MAX_FEED = 500.0
+DEFAULT_TRAVEL_FEED = 1000.0
+DEFAULT_FINE_APPROACH_FEED = 1000.0
+DEFAULT_PROBE_FEED = 1000.0
+DEFAULT_B_MAX_FEED = 180.0
 DEFAULT_B_ACCEL_TIME_S = 0.5
 DEFAULT_B_DECEL_TIME_S = 0.5
 
@@ -89,7 +90,7 @@ DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
 DEFAULT_ORIENTATION_SEQUENCE = (0.0, 180.0)
 DEFAULT_OSCILLATIONS_PER_ORIENTATION = 2.0
-DEFAULT_ORIENTATION_MOVE_STEPS = 1200
+DEFAULT_ORIENTATION_MOVE_STEPS = 2400
 DEFAULT_ORIENTATION_CAPTURE_STEPS = 100
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
@@ -97,14 +98,14 @@ DEFAULT_SWEEP_TIP_MAX_DEG = 180.0
 DEFAULT_B_PHASE_OFFSET_DEG = -90.0   # starts at tip_min and ends at tip_min
 
 DEFAULT_START_X = 100.0
-DEFAULT_START_Y = 20.0
-DEFAULT_START_Z = -155.0
+DEFAULT_START_Y = 52.0
+DEFAULT_START_Z = -130.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
-DEFAULT_END_Y = 20.0
-DEFAULT_END_Z = -155.0
+DEFAULT_END_Y = 52.0
+DEFAULT_END_Z = -130.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
@@ -130,6 +131,7 @@ DEFAULT_CAMERA_FLUSH_FRAMES = 1
 
 DEFAULT_TRACKED_MOVE_SETTLE_S = 0.02
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.05
+DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_CAPTURE_EVERY_MOVE_POINT = False
 
@@ -379,8 +381,7 @@ def eval_z(
     flip_rz_sign: bool = False,
     motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
+    return evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
 
 
 def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
@@ -979,6 +980,8 @@ class FixedTipPointTracker:
         self.cam = None
         self.rrf = None
         self.cam_port = None
+        self.command_log: List[dict] = []
+        self.commanded_axes: dict = {}
 
         print(f"Using run folder: {self.run_folder}")
         print(f"Using point-tracking folder: {self.point_tracking_folder}")
@@ -1129,7 +1132,65 @@ class FixedTipPointTracker:
         parts.append(f"F{float(feedrate):.3f}")
         gcode = " ".join(parts)
         print(f" Command: {gcode}")
+        for ax, val in axes_targets.items():
+            if val is None:
+                continue
+            self.commanded_axes[str(ax)] = float(val)
+        self.command_log.append(
+            {
+                "command_index": int(len(self.command_log) + 1),
+                "feedrate": float(feedrate),
+                "gcode": gcode,
+                "axes_targets": {
+                    str(ax): float(val)
+                    for ax, val in axes_targets.items()
+                    if val is not None
+                },
+                "resolved_axes": dict(self.commanded_axes),
+            }
+        )
         self.rrf.send_code(gcode)
+
+    def write_command_log_csv(self, cal: Calibration) -> str:
+        csv_path = os.path.join(self.run_folder, "commanded_motor_positions.csv")
+        fieldnames = [
+            "command_index",
+            "feedrate",
+            "gcode",
+            "x_axis_name",
+            "y_axis_name",
+            "z_axis_name",
+            "b_axis_name",
+            "c_axis_name",
+            "x_cmd",
+            "y_cmd",
+            "z_cmd",
+            "b_cmd",
+            "c_cmd",
+        ]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in self.command_log:
+                resolved = row.get("resolved_axes", {})
+                writer.writerow(
+                    {
+                        "command_index": row.get("command_index"),
+                        "feedrate": row.get("feedrate"),
+                        "gcode": row.get("gcode"),
+                        "x_axis_name": cal.x_axis,
+                        "y_axis_name": cal.y_axis,
+                        "z_axis_name": cal.z_axis,
+                        "b_axis_name": cal.b_axis,
+                        "c_axis_name": cal.c_axis,
+                        "x_cmd": resolved.get(cal.x_axis),
+                        "y_cmd": resolved.get(cal.y_axis),
+                        "z_cmd": resolved.get(cal.z_axis),
+                        "b_cmd": resolved.get(cal.b_axis),
+                        "c_cmd": resolved.get(cal.c_axis),
+                    }
+                )
+        return csv_path
 
     def _move_to_pose_safe(
         self,
@@ -1215,6 +1276,7 @@ class FixedTipPointTracker:
         use_segment_feed_scheduler: bool = True,
         tracked_move_settle_s: float = 0.0,
         travel_move_settle_s: float = 0.0,
+        b_extra_settle_s: float = 0.0,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
         initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
@@ -1227,6 +1289,8 @@ class FixedTipPointTracker:
 
         bbox_warnings: List[str] = []
         sample_counter = 0
+        self.command_log = []
+        self.commanded_axes = {}
 
         blocks = split_trajectory_into_blocks(traj)
 
@@ -1370,6 +1434,8 @@ class FixedTipPointTracker:
                     }
                 )
                 self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
+                if float(b_extra_settle_s) > 0:
+                    time.sleep(float(b_extra_settle_s))
 
                 if point.capture_image:
                     sample_counter += 1
@@ -1410,9 +1476,13 @@ class FixedTipPointTracker:
         for msg in bbox_warnings:
             print(msg)
 
+        command_csv_path = self.write_command_log_csv(cal)
+        print(f"Commanded motor positions CSV: {command_csv_path}")
+
         return {
             "images_saved": sample_counter,
             "bbox_warnings": bbox_warnings,
+            "command_csv_path": command_csv_path,
         }
 
 
@@ -1545,6 +1615,7 @@ def main(args):
             use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
             tracked_move_settle_s=float(args.tracked_move_settle_s),
             travel_move_settle_s=float(args.travel_move_settle_s),
+            b_extra_settle_s=float(args.b_extra_settle_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
             initial_sweep_wait_s=float(args.initial_sweep_wait_s),
@@ -1606,7 +1677,7 @@ if __name__ == "__main__":
         "--flip-rz-sign",
         action="store_true",
         default=DEFAULT_FLIP_RZ_SIGN,
-        help="Multiply the polynomial-derived r and z offsets by -1. Use this if your calibration file has flipped r/z signs.",
+        help="Multiply only the planar r/X offset by -1. Use this if your calibration file has a flipped X sign.",
     )
 
     # Fixed-C dual-orientation sweep controls
@@ -1654,6 +1725,8 @@ if __name__ == "__main__":
                     help="Extra settle time after each tracked move, before capture.")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
+    ap.add_argument("--b-extra-settle-s", type=float, default=DEFAULT_B_EXTRA_SETTLE_S,
+                    help="Additional hold after each tracked move to let the B-axis mechanically settle.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
                     help="Capture at the first point of each block if that point is marked for acquisition.")
 

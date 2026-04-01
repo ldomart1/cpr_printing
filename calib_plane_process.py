@@ -97,6 +97,13 @@ _NEI8_W = [
     (0, -1, 1.0),                             (0, 1, 1.0),
     (1, -1, 2 ** 0.5),  (1, 0, 1.0),  (1, 1, 2 ** 0.5),
 ]
+DEFAULT_CHARUCO_BOARD = {
+    "squares_x": 10,
+    "squares_y": 14,
+    "square_size_mm": 15.0,
+    "marker_size_mm": 11.0,
+    "aruco_dictionary": "DICT_4X4",
+}
 
 
 # =============================================================================
@@ -150,6 +157,27 @@ def _json_ready(value: Any):
     if isinstance(value, (list, tuple)):
         return [_json_ready(v) for v in value]
     return value
+
+
+def _board_reference_kwargs(cal: CTR_Shadow_Calibration, args) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "inner_corners": args.checkerboard_inner_corners,
+        "square_size_mm": args.checkerboard_square_size_mm,
+        "use_undistort": (not args.checkerboard_no_undistort),
+        "draw_debug": True,
+    }
+    meta = getattr(cal, "camera_calib_meta", None) or {}
+    board_type = str(meta.get("board_type", "checkerboard")).strip().lower()
+    if board_type == "charuco":
+        kwargs.update({
+            "squares_x": int(meta.get("squares_x", DEFAULT_CHARUCO_BOARD["squares_x"])),
+            "squares_y": int(meta.get("squares_y", DEFAULT_CHARUCO_BOARD["squares_y"])),
+            "marker_size_mm": float(meta.get("marker_size_mm", DEFAULT_CHARUCO_BOARD["marker_size_mm"])),
+            "aruco_dictionary": str(meta.get("aruco_dictionary", DEFAULT_CHARUCO_BOARD["aruco_dictionary"])),
+        })
+        if kwargs["square_size_mm"] is None:
+            kwargs["square_size_mm"] = float(meta.get("square_size_mm", DEFAULT_CHARUCO_BOARD["square_size_mm"]))
+    return kwargs
 
 
 def _parse_inner_corners_arg(value):
@@ -2363,13 +2391,11 @@ def main():
     processed_dir.mkdir(parents=True, exist_ok=True)
     checkerboard_debug_path = processed_dir / "checkerboard_reference_debug.png"
 
+    board_ref_kwargs = _board_reference_kwargs(cal, args)
     board_result = cal.estimate_board_reference_from_image(
         str(board_ref_path),
-        inner_corners=args.checkerboard_inner_corners,
-        square_size_mm=args.checkerboard_square_size_mm,
-        use_undistort=(not args.checkerboard_no_undistort),
-        draw_debug=True,
         save_debug_path=str(checkerboard_debug_path),
+        **board_ref_kwargs,
     )
     board_reference_debug_image = board_result.get("debug_image")
 

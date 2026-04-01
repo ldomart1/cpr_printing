@@ -42,6 +42,7 @@ from typing import Any, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 try:
     from duetwebapi import DuetWebAPI
@@ -62,35 +63,35 @@ DEFAULT_PROJECT_NAME = "Fixed_Orientation_Grid_Run"
 DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
-DEFAULT_POINT_Y = 45.0
+DEFAULT_POINT_Y = 52.0
 
-DEFAULT_X_START = 60.0
-DEFAULT_X_END = 155.0
+DEFAULT_X_START = 85.0
+DEFAULT_X_END = 115.0
 DEFAULT_X_STEP = 5.0
 
-DEFAULT_Z_START = -155.0
-DEFAULT_Z_END = -135.0
+DEFAULT_Z_START = -140.0
+DEFAULT_Z_END = -110.0
 DEFAULT_Z_STEP = 5.0
 
 DEFAULT_FIXED_C = 0.0
 DEFAULT_REQUESTED_TIP_ANGLES_DEG = [0.0, 90.0, 180.0]
 
-DEFAULT_TRAVEL_FEED = 1500.0
-DEFAULT_SCAN_FEED = 1000.0
+DEFAULT_TRAVEL_FEED = 2000.0
+DEFAULT_SCAN_FEED = 2000.0
 
-DEFAULT_START_X = 60.0
-DEFAULT_START_Y = 45.0
-DEFAULT_START_Z = -155.0
+DEFAULT_START_X = 85.0
+DEFAULT_START_Y = 52.0
+DEFAULT_START_Z = -140.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
-DEFAULT_END_X = 60.0
-DEFAULT_END_Y = 45.0
-DEFAULT_END_Z = -155.0
+DEFAULT_END_X = 75.0
+DEFAULT_END_Y = 52.0
+DEFAULT_END_Z = -160.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
-DEFAULT_SAFE_APPROACH_Z = -155.0
+DEFAULT_SAFE_APPROACH_Z = -140.0
 
 DEFAULT_DWELL_BEFORE_MS = 0.2
 DEFAULT_DWELL_AFTER_MS = 0.2
@@ -124,10 +125,12 @@ OFFPLANE_SIGN = -1.0
 
 @dataclass
 class Calibration:
-    pr: np.ndarray
-    pz: np.ndarray
-    py_off: Optional[np.ndarray]
-    pa: Optional[np.ndarray]
+    r_model: Any
+    z_model: Any
+    y_off_model: Optional[Any]
+    tip_angle_model: Optional[Any]
+    phase_models: dict
+    default_motion_phase: str
 
     b_min: float
     b_max: float
@@ -186,6 +189,92 @@ def poly_eval(coeffs: Any, u: Any, default_if_none: Optional[float] = None) -> n
     return np.polyval(arr, u)
 
 
+def evaluate_fit_model(model: Any, u: Any, default_if_none: Optional[float] = None) -> np.ndarray:
+    u_arr = np.asarray(u, dtype=float)
+    if model is None:
+        if default_if_none is None:
+            raise ValueError("Missing required fit model.")
+        return np.full_like(u_arr, float(default_if_none), dtype=float)
+
+    model_type = str(model.get("model_type", "polynomial")).lower()
+    if model_type == "polynomial":
+        return poly_eval(model.get("coefficients"), u_arr, default_if_none=default_if_none)
+
+    if model_type == "pchip":
+        x_knots = model.get("x_knots")
+        y_knots = model.get("y_knots")
+        if x_knots is None or y_knots is None:
+            raise ValueError("PCHIP fit model is missing knots.")
+        interp = PchipInterpolator(
+            np.asarray(x_knots, dtype=float),
+            np.asarray(y_knots, dtype=float),
+            extrapolate=True,
+        )
+        return np.asarray(interp(u_arr), dtype=float)
+
+    raise ValueError(f"Unsupported fit model type: {model_type}")
+
+
+def legacy_poly_model(coeffs: Any, equation: Optional[str], value_name: str) -> Optional[dict]:
+    if coeffs is None:
+        return None
+    coeff_list = np.asarray(coeffs, dtype=float).reshape(-1).tolist()
+    return {
+        "model_type": "polynomial",
+        "basis": "monomial",
+        "degree": len(coeff_list) - 1,
+        "input_axis": "b_motor",
+        "value_name": value_name,
+        "coefficients": coeff_list,
+        "equation": equation,
+    }
+
+
+def _normalize_motion_phase_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
+
+
+def _extract_phase_models(data: dict) -> Tuple[dict, str]:
+    phase_payload = data.get("fit_models_by_phase") or {}
+    phase_models: dict = {}
+    for raw_phase_name, models in phase_payload.items():
+        phase_name = _normalize_motion_phase_name(raw_phase_name)
+        if phase_name is None or not isinstance(models, dict):
+            continue
+        phase_models[phase_name] = dict(models)
+
+    default_phase = _normalize_motion_phase_name(
+        data.get("default_phase_for_legacy_access")
+        or (data.get("cubic_coefficients") or {}).get("default_phase")
+        or "pull"
+    ) or "pull"
+
+    return phase_models, default_phase
+
+
+def _select_fit_model(
+    cal: Calibration,
+    model_name: str,
+    motion_phase: Optional[str] = None,
+) -> Any:
+    phase_name = _normalize_motion_phase_name(motion_phase) or cal.default_motion_phase
+    if phase_name in cal.phase_models:
+        model = cal.phase_models[phase_name].get(model_name)
+        if model is not None:
+            return model
+
+    fallback_attr = {
+        "r": cal.r_model,
+        "z": cal.z_model,
+        "offplane_y": cal.y_off_model,
+        "tip_angle": cal.tip_angle_model,
+    }.get(model_name)
+    return fallback_attr
+
+
 def load_calibration(json_path: str) -> Calibration:
     p = Path(json_path)
     if not p.exists():
@@ -194,13 +283,30 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r") as f:
         data = json.load(f)
 
-    cubic = data["cubic_coefficients"]
-    pr = np.array(cubic["r_coeffs"], dtype=float)
-    pz = np.array(cubic["z_coeffs"], dtype=float)
-    py_off_raw = cubic.get("offplane_y_coeffs", None)
-    py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
-    pa_raw = cubic.get("tip_angle_coeffs", None)
-    pa = None if pa_raw is None else np.array(pa_raw, dtype=float)
+    cubic = data.get("cubic_coefficients", {})
+    fit_models = data.get("fit_models", {})
+    phase_models, default_motion_phase = _extract_phase_models(data)
+
+    r_model = fit_models.get("r") or legacy_poly_model(
+        cubic.get("r_coeffs"),
+        cubic.get("r_equation"),
+        "r",
+    )
+    z_model = fit_models.get("z") or legacy_poly_model(
+        cubic.get("z_coeffs"),
+        cubic.get("z_equation"),
+        "z",
+    )
+    y_off_model = fit_models.get("offplane_y") or legacy_poly_model(
+        cubic.get("offplane_y_coeffs"),
+        cubic.get("offplane_y_equation"),
+        "offplane_y",
+    )
+    tip_angle_model = fit_models.get("tip_angle") or legacy_poly_model(
+        cubic.get("tip_angle_coeffs"),
+        cubic.get("tip_angle_equation"),
+        "tip_angle",
+    )
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -218,10 +324,12 @@ def load_calibration(json_path: str) -> Calibration:
     c_180 = float(motor_setup.get("rotation_axis_180_deg", 180.0))
 
     return Calibration(
-        pr=pr,
-        pz=pz,
-        py_off=py_off,
-        pa=pa,
+        r_model=r_model,
+        z_model=z_model,
+        y_off_model=y_off_model,
+        tip_angle_model=tip_angle_model,
+        phase_models=phase_models,
+        default_motion_phase=default_motion_phase,
         b_min=b_min,
         b_max=b_max,
         x_axis=x_axis,
@@ -238,32 +346,47 @@ def load_calibration(json_path: str) -> Calibration:
     )
 
 
-def eval_r(cal: Calibration, b: Any, flip_rz_sign: bool = False) -> np.ndarray:
+def eval_r(
+    cal: Calibration,
+    b: Any,
+    flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
     s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * poly_eval(cal.pr, b)
+    return s * evaluate_fit_model(_select_fit_model(cal, "r", motion_phase=motion_phase), b)
 
 
-def eval_z(cal: Calibration, b: Any, flip_rz_sign: bool = False) -> np.ndarray:
+def eval_z(
+    cal: Calibration,
+    b: Any,
+    flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
     s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * poly_eval(cal.pz, b)
+    return s * evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
 
 
-def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
-    return OFFPLANE_SIGN * poly_eval(cal.py_off, b, default_if_none=0.0)
+def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    return OFFPLANE_SIGN * evaluate_fit_model(
+        _select_fit_model(cal, "offplane_y", motion_phase=motion_phase),
+        b,
+        default_if_none=0.0,
+    )
 
 
-def eval_tip_angle_deg(cal: Calibration, b: Any) -> np.ndarray:
-    return poly_eval(cal.pa, b)
+def eval_tip_angle_deg(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    return evaluate_fit_model(_select_fit_model(cal, "tip_angle", motion_phase=motion_phase), b)
 
 
 def predict_r_z_offplane(
     cal: Calibration,
     b: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> Tuple[float, float, float]:
-    r = float(eval_r(cal, b, flip_rz_sign=flip_rz_sign))
-    z = float(eval_z(cal, b, flip_rz_sign=flip_rz_sign))
-    y_off = float(eval_offplane_y(cal, b))
+    r = float(eval_r(cal, b, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase))
+    z = float(eval_z(cal, b, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase))
+    y_off = float(eval_offplane_y(cal, b, motion_phase=motion_phase))
     return r, z, y_off
 
 
@@ -272,10 +395,16 @@ def predict_tip_xyz_from_bc(
     b: float,
     c_deg: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    r, z, y_off = predict_r_z_offplane(cal, b, flip_rz_sign=flip_rz_sign)
+    r, z, y_off = predict_r_z_offplane(
+        cal,
+        b,
+        flip_rz_sign=flip_rz_sign,
+        motion_phase=motion_phase,
+    )
     c = math.radians(float(c_deg))
-    x = r * math.cos(c) - y_off * math.sin(c)
+    x = -r * math.cos(c) - y_off * math.sin(c)
     y = r * math.sin(c) + y_off * math.cos(c)
     return np.array([x, y, z], dtype=float)
 
@@ -285,8 +414,15 @@ def tip_offset_xyz_physical(
     b: float,
     c_deg: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    return predict_tip_xyz_from_bc(cal, b, c_deg, flip_rz_sign=flip_rz_sign)
+    return predict_tip_xyz_from_bc(
+        cal,
+        b,
+        c_deg,
+        flip_rz_sign=flip_rz_sign,
+        motion_phase=motion_phase,
+    )
 
 
 def stage_xyz_for_fixed_tip(
@@ -295,8 +431,15 @@ def stage_xyz_for_fixed_tip(
     b: float,
     c_deg: float,
     flip_rz_sign: bool = False,
+    motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    return p_tip_xyz - tip_offset_xyz_physical(cal, b, c_deg, flip_rz_sign=flip_rz_sign)
+    return p_tip_xyz - tip_offset_xyz_physical(
+        cal,
+        b,
+        c_deg,
+        flip_rz_sign=flip_rz_sign,
+        motion_phase=motion_phase,
+    )
 
 
 # =========================
@@ -335,15 +478,16 @@ def inclusive_float_range(start: float, end: float, step: float) -> List[float]:
 def build_tip_angle_inverse_table(
     cal: Calibration,
     num_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
+    motion_phase: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if cal.pa is None:
+    if _select_fit_model(cal, "tip_angle", motion_phase=motion_phase) is None:
         raise ValueError(
-            "This script requires 'tip_angle_coeffs' in the calibration JSON."
+            "This script requires a tip-angle fit model in the calibration JSON."
         )
 
     ns = max(1000, int(num_samples))
     b_samples = np.linspace(float(cal.b_min), float(cal.b_max), ns, dtype=float)
-    angle_samples = eval_tip_angle_deg(cal, b_samples)
+    angle_samples = eval_tip_angle_deg(cal, b_samples, motion_phase=motion_phase)
 
     order = np.argsort(angle_samples)
     angle_sorted = np.asarray(angle_samples[order], dtype=float)
@@ -425,10 +569,12 @@ def generate_fixed_angle_grid_pass(
     inverse_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
     flip_rz_sign: bool = False,
     snake_scan: bool = True,
+    motion_phase: Optional[str] = None,
 ) -> FixedAnglePass:
     angle_table_deg, b_table = build_tip_angle_inverse_table(
         cal=cal,
         num_samples=int(inverse_samples),
+        motion_phase=motion_phase,
     )
 
     b_cmd, used_tip_angle_deg = tip_angle_deg_to_b_clipped(
@@ -455,6 +601,7 @@ def generate_fixed_angle_grid_pass(
                 b=b_cmd,
                 c_deg=c_cmd,
                 flip_rz_sign=flip_rz_sign,
+                motion_phase=motion_phase,
             )
 
             capture_index += 1
@@ -1001,6 +1148,7 @@ def main(args):
     z_values = inclusive_float_range(args.z_start, args.z_end, args.z_step)
 
     requested_tip_angles_deg = [0.0, 90.0, 180.0]
+    motion_phase = _normalize_motion_phase_name(args.motion_phase) or cal.default_motion_phase
 
     passes: List[FixedAnglePass] = []
     for req_angle in requested_tip_angles_deg:
@@ -1014,6 +1162,7 @@ def main(args):
             inverse_samples=int(args.custom_inverse_samples),
             flip_rz_sign=bool(args.flip_rz_sign),
             snake_scan=(not bool(args.disable_snake_scan)),
+            motion_phase=motion_phase,
         )
         passes.append(pass_plan)
 
@@ -1039,6 +1188,7 @@ def main(args):
     print(f"  Total captures planned: {sum(len(p.grid_points) for p in passes)}")
     print(f"  C fixed for all passes: {float(args.fixed_c):.3f}")
     print(f"  flip_rz_sign: {bool(args.flip_rz_sign)}")
+    print(f"  motion_phase: {motion_phase}")
 
     start_pose = (
         float(args.start_x),
@@ -1180,6 +1330,13 @@ if __name__ == "__main__":
     # Inversion resolution
     ap.add_argument("--custom-inverse-samples", type=int, default=DEFAULT_CUSTOM_INV_SAMPLES,
                     help="Dense sampling count used for numeric tip-angle -> B inversion.")
+    ap.add_argument(
+        "--motion-phase",
+        choices=["pull", "release"],
+        default=None,
+        help="Which phase-specific fit models to use for tip angle and kinematics. "
+             "Defaults to the calibration JSON's default phase.",
+    )
 
     # Scan order
     ap.add_argument("--disable-snake-scan", action="store_true",

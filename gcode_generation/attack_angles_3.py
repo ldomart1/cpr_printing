@@ -24,8 +24,9 @@ Prepended line-stack behavior
 Existing pattern behavior
 -------------------------
 - Uses calibration JSON (cubic_coefficients + axis mapping), just like your other scripts.
-- Computes B command by solving the calibration tip-angle polynomial for 0.00 deg
-  (the "pulled" B corresponding to 0 from the angle equation).
+- Computes B command by solving the active calibration tip-angle model for 0.00 deg.
+- Prefers `fit_models_by_phase.pull` when present, and falls back to the legacy
+  cubic coefficients only if the phase-aware model is missing.
 - Keeps B fixed at that value during printing and travel for pattern generation.
 - Keeps C fixed at 0 deg during printing and travel (but supports a separate C-only feedrate).
 - Uses XYZ stage moves computed from desired tip-space geometry using the calibration offset.
@@ -62,19 +63,19 @@ DEFAULT_OUT = "gcode_generation/xz_line_pattern_test_20260306.gcode"
 
 # Pattern placement in TIP SPACE (world coordinates)
 DEFAULT_START_X = 40.0
-DEFAULT_START_Y = 25.0
-DEFAULT_START_Z = -175.0
+DEFAULT_START_Y = 60.0
+DEFAULT_START_Z = -195.0
 
 # Prepended X-line stack defaults (TIP SPACE)
 DEFAULT_PREP_LINE_START_X = 40.0
-DEFAULT_PREP_LINE_START_Y = 15.0
-DEFAULT_PREP_LINE_START_Z = -165.0
+DEFAULT_PREP_LINE_START_Y = 60.0
+DEFAULT_PREP_LINE_START_Z = -195.0
 DEFAULT_PREP_LINE_LENGTH = 60.0
 DEFAULT_PREP_LINE_COUNT = 10
 DEFAULT_PREP_LINE_Z_STEP = 1.0
 
 # Startup/end MACHINE STAGE poses (raw stage axes)
-DEFAULT_MACHINE_START_X = 100.0
+DEFAULT_MACHINE_START_X = 40.0
 DEFAULT_MACHINE_START_Y = 60.0
 DEFAULT_MACHINE_START_Z = -20.0
 DEFAULT_MACHINE_START_B = 0.0
@@ -126,8 +127,8 @@ DEFAULT_EXTRUSION_MULTIPLIERS = (1.0, 1.5, 2.0)
 DEFAULT_BBOX_X_MIN = 40.0
 DEFAULT_BBOX_X_MAX = 180.0
 DEFAULT_BBOX_Y_MIN = 0.0
-DEFAULT_BBOX_Y_MAX = 120.0
-DEFAULT_BBOX_Z_MIN = -180.0
+DEFAULT_BBOX_Y_MAX = 200.0
+DEFAULT_BBOX_Z_MIN = -200.0
 DEFAULT_BBOX_Z_MAX = 00.0
 
 
@@ -151,6 +152,13 @@ class Calibration:
     u_axis: str
 
     c_180_deg: float
+
+    r_model: Optional[Dict[str, Any]] = None
+    z_model: Optional[Dict[str, Any]] = None
+    y_off_model: Optional[Dict[str, Any]] = None
+    tip_angle_model: Optional[Dict[str, Any]] = None
+    selected_fit_model: Optional[str] = None
+    active_phase: str = "pull"
 
 
 @dataclass
@@ -179,6 +187,92 @@ def poly_eval(coeffs: Any, u: Any, default_if_none: Optional[float] = None) -> n
     return np.polyval(arr, u)
 
 
+def _normalize_model_spec(model_spec: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(model_spec, dict):
+        return None
+    out = dict(model_spec)
+    if out.get("model_type") is not None:
+        out["model_type"] = str(out["model_type"]).strip().lower()
+    return out
+
+
+def _pchip_endpoint_slope(h0: float, h1: float, delta0: float, delta1: float) -> float:
+    d = ((2.0 * h0 + h1) * delta0 - h0 * delta1) / max(h0 + h1, 1e-12)
+    if np.sign(d) != np.sign(delta0):
+        return 0.0
+    if np.sign(delta0) != np.sign(delta1) and abs(d) > abs(3.0 * delta0):
+        return 3.0 * delta0
+    return float(d)
+
+
+def pchip_eval(x_knots: Any, y_knots: Any, x_query: Any) -> np.ndarray:
+    x = np.asarray(x_knots, dtype=float).reshape(-1)
+    y = np.asarray(y_knots, dtype=float).reshape(-1)
+    xq = np.asarray(x_query, dtype=float)
+
+    if x.size != y.size or x.size == 0:
+        raise ValueError("PCHIP model requires equal-length non-empty x_knots and y_knots.")
+    if x.size == 1:
+        return np.full_like(xq, float(y[0]), dtype=float)
+
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+
+    if np.any(np.diff(x) <= 0):
+        raise ValueError("PCHIP x_knots must be strictly increasing.")
+
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    d = np.zeros_like(y)
+
+    if x.size == 2:
+        d[:] = delta[0]
+    else:
+        for k in range(1, x.size - 1):
+            if delta[k - 1] == 0.0 or delta[k] == 0.0 or np.sign(delta[k - 1]) != np.sign(delta[k]):
+                d[k] = 0.0
+            else:
+                w1 = 2.0 * h[k] + h[k - 1]
+                w2 = h[k] + 2.0 * h[k - 1]
+                d[k] = (w1 + w2) / ((w1 / delta[k - 1]) + (w2 / delta[k]))
+        d[0] = _pchip_endpoint_slope(h[0], h[1], delta[0], delta[1])
+        d[-1] = _pchip_endpoint_slope(h[-1], h[-2], delta[-1], delta[-2])
+
+    flat = xq.reshape(-1)
+    idx = np.searchsorted(x, flat, side="right") - 1
+    idx = np.clip(idx, 0, x.size - 2)
+
+    x0 = x[idx]
+    x1 = x[idx + 1]
+    y0 = y[idx]
+    y1 = y[idx + 1]
+    h_i = x1 - x0
+    t = (flat - x0) / h_i
+
+    h00 = (2.0 * t ** 3) - (3.0 * t ** 2) + 1.0
+    h10 = t ** 3 - 2.0 * t ** 2 + t
+    h01 = (-2.0 * t ** 3) + (3.0 * t ** 2)
+    h11 = t ** 3 - t ** 2
+    yq = h00 * y0 + h10 * h_i * d[idx] + h01 * y1 + h11 * h_i * d[idx + 1]
+    return yq.reshape(xq.shape)
+
+
+def eval_model_spec(model_spec: Optional[Dict[str, Any]], u: Any, default_if_none: Optional[float] = None) -> np.ndarray:
+    if model_spec is None:
+        if default_if_none is None:
+            raise ValueError("Missing required calibration model.")
+        return np.full_like(np.asarray(u, dtype=float), float(default_if_none), dtype=float)
+
+    model_type = str(model_spec.get("model_type") or "").strip().lower()
+    if model_type == "pchip":
+        return pchip_eval(model_spec.get("x_knots"), model_spec.get("y_knots"), u)
+    if model_type == "polynomial":
+        coeffs = model_spec.get("coefficients", model_spec.get("coeffs"))
+        return poly_eval(coeffs, u, default_if_none=default_if_none)
+    raise ValueError(f"Unsupported calibration model_type: {model_type}")
+
+
 def load_calibration(json_path: str) -> Calibration:
     p = Path(json_path)
     if not p.exists():
@@ -194,6 +288,20 @@ def load_calibration(json_path: str) -> Calibration:
     py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
     pa_raw = cubic.get("tip_angle_coeffs", None)
     pa = None if pa_raw is None else np.array(pa_raw, dtype=float)
+    selected_fit_model = data.get("selected_fit_model")
+    selected_fit_model = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
+    active_phase = str(data.get("default_phase_for_legacy_access") or "pull").strip().lower()
+
+    fit_models = data.get("fit_models", {}) or {}
+    phase_models = data.get("fit_models_by_phase", {}) or {}
+    active_phase_models = phase_models.get(active_phase) if isinstance(phase_models, dict) else None
+    if not isinstance(active_phase_models, dict):
+        active_phase_models = fit_models
+
+    r_model = _normalize_model_spec(active_phase_models.get("r"))
+    z_model = _normalize_model_spec(active_phase_models.get("z"))
+    y_off_model = _normalize_model_spec(active_phase_models.get("offplane_y"))
+    tip_angle_model = _normalize_model_spec(active_phase_models.get("tip_angle"))
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -213,6 +321,8 @@ def load_calibration(json_path: str) -> Calibration:
 
     return Calibration(
         pr=pr, pz=pz, py_off=py_off, pa=pa,
+        r_model=r_model, z_model=z_model, y_off_model=y_off_model, tip_angle_model=tip_angle_model,
+        selected_fit_model=selected_fit_model, active_phase=active_phase,
         b_min=b_min, b_max=b_max,
         x_axis=x_axis, y_axis=y_axis, z_axis=z_axis,
         b_axis=b_axis, c_axis=c_axis, u_axis=u_axis,
@@ -221,18 +331,26 @@ def load_calibration(json_path: str) -> Calibration:
 
 
 def eval_r(cal: Calibration, b: Any) -> np.ndarray:
+    if cal.r_model is not None:
+        return eval_model_spec(cal.r_model, b)
     return poly_eval(cal.pr, b)
 
 
 def eval_z(cal: Calibration, b: Any) -> np.ndarray:
+    if cal.z_model is not None:
+        return eval_model_spec(cal.z_model, b)
     return poly_eval(cal.pz, b)
 
 
 def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
+    if cal.y_off_model is not None:
+        return eval_model_spec(cal.y_off_model, b, default_if_none=0.0)
     return poly_eval(cal.py_off, b, default_if_none=0.0)
 
 
 def eval_tip_angle_deg(cal: Calibration, b: Any) -> np.ndarray:
+    if cal.tip_angle_model is not None:
+        return eval_model_spec(cal.tip_angle_model, b)
     if cal.pa is None:
         raise ValueError("Calibration is missing tip_angle_coeffs.")
     return poly_eval(cal.pa, b)
@@ -267,10 +385,12 @@ def stage_xyz_for_tip(cal: Calibration, tip_xyz: np.ndarray, b: float, c_deg: fl
 
 def solve_b_for_tip_angle_zero(cal: Calibration, search_samples: int = 5001) -> float:
     """
-    Solve for B such that tip_angle_poly(B) = 0 deg, restricted to calibration B range.
+    Solve for B such that the active tip-angle calibration model evaluates to 0 deg,
+    restricted to the calibration B range.
     """
     if cal.pa is None:
-        raise ValueError("Calibration JSON has no tip_angle_coeffs; cannot solve B for 0 deg angle.")
+        if cal.tip_angle_model is None:
+            raise ValueError("Calibration JSON has no tip-angle model; cannot solve B for 0 deg angle.")
 
     b_lo, b_hi = float(cal.b_min), float(cal.b_max)
     bb = np.linspace(b_lo, b_hi, int(max(101, search_samples)))
@@ -735,11 +855,13 @@ def write_pattern_gcode(
         f.write("; calibration-based tip-position planning (exact stage = tip - offset_tip(B,C))\n")
         f.write("; prepended pattern: X-line stack in XZ plane\n")
         f.write("; main pattern: XZ-plane line tests in Y-offset planes\n")
-        f.write("; B chosen by solving tip_angle_poly(B)=0 deg (within calibration B range)\n")
+        f.write("; B chosen by solving active tip-angle calibration model = 0 deg (within calibration B range)\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
+        f.write(f"; selected_fit_model = {cal.selected_fit_model or 'legacy-polynomial'}\n")
+        f.write(f"; active_phase = {cal.active_phase}\n")
         f.write(f"; calibration B range: [{cal.b_min:.6f}, {cal.b_max:.6f}]\n")
         f.write(f"; solved fixed B for tip_angle=0 deg: {b_zero_angle:.6f}\n")
-        f.write(f"; tip_angle_poly(B_fixed) = {tip_angle_at_b:.9f} deg\n")
+        f.write(f"; tip_angle_model(B_fixed) = {tip_angle_at_b:.9f} deg\n")
         f.write(f"; fixed C = {c_fixed:.3f} deg\n")
         f.write(f"; fixed tip offset(B_fixed,C_fixed) = [{tip_offset[0]:.6f}, {tip_offset[1]:.6f}, {tip_offset[2]:.6f}] mm\n")
         f.write(f"; prepended line start (first line) = [{plx:.3f}, {ply:.3f}, {plz:.3f}] mm\n")
@@ -977,7 +1099,7 @@ def write_pattern_gcode(
     print(f"Axes mapping: X={cal.x_axis}, Y={cal.y_axis}, Z={cal.z_axis}, B={cal.b_axis}, C={cal.c_axis}, U={cal.u_axis}")
     print(f"Calibration B range: [{cal.b_min:.6f}, {cal.b_max:.6f}]")
     print(f"Solved B for tip_angle=0 deg: {b_zero_angle:.6f}")
-    print(f"tip_angle_poly(B_fixed) = {tip_angle_at_b:.9f} deg")
+    print(f"tip_angle_model(B_fixed) = {tip_angle_at_b:.9f} deg")
     print(f"Fixed tip offset(B,C=0): [{tip_offset[0]:.6f}, {tip_offset[1]:.6f}, {tip_offset[2]:.6f}] mm")
     print(f"Prepended line start: [{plx:.3f}, {ply:.3f}, {plz:.3f}]")
     print(f"Prepended line length: {float(prep_line_length):.3f} mm, count={int(prep_line_count)}, z_step={float(prep_line_z_step):.3f} mm")
@@ -1068,7 +1190,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description=(
             "Generate calibrated G-code for a prepended X-line stack in the XZ plane plus the requested XZ-plane line test pattern "
-            "using exact tip-position planning from calibration, with fixed B chosen from tip_angle_poly(B)=0 deg "
+            "using exact tip-position planning from calibration, with fixed B chosen from the active tip-angle calibration model = 0 deg "
             "and fixed C=0."
         )
     )

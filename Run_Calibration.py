@@ -14,20 +14,21 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-03-31_03',
+    project_name='Test_Calibration_2026-04-07_02_daq',
     allow_existing= True,
     add_date=False
 )
 print("Calibration object created!")
 
-# --- CONFIG ---
+
+# --- CONFIG ---p
 MANUAL_CROP_ADJUSTMENT = True
-THRESHOLD = 200
-PULL_B_START = 0.3
+THRESHOLD = 220
+PULL_B_START = 0.0
 PULL_B_STEPS = 22
-PULL_B_STEP_SIZE = -0.25
-CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260331_100557.npz")
-BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260331_100553.png")
+PULL_B_STEP_SIZE = -0.2
+CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
+BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260406_104134.png")
 
 PROBE_MODE = "middle"  # "middle" | "five"
 FIT_MODEL = "pchip"  # "pchip" | "cubic"
@@ -57,13 +58,26 @@ if os.path.isfile(CAMERA_CALIBRATION_FILE):
 else:
     print(f"[WARN] Camera calibration file not found, continuing without it: {CAMERA_CALIBRATION_FILE}")
 
+# Tip selection
+cal.tip_refine_mode = "coarse"
+# other options: "auto", "parallel_centerline"
+
+# Parallel-centerline tuning
+cal.tip_parallel_section_near_r = 0.75
+cal.tip_parallel_section_far_r = 5.0
+cal.tip_parallel_scan_half_r = 2.5
+cal.tip_parallel_num_sections = 7
+cal.tip_parallel_cross_step_px = 0.5
+cal.tip_parallel_ray_step_px = 0.5
+cal.tip_parallel_ray_max_len_r = 10.0
+
 # Example usage:
 cal.connect_to_camera(cam_port=0, show_preview=False)
 cal.setup_analysis_crop(enable_manual_adjustment=MANUAL_CROP_ADJUSTMENT)
 #cal.disconnect_camera()
 cal.connect_to_robot()
 cal.calibrate(
-    jogging_feedrate=600,
+    jogging_feedrate=200,
     probe_points=probe_points,
     b_start=PULL_B_START,
     b_steps=PULL_B_STEPS,

@@ -25,7 +25,7 @@ Key behavior changes vs the old cyclic C-sweep script:
 - Accuracy tricks included:
     * smooth sinusoidal B motion with zero velocity at block boundaries
     * exact fixed-tip XYZ compensation at every sample
-    * per-segment feed scheduling
+    * queued constant-feed tracked motion
     * explicit M400 waits
     * fine re-approach to the first point of each block at a slower feed
     * conservative large-move handling between blocks
@@ -46,6 +46,8 @@ import csv
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,18 +81,18 @@ DEFAULT_POINT_X = 100.0
 DEFAULT_POINT_Y = 52.0
 DEFAULT_POINT_Z = -130.0
 
-DEFAULT_TRAVEL_FEED = 1000.0
-DEFAULT_FINE_APPROACH_FEED = 1000.0
-DEFAULT_PROBE_FEED = 1000.0
-DEFAULT_B_MAX_FEED = 180.0
-DEFAULT_B_ACCEL_TIME_S = 0.5
-DEFAULT_B_DECEL_TIME_S = 0.5
+DEFAULT_TRAVEL_FEED = 8000.0
+DEFAULT_FINE_APPROACH_FEED = 150.0
+DEFAULT_PROBE_FEED = 150.0
+DEFAULT_B_MAX_FEED = 500.0
+DEFAULT_B_ACCEL_TIME_S = 0.2
+DEFAULT_B_DECEL_TIME_S = 0.2
 
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
 DEFAULT_ORIENTATION_SEQUENCE = (0.0, 180.0)
-DEFAULT_OSCILLATIONS_PER_ORIENTATION = 2.0
-DEFAULT_ORIENTATION_MOVE_STEPS = 2400
+DEFAULT_OSCILLATIONS_PER_ORIENTATION = 1.0
+DEFAULT_ORIENTATION_MOVE_STEPS = 3000
 DEFAULT_ORIENTATION_CAPTURE_STEPS = 100
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
@@ -113,8 +115,10 @@ DEFAULT_SAFE_APPROACH_Z = -155.0
 
 DEFAULT_DWELL_BEFORE_MS = 0.5
 DEFAULT_DWELL_AFTER_MS = 0
-DEFAULT_INITIAL_SWEEP_WAIT_S = 4.0
-DEFAULT_C_FLIP_FEED = 15000.0
+DEFAULT_INITIAL_SWEEP_WAIT_S = 6.0
+DEFAULT_C_FLIP_FEED = 20000.0
+DEFAULT_C_FLIP_DELAY_S = 4.0
+DEFAULT_PULL_SEQUENCE_BUFFER_S = 3.0
 
 DEFAULT_BBOX_X_MIN = 0.0
 DEFAULT_BBOX_X_MAX = 200.0
@@ -132,6 +136,7 @@ DEFAULT_CAMERA_FLUSH_FRAMES = 1
 DEFAULT_TRACKED_MOVE_SETTLE_S = 0.02
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.05
 DEFAULT_B_EXTRA_SETTLE_S = 0.0
+DEFAULT_INTER_COMMAND_DELAY_S = 0.005
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_CAPTURE_EVERY_MOVE_POINT = False
 
@@ -606,6 +611,7 @@ def _append_fixed_c_block(
             }
         )
 
+    last_pull_stage_xyz: Optional[np.ndarray] = None
     for idx, point in enumerate(raw_points):
         prev_b = None if idx == 0 else raw_points[idx - 1]["b"]
         next_b = None if idx + 1 >= len(raw_points) else raw_points[idx + 1]["b"]
@@ -615,14 +621,19 @@ def _append_fixed_c_block(
             curr_b=point["b"],
             next_b=next_b,
         )
-        p_stage = stage_xyz_for_fixed_tip(
+        tracked_pull_stage = stage_xyz_for_fixed_tip(
             cal=cal,
             p_tip_xyz=p_tip_fixed,
             b=point["b"],
             c_deg=c_deg,
             flip_rz_sign=flip_rz_sign,
-            motion_phase=motion_phase,
+            motion_phase="pull",
         )
+        if motion_phase == "pull" or last_pull_stage_xyz is None:
+            p_stage = tracked_pull_stage
+            last_pull_stage_xyz = np.array(tracked_pull_stage, dtype=float)
+        else:
+            p_stage = np.array(last_pull_stage_xyz, dtype=float)
 
         traj.append(
             TrajectoryPoint(
@@ -630,7 +641,7 @@ def _append_fixed_c_block(
                 c=float(c_deg),
                 stage_xyz=p_stage,
                 segment_kind="tracked_block",
-                capture_image=bool(point["capture_image"]),
+                capture_image=bool(point["capture_image"]) and motion_phase == "pull",
                 tip_angle_deg=point["tip_angle_deg"],
                 block_name=str(block_name),
                 block_phase_01=point["block_phase_01"],
@@ -1277,6 +1288,7 @@ class FixedTipPointTracker:
         tracked_move_settle_s: float = 0.0,
         travel_move_settle_s: float = 0.0,
         b_extra_settle_s: float = 0.0,
+        inter_command_delay_s: float = 0.0,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
         initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
@@ -1323,24 +1335,12 @@ class FixedTipPointTracker:
             print(f"Starting block {block_idx + 1}/{len(blocks)}: {block_name} (C={first_pt.c:.3f})")
             print("-" * 72)
 
-            block_sched_feeds: List[float] = []
-            block_sched_meta = {
-                "est_total_time_s": 0.0,
-                "max_est_b_speed_units_min": 0.0,
-                "mean_seg_time_ms": 0.0,
-            }
-            if use_segment_feed_scheduler and len(block) > 1:
-                block_sched_feeds, block_sched_meta = plan_segment_feeds_with_b_envelope(
-                    traj=block,
-                    probe_feed_mm_min=float(probe_feed),
-                    b_max_feed_units_min=float(b_max_feed),
-                    b_accel_time_s=float(b_accel_time_s),
-                    b_decel_time_s=float(b_decel_time_s),
+            if use_segment_feed_scheduler:
+                print(
+                    "Segment feed scheduling disabled for execution; "
+                    "using controller-side acceleration with constant queued feed."
                 )
-
-            print(f"Estimated block time: {block_sched_meta['est_total_time_s']:.3f} s")
-            print(f"Estimated max B speed: {block_sched_meta['max_est_b_speed_units_min']:.3f} units/min")
-            print(f"Mean segment time: {block_sched_meta['mean_seg_time_ms']:.2f} ms")
+            print(f"Tracked block feed: {float(probe_feed):.3f}")
 
             x0, y0, z0 = _clamp_stage_xyz_to_bbox(
                 first_pt.stage_xyz[0], first_pt.stage_xyz[1], first_pt.stage_xyz[2],
@@ -1350,8 +1350,10 @@ class FixedTipPointTracker:
             )
 
             transition_feed = float(travel_feed)
+            c_flip_delay_s = 0.0
             if block_idx > 0 and math.isclose(float(first_pt.c), float(cal.c_180_deg), abs_tol=1e-6):
                 transition_feed = float(c_flip_feed)
+                c_flip_delay_s = float(DEFAULT_C_FLIP_DELAY_S)
                 print(
                     f"Tracked transition into {block_name}: "
                     f"moving XYZ/B/C together with C turn at feed {transition_feed:.3f}..."
@@ -1370,6 +1372,9 @@ class FixedTipPointTracker:
                 }
             )
             self.wait_for_duet_motion_complete(extra_settle=float(travel_move_settle_s))
+            if c_flip_delay_s > 0:
+                print(f"Holding {c_flip_delay_s:.3f} s after C rotation...")
+                time.sleep(c_flip_delay_s)
 
             self._fine_land_on_point(
                 cal=cal,
@@ -1412,8 +1417,16 @@ class FixedTipPointTracker:
             else:
                 print("Start point not captured.")
 
-            print("Executing tracked oscillation block...")
+            print("Executing pull-tracked / release-untracked oscillation block...")
             for i, point in enumerate(block[1:], start=1):
+                prev_point = block[i - 1]
+                if point.motion_phase == "pull" and prev_point.motion_phase == "release":
+                    self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
+                    if float(b_extra_settle_s) > 0:
+                        time.sleep(float(b_extra_settle_s))
+                    print(f"Holding {float(DEFAULT_PULL_SEQUENCE_BUFFER_S):.3f} s before next pull sequence...")
+                    time.sleep(float(DEFAULT_PULL_SEQUENCE_BUFFER_S))
+
                 x, y, z = _clamp_stage_xyz_to_bbox(
                     point.stage_xyz[0], point.stage_xyz[1], point.stage_xyz[2],
                     virtual_bbox,
@@ -1421,10 +1434,8 @@ class FixedTipPointTracker:
                     bbox_warnings,
                 )
 
-                fseg = block_sched_feeds[i - 1] if block_sched_feeds else float(probe_feed)
-
                 self.send_absolute_move(
-                    fseg,
+                    float(probe_feed),
                     **{
                         cal.x_axis: x,
                         cal.y_axis: y,
@@ -1433,10 +1444,8 @@ class FixedTipPointTracker:
                         cal.c_axis: clamp_c_bounded(float(point.c)),
                     }
                 )
-                self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
-                if float(b_extra_settle_s) > 0:
-                    time.sleep(float(b_extra_settle_s))
-
+                if float(inter_command_delay_s) > 0:
+                    time.sleep(float(inter_command_delay_s))
                 if point.capture_image:
                     sample_counter += 1
                     self.capture_and_save(
@@ -1453,6 +1462,11 @@ class FixedTipPointTracker:
                         block_phase_01=point.block_phase_01,
                         motion_phase=point.motion_phase,
                     )
+
+            if len(block) > 1:
+                self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
+                if float(b_extra_settle_s) > 0:
+                    time.sleep(float(b_extra_settle_s))
 
         if int(dwell_after_ms) > 0:
             print(f"Dwell after motion: {int(dwell_after_ms)} ms")
@@ -1491,6 +1505,7 @@ class FixedTipPointTracker:
 # =========================
 
 def main(args):
+    script_dir = Path(__file__).resolve().parent
     cal = load_calibration(args.calibration)
 
     p_tip_fixed = np.array(
@@ -1616,13 +1631,35 @@ def main(args):
             tracked_move_settle_s=float(args.tracked_move_settle_s),
             travel_move_settle_s=float(args.travel_move_settle_s),
             b_extra_settle_s=float(args.b_extra_settle_s),
+            inter_command_delay_s=float(args.inter_command_delay_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
             initial_sweep_wait_s=float(args.initial_sweep_wait_s),
+            c_flip_feed=float(args.c_flip_feed),
         )
 
         print("\nFinal results:")
         print(results)
+
+        if bool(args.enable_post):
+            post_cmd = [
+                sys.executable,
+                str(script_dir / "calib_plane_process.py"),
+                "--project_dir",
+                runner.run_folder,
+                "--camera_calibration_file",
+                str(script_dir / "captures/calibration_webcam_20260406_104136.npz"),
+                "--checkerboard_reference_image",
+                str(script_dir / "captures/photo_20260406_104134.png"),
+                "--threshold",
+                "200",
+                "--tip_refine_mode",
+                "none",
+                "--save_plots",
+            ]
+            print("\nRunning post-processing:")
+            print(" ".join(post_cmd))
+            subprocess.run(post_cmd, check=True, cwd=str(script_dir))
 
     finally:
         try:
@@ -1646,6 +1683,8 @@ if __name__ == "__main__":
                     help="Allow reuse of an existing run folder.")
     ap.add_argument("--add-date", action="store_true", default=DEFAULT_ADD_DATE,
                     help="Append timestamp to the run folder name.")
+    ap.add_argument("--enable-post", action="store_true",
+                    help="Run calib_plane_process.py on the generated project directory after acquisition.")
 
     # Connectivity
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet web address.")
@@ -1703,6 +1742,8 @@ if __name__ == "__main__":
     # Feedrates
     ap.add_argument("--travel-feed", type=float, default=DEFAULT_TRAVEL_FEED,
                     help="Feedrate for large moves.")
+    ap.add_argument("--c-flip-feed", type=float, default=DEFAULT_C_FLIP_FEED,
+                    help="Feedrate for the 180-degree C-orientation transition move.")
     ap.add_argument("--fine-approach-feed", type=float, default=DEFAULT_FINE_APPROACH_FEED,
                     help="Slow final landing feed for the first point of each orientation block.")
     ap.add_argument("--probe-feed", type=float, default=DEFAULT_PROBE_FEED,
@@ -1727,6 +1768,8 @@ if __name__ == "__main__":
                     help="Extra settle time after travel moves.")
     ap.add_argument("--b-extra-settle-s", type=float, default=DEFAULT_B_EXTRA_SETTLE_S,
                     help="Additional hold after each tracked move to let the B-axis mechanically settle.")
+    ap.add_argument("--inter-command-delay-s", type=float, default=DEFAULT_INTER_COMMAND_DELAY_S,
+                    help="Small pacing delay inserted after each streamed tracked move command.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
                     help="Capture at the first point of each block if that point is marked for acquisition.")
 

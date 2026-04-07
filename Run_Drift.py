@@ -26,7 +26,7 @@ from shadow_calibration import CTR_Shadow_Calibration, refine_tip_parallel_cente
 # =========================
 # USER CONFIGURATION
 # =========================
-PROJECT_NAME = "Drift_Test_2026-04_01_02"
+PROJECT_NAME = "Drift_Test_2026-04_06_00_500pulls"
 ALLOW_EXISTING_PROJECT = True
 ADD_DATE_TO_PROJECT_FOLDER = False
 
@@ -34,8 +34,8 @@ MANUAL_CROP_ADJUSTMENT = True
 THRESHOLD = 200
 USE_EXACT_CLASS_THRESHOLDING = True  # True = match analyze_data() Otsu behavior from shadow_calibration.py
 
-PULL_B_START = 0.3
-PULL_B_STEPS = 24
+PULL_B_START = 0.25
+PULL_B_STEPS = 20
 PULL_B_STEP_SIZE = -0.25
 NUM_SEQUENCES = 500
 
@@ -54,8 +54,8 @@ ROBOT_STAGE_Y_AXIS_NAME = "Y"
 ROBOT_STAGE_Z_AXIS_NAME = "Z"
 ROBOT_REAR_AXIS_NAME = "B"
 
-CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260331_100557.npz")
-BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260331_100553.png")
+CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
+BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260406_104134.png")
 
 PROBE_MODE = "middle"  # "middle" | "five"
 RAW_IMAGE_EXTENSION = ".jpg"  # ".jpg" is compressed and reliable with cv2.imread

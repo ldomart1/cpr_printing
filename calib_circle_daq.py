@@ -1,43 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Standalone star-tracking acquisition script.
+Standalone circle-tracking acquisition script.
 
-What it does:
-- Loads the calibration JSON
-- Builds the mirrored-half star motion plan from script 2:
-    right half at fixed C=c0
-    single C flip
-    mirrored left half at fixed C=c180
-- Preserves the robot/camera execution style of script 1
-- Captures images only during star-path moves (not startup/end travel) and saves them to:
-    <project folder>/raw_image_data_folder/
-- Motion interpolation resolution and image-capture cadence are configured independently.
-- Adds offplane-tracking:
-    Y stage motion is solved so the tip remains at the requested constant tip-space Y
-    while compensating the calibrated offplane offset of the robot.
-- Adds optional sign flips for the calibrated r(B) and z(B) polynomial outputs.
+What it does
+------------
+- Loads the calibration JSON.
+- Builds a circle in tip-space using only B-driven lateral motion plus commanded Z motion
+  during the recorded segments.
+- Starts at B=0, C=0 on the bottom of the circle.
+- Quarter 1: curl using the pull PCHIP.
+- Quarter 2: uncurl using the release PCHIP, translated at the pull->release transition so
+  the tip starts the uncurl from the current tip location.
+- Midpoint: stop recording, move to the exact top point while rotating C by 180 deg
+  (default C feed 20000).
+- Quarter 3: curl again with C=180 while descending.
+- Quarter 4: uncurl again until the path returns near the starting point.
+- X motion is suppressed during recorded quarter segments and is only allowed during
+  transition phases (pull/release shifts, midpoint C flip, optional final recenter).
+- Y tracking is still solved so the tip remains at the requested constant tip-space Y.
 
-IMPORTANT C-AXIS BEHAVIOR:
-- C is held constant on the right half
-- C is held constant on the left half
-- C changes only once during the mirror-plane flip
-- All commanded C values are validated to remain within [-360, 360]
-
-IMPORTANT X-TRACKING BEHAVIOR:
-- X is allowed to move whenever needed to preserve exact tip tracking.
-- This includes cases where the calibration cannot realize very small |r| values
-  or cannot hit the nominal mirror plane directly.
+This preserves the robot/camera execution style of the uploaded star-tracking script while
+replacing the star path planner with a circle planner.
 """
 
 import argparse
+import copy
+import csv
 import json
 import math
 import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,41 +44,12 @@ import numpy as np
 try:
     from duetwebapi import DuetWebAPI
 except Exception:
-    raise ImportError(
-        "Missing duetwebapi. Install with:\n"
-        "    pip install duetwebapi==1.1.0"
-    )
+    DuetWebAPI = None  # type: ignore
 
 try:
     from scipy.interpolate import PchipInterpolator  # type: ignore
 except Exception:
     PchipInterpolator = None
-
-try:
-    from scipy.optimize import brentq  # type: ignore
-except Exception:
-    def brentq(f, a, b, maxiter=100, xtol=1e-10, rtol=4*np.finfo(float).eps):
-        fa = f(a)
-        fb = f(b)
-        if np.sign(fa) == np.sign(fb):
-            raise ValueError("Root not bracketed in [a,b].")
-        x0, x1, f0, f1 = a, b, fa, fb
-        x2 = 0.5 * (x0 + x1)
-        for _ in range(maxiter):
-            if f1 != f0:
-                x2 = x1 - f1 * (x1 - x0) / (f1 - f0)
-            else:
-                x2 = 0.5 * (x0 + x1)
-            if not (min(x0, x1) <= x2 <= max(x0, x1)):
-                x2 = 0.5 * (x0 + x1)
-            f2 = f(x2)
-            if abs(f2) < max(xtol, rtol * abs(x2)):
-                return x2
-            if np.sign(f2) == np.sign(f0):
-                x0, f0 = x2, f2
-            else:
-                x1, f1 = x2, f2
-        return x2
 
 
 # =========================
@@ -91,7 +58,7 @@ except Exception:
 
 DEFAULT_DUET_WEB_ADDRESS = "http://192.168.2.21"
 DEFAULT_CAMERA_PORT = 0
-DEFAULT_PROJECT_NAME = "Star_Tracking_Run"
+DEFAULT_PROJECT_NAME = "Circle_Tracking_Run"
 DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
@@ -104,8 +71,9 @@ DEFAULT_CAMERA_FLUSH_FRAMES = 1
 DEFAULT_TRAVEL_FEED = 2000.0
 DEFAULT_PRINT_FEED = 2000.0
 DEFAULT_FINE_APPROACH_FEED = 150.0
-DEFAULT_PRINT_FEED_B = 900.0
+DEFAULT_PRINT_FEED_B = 200.0
 DEFAULT_PRINT_FEED_C = 20000.0
+DEFAULT_TRANSITION_FEED = 1200.0
 DEFAULT_C_FLIP_DELAY_S = 4.0
 
 DEFAULT_DWELL_BEFORE_MS = 0
@@ -116,18 +84,24 @@ DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
 DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_INTER_COMMAND_DELAY_S = 0.005
+DEFAULT_FINAL_RECENTER = True
+DEFAULT_ENABLE_POST = False
+DEFAULT_USE_AVERAGE_CUBIC_FIT = False
 
-DEFAULT_SAFE_APPROACH_Z = -130.0
+DEFAULT_POST_CAMERA_CALIBRATION_FILE = "captures/calibration_webcam_20260406_104136.npz"
+DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "captures/photo_20260406_104134.png"
+
+DEFAULT_SAFE_APPROACH_Z = -155.0
 
 DEFAULT_START_X = 100.0
 DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -130.0
+DEFAULT_START_Z = -155.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
 DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -130.0
+DEFAULT_END_Z = -155.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
@@ -138,48 +112,31 @@ DEFAULT_BBOX_Y_MAX = 200.0
 DEFAULT_BBOX_Z_MIN = -200.0
 DEFAULT_BBOX_Z_MAX = 0.0
 
-STAR_CENTER_X = 100.0
-STAR_CENTER_Y = 52.0
-STAR_CENTER_Z = -125.0
+CIRCLE_CENTER_X = 100.0
+CIRCLE_CENTER_Y = 52.0
+CIRCLE_CENTER_Z = -155.0
 
-DESIRED_STAR_OUTER_RADIUS = 18.0
-INNER_RADIUS_RATIO = 0.38196601125
-STAR_ROTATION_DEG = 270.0
-STAR_ROTATION_CORRECTION_DEG = 180.0
-SAMPLES_PER_EDGE = 30
-DEFAULT_CAPTURE_EVERY_N_STAR_MOVES = 3
-
-DEFAULT_SAFETY_MARGIN = 0.5
+DEFAULT_SAMPLES_PER_QUARTER = 200
+DEFAULT_CAPTURE_EVERY_N_CIRCLE_MOVES = 7
 DEFAULT_C0_DEG = 0.0
-
 DEFAULT_FLIP_RZ_SIGN = True
-
-DEFAULT_POST_CAMERA_CALIBRATION_FILE = "../captures/calibration_webcam_20260406_104136.npz"
-DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "../captures/photo_20260406_104134.png"
-DEFAULT_POST_THRESHOLD = 200
-DEFAULT_POST_TIP_REFINE_MODE = "none"
+DEFAULT_QUARTER_GAP_MM = 15.0
 
 OFFPLANE_SIGN = -1.0
 C_HARD_MIN_DEG = -360.0
 C_HARD_MAX_DEG = 360.0
 
-DRAW_PHASES = {
-    "right_pull",
-    "right_release",
-    "left_pull",
-    "left_release",
+RECORDED_PHASES = {
+    "q1_pull",
+    "q2_release",
+    "q3_pull",
+    "q4_release",
 }
-STATIC_C0_PHASES = {
-    "right_start",
-    "right_pull",
-    "right_release",
-    "right_transition",
-}
-STATIC_C180_PHASES = {
-    "mirror_flip",
-    "left_pull",
-    "left_release",
-    "left_transition",
+TRANSITION_PHASES = {
+    "pull_to_release_1",
+    "midpoint_c_flip",
+    "pull_to_release_2",
+    "final_recenter",
 }
 
 
@@ -247,34 +204,6 @@ def assert_all_command_c_safe(command_sequence: List[CommandPoint]) -> None:
             "Generated command sequence contains out-of-range C values: "
             + ", ".join(f"{v:.3f}" for v in bad[:10])
         )
-
-
-def assert_c_is_piecewise_constant_with_single_flip(
-    command_sequence: List[CommandPoint],
-    c0_deg: float,
-    c180_deg: float,
-    atol: float = 1e-9,
-) -> None:
-    seen_flip = False
-    prev_c = None
-
-    for cp in command_sequence:
-        if cp.phase in STATIC_C0_PHASES:
-            if abs(cp.c - c0_deg) > atol:
-                raise RuntimeError(
-                    f"C changed during right half: expected {c0_deg:.3f}, got {cp.c:.3f}"
-                )
-        elif cp.phase in STATIC_C180_PHASES:
-            if abs(cp.c - c180_deg) > atol:
-                raise RuntimeError(
-                    f"C changed during left half / flip: expected {c180_deg:.3f}, got {cp.c:.3f}"
-                )
-
-        if prev_c is not None and abs(cp.c - prev_c) > atol:
-            if seen_flip:
-                raise RuntimeError("More than one C transition detected in command sequence.")
-            seen_flip = True
-        prev_c = cp.c
 
 
 # =========================
@@ -356,9 +285,7 @@ def _extract_phase_models(data: dict) -> Tuple[dict, str]:
             continue
         phase_models[phase_name] = dict(models)
 
-    default_phase = _normalize_motion_phase_name(
-        data.get("default_phase_for_legacy_access")
-    )
+    default_phase = _normalize_motion_phase_name(data.get("default_phase_for_legacy_access"))
     if default_phase is None or default_phase not in phase_models:
         if "pull" in phase_models:
             default_phase = "pull"
@@ -384,24 +311,16 @@ def load_calibration(json_path: str) -> Calibration:
     default_phase_models = phase_models.get(default_phase, {})
 
     r_model = fit_models.get("r") or default_phase_models.get("r") or legacy_poly_model(
-        cubic.get("r_coeffs"),
-        cubic.get("r_equation"),
-        "r",
+        cubic.get("r_coeffs"), cubic.get("r_equation"), "r"
     )
     z_model = fit_models.get("z") or default_phase_models.get("z") or legacy_poly_model(
-        cubic.get("z_coeffs"),
-        cubic.get("z_equation"),
-        "z",
+        cubic.get("z_coeffs"), cubic.get("z_equation"), "z"
     )
     y_off_model = fit_models.get("offplane_y") or default_phase_models.get("offplane_y") or legacy_poly_model(
-        cubic.get("offplane_y_coeffs"),
-        cubic.get("offplane_y_equation"),
-        "y_offplane_mm",
+        cubic.get("offplane_y_coeffs"), cubic.get("offplane_y_equation"), "y_offplane_mm"
     )
     tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
-        cubic.get("tip_angle_coeffs"),
-        cubic.get("tip_angle_equation"),
-        "tip_angle_deg",
+        cubic.get("tip_angle_coeffs"), cubic.get("tip_angle_equation"), "tip_angle_deg"
     )
 
     if r_model is None or z_model is None:
@@ -439,8 +358,7 @@ def load_calibration(json_path: str) -> Calibration:
         c_180_deg=c_180,
         offplane_y_equation=cubic.get("offplane_y_equation"),
         offplane_y_r_squared=(
-            None if cubic.get("offplane_y_r_squared") is None
-            else float(cubic["offplane_y_r_squared"])
+            None if cubic.get("offplane_y_r_squared") is None else float(cubic["offplane_y_r_squared"])
         ),
     )
 
@@ -469,9 +387,8 @@ def resolve_phase_name(cal: Calibration, base_name: str) -> str:
 
 def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Any:
     phase_name = _normalize_motion_phase_name(motion_phase) or cal.default_motion_phase
-    phase_model = cal.phase_models.get(phase_name, {}).get(model_name)
-    if phase_model is not None:
-        return phase_model
+    if phase_name in cal.phase_models and model_name in cal.phase_models[phase_name]:
+        return cal.phase_models[phase_name][model_name]
 
     fallback_attr = {
         "r": cal.r_model,
@@ -482,29 +399,99 @@ def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[
     return fallback_attr
 
 
-def eval_r(
-    cal: Calibration,
-    b: Any,
-    flip_rz_sign: bool = False,
-    motion_phase: Optional[str] = None,
-) -> np.ndarray:
+def _phase_model_variant(cal: Calibration, phase_name: str, variant_key: str) -> Optional[dict]:
+    phase = _normalize_motion_phase_name(phase_name)
+    if phase is None:
+        return None
+    payload = cal.phase_models.get(phase)
+    if not isinstance(payload, dict):
+        return None
+    model = payload.get(variant_key)
+    return dict(model) if isinstance(model, dict) else None
+
+
+def _average_polynomial_models(models: List[dict], value_name: str) -> dict:
+    usable = [m for m in models if isinstance(m, dict)]
+    if not usable:
+        raise ValueError(f"No usable polynomial models were provided for {value_name}.")
+
+    coeff_arrays = [np.asarray(m.get("coefficients"), dtype=float).reshape(-1) for m in usable]
+    if any(arr.size == 0 for arr in coeff_arrays):
+        raise ValueError(f"Polynomial model for {value_name} is missing coefficients.")
+    degrees = {arr.size for arr in coeff_arrays}
+    if len(degrees) != 1:
+        raise ValueError(f"Polynomial models for {value_name} do not share the same degree.")
+
+    avg_coeffs = np.mean(np.stack(coeff_arrays, axis=0), axis=0)
+
+    fit_lo = -np.inf
+    fit_hi = np.inf
+    sample_count = 0
+    for model in usable:
+        fit_x_range = model.get("fit_x_range")
+        if fit_x_range and len(fit_x_range) == 2:
+            lo = float(min(fit_x_range))
+            hi = float(max(fit_x_range))
+            fit_lo = max(fit_lo, lo)
+            fit_hi = min(fit_hi, hi)
+        sample_count = max(sample_count, int(model.get("sample_count", 0) or 0))
+
+    avg_model = {
+        "model_type": "polynomial",
+        "basis": "monomial",
+        "degree": int(avg_coeffs.size - 1),
+        "input_axis": "b_motor",
+        "value_name": str(value_name),
+        "coefficients": avg_coeffs.tolist(),
+        "equation": f"{value_name}(b) = averaged polynomial coefficients across phases",
+        "sample_count": int(sample_count),
+    }
+    if np.isfinite(fit_lo) and np.isfinite(fit_hi) and fit_lo <= fit_hi:
+        avg_model["fit_x_range"] = [float(fit_lo), float(fit_hi)]
+    return avg_model
+
+
+def calibration_with_average_cubic_override(cal: Calibration) -> Calibration:
+    cal_out = copy.deepcopy(cal)
+
+    pull_phase = resolve_phase_name(cal_out, "pull")
+    release_phase = resolve_phase_name(cal_out, "release")
+
+    avg_r_model = _average_polynomial_models(
+        [
+            _phase_model_variant(cal_out, pull_phase, "r_cubic"),
+            _phase_model_variant(cal_out, release_phase, "r_cubic"),
+        ],
+        value_name="r_avg_cubic_override",
+    )
+    avg_z_model = _average_polynomial_models(
+        [
+            _phase_model_variant(cal_out, pull_phase, "z_cubic"),
+            _phase_model_variant(cal_out, release_phase, "z_cubic"),
+        ],
+        value_name="z_avg_cubic_override",
+    )
+
+    for phase_name in {pull_phase, release_phase}:
+        phase_payload = cal_out.phase_models.get(phase_name)
+        if not isinstance(phase_payload, dict):
+            phase_payload = {}
+            cal_out.phase_models[phase_name] = phase_payload
+        phase_payload["r"] = dict(avg_r_model)
+        phase_payload["z"] = dict(avg_z_model)
+
+    cal_out.r_model = dict(avg_r_model)
+    cal_out.z_model = dict(avg_z_model)
+    return cal_out
+
+
+def eval_r(cal: Calibration, b: Any, flip_rz_sign: bool = False, motion_phase: Optional[str] = None) -> np.ndarray:
     s = -1.0 * (-1.0 if bool(flip_rz_sign) else 1.0)
-    return s * evaluate_fit_model(
-        _select_fit_model(cal, "r", motion_phase=motion_phase),
-        b,
-    )
+    return s * evaluate_fit_model(_select_fit_model(cal, "r", motion_phase=motion_phase), b)
 
 
-def eval_z(
-    cal: Calibration,
-    b: Any,
-    flip_rz_sign: bool = False,
-    motion_phase: Optional[str] = None,
-) -> np.ndarray:
-    return evaluate_fit_model(
-        _select_fit_model(cal, "z", motion_phase=motion_phase),
-        b,
-    )
+def eval_z(cal: Calibration, b: Any, flip_rz_sign: bool = False, motion_phase: Optional[str] = None) -> np.ndarray:
+    return evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
 
 
 def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
@@ -515,26 +502,6 @@ def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None
     )
 
 
-def infer_motion_phase_for_b(
-    cal: Calibration,
-    prev_b: Optional[float],
-    curr_b: float,
-    next_b: Optional[float],
-) -> str:
-    deltas = []
-    if prev_b is not None:
-        deltas.append(float(curr_b) - float(prev_b))
-    if next_b is not None:
-        deltas.append(float(next_b) - float(curr_b))
-
-    for delta in deltas:
-        if abs(delta) <= 1e-9:
-            continue
-        return "pull" if delta < 0.0 else "release"
-
-    return cal.default_motion_phase
-
-
 def tip_offset_xyz_physical(
     cal: Calibration,
     b: float,
@@ -542,12 +509,6 @@ def tip_offset_xyz_physical(
     flip_rz_sign: bool = False,
     motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    """
-    Full 3D tip offset in world/stage axes due to B and C.
-
-    r(B) and z(B) may be sign-flipped by CLI flags.
-    offplane_y(B) uses the calibration convention from script 1.
-    """
     c_deg = assert_c_in_safe_range("tip_offset C", c_deg)
 
     r = float(eval_r(cal, b, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase))
@@ -569,371 +530,199 @@ def stage_xyz_for_tip_target(
     motion_phase: Optional[str] = None,
 ) -> np.ndarray:
     return p_tip_xyz - tip_offset_xyz_physical(
-        cal,
-        b,
-        c_deg,
-        flip_rz_sign,
-        motion_phase=motion_phase,
+        cal, b, c_deg, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase
     )
 
 
-def sampled_r_abs_range(
+def _model_b_range(model: Optional[dict], fallback_lo: float, fallback_hi: float) -> Tuple[float, float]:
+    if model is None:
+        return float(fallback_lo), float(fallback_hi)
+
+    if model.get("model_type", "").lower() == "pchip":
+        x_knots = model.get("x_knots") or []
+        if len(x_knots) >= 2:
+            return float(min(x_knots)), float(max(x_knots))
+
+    fit_x_range = model.get("fit_x_range")
+    if fit_x_range and len(fit_x_range) == 2:
+        return float(min(fit_x_range)), float(max(fit_x_range))
+
+    return float(fallback_lo), float(fallback_hi)
+
+
+def common_b_window_for_pull_release(
     cal: Calibration,
-    flip_rz_sign: bool = False,
-    b_lo: Optional[float] = None,
-    b_hi: Optional[float] = None,
-    n: int = 2001,
-    motion_phase: Optional[str] = None,
+    b_lo_user: float,
+    b_hi_user: float,
+    pull_phase: str,
+    release_phase: str,
 ) -> Tuple[float, float]:
-    lo = cal.b_min if b_lo is None else float(b_lo)
-    hi = cal.b_max if b_hi is None else float(b_hi)
+    pull_r_lo, pull_r_hi = _model_b_range(_select_fit_model(cal, "r", motion_phase=pull_phase), cal.b_min, cal.b_max)
+    rel_r_lo, rel_r_hi = _model_b_range(_select_fit_model(cal, "r", motion_phase=release_phase), cal.b_min, cal.b_max)
+
+    lo = max(float(b_lo_user), pull_r_lo, rel_r_lo)
+    hi = min(float(b_hi_user), pull_r_hi, rel_r_hi)
     if lo > hi:
-        lo, hi = hi, lo
-    bb = np.linspace(lo, hi, n)
-    rr = eval_r(
-        cal,
-        bb,
-        flip_rz_sign=flip_rz_sign,
-        motion_phase=motion_phase or cal.default_motion_phase,
-    )
-    return float(np.min(np.abs(rr))), float(np.max(np.abs(rr)))
-
-
-def common_r_abs_range_for_pull_release(
-    cal: Calibration,
-    flip_rz_sign: bool = False,
-    b_lo: Optional[float] = None,
-    b_hi: Optional[float] = None,
-    n: int = 2001,
-) -> Tuple[float, float]:
-    pull_phase = resolve_phase_name(cal, "pull")
-    release_phase = resolve_phase_name(cal, "release")
-    pull_min, pull_max = sampled_r_abs_range(
-        cal,
-        flip_rz_sign=flip_rz_sign,
-        b_lo=b_lo,
-        b_hi=b_hi,
-        n=n,
-        motion_phase=pull_phase,
-    )
-    release_min, release_max = sampled_r_abs_range(
-        cal,
-        flip_rz_sign=flip_rz_sign,
-        b_lo=b_lo,
-        b_hi=b_hi,
-        n=n,
-        motion_phase=release_phase,
-    )
-    common_min = max(float(pull_min), float(release_min))
-    common_max = min(float(pull_max), float(release_max))
-    if common_min > common_max:
         raise RuntimeError(
-            "No common |r| range available for pull/release within the requested B window: "
-            f"pull=[{pull_min:.3f},{pull_max:.3f}], "
-            f"release=[{release_min:.3f},{release_max:.3f}]"
+            f"No common B range available for pull/release within requested limits: "
+            f"pull=[{pull_r_lo:.3f},{pull_r_hi:.3f}], release=[{rel_r_lo:.3f},{rel_r_hi:.3f}], "
+            f"user=[{b_lo_user:.3f},{b_hi_user:.3f}]"
         )
-    return float(common_min), float(common_max)
+    return float(lo), float(hi)
 
 
-def invert_r_to_b(
-    r_target_abs: float,
+# =========================
+# Circle planner
+# =========================
+
+def find_circle_switch_b(
     cal: Calibration,
+    flip_rz_sign: bool,
+    c0_deg: float,
+    pull_phase: str,
+    release_phase: str,
     b_lo: float,
     b_hi: float,
-    flip_rz_sign: bool = False,
-    motion_phase: Optional[str] = None,
-    b_prev: Optional[float] = None,
-) -> float:
-    ns = 20001
-    bb = np.linspace(float(b_lo), float(b_hi), ns, dtype=float)
-    rr = np.abs(
-        np.asarray(
-            eval_r(
-                cal,
-                bb,
-                flip_rz_sign=flip_rz_sign,
-                motion_phase=motion_phase,
-            ),
-            dtype=float,
+    quarter_b_override: Optional[float] = None,
+    n_dense: int = 6001,
+) -> Tuple[float, float]:
+    common_lo, common_hi = common_b_window_for_pull_release(
+        cal=cal,
+        b_lo_user=b_lo,
+        b_hi_user=b_hi,
+        pull_phase=pull_phase,
+        release_phase=release_phase,
+    )
+
+    b_start = 0.0
+    if not (common_lo <= b_start <= common_hi):
+        raise RuntimeError(
+            f"B=0 is not inside the common pull/release range [{common_lo:.3f}, {common_hi:.3f}]."
         )
-    )
-    err = np.abs(rr - float(r_target_abs))
-    if not np.any(np.isfinite(err)):
-        raise RuntimeError("Could not invert r(B): sampled calibration values are not finite.")
 
-    best_err = float(np.nanmin(err))
-    candidate_idx = np.flatnonzero(np.isfinite(err) & (err <= best_err + 1e-6))
-    if candidate_idx.size == 0:
-        candidate_idx = np.asarray([int(np.nanargmin(err))], dtype=int)
+    if quarter_b_override is not None:
+        b_switch = float(quarter_b_override)
+        if b_switch < common_lo or b_switch > common_hi:
+            raise ValueError(
+                f"--quarter-b={b_switch:.3f} is outside the common pull/release range "
+                f"[{common_lo:.3f}, {common_hi:.3f}]"
+            )
+        x0 = float(tip_offset_xyz_physical(
+            cal, b_start, c0_deg, flip_rz_sign=flip_rz_sign, motion_phase=pull_phase
+        )[0])
+        xq = float(tip_offset_xyz_physical(
+            cal, b_switch, c0_deg, flip_rz_sign=flip_rz_sign, motion_phase=pull_phase
+        )[0])
+        radius = abs(xq - x0)
+        if radius <= 0.0:
+            raise RuntimeError("Computed circle radius is not positive.")
+        return float(b_switch), float(radius)
 
-    candidate_b = bb[candidate_idx]
-    if b_prev is None or candidate_b.size == 1:
-        return float(candidate_b[0])
+    bb = np.linspace(common_lo, b_start, int(n_dense), dtype=float)
+    x_pull = np.asarray([
+        tip_offset_xyz_physical(
+            cal, float(b), c0_deg, flip_rz_sign=flip_rz_sign, motion_phase=pull_phase
+        )[0]
+        for b in bb
+    ], dtype=float)
+    x_release = np.asarray([
+        tip_offset_xyz_physical(
+            cal, float(b), c0_deg, flip_rz_sign=flip_rz_sign, motion_phase=release_phase
+        )[0]
+        for b in bb
+    ], dtype=float)
 
-    return float(candidate_b[np.argmin(np.abs(candidate_b - float(b_prev)))])
+    x0_pull = float(tip_offset_xyz_physical(
+        cal, b_start, c0_deg, flip_rz_sign=flip_rz_sign, motion_phase=pull_phase
+    )[0])
 
+    best_radius = -1.0
+    best_b = None
 
-# =========================
-# Star geometry / path extraction
-# =========================
-
-def build_star_vertices(outer_radius: float, inner_ratio: float, rotation_deg: float) -> np.ndarray:
-    inner_radius = outer_radius * inner_ratio
-    rot = math.radians(rotation_deg + STAR_ROTATION_CORRECTION_DEG)
-    verts: List[Tuple[float, float]] = []
-
-    for i in range(10):
-        ang = rot + i * math.pi / 5.0
-        r = outer_radius if (i % 2 == 0) else inner_radius
-        x = r * math.cos(ang)
-        z = r * math.sin(ang)
-        verts.append((x, z))
-
-    verts.append(verts[0])
-    return np.array(verts, dtype=float)
-
-
-def densify_polyline(vertices: np.ndarray, samples_per_edge: int) -> np.ndarray:
-    if samples_per_edge < 2:
-        samples_per_edge = 2
-
-    pts = []
-    for i in range(len(vertices) - 1):
-        p0 = vertices[i]
-        p1 = vertices[i + 1]
-        t = np.linspace(0.0, 1.0, samples_per_edge, endpoint=False)
-        seg = (1.0 - t[:, None]) * p0[None, :] + t[:, None] * p1[None, :]
-        pts.append(seg)
-    pts.append(vertices[-1][None, :])
-    return np.vstack(pts)
-
-
-def _clip_segment_to_right_half(p0: np.ndarray, p1: np.ndarray, eps: float = 1e-12) -> List[np.ndarray]:
-    x0, x1 = float(p0[0]), float(p1[0])
-    in0 = x0 >= -eps
-    in1 = x1 >= -eps
-
-    if in0 and in1:
-        return [p0, p1]
-    if (not in0) and (not in1):
-        return []
-
-    dx = x1 - x0
-    if abs(dx) < eps:
-        return [p0, p1] if (in0 or in1) else []
-
-    t = -x0 / dx
-    t = float(np.clip(t, 0.0, 1.0))
-    p_cross = (1.0 - t) * p0 + t * p1
-    p_cross[0] = 0.0
-
-    if in0 and not in1:
-        return [p0, p_cross]
-    if (not in0) and in1:
-        return [p_cross, p1]
-    return []
-
-
-def _densify_segment(p0: np.ndarray, p1: np.ndarray, samples_per_edge: int) -> np.ndarray:
-    n = max(2, int(samples_per_edge))
-    t = np.linspace(0.0, 1.0, n, endpoint=False)
-    seg = (1.0 - t[:, None]) * p0[None, :] + t[:, None] * p1[None, :]
-    return np.vstack([seg, p1[None, :]])
-
-
-def extract_right_half_star_segments(vertices: np.ndarray, samples_per_edge: int) -> List[np.ndarray]:
-    segments: List[np.ndarray] = []
-    for i in range(len(vertices) - 1):
-        clipped = _clip_segment_to_right_half(vertices[i].copy(), vertices[i + 1].copy())
-        if len(clipped) != 2:
+    for i, b_switch in enumerate(bb):
+        signed_dx_q = float(x_pull[i] - x0_pull)
+        radius = abs(signed_dx_q)
+        if radius <= 0.0:
             continue
-        q0, q1 = clipped
-        if np.linalg.norm(q1 - q0) <= 1e-9:
+
+        # Pull quarter must stay inside the chosen radius before the switch.
+        dx_pull_path = x_pull[i:] - x0_pull
+        if np.max(np.abs(dx_pull_path)) > radius + 1e-6:
             continue
-        segments.append(_densify_segment(q0, q1, samples_per_edge))
-    if not segments:
-        raise RuntimeError("Right-half extraction produced no drawable star segments.")
-    return segments
 
-
-def extract_right_half_polyline(full_pts: np.ndarray, dedup_tol: float = 1e-9) -> np.ndarray:
-    out: List[np.ndarray] = []
-
-    for i in range(len(full_pts) - 1):
-        p0 = full_pts[i].copy()
-        p1 = full_pts[i + 1].copy()
-        clipped = _clip_segment_to_right_half(p0, p1)
-        if len(clipped) != 2:
+        # Release quarter is translated so it starts exactly at the current tip location.
+        # It must also stay inside the same circle radius while returning toward B=0.
+        dx_release_shifted = signed_dx_q + (x_release[i:] - x_release[i])
+        if np.max(np.abs(dx_release_shifted)) > radius + 1e-6:
             continue
-        q0, q1 = clipped
 
-        if not out:
-            out.append(q0)
-        else:
-            if np.linalg.norm(out[-1] - q0) > dedup_tol:
-                out.append(q0)
-        if np.linalg.norm(out[-1] - q1) > dedup_tol:
-            out.append(q1)
+        if radius > best_radius:
+            best_radius = float(radius)
+            best_b = float(b_switch)
 
-    if not out:
-        raise RuntimeError("Right-half extraction produced no points.")
-    return np.vstack(out)
+    if best_b is None or best_radius <= 0.0:
+        raise RuntimeError(
+            "Could not find a feasible curl->uncurl switch point that stays inside a single-radius circle."
+        )
+
+    return float(best_b), float(best_radius)
 
 
-def scale_star_if_needed(
-    desired_outer_radius: float,
-    cal: Calibration,
-    b_lo: float,
-    b_hi: float,
-    safety_margin: float,
-    flip_rz_sign: bool = False,
-) -> Tuple[float, float, float]:
-    r_abs_min, r_abs_max = common_r_abs_range_for_pull_release(
-        cal,
-        flip_rz_sign=flip_rz_sign,
-        b_lo=b_lo,
-        b_hi=b_hi,
-    )
-    max_reachable = max(0.0, r_abs_max - float(safety_margin))
-    outer_used = min(float(desired_outer_radius), max_reachable)
-    return outer_used, r_abs_min, r_abs_max
+def _safe_circle_dz(radius: float, dx: float) -> float:
+    residual = float(radius * radius - dx * dx)
+    if residual < -1e-6:
+        raise RuntimeError(
+            f"Requested circle point is not reachable with the chosen segment radius: "
+            f"radius={radius:.6f}, dx={dx:.6f}"
+        )
+    return math.sqrt(max(0.0, residual))
 
 
-# =========================
-# Command generation
-# =========================
-
-def local_star_points_to_command_points_tip_priority(
-    local_pts_xz: np.ndarray,
+def build_circle_quarter_segment(
     cal: Calibration,
     flip_rz_sign: bool,
     center_x: float,
     center_y: float,
     center_z: float,
-    b_lo: float,
-    b_hi: float,
+    radius: float,
+    b_values: np.ndarray,
     c_state: float,
-    move_phase_start: str,
-    move_phase_rest: str,
+    motion_phase: str,
+    upper_half: bool,
+    start_label: str,
+    rest_label: str,
     move_feed_start: float,
     move_feed_rest: float,
-    b_seed_from: Optional[np.ndarray] = None,
-    forced_motion_phase: Optional[str] = None,
-    b_prev_seed: Optional[float] = None,
-) -> Tuple[List[CommandPoint], dict, np.ndarray]:
+    stage_x_const: Optional[float] = None,
+) -> Tuple[List[CommandPoint], Dict[str, float], float]:
     c_state = assert_c_in_safe_range("c_state", c_state)
+    b_values = np.asarray(b_values, dtype=float)
+    if b_values.size < 2:
+        raise ValueError("Each circle quarter must contain at least 2 B samples.")
 
-    N = local_pts_xz.shape[0]
+    if stage_x_const is None:
+        x_offset_start = float(tip_offset_xyz_physical(
+            cal, float(b_values[0]), c_state, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase
+        )[0])
+        stage_x_const = float(center_x - x_offset_start)
+
     pts: List[CommandPoint] = []
-    b_cmd = np.zeros(N, dtype=float)
+    stage_x_trace = []
 
-    range_phase = forced_motion_phase if forced_motion_phase is not None else None
-    r_abs_min, r_abs_max = sampled_r_abs_range(
-        cal,
-        flip_rz_sign=flip_rz_sign,
-        b_lo=b_lo,
-        b_hi=b_hi,
-        motion_phase=range_phase,
-    )
+    for i, b_i in enumerate(b_values):
+        offset = tip_offset_xyz_physical(
+            cal, float(b_i), c_state, flip_rz_sign=flip_rz_sign, motion_phase=motion_phase
+        )
+        x_tip = float(stage_x_const + offset[0])
+        dx = float(x_tip - float(center_x))
+        dz_mag = _safe_circle_dz(float(radius), dx)
+        z_tip = float(center_z + (dz_mag if upper_half else -dz_mag))
+        tip_target = np.array([x_tip, float(center_y), z_tip], dtype=float)
 
-    n_inner_clamped = 0
-    n_outer_clamped = 0
-    max_abs_x_offset_from_nominal = 0.0
-    max_abs_y_offset_from_nominal = 0.0
-
-    clamped_r_targets = np.zeros(N, dtype=float)
-    for i in range(N):
-        x_local = float(local_pts_xz[i, 0])
-        r_target_abs = abs(x_local)
-        if r_target_abs < r_abs_min:
-            r_target_abs = r_abs_min
-            n_inner_clamped += 1
-        elif r_target_abs > r_abs_max:
-            r_target_abs = r_abs_max
-            n_outer_clamped += 1
-        clamped_r_targets[i] = float(r_target_abs)
-
-    if forced_motion_phase is not None:
-        motion_phases = [str(forced_motion_phase)] * N
-        b_prev: Optional[float] = float(b_prev_seed) if b_prev_seed is not None else None
-        for i in range(N):
-            b_hint = None
-            if i == 0 and b_prev_seed is not None:
-                b_hint = float(b_prev_seed)
-            elif b_seed_from is not None and i < len(b_seed_from):
-                b_hint = float(b_seed_from[i])
-            elif b_prev is not None:
-                b_hint = float(b_prev)
-
-            b_i = invert_r_to_b(
-                clamped_r_targets[i],
-                cal,
-                b_lo=b_lo,
-                b_hi=b_hi,
-                flip_rz_sign=flip_rz_sign,
-                motion_phase=forced_motion_phase,
-                b_prev=b_hint,
-            )
-            b_cmd[i] = float(b_i)
-            b_prev = float(b_i)
-    else:
-        motion_phases = [str(cal.default_motion_phase)] * N
-        for phase_refine_iter in range(3):
-            b_prev = None
-            b_next = np.zeros(N, dtype=float)
-            for i in range(N):
-                b_hint = None
-                if b_seed_from is not None and i < len(b_seed_from):
-                    b_hint = float(b_seed_from[i])
-                elif b_prev is not None:
-                    b_hint = float(b_prev)
-
-                use_phase = motion_phases[i] if phase_refine_iter > 0 else cal.default_motion_phase
-                b_i = invert_r_to_b(
-                    clamped_r_targets[i],
-                    cal,
-                    b_lo=b_lo,
-                    b_hi=b_hi,
-                    flip_rz_sign=flip_rz_sign,
-                    motion_phase=use_phase,
-                    b_prev=b_hint,
-                )
-                b_next[i] = float(b_i)
-                b_prev = float(b_i)
-
-            next_motion_phases: List[str] = []
-            for i in range(N):
-                prev_b = None if i == 0 else float(b_next[i - 1])
-                next_b = None if i + 1 >= N else float(b_next[i + 1])
-                next_motion_phases.append(
-                    infer_motion_phase_for_b(
-                        cal=cal,
-                        prev_b=prev_b,
-                        curr_b=float(b_next[i]),
-                        next_b=next_b,
-                    )
-                )
-
-            b_cmd = b_next
-            if phase_refine_iter > 0 and next_motion_phases == motion_phases:
-                motion_phases = next_motion_phases
-                break
-            motion_phases = next_motion_phases
-
-    for i in range(N):
-        x_local = float(local_pts_xz[i, 0])
-        z_local = float(local_pts_xz[i, 1])
-        b_i = float(b_cmd[i])
-        motion_phase = motion_phases[i]
-
-        x_tip_target = float(center_x + x_local)
-        y_tip_target = float(center_y)
-        z_tip_target = float(center_z + z_local)
-        tip_target = np.array([x_tip_target, y_tip_target, z_tip_target], dtype=float)
         stage_xyz = stage_xyz_for_tip_target(
             cal,
             tip_target,
-            b_i,
+            float(b_i),
             float(c_state),
             flip_rz_sign=flip_rz_sign,
             motion_phase=motion_phase,
@@ -941,69 +730,56 @@ def local_star_points_to_command_points_tip_priority(
 
         tip_check = stage_xyz + tip_offset_xyz_physical(
             cal,
-            b_i,
+            float(b_i),
             float(c_state),
             flip_rz_sign=flip_rz_sign,
             motion_phase=motion_phase,
         )
         if not np.allclose(tip_check, tip_target, atol=1e-9, rtol=0.0):
-            raise RuntimeError("Internal tip-tracking consistency check failed.")
+            raise RuntimeError("Internal tip-tracking consistency check failed in circle planner.")
 
-        x_offset = stage_xyz[0] - float(center_x)
-        y_offset = stage_xyz[1] - float(center_y)
-        max_abs_x_offset_from_nominal = max(max_abs_x_offset_from_nominal, abs(x_offset))
-        max_abs_y_offset_from_nominal = max(max_abs_y_offset_from_nominal, abs(y_offset))
-
+        stage_x_trace.append(float(stage_xyz[0]))
         pts.append(
             CommandPoint(
-                phase=move_phase_start if i == 0 else move_phase_rest,
+                phase=start_label if i == 0 else rest_label,
                 x=float(stage_xyz[0]),
                 y=float(stage_xyz[1]),
                 z=float(stage_xyz[2]),
                 b=float(b_i),
                 c=float(c_state),
                 feed=float(move_feed_start if i == 0 else move_feed_rest),
-                tip_x=float(x_tip_target),
-                tip_y=float(y_tip_target),
-                tip_z=float(z_tip_target),
+                tip_x=float(tip_target[0]),
+                tip_y=float(tip_target[1]),
+                tip_z=float(tip_target[2]),
                 motion_phase=str(motion_phase),
             )
         )
 
+    x_var = float(np.max(stage_x_trace) - np.min(stage_x_trace)) if stage_x_trace else 0.0
     meta = {
-        "r_abs_min": float(r_abs_min),
-        "r_abs_max": float(r_abs_max),
-        "n_inner_clamped": int(n_inner_clamped),
-        "n_outer_clamped": int(n_outer_clamped),
-        "max_abs_x_offset_from_nominal": float(max_abs_x_offset_from_nominal),
-        "max_abs_y_offset_from_nominal": float(max_abs_y_offset_from_nominal),
-        "motion_phases": motion_phases,
+        "stage_x_const": float(stage_x_const),
+        "stage_x_variation": float(x_var),
+        "tip_x_min": float(min(p.tip_x for p in pts)),
+        "tip_x_max": float(max(p.tip_x for p in pts)),
+        "tip_z_min": float(min(p.tip_z for p in pts)),
+        "tip_z_max": float(max(p.tip_z for p in pts)),
+        "stage_y_min": float(min(p.y for p in pts)),
+        "stage_y_max": float(max(p.y for p in pts)),
+        "stage_z_min": float(min(p.z for p in pts)),
+        "stage_z_max": float(max(p.z for p in pts)),
     }
-    return pts, meta, b_cmd
+    return pts, meta, float(stage_x_const)
 
 
-def _infer_segment_motion_phase(local_pts_xz: np.ndarray, preferred_phase: Optional[str] = None) -> str:
-    x_abs_start = abs(float(local_pts_xz[0, 0]))
-    x_abs_end = abs(float(local_pts_xz[-1, 0]))
-    dx_abs = x_abs_end - x_abs_start
-    if dx_abs > 1e-9:
-        return "pull"
-    if dx_abs < -1e-9:
-        return "release"
-    if preferred_phase is not None:
-        return str(preferred_phase)
-    return "pull"
-
-
-def _transition_same_tip_command(
+def transition_point_for_same_tip(
     cal: Calibration,
+    flip_rz_sign: bool,
     tip_target: np.ndarray,
     b_value: float,
     c_state: float,
     motion_phase: str,
     phase_label: str,
     feed: float,
-    flip_rz_sign: bool,
 ) -> CommandPoint:
     stage_xyz = stage_xyz_for_tip_target(
         cal,
@@ -1028,129 +804,13 @@ def _transition_same_tip_command(
     )
 
 
-def _build_half_star_command_sequence(
-    local_segments_xz: List[np.ndarray],
+def build_circle_command_sequence(
     cal: Calibration,
     flip_rz_sign: bool,
     center_x: float,
     center_y: float,
     center_z: float,
-    b_lo: float,
-    b_hi: float,
-    c_state: float,
-    half_name: str,
-    first_phase_label: str,
-    transition_phase_label: str,
-    move_feed_first: float,
-    move_feed_draw: float,
-    move_feed_transition: float,
-    b_seed_first_segment: Optional[np.ndarray] = None,
-    b_prev_seed: Optional[float] = None,
-) -> Tuple[List[CommandPoint], Dict[str, Any], np.ndarray]:
-    sequence: List[CommandPoint] = []
-    segment_meta: List[Dict[str, Any]] = []
-    segment_end_b: List[float] = []
-    prev_segment_phase: Optional[str] = None
-    prev_segment_b_end: Optional[float] = b_prev_seed
-    n_inner_clamped = 0
-    n_outer_clamped = 0
-    max_abs_x_offset_from_nominal = 0.0
-    max_abs_y_offset_from_nominal = 0.0
-
-    for seg_idx, seg_pts in enumerate(local_segments_xz):
-        preferred_phase = prev_segment_phase
-        motion_phase = _infer_segment_motion_phase(seg_pts, preferred_phase=preferred_phase)
-        draw_phase = f"{half_name}_{motion_phase}"
-        seg_cmds, seg_meta, seg_b = local_star_points_to_command_points_tip_priority(
-            local_pts_xz=seg_pts,
-            cal=cal,
-            flip_rz_sign=flip_rz_sign,
-            center_x=float(center_x),
-            center_y=float(center_y),
-            center_z=float(center_z),
-            b_lo=b_lo,
-            b_hi=b_hi,
-            c_state=float(c_state),
-            move_phase_start=first_phase_label if seg_idx == 0 else draw_phase,
-            move_phase_rest=draw_phase,
-            move_feed_start=float(move_feed_first if seg_idx == 0 else move_feed_draw),
-            move_feed_rest=float(move_feed_draw),
-            b_seed_from=b_seed_first_segment if seg_idx == 0 else None,
-            forced_motion_phase=motion_phase,
-            b_prev_seed=prev_segment_b_end,
-        )
-
-        if seg_idx > 0:
-            tip_target = np.array(
-                [float(seg_cmds[0].tip_x), float(seg_cmds[0].tip_y), float(seg_cmds[0].tip_z)],
-                dtype=float,
-            )
-            sequence.append(
-                _transition_same_tip_command(
-                    cal=cal,
-                    tip_target=tip_target,
-                    b_value=float(seg_cmds[0].b),
-                    c_state=float(c_state),
-                    motion_phase=motion_phase,
-                    phase_label=transition_phase_label,
-                    feed=float(move_feed_transition),
-                    flip_rz_sign=flip_rz_sign,
-                )
-            )
-            sequence.extend(seg_cmds[1:])
-        else:
-            sequence.extend(seg_cmds)
-
-        segment_meta.append(
-            {
-                "segment_index": int(seg_idx),
-                "motion_phase": str(motion_phase),
-                "phase_label": str(draw_phase),
-                "num_points": int(len(seg_pts)),
-                "b_start": float(seg_b[0]),
-                "b_end": float(seg_b[-1]),
-                "n_inner_clamped": int(seg_meta["n_inner_clamped"]),
-                "n_outer_clamped": int(seg_meta["n_outer_clamped"]),
-                "max_abs_x_offset_from_nominal": float(seg_meta["max_abs_x_offset_from_nominal"]),
-                "max_abs_y_offset_from_nominal": float(seg_meta["max_abs_y_offset_from_nominal"]),
-            }
-        )
-        n_inner_clamped += int(seg_meta["n_inner_clamped"])
-        n_outer_clamped += int(seg_meta["n_outer_clamped"])
-        max_abs_x_offset_from_nominal = max(
-            max_abs_x_offset_from_nominal,
-            float(seg_meta["max_abs_x_offset_from_nominal"]),
-        )
-        max_abs_y_offset_from_nominal = max(
-            max_abs_y_offset_from_nominal,
-            float(seg_meta["max_abs_y_offset_from_nominal"]),
-        )
-        segment_end_b.append(float(seg_b[-1]))
-        prev_segment_phase = motion_phase
-        prev_segment_b_end = float(seg_b[-1])
-
-    meta = {
-        "num_segments": int(len(local_segments_xz)),
-        "segments": segment_meta,
-        "n_inner_clamped": int(n_inner_clamped),
-        "n_outer_clamped": int(n_outer_clamped),
-        "max_abs_x_offset_from_nominal": float(max_abs_x_offset_from_nominal),
-        "max_abs_y_offset_from_nominal": float(max_abs_y_offset_from_nominal),
-    }
-    return sequence, meta, np.asarray(segment_end_b, dtype=float)
-
-
-def build_star_command_sequence(
-    cal: Calibration,
-    flip_rz_sign: bool,
-    center_x: float,
-    center_y: float,
-    center_z: float,
-    outer_radius: float,
-    inner_ratio: float,
-    rotation_deg: float,
-    samples_per_edge: int,
-    safety_margin: float,
+    samples_per_quarter: int,
     b_lo: float,
     b_hi: float,
     c0_deg: float,
@@ -1158,160 +818,268 @@ def build_star_command_sequence(
     jog_feed: float,
     print_feed_b: float,
     print_feed_c: float,
+    transition_feed: float,
+    quarter_b_override: Optional[float] = None,
+    final_recenter: bool = True,
+    quarter_gap_mm: float = DEFAULT_QUARTER_GAP_MM,
 ) -> Tuple[List[CommandPoint], dict]:
     c0_deg = assert_c_in_safe_range("c0_deg", c0_deg)
     c180_deg = assert_c_in_safe_range("c180_deg", c180_deg)
 
-    outer_used, r_abs_min, r_abs_max = scale_star_if_needed(
-        desired_outer_radius=float(outer_radius),
+    pull_phase = resolve_phase_name(cal, "pull")
+    release_phase = resolve_phase_name(cal, "release")
+
+    b_switch, radius = find_circle_switch_b(
         cal=cal,
         flip_rz_sign=flip_rz_sign,
+        c0_deg=c0_deg,
+        pull_phase=pull_phase,
+        release_phase=release_phase,
         b_lo=b_lo,
         b_hi=b_hi,
-        safety_margin=float(safety_margin),
+        quarter_b_override=quarter_b_override,
     )
-    if outer_used <= 0.0:
-        raise RuntimeError("Star radius not reachable after safety margin.")
 
-    star_vertices = build_star_vertices(
-        outer_radius=outer_used,
-        inner_ratio=float(inner_ratio),
-        rotation_deg=float(rotation_deg),
-    )
-    right_half_segments = extract_right_half_star_segments(
-        star_vertices,
-        samples_per_edge=int(samples_per_edge),
-    )
-    right_half_pts = np.vstack(right_half_segments)
+    n = max(2, int(samples_per_quarter))
+    gap = max(0.0, float(quarter_gap_mm))
+    b_q_pull = np.linspace(0.0, float(b_switch), n, dtype=float)
+    b_q_release = np.linspace(float(b_switch), 0.0, n, dtype=float)
 
-    right_cmds, meta_right, b_right = _build_half_star_command_sequence(
-        local_segments_xz=right_half_segments,
+    q1_center_x = float(center_x)
+    q1_center_z = float(center_z)
+    q2_center_x = float(center_x)
+    q2_center_z = float(center_z + gap)
+    q3_center_x = float(center_x - gap)
+    q3_center_z = float(center_z + gap)
+    q4_center_x = float(center_x - gap)
+    q4_center_z = float(center_z)
+
+    q1_pts, meta_q1, x_stage_q1 = build_circle_quarter_segment(
         cal=cal,
         flip_rz_sign=flip_rz_sign,
-        center_x=float(center_x),
+        center_x=float(q1_center_x),
         center_y=float(center_y),
-        center_z=float(center_z),
-        b_lo=b_lo,
-        b_hi=b_hi,
+        center_z=float(q1_center_z),
+        radius=float(radius),
+        b_values=b_q_pull,
         c_state=float(c0_deg),
-        half_name="right",
-        first_phase_label="right_start",
-        transition_phase_label="right_transition",
-        move_feed_first=float(jog_feed),
-        move_feed_draw=float(print_feed_b),
-        move_feed_transition=float(print_feed_b),
-        b_seed_first_segment=None,
-        b_prev_seed=None,
+        motion_phase=pull_phase,
+        upper_half=False,
+        start_label="q1_pull_start",
+        rest_label="q1_pull",
+        move_feed_start=float(jog_feed),
+        move_feed_rest=float(print_feed_b),
+        stage_x_const=None,
     )
 
-    left_half_segments = [seg.copy() for seg in right_half_segments]
-    for seg in left_half_segments:
-        seg[:, 0] *= -1.0
-    left_half_pts = np.vstack(left_half_segments)
-
-    left_cmds, meta_left, b_left = _build_half_star_command_sequence(
-        local_segments_xz=left_half_segments,
+    q1_end_tip = np.array([q1_pts[-1].tip_x, q1_pts[-1].tip_y, q1_pts[-1].tip_z], dtype=float)
+    q2_start_tip = np.array(
+        [float(q2_center_x + radius), float(center_y), float(q2_center_z)],
+        dtype=float,
+    )
+    pull_to_release_1 = transition_point_for_same_tip(
         cal=cal,
         flip_rz_sign=flip_rz_sign,
-        center_x=float(center_x),
-        center_y=float(center_y),
-        center_z=float(center_z),
-        b_lo=b_lo,
-        b_hi=b_hi,
-        c_state=float(c180_deg),
-        half_name="left",
-        first_phase_label="mirror_flip",
-        transition_phase_label="left_transition",
-        move_feed_first=float(print_feed_c),
-        move_feed_draw=float(print_feed_b),
-        move_feed_transition=float(print_feed_b),
-        b_seed_first_segment=None,
-        b_prev_seed=float(b_right[-1]) if b_right.size else None,
+        tip_target=q2_start_tip,
+        b_value=float(b_switch),
+        c_state=float(c0_deg),
+        motion_phase=release_phase,
+        phase_label="pull_to_release_1",
+        feed=float(transition_feed),
     )
 
-    sequence = []
-    sequence.extend(right_cmds)
-    sequence.extend(left_cmds)
+    q2_pts, meta_q2, x_stage_q2 = build_circle_quarter_segment(
+        cal=cal,
+        flip_rz_sign=flip_rz_sign,
+        center_x=float(q2_center_x),
+        center_y=float(center_y),
+        center_z=float(q2_center_z),
+        radius=float(radius),
+        b_values=b_q_release,
+        c_state=float(c0_deg),
+        motion_phase=release_phase,
+        upper_half=True,
+        start_label="q2_release_start",
+        rest_label="q2_release",
+        move_feed_start=float(transition_feed),
+        move_feed_rest=float(print_feed_b),
+        stage_x_const=float(pull_to_release_1.x),
+    )
+
+    q3_preflip_tip = np.array(
+        [float(q3_center_x), float(center_y), float(q3_center_z + radius)],
+        dtype=float,
+    )
+    quarter_gap_2 = transition_point_for_same_tip(
+        cal=cal,
+        flip_rz_sign=flip_rz_sign,
+        tip_target=q3_preflip_tip,
+        b_value=0.0,
+        c_state=float(c0_deg),
+        motion_phase=release_phase,
+        phase_label="quarter_gap_2",
+        feed=float(transition_feed),
+    )
+    midpoint_c_flip = transition_point_for_same_tip(
+        cal=cal,
+        flip_rz_sign=flip_rz_sign,
+        tip_target=q3_preflip_tip,
+        b_value=0.0,
+        c_state=float(c180_deg),
+        motion_phase=pull_phase,
+        phase_label="midpoint_c_flip",
+        feed=float(print_feed_c),
+    )
+
+    q3_pts, meta_q3, x_stage_q3 = build_circle_quarter_segment(
+        cal=cal,
+        flip_rz_sign=flip_rz_sign,
+        center_x=float(q3_center_x),
+        center_y=float(center_y),
+        center_z=float(q3_center_z),
+        radius=float(radius),
+        b_values=b_q_pull,
+        c_state=float(c180_deg),
+        motion_phase=pull_phase,
+        upper_half=True,
+        start_label="q3_pull_start",
+        rest_label="q3_pull",
+        move_feed_start=float(transition_feed),
+        move_feed_rest=float(print_feed_b),
+        stage_x_const=float(midpoint_c_flip.x),
+    )
+
+    q3_end_tip = np.array([q3_pts[-1].tip_x, q3_pts[-1].tip_y, q3_pts[-1].tip_z], dtype=float)
+    q4_start_tip = np.array(
+        [float(q4_center_x - radius), float(center_y), float(q4_center_z)],
+        dtype=float,
+    )
+    pull_to_release_2 = transition_point_for_same_tip(
+        cal=cal,
+        flip_rz_sign=flip_rz_sign,
+        tip_target=q4_start_tip,
+        b_value=float(b_switch),
+        c_state=float(c180_deg),
+        motion_phase=release_phase,
+        phase_label="pull_to_release_2",
+        feed=float(transition_feed),
+    )
+
+    q4_pts, meta_q4, x_stage_q4 = build_circle_quarter_segment(
+        cal=cal,
+        flip_rz_sign=flip_rz_sign,
+        center_x=float(q4_center_x),
+        center_y=float(center_y),
+        center_z=float(q4_center_z),
+        radius=float(radius),
+        b_values=b_q_release,
+        c_state=float(c180_deg),
+        motion_phase=release_phase,
+        upper_half=False,
+        start_label="q4_release_start",
+        rest_label="q4_release",
+        move_feed_start=float(transition_feed),
+        move_feed_rest=float(print_feed_b),
+        stage_x_const=float(pull_to_release_2.x),
+    )
+
+    sequence: List[CommandPoint] = []
+    sequence.extend(q1_pts)
+    sequence.append(pull_to_release_1)
+    sequence.extend(q2_pts[1:])
+    sequence.append(quarter_gap_2)
+    sequence.append(midpoint_c_flip)
+    sequence.extend(q3_pts[1:])
+    sequence.append(pull_to_release_2)
+    sequence.extend(q4_pts[1:])
+
+    final_recenter_cp = None
+    exact_bottom_tip = np.array([float(q4_center_x), float(center_y), float(q4_center_z - radius)], dtype=float)
+    if bool(final_recenter):
+        final_recenter_cp = transition_point_for_same_tip(
+            cal=cal,
+            flip_rz_sign=flip_rz_sign,
+            tip_target=np.array([float(center_x), float(center_y), float(center_z - radius)], dtype=float),
+            b_value=0.0,
+            c_state=float(c180_deg),
+            motion_phase=release_phase,
+            phase_label="final_recenter",
+            feed=float(transition_feed),
+        )
+        sequence.append(final_recenter_cp)
 
     assert_all_command_c_safe(sequence)
-    assert_c_is_piecewise_constant_with_single_flip(sequence, c0_deg=float(c0_deg), c180_deg=float(c180_deg))
 
-    rr_right = np.asarray(
-        [
-            eval_r(cal, seg["b_end"], flip_rz_sign=flip_rz_sign, motion_phase=seg["motion_phase"])
-            for seg in meta_right["segments"]
-        ],
-        dtype=float,
-    )
-    rr_left = np.asarray(
-        [
-            eval_r(cal, seg["b_end"], flip_rz_sign=flip_rz_sign, motion_phase=seg["motion_phase"])
-            for seg in meta_left["segments"]
-        ],
-        dtype=float,
-    )
-    zz_right = np.asarray(
-        [
-            eval_z(cal, seg["b_end"], flip_rz_sign=flip_rz_sign, motion_phase=seg["motion_phase"])
-            for seg in meta_right["segments"]
-        ],
-        dtype=float,
-    )
-    zz_left = np.asarray(
-        [
-            eval_z(cal, seg["b_end"], flip_rz_sign=flip_rz_sign, motion_phase=seg["motion_phase"])
-            for seg in meta_left["segments"]
-        ],
-        dtype=float,
-    )
-    yy_right = np.asarray(
-        [
-            eval_offplane_y(cal, seg["b_end"], motion_phase=seg["motion_phase"])
-            for seg in meta_right["segments"]
-        ],
-        dtype=float,
-    )
-    yy_left = np.asarray(
-        [
-            eval_offplane_y(cal, seg["b_end"], motion_phase=seg["motion_phase"])
-            for seg in meta_left["segments"]
-        ],
-        dtype=float,
-    )
+    stage_x_ranges = {
+        "q1": float(meta_q1["stage_x_variation"]),
+        "q2": float(meta_q2["stage_x_variation"]),
+        "q3": float(meta_q3["stage_x_variation"]),
+        "q4": float(meta_q4["stage_x_variation"]),
+    }
+
+    q2_end = q2_pts[-1]
+    q4_end = q4_pts[-1]
+    midpoint_preflip_error = {
+        "dx": float(q2_end.tip_x - q3_preflip_tip[0]),
+        "dy": float(q2_end.tip_y - q3_preflip_tip[1]),
+        "dz": float(q2_end.tip_z - q3_preflip_tip[2]),
+        "dist": float(np.linalg.norm(
+            np.array([q2_end.tip_x, q2_end.tip_y, q2_end.tip_z], dtype=float) - q3_preflip_tip
+        )),
+    }
+    closure_error_before_final = {
+        "dx": float(q4_end.tip_x - exact_bottom_tip[0]),
+        "dy": float(q4_end.tip_y - exact_bottom_tip[1]),
+        "dz": float(q4_end.tip_z - exact_bottom_tip[2]),
+        "dist": float(np.linalg.norm(
+            np.array([q4_end.tip_x, q4_end.tip_y, q4_end.tip_z], dtype=float) - exact_bottom_tip
+        )),
+    }
 
     meta = {
-        "outer_radius_requested": float(outer_radius),
-        "outer_radius_used": float(outer_used),
-        "r_abs_min_reachable": float(r_abs_min),
-        "r_abs_max_reachable": float(r_abs_max),
-        "right_half_points": int(len(right_half_pts)),
-        "meta_right": meta_right,
-        "meta_left": meta_left,
-        "b_right_min": float(np.min(b_right)) if b_right.size else float("nan"),
-        "b_right_max": float(np.max(b_right)) if b_right.size else float("nan"),
-        "b_left_min": float(np.min(b_left)) if b_left.size else float("nan"),
-        "b_left_max": float(np.max(b_left)) if b_left.size else float("nan"),
-        "r_right_min": float(np.min(rr_right)) if rr_right.size else float("nan"),
-        "r_right_max": float(np.max(rr_right)) if rr_right.size else float("nan"),
-        "r_left_min": float(np.min(rr_left)) if rr_left.size else float("nan"),
-        "r_left_max": float(np.max(rr_left)) if rr_left.size else float("nan"),
-        "z_right_min": float(np.min(zz_right)) if zz_right.size else float("nan"),
-        "z_right_max": float(np.max(zz_right)) if zz_right.size else float("nan"),
-        "z_left_min": float(np.min(zz_left)) if zz_left.size else float("nan"),
-        "z_left_max": float(np.max(zz_left)) if zz_left.size else float("nan"),
-        "yoff_right_min": float(np.min(yy_right)) if yy_right.size else float("nan"),
-        "yoff_right_max": float(np.max(yy_right)) if yy_right.size else float("nan"),
-        "yoff_left_min": float(np.min(yy_left)) if yy_left.size else float("nan"),
-        "yoff_left_max": float(np.max(yy_left)) if yy_left.size else float("nan"),
+        "pull_phase": str(pull_phase),
+        "release_phase": str(release_phase),
+        "quarter_b": float(b_switch),
+        "circle_radius": float(radius),
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "center_z": float(center_z),
+        "quarter_gap_mm": float(gap),
+        "quarter_centers": {
+            "q1": {"x": float(q1_center_x), "z": float(q1_center_z)},
+            "q2": {"x": float(q2_center_x), "z": float(q2_center_z)},
+            "q3": {"x": float(q3_center_x), "z": float(q3_center_z)},
+            "q4": {"x": float(q4_center_x), "z": float(q4_center_z)},
+        },
+        "c0_deg": float(c0_deg),
+        "c180_deg": float(c180_deg),
+        "flip_rz_sign": bool(flip_rz_sign),
+        "samples_per_quarter": int(n),
+        "stage_x_variation_by_recorded_quarter": stage_x_ranges,
+        "midpoint_preflip_error": midpoint_preflip_error,
+        "closure_error_before_final": closure_error_before_final,
+        "transition_stage_x": {
+            "q1": float(x_stage_q1),
+            "q2": float(x_stage_q2),
+            "q3": float(x_stage_q3),
+            "q4": float(x_stage_q4),
+        },
+        "meta_q1": meta_q1,
+        "meta_q2": meta_q2,
+        "meta_q3": meta_q3,
+        "meta_q4": meta_q4,
         "x_stage_min": float(min(p.x for p in sequence)),
         "x_stage_max": float(max(p.x for p in sequence)),
         "y_stage_min": float(min(p.y for p in sequence)),
         "y_stage_max": float(max(p.y for p in sequence)),
         "z_stage_min": float(min(p.z for p in sequence)),
         "z_stage_max": float(max(p.z for p in sequence)),
-        "c0_deg": float(c0_deg),
-        "c180_deg": float(c180_deg),
-        "flip_rz_sign": bool(flip_rz_sign),
+        "tip_x_min": float(min(p.tip_x for p in sequence)),
+        "tip_x_max": float(max(p.tip_x for p in sequence)),
+        "tip_z_min": float(min(p.tip_z for p in sequence)),
+        "tip_z_max": float(max(p.tip_z for p in sequence)),
+        "final_recenter_enabled": bool(final_recenter),
+        "final_recenter_point": None if final_recenter_cp is None else asdict(final_recenter_cp),
     }
     return sequence, meta
 
@@ -1347,17 +1115,14 @@ def _clamp_stage_xyz_to_bbox(
     return xc, yc, zc
 
 
-def save_desired_star_motion_plot(
-    plot_path: str,
-    command_sequence: List[CommandPoint],
-) -> str:
+def save_desired_circle_motion_plot(plot_path: str, command_sequence: List[CommandPoint]) -> str:
     if not command_sequence:
-        raise RuntimeError("Cannot save desired star motion plot: command_sequence is empty.")
+        raise RuntimeError("Cannot save desired circle motion plot: command_sequence is empty.")
 
     import matplotlib.pyplot as plt
 
-    tip_x = np.asarray([cp.tip_x for cp in command_sequence], dtype=float)
-    tip_z = np.asarray([cp.tip_z for cp in command_sequence], dtype=float)
+    tip_x = np.asarray([cp.tip_x for cp in command_sequence if cp.phase in RECORDED_PHASES or cp.phase.endswith("_start")], dtype=float)
+    tip_z = np.asarray([cp.tip_z for cp in command_sequence if cp.phase in RECORDED_PHASES or cp.phase.endswith("_start")], dtype=float)
 
     fig, ax = plt.subplots(figsize=(7.5, 7.5), facecolor=(0.0, 0.0, 0.0, 0.0))
     ax.set_facecolor((0.04, 0.09, 0.14, 0.88))
@@ -1368,45 +1133,24 @@ def save_desired_star_motion_plot(
         color="#8cf7ff",
         linewidth=2.4,
         alpha=0.98,
-        label="Desired star motion",
+        label="Desired circle motion",
         zorder=2,
     )
     ax.scatter(
         tip_x,
         tip_z,
-        s=14,
+        s=12,
         color="#f8fafc",
         edgecolors="#8cf7ff",
-        linewidths=0.45,
+        linewidths=0.4,
         alpha=0.95,
         label="Sampled tip targets",
         zorder=3,
     )
-    ax.scatter(
-        [tip_x[0]],
-        [tip_z[0]],
-        s=72,
-        color="#f4d35e",
-        edgecolors="none",
-        label="Start",
-        zorder=4,
-    )
+    ax.scatter([tip_x[0]], [tip_z[0]], s=72, color="#f4d35e", edgecolors="none", label="Start", zorder=4)
 
-    phases = [cp.phase for cp in command_sequence]
-    mirror_idx = next((i for i, phase in enumerate(phases) if phase == "mirror_flip"), None)
-    if mirror_idx is not None:
-        ax.scatter(
-            [tip_x[mirror_idx]],
-            [tip_z[mirror_idx]],
-            s=60,
-            color="#ff8fab",
-            edgecolors="none",
-            label="Mirror flip",
-            zorder=4,
-        )
-
-    cx = float(np.mean(tip_x))
-    cz = float(np.mean(tip_z))
+    cx = float(np.mean([np.min(tip_x), np.max(tip_x)]))
+    cz = float(np.mean([np.min(tip_z), np.max(tip_z)]))
     span_x = max(float(np.max(np.abs(tip_x - cx))), 1.0)
     span_z = max(float(np.max(np.abs(tip_z - cz))), 1.0)
     span = 1.08 * max(span_x, span_z)
@@ -1416,7 +1160,7 @@ def save_desired_star_motion_plot(
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Desired tip X (mm)", color="#e8f3ff")
     ax.set_ylabel("Desired tip Z (mm)", color="#e8f3ff")
-    ax.set_title("Desired Generated Star Motion", color="#f8fbff")
+    ax.set_title("Desired Generated Circle Motion", color="#f8fbff")
     ax.grid(True, color="#8eb8d8", alpha=0.14, linewidth=0.8)
     ax.tick_params(colors="#dceaf7")
     for spine in ax.spines.values():
@@ -1432,11 +1176,31 @@ def save_desired_star_motion_plot(
     return plot_path
 
 
+def save_command_sequence_csv(csv_path: str, command_sequence: List[CommandPoint]) -> str:
+    fieldnames = [
+        "idx", "phase", "motion_phase", "x", "y", "z", "b", "c", "feed", "tip_x", "tip_y", "tip_z"
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx, cp in enumerate(command_sequence):
+            row = asdict(cp)
+            row["idx"] = idx
+            writer.writerow({k: row[k] for k in fieldnames})
+    return csv_path
+
+
+def save_json(path: str, payload: Any) -> str:
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    return path
+
+
 # =========================
 # Acquisition runner
 # =========================
 
-class StarTrackerRunner:
+class CircleTrackerRunner:
     def __init__(
         self,
         parent_directory: str,
@@ -1565,6 +1329,11 @@ class StarTrackerRunner:
         return None
 
     def connect_to_robot(self, duet_web_address: str):
+        if DuetWebAPI is None:
+            raise ImportError(
+                "Missing duetwebapi. Install with:\n"
+                "    pip install duetwebapi==1.1.0"
+            )
         self.rrf = DuetWebAPI(duet_web_address)
         print("Connection attempted. Requesting diagnostics.")
         resp = self.rrf.send_code("M122")
@@ -1701,7 +1470,7 @@ class StarTrackerRunner:
         )
         self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
-    def execute_star_motion_and_capture(
+    def execute_circle_motion_and_capture(
         self,
         cal: Calibration,
         command_sequence: List[CommandPoint],
@@ -1720,7 +1489,7 @@ class StarTrackerRunner:
         inter_command_delay_s: float = 0.0,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
-        capture_every_n_star_moves: int = 1,
+        capture_every_n_circle_moves: int = 1,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1729,12 +1498,12 @@ class StarTrackerRunner:
 
         bbox_warnings: List[str] = []
         sample_counter = 0
-        star_move_counter = 0
-        capture_every_n_star_moves = max(1, int(capture_every_n_star_moves))
+        circle_move_counter = 0
+        capture_every_n_circle_moves = max(1, int(capture_every_n_circle_moves))
         self.commanded_axes = {}
 
         print("\n" + "=" * 72)
-        print("STARTING STAR-TRACKING ACQUISITION RUN")
+        print("STARTING CIRCLE-TRACKING ACQUISITION RUN")
         print("=" * 72)
         print(f"Tracked samples: {len(command_sequence)}")
 
@@ -1754,10 +1523,7 @@ class StarTrackerRunner:
         else:
             first = command_sequence[0]
             x0, y0, z0 = _clamp_stage_xyz_to_bbox(
-                first.x, first.y, first.z,
-                virtual_bbox,
-                "move to tracked start",
-                bbox_warnings,
+                first.x, first.y, first.z, virtual_bbox, "move to tracked start", bbox_warnings
             )
 
             print("\nMoving to first tracked sample...")
@@ -1805,13 +1571,10 @@ class StarTrackerRunner:
                 print(f"Dwell before motion: {int(dwell_before_ms)} ms")
                 time.sleep(float(dwell_before_ms) / 1000.0)
 
-            print("\nExecuting star tracking motion...")
+            print("\nExecuting circle tracking motion...")
             for i, cp in enumerate(command_sequence[1:], start=1):
                 x, y, z = _clamp_stage_xyz_to_bbox(
-                    cp.x, cp.y, cp.z,
-                    virtual_bbox,
-                    f"tracked sample {i}",
-                    bbox_warnings,
+                    cp.x, cp.y, cp.z, virtual_bbox, f"tracked sample {i}", bbox_warnings
                 )
 
                 est_move_time_s = self.send_absolute_move(
@@ -1831,13 +1594,13 @@ class StarTrackerRunner:
                 if wait_s > 0.0:
                     time.sleep(wait_s)
 
-                if cp.phase == "mirror_flip":
+                if cp.phase == "midpoint_c_flip":
                     print(f"Holding {float(DEFAULT_C_FLIP_DELAY_S):.3f} s after C rotation...")
                     time.sleep(float(DEFAULT_C_FLIP_DELAY_S))
 
-                if cp.phase in DRAW_PHASES:
-                    star_move_counter += 1
-                    if (star_move_counter % capture_every_n_star_moves) == 0:
+                if cp.phase in RECORDED_PHASES:
+                    circle_move_counter += 1
+                    if (circle_move_counter % capture_every_n_circle_moves) == 0:
                         sample_counter += 1
                         self.capture_and_save(
                             sample_idx=sample_counter,
@@ -1888,8 +1651,9 @@ class StarTrackerRunner:
 # =========================
 
 def main(args):
-    script_dir = Path(__file__).resolve().parent
     cal = load_calibration(args.calibration)
+    if bool(args.use_average_cubic_fit):
+        cal = calibration_with_average_cubic_override(cal)
 
     flip_rz_sign = bool(args.flip_rz_sign)
 
@@ -1907,17 +1671,13 @@ def main(args):
     start_c = assert_c_in_safe_range("start_c", float(args.start_c))
     end_c = assert_c_in_safe_range("end_c", float(args.end_c))
 
-    command_sequence, meta = build_star_command_sequence(
+    command_sequence, meta = build_circle_command_sequence(
         cal=cal,
         flip_rz_sign=flip_rz_sign,
         center_x=float(args.center_x),
         center_y=float(args.center_y),
         center_z=float(args.center_z),
-        outer_radius=float(args.outer_radius),
-        inner_ratio=float(args.inner_ratio),
-        rotation_deg=float(args.rotation_deg),
-        samples_per_edge=int(args.samples_per_edge),
-        safety_margin=float(args.safety_margin),
+        samples_per_quarter=int(args.samples_per_quarter),
         b_lo=b_lo,
         b_hi=b_hi,
         c0_deg=c0_deg,
@@ -1925,58 +1685,51 @@ def main(args):
         jog_feed=float(args.jog_feed),
         print_feed_b=float(args.print_feed if args.print_feed_b is None else args.print_feed_b),
         print_feed_c=float(args.print_feed if args.print_feed_c is None else args.print_feed_c),
+        transition_feed=float(args.transition_feed),
+        quarter_b_override=(None if args.quarter_b is None else float(args.quarter_b)),
+        final_recenter=bool(args.final_recenter),
+        quarter_gap_mm=float(args.quarter_gap_mm),
     )
+    meta["fit_mode"] = "shared_average_cubic" if bool(args.use_average_cubic_fit) else "phase_specific_default"
 
     print("Trajectory summary:")
-    print(f"  Right-half points: {meta['right_half_points']}")
-    print(f"  Star outer radius requested: {meta['outer_radius_requested']:.3f} mm")
-    print(f"  Star outer radius used:      {meta['outer_radius_used']:.3f} mm")
+    print(f"  fit_mode: {'shared_average_cubic' if bool(args.use_average_cubic_fit) else 'phase_specific_default'}")
+    print(f"  quarter_gap_mm: {meta['quarter_gap_mm']:.3f}")
+    print(f"  pull_phase: {meta['pull_phase']}")
+    print(f"  release_phase: {meta['release_phase']}")
+    print(f"  Circle radius used: {meta['circle_radius']:.3f} mm")
+    print(f"  Quarter-switch B:   {meta['quarter_b']:.3f}")
     print(f"  flip_rz_sign: {meta['flip_rz_sign']}")
-    print(
-        f"  Reachable |r(B)| over commanded range: "
-        f"[{meta['r_abs_min_reachable']:.3f}, {meta['r_abs_max_reachable']:.3f}] mm"
-    )
-    print(f"  B right range: [{meta['b_right_min']:.3f}, {meta['b_right_max']:.3f}]")
-    print(f"  B left  range: [{meta['b_left_min']:.3f}, {meta['b_left_max']:.3f}]")
     print(f"  X stage range: [{meta['x_stage_min']:.3f}, {meta['x_stage_max']:.3f}]")
     print(f"  Y stage range: [{meta['y_stage_min']:.3f}, {meta['y_stage_max']:.3f}]")
     print(f"  Z stage range: [{meta['z_stage_min']:.3f}, {meta['z_stage_max']:.3f}]")
-    print(f"  C values used: [{meta['c0_deg']:.3f}, {meta['c180_deg']:.3f}] (single flip only)")
+    print(f"  C values used: [{meta['c0_deg']:.3f}, {meta['c180_deg']:.3f}]")
     print(
-        f"  Right max |X offset from nominal center|: "
-        f"{meta['meta_right']['max_abs_x_offset_from_nominal']:.3f} mm"
+        "  Recorded-quarter stage X variation (should be ~0): "
+        + ", ".join(f"{k}={v:.6f}" for k, v in meta["stage_x_variation_by_recorded_quarter"].items())
     )
     print(
-        f"  Left  max |X offset from nominal center|: "
-        f"{meta['meta_left']['max_abs_x_offset_from_nominal']:.3f} mm"
+        f"  Midpoint pre-flip error before exact C-flip recenter: "
+        f"{meta['midpoint_preflip_error']['dist']:.6f} mm"
     )
     print(
-        f"  Right max |Y offset from nominal center_y|: "
-        f"{meta['meta_right']['max_abs_y_offset_from_nominal']:.3f} mm"
+        f"  Final closure error before optional recenter: "
+        f"{meta['closure_error_before_final']['dist']:.6f} mm"
     )
-    print(
-        f"  Left  max |Y offset from nominal center_y|: "
-        f"{meta['meta_left']['max_abs_y_offset_from_nominal']:.3f} mm"
-    )
-
-    if meta["meta_right"]["n_inner_clamped"] or meta["meta_left"]["n_inner_clamped"]:
-        print("[info] Inner radial clamp occurred; X/Y correction preserved exact tip position near centerline.")
-    if meta["meta_right"]["n_outer_clamped"] or meta["meta_left"]["n_outer_clamped"]:
-        print("[info] Outer radial clamp occurred; consider reducing star radius for lower correction.")
 
     start_pose = (
         float(args.start_x),
         float(args.start_y),
         float(args.start_z),
         float(args.start_b),
-        start_c,
+        float(start_c),
     )
     end_pose = (
         float(args.end_x),
         float(args.end_y),
         float(args.end_z),
         float(args.end_b),
-        end_c,
+        float(end_c),
     )
 
     virtual_bbox = {
@@ -1987,28 +1740,28 @@ def main(args):
         "z_min": float(args.bbox_z_min),
         "z_max": float(args.bbox_z_max),
     }
-    if virtual_bbox["x_min"] > virtual_bbox["x_max"]:
-        virtual_bbox["x_min"], virtual_bbox["x_max"] = virtual_bbox["x_max"], virtual_bbox["x_min"]
-    if virtual_bbox["y_min"] > virtual_bbox["y_max"]:
-        virtual_bbox["y_min"], virtual_bbox["y_max"] = virtual_bbox["y_max"], virtual_bbox["y_min"]
-    if virtual_bbox["z_min"] > virtual_bbox["z_max"]:
-        virtual_bbox["z_min"], virtual_bbox["z_max"] = virtual_bbox["z_max"], virtual_bbox["z_min"]
 
-    runner = StarTrackerRunner(
+    runner = CircleTrackerRunner(
         parent_directory=args.parent_directory,
         project_name=args.project_name,
         allow_existing=bool(args.allow_existing),
         add_date=bool(args.add_date),
     )
 
-    desired_star_plot_path = os.path.join(runner.run_folder, "desired_star_motion.png")
-    save_desired_star_motion_plot(
-        plot_path=desired_star_plot_path,
-        command_sequence=command_sequence,
-    )
-    print(f"Saved desired star motion plot: {desired_star_plot_path}")
-
     try:
+        meta_path = save_json(os.path.join(runner.run_folder, "trajectory_meta.json"), meta)
+        csv_path = save_command_sequence_csv(
+            os.path.join(runner.run_folder, "planned_command_sequence.csv"),
+            command_sequence,
+        )
+        plot_path = save_desired_circle_motion_plot(
+            os.path.join(runner.run_folder, "desired_circle_motion.png"),
+            command_sequence,
+        )
+        print(f"Saved plan metadata: {meta_path}")
+        print(f"Saved command CSV:   {csv_path}")
+        print(f"Saved path plot:     {plot_path}")
+
         runner.connect_to_camera(
             cam_port=int(args.cam_port),
             show_preview=bool(args.show_preview),
@@ -2020,7 +1773,7 @@ def main(args):
 
         runner.connect_to_robot(args.duet_web_address)
 
-        results = runner.execute_star_motion_and_capture(
+        results = runner.execute_circle_motion_and_capture(
             cal=cal,
             command_sequence=command_sequence,
             start_pose=start_pose,
@@ -2038,53 +1791,53 @@ def main(args):
             inter_command_delay_s=float(args.inter_command_delay_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
-            capture_every_n_star_moves=int(args.capture_every_n_star_moves),
+            capture_every_n_circle_moves=int(args.capture_every_n_circle_moves),
         )
 
         print("\nFinal results:")
         print(results)
 
-        if bool(args.enable_post):
+        if args.enable_post:
+            post_camera_calibration = Path(args.post_camera_calibration_file).expanduser().resolve()
+            post_reference_image = Path(args.post_checkerboard_reference_image).expanduser().resolve()
+
+            if not post_camera_calibration.is_file():
+                raise FileNotFoundError(
+                    f"Post-processing camera calibration file not found: {post_camera_calibration}"
+                )
+            if not post_reference_image.is_file():
+                raise FileNotFoundError(
+                    f"Post-processing checkerboard reference image not found: {post_reference_image}"
+                )
+
             post_cmd = [
                 sys.executable,
-                str(script_dir / "calib_star_process.py"),
+                str((Path(__file__).resolve().parent / "calib_circle_process.py").resolve()),
                 "--project_dir",
-                runner.run_folder,
+                str(Path(runner.run_folder).resolve()),
                 "--camera_calibration_file",
-                str(Path(args.post_camera_calibration_file).expanduser()),
+                str(post_camera_calibration),
                 "--checkerboard_reference_image",
-                str(Path(args.post_checkerboard_reference_image).expanduser()),
-                "--threshold",
-                str(int(args.post_threshold)),
-                "--tip_refine_mode",
-                str(args.post_tip_refine_mode),
-                "--star_center_x_mm",
-                str(float(args.center_x)),
-                "--star_center_z_mm",
-                str(float(args.center_z)),
-                "--star_outer_radius_mm",
-                str(float(args.outer_radius)),
-                "--star_inner_ratio",
-                str(float(args.inner_ratio)),
-                "--star_rotation_deg",
-                str(float(args.rotation_deg)),
-                "--star_samples_per_edge",
-                str(int(args.samples_per_edge)),
-                "--capture_every_n_star_moves",
-                str(int(args.capture_every_n_star_moves)),
+                str(post_reference_image),
+                "--capture_every_n_circle_moves",
+                str(int(args.capture_every_n_circle_moves)),
             ]
             if bool(args.capture_at_start):
                 post_cmd.append("--capture_at_start")
-            if bool(args.post_save_analysis_config):
-                post_cmd.append("--save_analysis_config")
+            if bool(args.post_save_plots):
+                post_cmd.append("--save_plots")
 
-            print("\nRunning post-processing:")
-            print(" ".join(post_cmd))
-            subprocess.run(post_cmd, check=True, cwd=str(script_dir))
+            print("\nStarting post-processing:")
+            print("  " + " ".join(post_cmd))
+            subprocess.run(post_cmd, check=True)
 
     finally:
         try:
             runner.disconnect_camera()
+        except Exception:
+            pass
+        try:
+            runner.disconnect_robot()
         except Exception:
             pass
 
@@ -2092,9 +1845,9 @@ def main(args):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description=(
-            "Run mirrored-half star tracking directly on the robot, preserving the "
-            "motion planning of script 2 while keeping the camera/image-acquisition "
-            "workflow of script 1, with offplane Y compensation enabled."
+            "Run a circle-tracking acquisition directly on the robot using pull/release "
+            "PCHIP B calibration plus commanded Z motion, with only transition phases "
+            "allowed to change X."
         )
     )
 
@@ -2105,8 +1858,6 @@ if __name__ == "__main__":
                     help="Allow reuse of an existing run folder.")
     ap.add_argument("--add-date", action="store_true", default=DEFAULT_ADD_DATE,
                     help="Append timestamp to the run folder name.")
-    ap.add_argument("--enable-post", action="store_true",
-                    help="Run calib_star_process.py on the generated project directory after acquisition.")
 
     # Connectivity
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet web address.")
@@ -2130,84 +1881,82 @@ if __name__ == "__main__":
 
     # Kinematic sign override
     ap.add_argument("--flip-rz-sign", action="store_true", default=DEFAULT_FLIP_RZ_SIGN,
-                    help="Match calib_point_track_daq.py: flip only the planar r/X sign from calibration.")
+                    help="Match the uploaded tracking script: flip only the planar r/X sign from calibration.")
+    ap.add_argument("--use-average-cubic-fit", action="store_true", default=DEFAULT_USE_AVERAGE_CUBIC_FIT,
+                    help="Override pull/release r/z PCHIP models with one shared average cubic fit built from the phase cubic coefficients.")
 
-    # Star placement (tip-space)
-    ap.add_argument("--center-x", type=float, default=STAR_CENTER_X,
-                    help="Nominal star center X in tip space.")
-    ap.add_argument("--center-y", type=float, default=STAR_CENTER_Y,
-                    help="Constant star center Y in tip space. Stage Y is solved to hold this exactly.")
-    ap.add_argument("--center-z", type=float, default=STAR_CENTER_Z,
-                    help="Star center Z in tip space.")
+    # Circle placement (tip-space)
+    ap.add_argument("--center-x", type=float, default=CIRCLE_CENTER_X,
+                    help="Nominal circle center X in tip space.")
+    ap.add_argument("--center-y", type=float, default=CIRCLE_CENTER_Y,
+                    help="Constant circle center Y in tip space. Stage Y is solved to hold this exactly.")
+    ap.add_argument("--center-z", type=float, default=CIRCLE_CENTER_Z,
+                    help="Circle center Z in tip space.")
 
-    # Star geometry
-    ap.add_argument("--outer-radius", type=float, default=DESIRED_STAR_OUTER_RADIUS,
-                    help="Desired outer star radius in mm (auto-scaled down if needed).")
-    ap.add_argument("--inner-ratio", type=float, default=INNER_RADIUS_RATIO,
-                    help="Inner radius / outer radius for 5-point star.")
-    ap.add_argument("--rotation-deg", type=float, default=STAR_ROTATION_DEG,
-                    help="Star rotation in XZ plane (deg).")
-    ap.add_argument("--samples-per-edge", type=int, default=SAMPLES_PER_EDGE,
-                    help="Interpolation points per star edge for motion generation before half-plane extraction.")
-    ap.add_argument("--safety-margin", type=float, default=DEFAULT_SAFETY_MARGIN,
-                    help="Margin subtracted from max reachable |r(B)| when auto-scaling.")
+    # Circle shape from B curve
+    ap.add_argument("--samples-per-quarter", type=int, default=DEFAULT_SAMPLES_PER_QUARTER,
+                    help="Interpolation points per quarter-circle segment.")
+    ap.add_argument("--quarter-b", type=float, default=None,
+                    help=(
+                        "Optional B value where curl switches to uncurl. "
+                        "Default: auto-pick the pull-curve quarter point inside the common pull/release B window."
+                    ))
+    ap.add_argument("--quarter-gap-mm", type=float, default=DEFAULT_QUARTER_GAP_MM,
+                    help="Untracked straight-line spacing inserted between quarter arcs in tip space.")
+    ap.add_argument("--final-recenter", dest="final_recenter", action="store_true", default=DEFAULT_FINAL_RECENTER,
+                    help="After Q4, add a final unrecorded recenter to the exact start point at C=180.")
+    ap.add_argument("--no-final-recenter", dest="final_recenter", action="store_false",
+                    help="Do not add the final exact-bottom recenter after Q4.")
 
     # Motion / feeds
     ap.add_argument("--travel-feed", type=float, default=DEFAULT_TRAVEL_FEED,
                     help="Feedrate for safe travel moves.")
     ap.add_argument("--fine-approach-feed", type=float, default=DEFAULT_FINE_APPROACH_FEED,
-                    help="Slow landing move used before the queued star sweep.")
+                    help="Slow landing move used before the queued circle sweep.")
     ap.add_argument("--jog-feed", type=float, default=DEFAULT_PRINT_FEED,
                     help="Feedrate for startup move to first tracked point.")
     ap.add_argument("--print-feed", type=float, default=DEFAULT_PRINT_FEED,
                     help="Base feedrate for drawing moves.")
     ap.add_argument("--print-feed-b", type=float, default=DEFAULT_PRINT_FEED_B,
-                    help="Feedrate for drawing moves without C rotation.")
+                    help="Feedrate for recorded B/Z circle moves.")
     ap.add_argument("--print-feed-c", type=float, default=DEFAULT_PRINT_FEED_C,
-                    help="Feedrate for the single mirror-flip move that also changes C.")
+                    help="Feedrate for the midpoint 180-degree C rotation while tracking.")
+    ap.add_argument("--transition-feed", type=float, default=DEFAULT_TRANSITION_FEED,
+                    help="Feedrate for pull/release transition moves and the optional final recenter.")
 
     # B/C overrides
     ap.add_argument("--min-b", type=float, default=None, help="Lower bound for commanded B (default: calibration).")
     ap.add_argument("--max-b", type=float, default=None, help="Upper bound for commanded B (default: calibration).")
     ap.add_argument("--c0-deg", type=float, default=DEFAULT_C0_DEG,
-                    help="Fixed C value for the right-half side.")
+                    help="Fixed C value for the first half.")
     ap.add_argument("--c180-deg", type=float, default=None,
-                    help="Fixed C value for the mirrored left-half side (default from calibration).")
+                    help="Fixed C value for the second half (default from calibration).")
 
     # Optional waits / capture behavior
     ap.add_argument("--dwell-before-ms", type=int, default=DEFAULT_DWELL_BEFORE_MS)
     ap.add_argument("--dwell-after-ms", type=int, default=DEFAULT_DWELL_AFTER_MS)
     ap.add_argument("--initial-sweep-wait-s", type=float, default=DEFAULT_INITIAL_SWEEP_WAIT_S,
-                    help="Hold time after landing on the first tracked point before queuing the star sweep.")
+                    help="Hold time after landing on the first tracked point before queuing the circle sweep.")
     ap.add_argument("--tracked-move-settle-s", type=float, default=DEFAULT_TRACKED_MOVE_SETTLE_S,
-                    help="Extra settle time after each tracked move, before capture.")
+                    help="Extra settle time after the queued tracked move block, before finishing.")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
     ap.add_argument("--b-extra-settle-s", type=float, default=DEFAULT_B_EXTRA_SETTLE_S,
-                    help="Additional hold after the queued star motion to let the mechanism settle.")
+                    help="Additional hold after the queued circle motion to let the mechanism settle.")
     ap.add_argument("--inter-command-delay-s", type=float, default=DEFAULT_INTER_COMMAND_DELAY_S,
                     help="Small delay between queued tracked commands.")
-    ap.add_argument("--capture-every-n-star-moves", type=int, default=DEFAULT_CAPTURE_EVERY_N_STAR_MOVES,
-                    help="Capture one image every N star-path moves. Travel moves and the mirror flip are not captured.")
+    ap.add_argument("--capture-every-n-circle-moves", type=int, default=DEFAULT_CAPTURE_EVERY_N_CIRCLE_MOVES,
+                    help="Capture one image every N recorded circle-path moves. Transition moves are never captured.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
                     help="Also capture once at the first tracked sample after positioning there.")
-
-    # Post-processing
-    ap.add_argument("--post-camera-calibration-file", type=str, default=DEFAULT_POST_CAMERA_CALIBRATION_FILE,
-                    help="Camera calibration file passed to calib_star_process.py.")
-    ap.add_argument("--post-checkerboard-reference-image", type=str,
-                    default=DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE,
-                    help="Checkerboard reference image passed to calib_star_process.py.")
-    ap.add_argument("--post-threshold", type=int, default=DEFAULT_POST_THRESHOLD,
-                    help="Threshold passed to calib_star_process.py.")
-    ap.add_argument("--post-tip-refine-mode", type=str, default=DEFAULT_POST_TIP_REFINE_MODE,
-                    help="Tip refinement mode passed to calib_star_process.py.")
-    ap.add_argument("--post-save-analysis-config", dest="post_save_analysis_config",
-                    action="store_true", default=True,
-                    help="Pass --save_analysis_config to calib_star_process.py.")
-    ap.add_argument("--no-post-save-analysis-config", dest="post_save_analysis_config",
-                    action="store_false",
-                    help="Do not pass --save_analysis_config to calib_star_process.py.")
+    ap.add_argument("--enable-post", action="store_true", default=DEFAULT_ENABLE_POST,
+                    help="Run calib_circle_process.py automatically after acquisition completes.")
+    ap.add_argument("--post-camera-calibration-file", default=DEFAULT_POST_CAMERA_CALIBRATION_FILE,
+                    help="Camera calibration .npz to pass to post-processing.")
+    ap.add_argument("--post-checkerboard-reference-image", default=DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE,
+                    help="Checkerboard reference image to pass to post-processing.")
+    ap.add_argument("--post-save-plots", action="store_true",
+                    help="Pass --save_plots to the post-processing script.")
 
     # Startup / end poses
     ap.add_argument("--safe-approach-z", type=float, default=DEFAULT_SAFE_APPROACH_Z)

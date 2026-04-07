@@ -59,7 +59,6 @@ import cv2
 import matplotlib.pyplot as plt
 import math
 import numpy as np
-from matplotlib.colors import LinearSegmentedColormap
 
 # Add path to your shadow_calibration script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -75,12 +74,19 @@ _NEI8_W = [
     (1, -1, 2 ** 0.5),  (1, 0, 1.0),  (1, 1, 2 ** 0.5),
 ]
 STAR_CENTER_X_DEFAULT = 100.0
-STAR_CENTER_Z_DEFAULT = -135.0
+STAR_CENTER_Z_DEFAULT = -125.0
 STAR_OUTER_RADIUS_DEFAULT = 18.0
 STAR_INNER_RATIO_DEFAULT = 0.38196601125
 STAR_ROTATION_DEG_DEFAULT = 270.0
+STAR_ROTATION_CORRECTION_DEG = 180.0
 STAR_SAMPLES_PER_EDGE_DEFAULT = 30
-_TRACKED_SAMPLE_RE = re.compile(r"(?:^|_)(\d{5})_(right_start|right|mirror_flip|left|tracked)(?:_|$)")
+DRAW_PHASES = {
+    "right_pull",
+    "right_release",
+    "left_pull",
+    "left_release",
+}
+_TRACKED_SAMPLE_RE = re.compile(r"(?:^|_)(\d{5})_([A-Za-z0-9]+(?:_[A-Za-z0-9]+)*?)(?:_X|$)")
 
 
 # -----------------------------
@@ -275,7 +281,7 @@ def _image_sort_key(path: Path):
 
 def build_star_vertices(outer_radius: float, inner_ratio: float, rotation_deg: float) -> np.ndarray:
     inner_radius = float(outer_radius) * float(inner_ratio)
-    rot = math.radians(float(rotation_deg))
+    rot = math.radians(float(rotation_deg) + STAR_ROTATION_CORRECTION_DEG)
     verts: List[Tuple[float, float]] = []
 
     for i in range(10):
@@ -350,7 +356,42 @@ def extract_right_half_polyline(full_pts: np.ndarray, dedup_tol: float = 1e-9) -
     return np.vstack(out)
 
 
-def build_star_tip_lookup(
+def _densify_segment(p0: np.ndarray, p1: np.ndarray, samples_per_edge: int) -> np.ndarray:
+    n = max(2, int(samples_per_edge))
+    t = np.linspace(0.0, 1.0, n, endpoint=False)
+    seg = (1.0 - t[:, None]) * p0[None, :] + t[:, None] * p1[None, :]
+    return np.vstack([seg, p1[None, :]])
+
+
+def extract_right_half_star_segments(vertices: np.ndarray, samples_per_edge: int) -> List[np.ndarray]:
+    segments: List[np.ndarray] = []
+    for i in range(len(vertices) - 1):
+        clipped = _clip_segment_to_right_half(vertices[i].copy(), vertices[i + 1].copy())
+        if len(clipped) != 2:
+            continue
+        q0, q1 = clipped
+        if np.linalg.norm(q1 - q0) <= 1e-9:
+            continue
+        segments.append(_densify_segment(q0, q1, samples_per_edge))
+    if not segments:
+        raise RuntimeError("Right-half star extraction produced no drawable segments.")
+    return segments
+
+
+def _infer_segment_motion_phase(local_pts_xz: np.ndarray, preferred_phase: Optional[str] = None) -> str:
+    x_abs_start = abs(float(local_pts_xz[0, 0]))
+    x_abs_end = abs(float(local_pts_xz[-1, 0]))
+    dx_abs = x_abs_end - x_abs_start
+    if dx_abs > 1e-9:
+        return "pull"
+    if dx_abs < -1e-9:
+        return "release"
+    if preferred_phase is not None:
+        return str(preferred_phase)
+    return "pull"
+
+
+def build_star_tip_reference(
     center_x: float,
     center_z: float,
     outer_radius: float,
@@ -359,23 +400,40 @@ def build_star_tip_lookup(
     samples_per_edge: int,
     capture_at_start: bool = False,
     capture_every_n_star_moves: int = 1,
-) -> Dict[int, Dict[str, float]]:
+) -> Dict[str, Any]:
     vertices = build_star_vertices(
         outer_radius=float(outer_radius),
         inner_ratio=float(inner_ratio),
         rotation_deg=float(rotation_deg),
     )
-    full_pts = densify_polyline(vertices, samples_per_edge=int(samples_per_edge))
-    right_half_pts = extract_right_half_polyline(full_pts)
-    left_half_pts = right_half_pts.copy()
-    left_half_pts[:, 0] *= -1.0
+    right_half_segments = extract_right_half_star_segments(vertices, samples_per_edge=int(samples_per_edge))
+    left_half_segments = [seg.copy() for seg in right_half_segments]
+    for seg in left_half_segments:
+        seg[:, 0] *= -1.0
 
     lookup: Dict[int, Dict[str, float]] = {}
     command_sequence: List[Tuple[str, np.ndarray]] = []
-    for idx, pt in enumerate(right_half_pts):
-        command_sequence.append(("right_start" if idx == 0 else "right", pt))
-    for idx, pt in enumerate(left_half_pts):
-        command_sequence.append(("mirror_flip" if idx == 0 else "left", pt))
+    full_trajectory_pts: List[np.ndarray] = []
+
+    prev_phase: Optional[str] = None
+    for seg_idx, seg in enumerate(right_half_segments):
+        motion_phase = _infer_segment_motion_phase(seg, preferred_phase=prev_phase)
+        draw_phase = f"right_{motion_phase}"
+        for pt_idx, pt in enumerate(seg):
+            phase = "right_start" if (seg_idx == 0 and pt_idx == 0) else draw_phase
+            command_sequence.append((phase, pt))
+            full_trajectory_pts.append(np.array([float(center_x + pt[0]), float(center_z + pt[1])], dtype=float))
+        prev_phase = motion_phase
+
+    prev_phase = None
+    for seg_idx, seg in enumerate(left_half_segments):
+        motion_phase = _infer_segment_motion_phase(seg, preferred_phase=prev_phase)
+        draw_phase = f"left_{motion_phase}"
+        for pt_idx, pt in enumerate(seg):
+            phase = "mirror_flip" if (seg_idx == 0 and pt_idx == 0) else draw_phase
+            command_sequence.append((phase, pt))
+            full_trajectory_pts.append(np.array([float(center_x + pt[0]), float(center_z + pt[1])], dtype=float))
+        prev_phase = motion_phase
 
     sample_idx = 0
     star_move_counter = 0
@@ -390,7 +448,7 @@ def build_star_tip_lookup(
         }
 
     for phase, pt in command_sequence[1:]:
-        if phase not in {"right", "left"}:
+        if phase not in DRAW_PHASES:
             continue
         star_move_counter += 1
         if (star_move_counter % capture_every_n_star_moves) != 0:
@@ -400,7 +458,11 @@ def build_star_tip_lookup(
             "desired_tip_x_mm": float(center_x + pt[0]),
             "desired_tip_z_mm": float(center_z + pt[1]),
         }
-    return lookup
+    trajectory_mm = np.vstack(full_trajectory_pts) if full_trajectory_pts else np.empty((0, 2), dtype=float)
+    return {
+        "capture_lookup": lookup,
+        "trajectory_mm": trajectory_mm,
+    }
 
 
 def patch_filename_parser():
@@ -1718,19 +1780,58 @@ def compute_tracked_tip_positions_mm(
     }
 
 
-def compute_error_metrics(mm_points: np.ndarray) -> Dict[str, Any]:
+def _closest_points_on_polyline(points_mm: np.ndarray, trajectory_mm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(points_mm, dtype=float).reshape(-1, 2)
+    traj = np.asarray(trajectory_mm, dtype=float).reshape(-1, 2)
+    if points.shape[0] == 0:
+        raise RuntimeError("No measured points available for distance computation.")
+    if traj.shape[0] == 0:
+        raise RuntimeError("Desired trajectory is empty.")
+
+    if traj.shape[0] == 1:
+        closest = np.repeat(traj, points.shape[0], axis=0)
+        dist = np.linalg.norm(points - closest, axis=1)
+        return closest, dist
+
+    seg_start = traj[:-1]
+    seg_end = traj[1:]
+    seg_vec = seg_end - seg_start
+    seg_len_sq = np.sum(seg_vec * seg_vec, axis=1)
+
+    closest = np.zeros_like(points)
+    dist = np.full((points.shape[0],), np.inf, dtype=float)
+    for j in range(seg_start.shape[0]):
+        if seg_len_sq[j] <= 1e-12:
+            cand = np.repeat(seg_start[j:j + 1], points.shape[0], axis=0)
+        else:
+            t = np.sum((points - seg_start[j]) * seg_vec[j], axis=1) / seg_len_sq[j]
+            t = np.clip(t, 0.0, 1.0)
+            cand = seg_start[j] + t[:, None] * seg_vec[j]
+        cand_dist = np.linalg.norm(points - cand, axis=1)
+        update = cand_dist < dist
+        closest[update] = cand[update]
+        dist[update] = cand_dist[update]
+    return closest, dist
+
+
+def compute_error_metrics(mm_points: np.ndarray, desired_trajectory_mm: np.ndarray) -> Dict[str, Any]:
     """
-    Reference point = mean of all valid tracked points.
-    Error for each sample = Euclidean distance to that mean.
-    RMSE = sqrt(mean(error^2))
+    Align the measured cloud to the desired cloud by matching their means, then
+    compute each sample's Euclidean distance to the closest point on the desired trajectory.
     """
     mm_points = np.asarray(mm_points, dtype=float).reshape(-1, 2)
+    desired_trajectory_mm = np.asarray(desired_trajectory_mm, dtype=float).reshape(-1, 2)
     if mm_points.shape[0] == 0:
         raise RuntimeError("No valid mm points available for error analysis.")
+    if desired_trajectory_mm.shape[0] == 0:
+        raise RuntimeError("No desired trajectory points available for error analysis.")
 
-    ref_mean = np.mean(mm_points, axis=0)
-    deltas = mm_points - ref_mean[None, :]
-    dist_mm = np.linalg.norm(deltas, axis=1)
+    measured_mean = np.mean(mm_points, axis=0)
+    desired_mean = np.mean(desired_trajectory_mm, axis=0)
+    alignment_shift = desired_mean - measured_mean
+    aligned_points = mm_points + alignment_shift[None, :]
+    closest_desired_points, dist_mm = _closest_points_on_polyline(aligned_points, desired_trajectory_mm)
+    deltas = aligned_points - closest_desired_points
 
     rmse_mm = float(np.sqrt(np.mean(dist_mm ** 2)))
     mean_err_mm = float(np.mean(dist_mm))
@@ -1741,9 +1842,23 @@ def compute_error_metrics(mm_points: np.ndarray) -> Dict[str, Any]:
 
     return {
         "reference_point_mm": {
-            "u_mean_mm": float(ref_mean[0]),
-            "z_mean_mm": float(ref_mean[1]),
+            "u_mean_mm": float(desired_mean[0]),
+            "z_mean_mm": float(desired_mean[1]),
         },
+        "measured_mean_mm": {
+            "u_mean_mm": float(measured_mean[0]),
+            "z_mean_mm": float(measured_mean[1]),
+        },
+        "desired_mean_mm": {
+            "u_mean_mm": float(desired_mean[0]),
+            "z_mean_mm": float(desired_mean[1]),
+        },
+        "alignment_shift_mm": {
+            "du_mm": float(alignment_shift[0]),
+            "dz_mm": float(alignment_shift[1]),
+        },
+        "aligned_points_mm": aligned_points,
+        "closest_desired_points_mm": closest_desired_points,
         "errors_mm": dist_mm,
         "deltas_mm": deltas,
         "rmse_mm": rmse_mm,
@@ -1759,6 +1874,8 @@ def compute_error_metrics(mm_points: np.ndarray) -> Dict[str, Any]:
 def attach_errors_to_records(
     records: List[Dict[str, Any]],
     valid_indices: List[int],
+    aligned_points_mm: np.ndarray,
+    closest_desired_points_mm: np.ndarray,
     deltas_mm: np.ndarray,
     errors_mm: np.ndarray,
 ):
@@ -1766,14 +1883,22 @@ def attach_errors_to_records(
 
     for i, rec in enumerate(records):
         if i not in idx_to_local:
-            rec["du_from_mean_mm"] = None
-            rec["dz_from_mean_mm"] = None
+            rec["u_mm_aligned"] = None
+            rec["z_mm_aligned"] = None
+            rec["closest_desired_u_mm"] = None
+            rec["closest_desired_z_mm"] = None
+            rec["du_to_closest_desired_mm"] = None
+            rec["dz_to_closest_desired_mm"] = None
             rec["error_distance_mm"] = None
             continue
 
         k = idx_to_local[i]
-        rec["du_from_mean_mm"] = float(deltas_mm[k, 0])
-        rec["dz_from_mean_mm"] = float(deltas_mm[k, 1])
+        rec["u_mm_aligned"] = float(aligned_points_mm[k, 0])
+        rec["z_mm_aligned"] = float(aligned_points_mm[k, 1])
+        rec["closest_desired_u_mm"] = float(closest_desired_points_mm[k, 0])
+        rec["closest_desired_z_mm"] = float(closest_desired_points_mm[k, 1])
+        rec["du_to_closest_desired_mm"] = float(deltas_mm[k, 0])
+        rec["dz_to_closest_desired_mm"] = float(deltas_mm[k, 1])
         rec["error_distance_mm"] = float(errors_mm[k])
 
     return records
@@ -1795,8 +1920,12 @@ def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
         "desired_x_mm",
         "desired_y_mm",
         "desired_z_mm",
-        "du_from_mean_mm",
-        "dz_from_mean_mm",
+        "u_mm_aligned",
+        "z_mm_aligned",
+        "closest_desired_u_mm",
+        "closest_desired_z_mm",
+        "du_to_closest_desired_mm",
+        "dz_to_closest_desired_mm",
         "error_distance_mm",
         "valid",
     ]
@@ -1830,7 +1959,7 @@ def save_error_plot(error_plot_path: Path, records: List[Dict[str, Any]], title_
         markersize=4.5,
     )
     ax.set_xlabel("Sample index", color="white")
-    ax.set_ylabel("Error distance to mean tracked point (mm)", color="white")
+    ax.set_ylabel("Error distance to closest desired trajectory (mm)", color="white")
     ax.set_title(f"{title_prefix}Tracked tip error vs sample".strip(), color="white")
     ax.grid(True, alpha=0.22, color="white")
     ax.tick_params(colors="white")
@@ -1865,7 +1994,7 @@ def save_error_histogram(
     ax.set_xlabel("Error distance (mm)", color="white")
     ax.set_ylabel("Number of samples", color="white")
     ax.set_title(
-        f"{title_prefix}Histogram of tracked tip error | RMSE = {float(rmse_mm):.4f} mm".strip(),
+        f"{title_prefix}Histogram of trajectory error | RMSE = {float(rmse_mm):.4f} mm".strip(),
         color="white",
     )
     ax.grid(True, alpha=0.18, color="white")
@@ -1880,53 +2009,35 @@ def save_error_histogram(
 def save_desired_vs_actual_plot(
     plot_path: Path,
     records: List[Dict[str, Any]],
-    reference_point_mm: Dict[str, float],
+    desired_trajectory_mm: np.ndarray,
     title_prefix: str = "",
 ):
-    valid_recs = [r for r in records if r.get("valid", False) and r.get("u_mm") is not None and r.get("z_mm") is not None]
+    valid_recs = [
+        r for r in records
+        if r.get("valid", False)
+        and r.get("u_mm_aligned") is not None
+        and r.get("z_mm_aligned") is not None
+    ]
     desired_recs = [r for r in valid_recs if r.get("desired_x_mm") is not None and r.get("desired_z_mm") is not None]
     if not valid_recs:
         raise RuntimeError("No valid tracked records available for desired-vs-actual plot.")
-    if not desired_recs:
-        raise RuntimeError("Desired tip X/Z values could not be parsed from filenames.")
+    desired_trajectory_mm = np.asarray(desired_trajectory_mm, dtype=float).reshape(-1, 2)
+    if desired_trajectory_mm.shape[0] == 0:
+        raise RuntimeError("Desired trajectory is empty.")
 
     valid_recs = sorted(valid_recs, key=lambda r: int(r["sample_index"]))
     desired_recs = sorted(desired_recs, key=lambda r: int(r["sample_index"]))
 
-    actual_u = np.asarray([float(r["u_mm"]) for r in valid_recs], dtype=float)
-    actual_z = np.asarray([float(r["z_mm"]) for r in valid_recs], dtype=float)
+    actual_u = np.asarray([float(r["u_mm_aligned"]) for r in valid_recs], dtype=float)
+    actual_z = np.asarray([float(r["z_mm_aligned"]) for r in valid_recs], dtype=float)
     desired_tip_x = np.asarray([float(r["desired_x_mm"]) for r in desired_recs], dtype=float)
     desired_tip_z = np.asarray([float(r["desired_z_mm"]) for r in desired_recs], dtype=float)
-
-    ref_u = float(reference_point_mm["u_mean_mm"])
-    ref_z = float(reference_point_mm["z_mean_mm"])
-
-    desired_u = desired_tip_x - np.mean(desired_tip_x) + ref_u
-    desired_z = desired_tip_z - np.mean(desired_tip_z) + ref_z
-
-    cmap = LinearSegmentedColormap.from_list(
-        "sleek_actual_density",
-        ["#081018", "#12344d", "#1b6ca8", "#3ddbd9", "#f4d35e"],
-        N=256,
-    )
+    desired_u = desired_trajectory_mm[:, 0]
+    desired_z = desired_trajectory_mm[:, 1]
+    desired_mean = np.mean(desired_trajectory_mm, axis=0)
 
     fig, ax = plt.subplots(figsize=(8.5, 7.0), facecolor="none")
     ax.set_facecolor("none")
-
-    hb = ax.hexbin(
-        actual_u,
-        actual_z,
-        gridsize=26,
-        mincnt=1,
-        cmap=cmap,
-        linewidths=0.0,
-    )
-    cbar = fig.colorbar(hb, ax=ax, pad=0.02)
-    cbar.set_label("Actual point density", color="#dceaf7")
-    cbar.ax.yaxis.set_tick_params(color="#dceaf7")
-    plt.setp(cbar.ax.get_yticklabels(), color="#dceaf7")
-    cbar.outline.set_edgecolor("#8eb8d8")
-    cbar.ax.set_facecolor("none")
 
     ax.plot(
         desired_u,
@@ -1937,16 +2048,28 @@ def save_desired_vs_actual_plot(
         label="Desired trajectory",
         zorder=3,
     )
+    if desired_tip_x.size > 0:
+        ax.scatter(
+            desired_tip_x,
+            desired_tip_z,
+            s=20,
+            color="#f8fafc",
+            edgecolors="#8cf7ff",
+            linewidths=0.6,
+            alpha=0.95,
+            label="Desired captured points",
+            zorder=4,
+        )
     ax.scatter(
-        desired_u,
-        desired_z,
-        s=20,
-        color="#f8fafc",
-        edgecolors="#8cf7ff",
-        linewidths=0.6,
-        alpha=0.95,
-        label="Desired tracked points",
-        zorder=4,
+        actual_u,
+        actual_z,
+        s=26,
+        color="#ff8fab",
+        edgecolors="#fff1f5",
+        linewidths=0.5,
+        alpha=0.9,
+        label="Measured tracked points",
+        zorder=5,
     )
     ax.scatter(
         desired_u[:1],
@@ -1955,34 +2078,36 @@ def save_desired_vs_actual_plot(
         color="#f4d35e",
         edgecolors="none",
         label="Trajectory start",
-        zorder=5,
+        zorder=6,
     )
 
-    all_u = np.concatenate([actual_u, desired_u, np.asarray([ref_u])])
-    all_z = np.concatenate([actual_z, desired_z, np.asarray([ref_z])])
-    span_u = max(float(np.max(np.abs(all_u - ref_u))), 1.0)
-    span_z = max(float(np.max(np.abs(all_z - ref_z))), 1.0)
+    all_u = np.concatenate([actual_u, desired_u, desired_tip_x, np.asarray([desired_mean[0]])])
+    all_z = np.concatenate([actual_z, desired_z, desired_tip_z, np.asarray([desired_mean[1]])])
+    center_u = 0.5 * float(np.min(all_u) + np.max(all_u))
+    center_z = 0.5 * float(np.min(all_z) + np.max(all_z))
+    span_u = max(float(np.max(np.abs(all_u - center_u))), 1.0)
+    span_z = max(float(np.max(np.abs(all_z - center_z))), 1.0)
     span = 1.08 * max(span_u, span_z)
 
     ax.scatter(
-        [ref_u],
-        [ref_z],
+        [float(desired_mean[0])],
+        [float(desired_mean[1])],
         s=80,
         marker="x",
         color="#ff8fab",
         linewidths=2.0,
-        label="Tracked mean reference",
-        zorder=6,
+        label="Coincident mean",
+        zorder=7,
     )
 
-    ax.set_xlim(ref_u - span, ref_u + span)
-    ax.set_ylim(ref_z - span, ref_z + span)
+    ax.set_xlim(center_u - span, center_u + span)
+    ax.set_ylim(center_z - span, center_z + span)
     ax.set_aspect("equal", adjustable="box")
 
     ax.set_xlabel("u / desired X (mm)", color="#e8f3ff")
     ax.set_ylabel("z / desired tip Z (mm)", color="#e8f3ff")
     ax.set_title(
-        f"{title_prefix}Desired tip trajectory vs tracked point density".strip(),
+        f"{title_prefix}Desired tip trajectory vs mean-aligned measured tracked points".strip(),
         color="#f8fbff",
     )
     ax.grid(True, color="#8eb8d8", alpha=0.12, linewidth=0.8)
@@ -2007,6 +2132,9 @@ def save_metrics_json(
 ):
     payload = {
         "reference_point_mm": metrics["reference_point_mm"],
+        "measured_mean_mm": metrics["measured_mean_mm"],
+        "desired_mean_mm": metrics["desired_mean_mm"],
+        "alignment_shift_mm": metrics["alignment_shift_mm"],
         "rmse_mm": metrics["rmse_mm"],
         "mean_error_mm": metrics["mean_error_mm"],
         "std_error_mm": metrics["std_error_mm"],
@@ -2160,7 +2288,7 @@ def main():
 
     patch_filename_parser()
 
-    desired_tip_lookup = build_star_tip_lookup(
+    desired_ref = build_star_tip_reference(
         center_x=float(args.star_center_x_mm),
         center_z=float(args.star_center_z_mm),
         outer_radius=float(args.star_outer_radius_mm),
@@ -2170,6 +2298,8 @@ def main():
         capture_at_start=bool(args.capture_at_start),
         capture_every_n_star_moves=int(args.capture_every_n_star_moves),
     )
+    desired_tip_lookup = desired_ref["capture_lookup"]
+    desired_trajectory_mm = desired_ref["trajectory_mm"]
 
     if args.tip_refine_mode != "none":
         patch_analyze_data_for_tip_refinement(
@@ -2285,12 +2415,14 @@ def main():
             "Tracked rows exist, but none could be converted into checkerboard-referenced mm coordinates."
         )
 
-    print("[INFO] Computing mean reference point and error metrics...")
-    metrics = compute_error_metrics(tip_data["mm_points"])
+    print("[INFO] Computing mean-aligned closest-trajectory error metrics...")
+    metrics = compute_error_metrics(tip_data["mm_points"], desired_trajectory_mm)
 
     records = attach_errors_to_records(
         records=tip_data["records"],
         valid_indices=tip_data["valid_indices"],
+        aligned_points_mm=metrics["aligned_points_mm"],
+        closest_desired_points_mm=metrics["closest_desired_points_mm"],
         deltas_mm=metrics["deltas_mm"],
         errors_mm=metrics["errors_mm"],
     )
@@ -2318,7 +2450,7 @@ def main():
     save_desired_vs_actual_plot(
         desired_vs_actual_plot_path,
         records,
-        reference_point_mm=metrics["reference_point_mm"],
+        desired_trajectory_mm=desired_trajectory_mm,
         title_prefix="Checkerboard-referenced ",
     )
 
@@ -2345,9 +2477,19 @@ def main():
     print("\n========== RESULTS ==========")
     print(f"Valid samples: {metrics['num_samples']}")
     print(
-        "Reference point (mean tracked point): "
-        f"u = {metrics['reference_point_mm']['u_mean_mm']:.6f} mm, "
-        f"z = {metrics['reference_point_mm']['z_mean_mm']:.6f} mm"
+        "Measured mean before alignment: "
+        f"u = {metrics['measured_mean_mm']['u_mean_mm']:.6f} mm, "
+        f"z = {metrics['measured_mean_mm']['z_mean_mm']:.6f} mm"
+    )
+    print(
+        "Desired mean: "
+        f"u = {metrics['desired_mean_mm']['u_mean_mm']:.6f} mm, "
+        f"z = {metrics['desired_mean_mm']['z_mean_mm']:.6f} mm"
+    )
+    print(
+        "Applied alignment shift: "
+        f"du = {metrics['alignment_shift_mm']['du_mm']:.6f} mm, "
+        f"dz = {metrics['alignment_shift_mm']['dz_mm']:.6f} mm"
     )
     print(f"RMSE:         {metrics['rmse_mm']:.6f} mm")
     print(f"Mean error:   {metrics['mean_error_mm']:.6f} mm")

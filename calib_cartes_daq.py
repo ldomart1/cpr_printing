@@ -27,7 +27,7 @@ Important:
 - B is fixed within each pass.
 - If a requested tip angle (0, 90, 180) is outside calibration, the nearest
   available calibrated angle is used.
-- If your calibration uses opposite sign for r/z, keep --flip-rz-sign enabled.
+- If your calibration uses a flipped planar r/X sign, keep --flip-rz-sign enabled.
 """
 
 import argparse
@@ -248,9 +248,14 @@ def _extract_phase_models(data: dict) -> Tuple[dict, str]:
 
     default_phase = _normalize_motion_phase_name(
         data.get("default_phase_for_legacy_access")
-        or (data.get("cubic_coefficients") or {}).get("default_phase")
-        or "pull"
-    ) or "pull"
+    )
+    if default_phase is None or default_phase not in phase_models:
+        if "pull" in phase_models:
+            default_phase = "pull"
+        elif phase_models:
+            default_phase = next(iter(phase_models))
+        else:
+            default_phase = "pull"
 
     return phase_models, default_phase
 
@@ -283,30 +288,35 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r") as f:
         data = json.load(f)
 
-    cubic = data.get("cubic_coefficients", {})
-    fit_models = data.get("fit_models", {})
     phase_models, default_motion_phase = _extract_phase_models(data)
+    fit_models = data.get("fit_models", {})
+    cubic = data.get("cubic_coefficients", {})
 
-    r_model = fit_models.get("r") or legacy_poly_model(
+    default_phase_models = phase_models.get(default_motion_phase, {})
+
+    r_model = fit_models.get("r") or default_phase_models.get("r") or legacy_poly_model(
         cubic.get("r_coeffs"),
         cubic.get("r_equation"),
         "r",
     )
-    z_model = fit_models.get("z") or legacy_poly_model(
+    z_model = fit_models.get("z") or default_phase_models.get("z") or legacy_poly_model(
         cubic.get("z_coeffs"),
         cubic.get("z_equation"),
         "z",
     )
-    y_off_model = fit_models.get("offplane_y") or legacy_poly_model(
+    y_off_model = fit_models.get("offplane_y") or default_phase_models.get("offplane_y") or legacy_poly_model(
         cubic.get("offplane_y_coeffs"),
         cubic.get("offplane_y_equation"),
-        "offplane_y",
+        "y_offplane_mm",
     )
-    tip_angle_model = fit_models.get("tip_angle") or legacy_poly_model(
+    tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
         cubic.get("tip_angle_coeffs"),
         cubic.get("tip_angle_equation"),
-        "tip_angle",
+        "tip_angle_deg",
     )
+
+    if r_model is None or z_model is None:
+        raise ValueError("Calibration JSON is missing usable r/z fit models.")
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -352,7 +362,7 @@ def eval_r(
     flip_rz_sign: bool = False,
     motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    s = -1.0 if bool(flip_rz_sign) else 1.0
+    s = -1.0 * (-1.0 if bool(flip_rz_sign) else 1.0)
     return s * evaluate_fit_model(_select_fit_model(cal, "r", motion_phase=motion_phase), b)
 
 
@@ -362,8 +372,7 @@ def eval_z(
     flip_rz_sign: bool = False,
     motion_phase: Optional[str] = None,
 ) -> np.ndarray:
-    s = -1.0 if bool(flip_rz_sign) else 1.0
-    return s * evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
+    return evaluate_fit_model(_select_fit_model(cal, "z", motion_phase=motion_phase), b)
 
 
 def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
@@ -404,7 +413,7 @@ def predict_tip_xyz_from_bc(
         motion_phase=motion_phase,
     )
     c = math.radians(float(c_deg))
-    x = -r * math.cos(c) - y_off * math.sin(c)
+    x = r * math.cos(c) - y_off * math.sin(c)
     y = r * math.sin(c) + y_off * math.cos(c)
     return np.array([x, y, z], dtype=float)
 
@@ -1324,7 +1333,7 @@ if __name__ == "__main__":
         "--flip-rz-sign",
         action="store_true",
         default=DEFAULT_FLIP_RZ_SIGN,
-        help="Multiply the polynomial-derived r and z offsets by -1.",
+        help="Multiply only the planar r/X offset by -1. Use this if your calibration file has a flipped X sign.",
     )
 
     # Inversion resolution

@@ -31,6 +31,19 @@ from scipy.interpolate import PchipInterpolator
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import curve_fit
 
+def _to_json_compatible(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, dict):
+        return {str(k): _to_json_compatible(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_json_compatible(v) for v in value]
+    return value
+
 def _neighbor_count_8(skel_u8: np.ndarray) -> np.ndarray:
     # skel_u8 is 0/1
     k = np.ones((3, 3), np.uint8)
@@ -454,6 +467,14 @@ def _tip_angle_to_direction_xy(tip_angle_deg):
     return d / max(n, 1e-12)
 
 
+def _normalize_tip_angle_deg(angle_deg):
+    angle_arr = np.asarray(angle_deg, dtype=float)
+    normalized = np.where(np.isfinite(angle_arr) & (angle_arr < -90.0), angle_arr + 360.0, angle_arr)
+    if np.ndim(normalized) == 0:
+        return float(normalized)
+    return normalized
+
+
 def _inside_mask(mask_fg, xy):
     x = int(round(float(xy[0])))
     y = int(round(float(xy[1])))
@@ -794,6 +815,139 @@ def refine_tip_parallel_centerline(
     return float(tip_xy[1]), float(tip_xy[0]), dbg
 
 
+def _point_to_polyline_distance_xy(point_xy, polyline_xy):
+    p = np.asarray(point_xy, dtype=np.float64).reshape(2)
+    pts = np.asarray(polyline_xy, dtype=np.float64).reshape(-1, 2)
+    if pts.shape[0] == 0:
+        return float("inf"), None
+    if pts.shape[0] == 1:
+        q = pts[0].copy()
+        return float(np.linalg.norm(p - q)), q
+
+    best_dist = float("inf")
+    best_proj = None
+    for a, b in zip(pts[:-1], pts[1:]):
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        if denom <= 1e-12:
+            q = a
+        else:
+            t = float(np.clip(np.dot(p - a, ab) / denom, 0.0, 1.0))
+            q = a + t * ab
+        dist = float(np.linalg.norm(p - q))
+        if dist < best_dist:
+            best_dist = dist
+            best_proj = q.copy()
+
+    return best_dist, best_proj
+
+
+def _select_tip_candidate(coarse_tip_yx, refined_tip_yx, tip_dbg, mode="auto"):
+    dbg = dict(tip_dbg) if isinstance(tip_dbg, dict) else {}
+
+    coarse_yx = np.asarray(coarse_tip_yx, dtype=np.float64).reshape(2)
+    refined_yx = np.asarray(refined_tip_yx, dtype=np.float64).reshape(2)
+    coarse_xy = np.array([coarse_yx[1], coarse_yx[0]], dtype=np.float64)
+    refined_xy = np.array([refined_yx[1], refined_yx[0]], dtype=np.float64)
+
+    mode_norm = str(mode or "auto").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode_norm in ("skeleton", "coarse_only"):
+        mode_norm = "coarse"
+    elif mode_norm in ("refined", "parallel_centerline_only"):
+        mode_norm = "parallel_centerline"
+    elif mode_norm not in ("coarse", "parallel_centerline", "auto"):
+        mode_norm = "auto"
+
+    dbg["coarse_tip_xy"] = coarse_xy.tolist()
+    dbg["refined_tip_candidate_xy"] = refined_xy.tolist()
+    dbg["tip_selection_mode"] = mode_norm
+
+    selected_xy = refined_xy.copy()
+    selected_source = "parallel_centerline"
+    selected_reason = "explicit_parallel_centerline_mode"
+
+    if mode_norm == "coarse":
+        selected_xy = coarse_xy.copy()
+        selected_source = "coarse"
+        selected_reason = "explicit_coarse_mode"
+    elif mode_norm == "auto":
+        fallback_reason = dbg.get("fallback")
+        radius_px = max(1.0, float(dbg.get("radius_px", 3.0) or 3.0))
+
+        centerline_xy = dbg.get("centerline_trace_xy", [])
+        if len(centerline_xy) < 2:
+            centerline_xy = dbg.get("center_line_xy", [])
+        centerline_dist_px, projected_xy = _point_to_polyline_distance_xy(refined_xy, centerline_xy)
+
+        delta_xy = refined_xy - coarse_xy
+        d_xy = np.asarray(dbg.get("d_xy", [np.nan, np.nan]), dtype=np.float64).reshape(-1)
+        n_xy = np.asarray(dbg.get("n_xy", [np.nan, np.nan]), dtype=np.float64).reshape(-1)
+        along_shift_px = float("nan")
+        lateral_shift_px = float("nan")
+
+        if d_xy.size == 2 and np.all(np.isfinite(d_xy)):
+            d_norm = float(np.linalg.norm(d_xy))
+            if d_norm > 1e-12:
+                d_xy = d_xy / d_norm
+                along_shift_px = float(np.dot(delta_xy, d_xy))
+
+        if n_xy.size == 2 and np.all(np.isfinite(n_xy)):
+            n_norm = float(np.linalg.norm(n_xy))
+            if n_norm > 1e-12:
+                n_xy = n_xy / n_norm
+                lateral_shift_px = float(abs(np.dot(delta_xy, n_xy)))
+
+        max_centerline_dist_px = max(1.5, 0.35 * radius_px)
+        max_lateral_shift_px = max(1.5, 0.50 * radius_px)
+        min_along_shift_px = -max(1.0, 0.35 * radius_px)
+        max_along_shift_px = max(4.0, 2.0 * radius_px)
+
+        accept_refined = fallback_reason in (None, "", False)
+        accept_refined &= np.isfinite(centerline_dist_px) and (centerline_dist_px <= max_centerline_dist_px)
+        if np.isfinite(lateral_shift_px):
+            accept_refined &= (lateral_shift_px <= max_lateral_shift_px)
+        if np.isfinite(along_shift_px):
+            accept_refined &= (min_along_shift_px <= along_shift_px <= max_along_shift_px)
+
+        dbg["refined_tip_distance_to_centerline_px"] = (
+            None if not np.isfinite(centerline_dist_px) else float(centerline_dist_px)
+        )
+        dbg["refined_tip_projected_xy"] = (
+            None if projected_xy is None else np.asarray(projected_xy, dtype=np.float64).tolist()
+        )
+        dbg["refined_tip_lateral_shift_px"] = (
+            None if not np.isfinite(lateral_shift_px) else float(lateral_shift_px)
+        )
+        dbg["refined_tip_along_shift_px"] = (
+            None if not np.isfinite(along_shift_px) else float(along_shift_px)
+        )
+        dbg["refined_tip_acceptance_limits"] = {
+            "max_centerline_dist_px": float(max_centerline_dist_px),
+            "max_lateral_shift_px": float(max_lateral_shift_px),
+            "min_along_shift_px": float(min_along_shift_px),
+            "max_along_shift_px": float(max_along_shift_px),
+        }
+
+        if not accept_refined:
+            selected_xy = coarse_xy.copy()
+            selected_source = "coarse"
+            if fallback_reason not in (None, "", False):
+                selected_reason = f"refine_fallback:{fallback_reason}"
+            else:
+                selected_reason = "auto_rejected_refined_tip"
+        else:
+            selected_source = "parallel_centerline"
+            selected_reason = "auto_accepted_refined_tip"
+
+    dbg["tip_xy"] = selected_xy.tolist()
+    dbg["selected_tip_xy"] = selected_xy.tolist()
+    dbg["selected_tip_source"] = selected_source
+    dbg["selected_tip_reason"] = selected_reason
+    dbg["mode"] = selected_source
+
+    return float(selected_xy[1]), float(selected_xy[0]), dbg
+
+
 def _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min: int, zoom_x_max: int, zoom_y_min: int, zoom_y_max: int):
     """
     Re-express the lower zoom panels in the same cropped-image pixel coordinates
@@ -861,7 +1015,9 @@ def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
 
         used_labels = set()
         mode = str(dbg.get("mode", "tip_refine"))
+        selected_tip_source = str(dbg.get("selected_tip_source", mode))
         tip_xy = np.asarray(dbg.get("tip_xy", []), dtype=float).reshape(-1)
+        coarse_tip_xy = np.asarray(dbg.get("coarse_tip_xy", []), dtype=float).reshape(-1)
 
         for ax in target_axes:
             if ax is None:
@@ -911,10 +1067,27 @@ def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
                         used_labels.add(lbl)
                     ax.scatter([p[0]], [p[1]], s=40, c="#ffffff", edgecolors="#000000", label=lbl, zorder=5)
 
+            if coarse_tip_xy.size == 2 and np.all(np.isfinite(coarse_tip_xy)):
+                if tip_xy.size != 2 or not np.allclose(coarse_tip_xy, tip_xy, atol=0.25):
+                    lbl = "coarse tip" if "coarse tip" not in used_labels else None
+                    if lbl is not None:
+                        used_labels.add(lbl)
+                    ax.scatter(
+                        [coarse_tip_xy[0]],
+                        [coarse_tip_xy[1]],
+                        s=45,
+                        c="none",
+                        edgecolors="#66e0ff",
+                        linewidths=1.5,
+                        label=lbl,
+                        zorder=6,
+                    )
+
             if tip_xy.size == 2 and np.all(np.isfinite(tip_xy)):
-                lbl = f"refined tip ({mode})" if f"refined tip ({mode})" not in used_labels else None
+                lbl_txt = f"selected tip ({selected_tip_source})"
+                lbl = lbl_txt if lbl_txt not in used_labels else None
                 if lbl is not None:
-                    used_labels.add(lbl)
+                    used_labels.add(lbl_txt)
                 ax.scatter([tip_xy[0]], [tip_xy[1]], s=55, c="#ff3b30", edgecolors="#ffffff", label=lbl, zorder=6)
 
             try:
@@ -984,11 +1157,13 @@ class CTR_Shadow_Calibration:
         self.cam = None
         self.rrf = None
 
+        # On 3840x2160 frames this maps to the GUI box:
+        # x:[1005,2897] y:[330,1628]
         self.default_analysis_crop = {
-            "crop_width_min": 910,
-            "crop_width_max": 2850,
-            "crop_height_min": 450,
-            "crop_height_max": 1650,
+            "crop_width_min": 1005,
+            "crop_width_max": 2897,
+            "crop_height_min": 532,
+            "crop_height_max": 1830,
         }
         self.analysis_crop = dict(self.default_analysis_crop)
 
@@ -1022,7 +1197,7 @@ class CTR_Shadow_Calibration:
         self.ruler_axis_perp_unit = None
         self.ruler_calib_meta = None
         self.tip_refine_debug_records = {}
-        self.tip_refine_mode = "parallel_centerline"
+        self.tip_refine_mode = "coarse"
         self.tip_parallel_section_near_r = 0.75
         self.tip_parallel_section_far_r = 5.0
         self.tip_parallel_scan_half_r = 2.5
@@ -2470,7 +2645,7 @@ class CTR_Shadow_Calibration:
 
     def calibrate(self,
                   manual_focus_val=60,
-                  jogging_feedrate=500,
+                  jogging_feedrate=200,
                   # Axis names
                   robot_front_axis_name="X",
                   robot_stage_y_axis_name="Y",
@@ -2649,6 +2824,7 @@ class CTR_Shadow_Calibration:
 
         def run_pull_release_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float,
                                                       probe_idx: int, max_pull_steps=None):
+            nonlocal pos
             steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
             steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
             pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
@@ -2695,7 +2871,7 @@ class CTR_Shadow_Calibration:
         print("\nMoving pull axis to start position...")
         pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-        offplane_step_fraction = 0.7
+        offplane_step_fraction = 0.4
         n_partial_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
         print(
             f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps "
@@ -2756,7 +2932,7 @@ class CTR_Shadow_Calibration:
         os.chdir(self.calibration_data_folder)
         return 1
 
-    def find_ctr_tip_skeleton(self, binary_image, base_band_frac=0.05, do_erosion_break=False, prune_spurs=True, min_spur_len=20, return_tip_angle=False, tip_angle_path_len=75, return_debug=False):
+    def find_ctr_tip_skeleton(self, binary_image, base_band_frac=0.05, do_erosion_break=False, prune_spurs=False, min_spur_len=20, return_tip_angle=False, tip_angle_path_len=75, return_debug=False):
         """
         binary_image: uint8 0/255 where tube is dark (0) and background is white (255)
 
@@ -2767,9 +2943,9 @@ class CTR_Shadow_Calibration:
         if do_erosion_break:
             fg = cv2.erode(fg, np.ones((3, 3), np.uint8), iterations=1)
 
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k, iterations=2)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k, iterations=1)
+        #fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k, iterations=1)
 
         n, lab, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
         if n <= 1:
@@ -2851,12 +3027,12 @@ class CTR_Shadow_Calibration:
             skel_u8=skel,
             dist=dist,
             mask_u8=mask,
-            distal_window=45,
+            distal_window=60,
             roi_margin=25,
             tangent_len=tip_angle_path_len,
-            radius_frac=0.25,
-            tip_keep_frac=0.50,
-            weight_power=0.35,
+            radius_frac=0.15,
+            tip_keep_frac=0.30,
+            weight_power=0.15,
         )
         if return_debug:
             debug_data = {
@@ -2976,10 +3152,11 @@ class CTR_Shadow_Calibration:
 
         tip_row, tip_column, tip_angle_deg, tip_debug = self.find_ctr_tip_skeleton(
             binary_image,
-            min_spur_len=25,
+            min_spur_len=5,
             return_tip_angle=True,
             return_debug=True,
         )
+        tip_angle_deg = _normalize_tip_angle_deg(tip_angle_deg)
 
         skel = tip_debug["skeleton"]
         dist = tip_debug["dist"]
@@ -3019,6 +3196,12 @@ class CTR_Shadow_Calibration:
             ray_step_px=float(self.tip_parallel_ray_step_px),
             ray_max_len_r=float(self.tip_parallel_ray_max_len_r),
         )
+        yy_selected, xx_selected, tip_select_dbg = _select_tip_candidate(
+            coarse_tip_yx=(tip_y, tip_x),
+            refined_tip_yx=(yy_refined, xx_refined),
+            tip_dbg=tip_refine_dbg,
+            mode=self.tip_refine_mode,
+        )
 
         orientation = int(file_ctx['orientation'])
         ntnl_pos = float(file_ctx['ntnl_pos'])
@@ -3028,8 +3211,8 @@ class CTR_Shadow_Calibration:
 
         tip_locations_array_coarse[i, :] = np.array(
             [
-                yy_refined + crop_y_min_img,
-                xx_refined + crop_x_min_img,
+                tip_y + crop_y_min_img,
+                tip_x + crop_x_min_img,
                 float(orientation),
                 float(ss_pos),
                 float(ntnl_pos),
@@ -3198,17 +3381,19 @@ class CTR_Shadow_Calibration:
         # axs[1, 1].set_title('Identified fine tip')
 
         tip_locations_array_fine[i, :] = np.array(
-            [tip_location[1] + crop_y_min_img + crop_y_min,
-             tip_location[0] + crop_x_min_img + crop_x_min,
-             float(orientation),
-             float(ss_pos),
-             float(ntnl_pos),
-             float(tip_angle_deg),
-             motion_phase_code,
-             pass_idx]
+            [
+                yy_selected + crop_y_min_img,
+                xx_selected + crop_x_min_img,
+                float(orientation),
+                float(ss_pos),
+                float(ntnl_pos),
+                float(tip_angle_deg),
+                motion_phase_code,
+                pass_idx,
+            ]
         )
 
-        dbg_local = dict(tip_refine_dbg) if isinstance(tip_refine_dbg, dict) else {}
+        dbg_local = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
         dbg_local["image_file_name"] = image_file_name
         dbg_local["tip_angle_deg"] = float(tip_angle_deg)
         dbg_local["coarse_tip_before_local_xy"] = [float(tip_x), float(tip_y)]
@@ -3218,7 +3403,8 @@ class CTR_Shadow_Calibration:
         self.tip_refine_debug_records[image_file_name] = dbg_local
 
         _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
-        annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=" (parallel_centerline)")
+        selected_tip_source = str(dbg_local.get("selected_tip_source", self.tip_refine_mode))
+        annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=f" ({selected_tip_source})")
 
         calibrated_tip_axes = None
         if (
@@ -3230,8 +3416,8 @@ class CTR_Shadow_Calibration:
         ):
             try:
                 calibrated_tip_axes = self.pixel_point_to_calibrated_axes(
-                    x_px=float(tip_locations_array_coarse[i, 1]),
-                    y_px=float(tip_locations_array_coarse[i, 0]),
+                    x_px=float(tip_locations_array_fine[i, 1]),
+                    y_px=float(tip_locations_array_fine[i, 0]),
                 )
             except Exception:
                 calibrated_tip_axes = None
@@ -3239,11 +3425,13 @@ class CTR_Shadow_Calibration:
         if calibrated_tip_axes is not None:
             u_mm, z_mm = calibrated_tip_axes
             axs[1, 1].set_title(
-                f'Identified refined tip (angle={tip_angle_deg:.2f} deg)\n'
+                f'Identified selected tip [{selected_tip_source}] (angle={tip_angle_deg:.2f} deg)\n'
                 f'Calibrated: u={u_mm:.2f} mm, z={z_mm:.2f} mm'
             )
         else:
-            axs[1, 1].set_title(f'Identified refined tip (angle={tip_angle_deg:.2f} deg)')
+            axs[1, 1].set_title(
+                f'Identified selected tip [{selected_tip_source}] (angle={tip_angle_deg:.2f} deg)'
+            )
 
         return fig, axs, tip_locations_array_coarse[i, :], tip_locations_array_fine[i, :]
 
@@ -3348,7 +3536,7 @@ class CTR_Shadow_Calibration:
 
         num_images = len(image_files)
         self.tip_locations_array_coarse = np.zeros((num_images, 8))
-        # self.tip_locations_array_fine = np.zeros((num_images, 5))
+        self.tip_locations_array_selected = np.zeros((num_images, 8))
 
         successful_analyses = 0
         failed_analyses = 0
@@ -3356,8 +3544,7 @@ class CTR_Shadow_Calibration:
         for i, image_file in enumerate(image_files):
             print(f"\nProcessing image {i + 1}/{num_images}: {image_file}")
             try:
-                # fig, axs, coarse_tip, fine_tip = self.analyze_data(
-                fig, axs, coarse_tip, _ = self.analyze_data(
+                fig, axs, coarse_tip, selected_tip = self.analyze_data(
                     image_file,
                     crop_width_min,
                     crop_width_max,
@@ -3367,7 +3554,7 @@ class CTR_Shadow_Calibration:
                 )
 
                 self.tip_locations_array_coarse[i, :] = coarse_tip
-                # self.tip_locations_array_fine[i, :] = fine_tip
+                self.tip_locations_array_selected[i, :] = selected_tip
 
                 output_filename = f"{os.path.splitext(image_file)[0]}_analysis.png"
                 output_path = os.path.join(analysis_output_folder, output_filename)
@@ -3382,14 +3569,15 @@ class CTR_Shadow_Calibration:
                 print(f" ✗ Error processing {image_file}: {e}")
                 failed_analyses += 1
                 self.tip_locations_array_coarse[i, :] = np.nan
-                # self.tip_locations_array_fine[i, :] = np.nan
+                self.tip_locations_array_selected[i, :] = np.nan
 
         try:
             coarse_file = os.path.join(processed_folder, "tip_locations_coarse.npy")
+            selected_file = os.path.join(processed_folder, "tip_locations_selected.npy")
             np.save(coarse_file, self.tip_locations_array_coarse)
-            # np.save(fine_file, self.tip_locations_array_fine)
+            np.save(selected_file, self.tip_locations_array_selected)
             print(f"\n✓ Saved coarse tip locations to: {coarse_file}")
-            # print(f"✓ Saved fine tip locations to: {fine_file}")
+            print(f"✓ Saved selected tip locations to: {selected_file}")
 
             try:
                 columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code', 'pass_idx']
@@ -3397,11 +3585,12 @@ class CTR_Shadow_Calibration:
                 df_coarse['image_file'] = image_files
                 coarse_csv = os.path.join(processed_folder, "tip_locations_coarse.csv")
                 df_coarse.to_csv(coarse_csv, index=False)
-                # df_fine = pd.DataFrame(self.tip_locations_array_fine, columns=columns)
-                # df_fine['image_file'] = image_files
-                # fine_csv = os.path.join(processed_folder, "tip_locations_fine.csv")
-                # df_fine.to_csv(fine_csv, index=False)
+                df_selected = pd.DataFrame(self.tip_locations_array_selected, columns=columns)
+                df_selected['image_file'] = image_files
+                selected_csv = os.path.join(processed_folder, "tip_locations_selected.csv")
+                df_selected.to_csv(selected_csv, index=False)
                 print(f"✓ Saved CSV file: {coarse_csv}")
+                print(f"✓ Saved CSV file: {selected_csv}")
             except Exception as e:
                 print(f"Warning: Could not save CSV files: {e}")
 
@@ -3716,16 +3905,20 @@ class CTR_Shadow_Calibration:
         dataset = self.get_pass_dataset(phase=phase, pass_idx=pass_idx, combined=combined)
         dataset_key = str(dataset.get("phase_name", phase)).strip().lower()
         fit_family = str(fit_family).strip().lower()
-        if fit_family not in {"pchip", "cubic"}:
-            raise ValueError("fit_family must be 'pchip' or 'cubic'.")
+        if fit_family not in {"pchip", "linear", "cubic"}:
+            raise ValueError("fit_family must be 'pchip', 'linear', or 'cubic'.")
         key_map = {
-            "pchip": {"r": "r", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y"},
-            "cubic": {"r": "r_cubic", "z": "z_cubic", "tip_angle": "tip_angle_cubic", "offplane_y": "offplane_y"},
+            "pchip": {"r": "r", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y_pchip"},
+            "linear": {"r": "r", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y_linear"},
+            "cubic": {"r": "r_cubic", "z": "z_cubic", "tip_angle": "tip_angle_cubic", "offplane_y": "offplane_y_cubic"},
         }
         if dataset_key not in fit_models_by_phase:
             raise KeyError(f"Unknown fit model group '{dataset_key}'. Available: {list(fit_models_by_phase.keys())}")
         return {
-            quantity: fit_models_by_phase[dataset_key].get(model_key)
+            quantity: (
+                fit_models_by_phase[dataset_key].get(model_key)
+                or (fit_models_by_phase[dataset_key].get("offplane_y") if quantity == "offplane_y" else None)
+            )
             for quantity, model_key in key_map[fit_family].items()
         }
 
@@ -4166,18 +4359,30 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
         return param_path, py_path, stl_path, gcode_json_path
 
-    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic"):
+    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="linear"):
         """Postprocess calibration data and export separate pull/release fits."""
-        if not hasattr(self, 'tip_locations_array_coarse'):
+        if not hasattr(self, 'tip_locations_array_selected'):
             print("Tip location data not found in memory, attempting to load from saved files...")
             processed_folder = os.path.join(self.calibration_data_folder, "processed_image_data_folder")
+            selected_file = os.path.join(processed_folder, "tip_locations_selected.npy")
             coarse_file = os.path.join(processed_folder, "tip_locations_coarse.npy")
-            if not os.path.exists(coarse_file):
+            if os.path.exists(selected_file):
+                self.tip_locations_array_selected = np.load(selected_file)
+                print(f"✓ Loaded selected tip data from {selected_file}")
+                print(f" Selected data shape: {self.tip_locations_array_selected.shape}")
+            elif os.path.exists(coarse_file):
+                self.tip_locations_array_selected = np.load(coarse_file)
+                print(f"✓ Loaded fallback tip data from {coarse_file}")
+                print(f" Fallback data shape: {self.tip_locations_array_selected.shape}")
+            else:
                 print("Error: Required .npy files not found. Run analyze_data_batch() first.")
                 return None
-            self.tip_locations_array_coarse = np.load(coarse_file)
-            print(f"✓ Loaded existing data from {coarse_file}")
-            print(f" Coarse data shape: {self.tip_locations_array_coarse.shape}")
+
+        if not hasattr(self, 'tip_locations_array_coarse'):
+            processed_folder = os.path.join(self.calibration_data_folder, "processed_image_data_folder")
+            coarse_file = os.path.join(processed_folder, "tip_locations_coarse.npy")
+            if os.path.exists(coarse_file):
+                self.tip_locations_array_coarse = np.load(coarse_file)
 
         processed_folder = os.path.join(self.calibration_data_folder, "processed_image_data_folder")
         os.makedirs(processed_folder, exist_ok=True)
@@ -4188,9 +4393,9 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             print("\n" + "=" * 50)
             print("Starting calibration data postprocessing...")
 
-            arr = np.asarray(self.tip_locations_array_coarse, dtype=float)
+            arr = np.asarray(self.tip_locations_array_selected, dtype=float)
             if arr.ndim != 2 or arr.shape[1] < 5:
-                raise ValueError("tip_locations_coarse must have at least 5 columns.")
+                raise ValueError("tip_locations_selected must have at least 5 columns.")
 
             has_tip_angle = arr.shape[1] >= 6
             has_phase = arr.shape[1] >= 7
@@ -4253,7 +4458,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
             tip_mm[:, 0] = u_mm
             tip_mm[:, 1] = z_mm
-            pd.DataFrame(tip_mm).to_excel('tip_locations_coarse_mm.xlsx', index=False, header=False)
+            pd.DataFrame(tip_mm).to_excel('tip_locations_selected_mm.xlsx', index=False, header=False)
             print(f"Physical conversion mode: {conversion_mode} | representative mm/px={pixel_to_mm_scale:.6f}")
 
             valid_rows = tip_mm[np.all(np.isfinite(tip_mm[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL, PASS_COL]]), axis=1)].copy()
@@ -4267,7 +4472,9 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 if a.size == 0:
                     return float('nan')
                 rad = np.deg2rad(a)
-                return float(np.rad2deg(np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))))
+                return _normalize_tip_angle_deg(
+                    float(np.rad2deg(np.arctan2(np.mean(np.sin(rad)), np.mean(np.cos(rad)))))
+                )
 
             def collapse_by_bpull(arr_phase):
                 if arr_phase.size == 0:
@@ -4398,7 +4605,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 tip_angle_avg = avg_ang.copy()
                 finite_mask = np.isfinite(tip_angle_avg)
                 if np.any(finite_mask):
-                    tip_angle_avg[finite_mask] = np.where(tip_angle_avg[finite_mask] > 250.0, tip_angle_avg[finite_mask] - 360.0, tip_angle_avg[finite_mask])
+                    tip_angle_avg[finite_mask] = _normalize_tip_angle_deg(tip_angle_avg[finite_mask])
                 dataset = {
                     'phase_code': int(phase_code),
                     'pass_idx': int(pass_idx),
@@ -4675,6 +4882,11 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             fit_model = str(fit_model).strip().lower()
             if fit_model not in {'cubic', 'pchip'}:
                 raise ValueError(f"Unsupported fit_model '{fit_model}'. Use 'cubic' or 'pchip'.")
+            offplane_fit_model = str(offplane_fit_model).strip().lower()
+            if offplane_fit_model not in {'linear', 'cubic', 'pchip'}:
+                raise ValueError(
+                    f"Unsupported offplane_fit_model '{offplane_fit_model}'. Use 'linear', 'cubic', or 'pchip'."
+                )
 
             if fit_model == 'pchip':
                 datasets = self._enforce_phase_endpoint_continuity(
@@ -4696,11 +4908,16 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 if model_descriptor is None:
                     return "Fit"
                 model_type = str(model_descriptor.get('model_type', fit_model)).strip().lower()
-                return {
-                    'pchip': 'PCHIP',
-                    'polynomial': 'Cubic',
-                    'linear': 'Linear',
-                }.get(model_type, model_type.upper())
+                if model_type == 'pchip':
+                    return 'PCHIP'
+                if model_type == 'polynomial':
+                    degree = int(model_descriptor.get('degree', -1))
+                    if degree == 1:
+                        return 'Linear'
+                    if degree == 3:
+                        return 'Cubic'
+                    return f'Polynomial (deg {degree})'
+                return model_type.upper()
 
             fit_results = {}
             legacy_phase = dataset_aliases.get('pull', list(datasets_for_fitting.keys())[0])
@@ -4735,16 +4952,29 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 off_r2 = None
                 off_plot_b = None
                 off_plot_pred = None
+                off_linear_model = None
+                off_cubic_model = None
+                off_pchip_model = None
                 if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
                     off_b = ds['offplane_b']
                     off_y = ds['offplane_y']
                     if off_b.size >= 2:
-                        off_model = self._fit_curve_model(off_b, off_y, 'linear', f"offplane_y_{phase_name}")
-                        if off_model is not None:
-                            off_pred = self._evaluate_curve_model(off_model, off_b)
-                            off_r2 = r2_score_safe(off_y, off_pred)
-                            off_plot_b = ds['common_b']
-                            off_plot_pred = self._evaluate_curve_model(off_model, off_plot_b)
+                        off_linear_model = self._fit_curve_model(off_b, off_y, 'linear', f"offplane_y_{phase_name}_linear")
+                        off_pchip_model = self._fit_curve_model(off_b, off_y, 'pchip', f"offplane_y_{phase_name}_pchip")
+                    if off_b.size >= 4:
+                        off_cubic_model = self._fit_curve_model(off_b, off_y, 'cubic', f"offplane_y_{phase_name}_cubic")
+                    off_model = {
+                        'linear': off_linear_model,
+                        'cubic': off_cubic_model,
+                        'pchip': off_pchip_model,
+                    }.get(offplane_fit_model)
+                    if off_model is None:
+                        off_model = off_linear_model or off_cubic_model or off_pchip_model
+                    if off_model is not None:
+                        off_pred = self._evaluate_curve_model(off_model, off_b)
+                        off_r2 = r2_score_safe(off_y, off_pred)
+                        off_plot_b = ds['common_b']
+                        off_plot_pred = self._evaluate_curve_model(off_model, off_plot_b)
                 fit_results[phase_name] = {
                     'dataset': ds,
                     'r_model': r_model,
@@ -4757,6 +4987,9 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     'tip_angle_pchip_model': self._fit_curve_model(b[np.isfinite(tip_ang)], tip_ang[np.isfinite(tip_ang)], 'pchip', f"tip_angle_{phase_name}_pchip") if has_tip_angle and np.any(np.isfinite(tip_ang)) and np.sum(np.isfinite(tip_ang)) >= 2 else None,
                     'tip_angle_cubic_model': angle_cubic_model,
                     'offplane_y_model': off_model,
+                    'offplane_y_linear_model': off_linear_model,
+                    'offplane_y_cubic_model': off_cubic_model,
+                    'offplane_y_pchip_model': off_pchip_model,
                     'r_pred': r_pred,
                     'z_pred': z_pred,
                     'tip_angle_pred': angle_pred,
@@ -4768,89 +5001,217 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     'offplane_plot_pred': off_plot_pred,
                 }
 
+            selected_phase_fit_results = {}
+            for phase_alias in ('pull', 'release'):
+                canonical_name = dataset_aliases.get(phase_alias, phase_alias)
+                if canonical_name in fit_results:
+                    selected_phase_fit_results[phase_alias] = fit_results[canonical_name]
+
             shared_tip_angle_model = self._average_polynomial_models(
-                [fr['tip_angle_cubic_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
+                [fr['tip_angle_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='tip_angle_avg',
             )
             shared_r_cubic_model = self._average_polynomial_models(
-                [fr['r_cubic_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
+                [fr['r_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='r_avg',
             )
             shared_z_cubic_model = self._average_polynomial_models(
-                [fr['z_cubic_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
+                [fr['z_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='z_avg',
             )
             shared_offplane_y_model = self._average_polynomial_models(
-                [fr['offplane_y_model'] for key, fr in fit_results.items() if key in ('pull', 'release')],
+                [fr['offplane_y_model'] for fr in selected_phase_fit_results.values()],
                 value_name='offplane_y_avg',
             )
+            shared_offplane_y_linear_model = self._average_polynomial_models(
+                [fr['offplane_y_linear_model'] for fr in selected_phase_fit_results.values()],
+                value_name='offplane_y_avg_linear',
+            )
+            shared_offplane_y_cubic_model = self._average_polynomial_models(
+                [fr['offplane_y_cubic_model'] for fr in selected_phase_fit_results.values()],
+                value_name='offplane_y_avg_cubic',
+            )
+
+            def shared_pair_average_xy(x_key, y_key, circular=False):
+                fr_pull = selected_phase_fit_results.get('pull')
+                fr_release = selected_phase_fit_results.get('release')
+                if fr_pull is None or fr_release is None:
+                    return None, None
+
+                ds_pull = fr_pull['dataset']
+                ds_release = fr_release['dataset']
+                x_pull = ds_pull.get(x_key)
+                y_pull = ds_pull.get(y_key)
+                x_release = ds_release.get(x_key)
+                y_release = ds_release.get(y_key)
+                if x_pull is None or y_pull is None or x_release is None or y_release is None:
+                    return None, None
+
+                x_pull = np.asarray(x_pull, dtype=float)
+                y_pull = np.asarray(y_pull, dtype=float)
+                x_release = np.asarray(x_release, dtype=float)
+                y_release = np.asarray(y_release, dtype=float)
+                common_x = np.intersect1d(x_pull, x_release)
+                if common_x.size == 0:
+                    return None, None
+
+                idx_pull = np.searchsorted(x_pull, common_x)
+                idx_release = np.searchsorted(x_release, common_x)
+                a = y_pull[idx_pull]
+                b = y_release[idx_release]
+                valid = np.isfinite(a) & np.isfinite(b)
+                if not np.any(valid):
+                    return None, None
+
+                common_x = common_x[valid]
+                a = a[valid]
+                b = b[valid]
+                if circular:
+                    y_avg = np.array([circular_mean_deg([va, vb]) for va, vb in zip(a, b)], dtype=float)
+                else:
+                    y_avg = 0.5 * (a + b)
+                return common_x.astype(float), y_avg.astype(float)
 
             shared_r_cubic_r2 = None
             shared_z_cubic_r2 = None
             shared_tip_angle_r2 = None
             shared_offplane_y_r2 = None
+            shared_offplane_y_linear_r2 = None
+            shared_offplane_y_cubic_r2 = None
+
             if shared_r_cubic_model is not None:
-                r_b_all = []
-                r_y_all = []
-                for fr in fit_results.values():
-                    ds = fr['dataset']
-                    r_b_all.append(np.asarray(ds['common_b'], dtype=float))
-                    r_y_all.append(np.asarray(ds['r_coords'], dtype=float))
-                if r_b_all:
-                    r_b_all = np.concatenate(r_b_all)
-                    r_y_all = np.concatenate(r_y_all)
+                r_b_avg, r_y_avg = shared_pair_average_xy('common_b', 'r_coords', circular=False)
+                if r_b_avg is not None:
                     shared_r_cubic_r2 = r2_score_safe(
-                        r_y_all,
-                        self._evaluate_curve_model(shared_r_cubic_model, r_b_all),
+                        r_y_avg,
+                        self._evaluate_curve_model(shared_r_cubic_model, r_b_avg),
                     )
+                else:
+                    r_b_all = []
+                    r_y_all = []
+                    for fr in fit_results.values():
+                        ds = fr['dataset']
+                        r_b_all.append(np.asarray(ds['common_b'], dtype=float))
+                        r_y_all.append(np.asarray(ds['r_coords'], dtype=float))
+                    if r_b_all:
+                        r_b_all = np.concatenate(r_b_all)
+                        r_y_all = np.concatenate(r_y_all)
+                        shared_r_cubic_r2 = r2_score_safe(
+                            r_y_all,
+                            self._evaluate_curve_model(shared_r_cubic_model, r_b_all),
+                        )
 
             if shared_z_cubic_model is not None:
-                z_b_all = []
-                z_y_all = []
-                for fr in fit_results.values():
-                    ds = fr['dataset']
-                    z_b_all.append(np.asarray(ds['common_b'], dtype=float))
-                    z_y_all.append(np.asarray(ds['z_coords'], dtype=float))
-                if z_b_all:
-                    z_b_all = np.concatenate(z_b_all)
-                    z_y_all = np.concatenate(z_y_all)
+                z_b_avg, z_y_avg = shared_pair_average_xy('common_b', 'z_coords', circular=False)
+                if z_b_avg is not None:
                     shared_z_cubic_r2 = r2_score_safe(
-                        z_y_all,
-                        self._evaluate_curve_model(shared_z_cubic_model, z_b_all),
+                        z_y_avg,
+                        self._evaluate_curve_model(shared_z_cubic_model, z_b_avg),
                     )
+                else:
+                    z_b_all = []
+                    z_y_all = []
+                    for fr in fit_results.values():
+                        ds = fr['dataset']
+                        z_b_all.append(np.asarray(ds['common_b'], dtype=float))
+                        z_y_all.append(np.asarray(ds['z_coords'], dtype=float))
+                    if z_b_all:
+                        z_b_all = np.concatenate(z_b_all)
+                        z_y_all = np.concatenate(z_y_all)
+                        shared_z_cubic_r2 = r2_score_safe(
+                            z_y_all,
+                            self._evaluate_curve_model(shared_z_cubic_model, z_b_all),
+                        )
 
             if shared_tip_angle_model is not None:
-                tip_b_all = []
-                tip_y_all = []
-                for fr in fit_results.values():
-                    ds = fr['dataset']
-                    valid_ang = np.isfinite(ds['tip_angle'])
-                    if np.any(valid_ang):
-                        tip_b_all.append(ds['common_b'][valid_ang])
-                        tip_y_all.append(ds['tip_angle'][valid_ang])
-                if tip_b_all:
-                    tip_b_all = np.concatenate(tip_b_all)
-                    tip_y_all = np.concatenate(tip_y_all)
+                tip_b_avg, tip_y_avg = shared_pair_average_xy('common_b', 'tip_angle', circular=True)
+                if tip_b_avg is not None:
                     shared_tip_angle_r2 = r2_score_safe(
-                        tip_y_all,
-                        self._evaluate_curve_model(shared_tip_angle_model, tip_b_all),
+                        tip_y_avg,
+                        self._evaluate_curve_model(shared_tip_angle_model, tip_b_avg),
                     )
+                else:
+                    tip_b_all = []
+                    tip_y_all = []
+                    for fr in fit_results.values():
+                        ds = fr['dataset']
+                        valid_ang = np.isfinite(ds['tip_angle'])
+                        if np.any(valid_ang):
+                            tip_b_all.append(ds['common_b'][valid_ang])
+                            tip_y_all.append(ds['tip_angle'][valid_ang])
+                    if tip_b_all:
+                        tip_b_all = np.concatenate(tip_b_all)
+                        tip_y_all = np.concatenate(tip_y_all)
+                        shared_tip_angle_r2 = r2_score_safe(
+                            tip_y_all,
+                            self._evaluate_curve_model(shared_tip_angle_model, tip_b_all),
+                        )
 
+            off_b_avg, off_y_avg = shared_pair_average_xy('offplane_b', 'offplane_y', circular=False)
             if shared_offplane_y_model is not None:
-                off_b_all = []
-                off_y_all = []
-                for fr in fit_results.values():
-                    ds = fr['dataset']
-                    if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
-                        off_b_all.append(np.asarray(ds['offplane_b'], dtype=float))
-                        off_y_all.append(np.asarray(ds['offplane_y'], dtype=float))
-                if off_b_all:
-                    off_b_all = np.concatenate(off_b_all)
-                    off_y_all = np.concatenate(off_y_all)
+                if off_b_avg is not None:
                     shared_offplane_y_r2 = r2_score_safe(
-                        off_y_all,
-                        self._evaluate_curve_model(shared_offplane_y_model, off_b_all),
+                        off_y_avg,
+                        self._evaluate_curve_model(shared_offplane_y_model, off_b_avg),
                     )
+                else:
+                    off_b_all = []
+                    off_y_all = []
+                    for fr in fit_results.values():
+                        ds = fr['dataset']
+                        if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
+                            off_b_all.append(np.asarray(ds['offplane_b'], dtype=float))
+                            off_y_all.append(np.asarray(ds['offplane_y'], dtype=float))
+                    if off_b_all:
+                        off_b_all = np.concatenate(off_b_all)
+                        off_y_all = np.concatenate(off_y_all)
+                        shared_offplane_y_r2 = r2_score_safe(
+                            off_y_all,
+                            self._evaluate_curve_model(shared_offplane_y_model, off_b_all),
+                        )
+                        off_b_avg = off_b_all
+                        off_y_avg = off_y_all
+            if shared_offplane_y_linear_model is not None and off_b_avg is not None:
+                shared_offplane_y_linear_r2 = r2_score_safe(
+                    off_y_avg,
+                    self._evaluate_curve_model(shared_offplane_y_linear_model, off_b_avg),
+                )
+            if shared_offplane_y_cubic_model is not None and off_b_avg is not None:
+                shared_offplane_y_cubic_r2 = r2_score_safe(
+                    off_y_avg,
+                    self._evaluate_curve_model(shared_offplane_y_cubic_model, off_b_avg),
+                )
+
+            shared_offplane_plot_model = (
+                shared_offplane_y_model
+                or shared_offplane_y_cubic_model
+                or shared_offplane_y_linear_model
+            )
+            shared_offplane_plot_r2 = (
+                shared_offplane_y_r2
+                if shared_offplane_y_model is not None
+                else shared_offplane_y_cubic_r2
+                if shared_offplane_y_cubic_model is not None
+                else shared_offplane_y_linear_r2
+            )
+
+            def model_plot_b(model_descriptor, fallback_values, num_points=250):
+                if model_descriptor is None:
+                    return None
+                fit_x_range = model_descriptor.get('fit_x_range')
+                if fit_x_range is not None and len(fit_x_range) == 2:
+                    lo, hi = float(fit_x_range[0]), float(fit_x_range[1])
+                elif fallback_values:
+                    lo, hi = float(min(fallback_values)), float(max(fallback_values))
+                else:
+                    return None
+                if not np.isfinite(lo) or not np.isfinite(hi):
+                    return None
+                if hi < lo:
+                    lo, hi = hi, lo
+                if np.isclose(lo, hi):
+                    return np.array([lo], dtype=float)
+                return np.linspace(lo, hi, int(num_points))
 
             legacy_ds = fit_results[legacy_phase]['dataset']
             r_legacy_cubic_descriptor = self._fit_curve_model(legacy_ds['common_b'], legacy_ds['r_coords'], 'cubic', 'r')
@@ -4869,6 +5230,12 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 tip_angle_coefficients = np.asarray(shared_tip_angle_model['coefficients'], dtype=float)
             if shared_offplane_y_model is not None:
                 y_off_coefficients = np.asarray(shared_offplane_y_model['coefficients'], dtype=float)
+            y_off_linear_coefficients = None
+            y_off_cubic_coefficients = None
+            if shared_offplane_y_linear_model is not None:
+                y_off_linear_coefficients = np.asarray(shared_offplane_y_linear_model['coefficients'], dtype=float)
+            if shared_offplane_y_cubic_model is not None:
+                y_off_cubic_coefficients = np.asarray(shared_offplane_y_cubic_model['coefficients'], dtype=float)
 
             phase_metrics_rows = []
             for phase_name, fr in fit_results.items():
@@ -4876,12 +5243,15 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     {'Phase': phase_name, 'Channel': 'r', 'R2': fr['r_r2'], 'Equation': fr['r_model'].get('equation')},
                     {'Phase': phase_name, 'Channel': 'z', 'R2': fr['z_r2'], 'Equation': fr['z_model'].get('equation')},
                     {'Phase': phase_name, 'Channel': 'tip_angle', 'R2': fr['tip_angle_r2'], 'Equation': None if fr['tip_angle_model'] is None else fr['tip_angle_model'].get('equation')},
+                    {'Phase': phase_name, 'Channel': 'offplane_y', 'R2': fr['offplane_y_r2'], 'Equation': None if fr['offplane_y_model'] is None else fr['offplane_y_model'].get('equation')},
                 ])
             phase_metrics_rows.extend([
                 {'Phase': 'averaged', 'Channel': 'r_cubic', 'R2': shared_r_cubic_r2, 'Equation': None if shared_r_cubic_model is None else shared_r_cubic_model.get('equation')},
                 {'Phase': 'averaged', 'Channel': 'z_cubic', 'R2': shared_z_cubic_r2, 'Equation': None if shared_z_cubic_model is None else shared_z_cubic_model.get('equation')},
                 {'Phase': 'averaged', 'Channel': 'tip_angle', 'R2': shared_tip_angle_r2, 'Equation': None if shared_tip_angle_model is None else shared_tip_angle_model.get('equation')},
                 {'Phase': 'averaged', 'Channel': 'offplane_y', 'R2': shared_offplane_y_r2, 'Equation': None if shared_offplane_y_model is None else shared_offplane_y_model.get('equation')},
+                {'Phase': 'averaged', 'Channel': 'offplane_y_linear', 'R2': shared_offplane_y_linear_r2, 'Equation': None if shared_offplane_y_linear_model is None else shared_offplane_y_linear_model.get('equation')},
+                {'Phase': 'averaged', 'Channel': 'offplane_y_cubic', 'R2': shared_offplane_y_cubic_r2, 'Equation': None if shared_offplane_y_cubic_model is None else shared_offplane_y_cubic_model.get('equation')},
             ])
             pd.DataFrame(phase_metrics_rows).to_excel(f"{robot_name}_phase_fit_summary.xlsx", index=False)
 
@@ -5089,49 +5459,53 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                         )
 
                 if shared_tip_angle_model is not None and all_tip_b:
-                    tip_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
-                    ax_angle.plot(
-                        tip_plot_b,
-                        self._evaluate_curve_model(shared_tip_angle_model, tip_plot_b),
-                        color=avg_cubic_colors['angle'],
-                        linewidth=2.2,
-                        marker='s',
-                        markersize=3.0,
-                        markevery=max(1, len(tip_plot_b) // 22),
-                        label='Averaged cubic fit',
-                    )
+                    tip_plot_b = model_plot_b(shared_tip_angle_model, all_tip_b)
+                    if tip_plot_b is not None:
+                        ax_angle.plot(
+                            tip_plot_b,
+                            self._evaluate_curve_model(shared_tip_angle_model, tip_plot_b),
+                            color=avg_cubic_colors['angle'],
+                            linewidth=2.2,
+                            marker='s',
+                            markersize=3.0,
+                            markevery=max(1, len(tip_plot_b) // 22),
+                            label='Averaged cubic fit',
+                        )
 
                 if shared_r_cubic_model is not None and all_b_ranges:
-                    fit_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
-                    ax_r_fit.plot(
-                        fit_plot_b,
-                        self._evaluate_curve_model(shared_r_cubic_model, fit_plot_b),
-                        color=avg_cubic_colors['r'],
-                        linewidth=2.4,
-                        alpha=0.95,
-                        label='Averaged cubic fit',
-                    )
+                    fit_plot_b = model_plot_b(shared_r_cubic_model, all_b_ranges)
+                    if fit_plot_b is not None:
+                        ax_r_fit.plot(
+                            fit_plot_b,
+                            self._evaluate_curve_model(shared_r_cubic_model, fit_plot_b),
+                            color=avg_cubic_colors['r'],
+                            linewidth=2.4,
+                            alpha=0.95,
+                            label='Averaged cubic fit',
+                        )
 
                 if shared_z_cubic_model is not None and all_b_ranges:
-                    fit_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
-                    ax_z_fit.plot(
-                        fit_plot_b,
-                        self._evaluate_curve_model(shared_z_cubic_model, fit_plot_b),
-                        color=avg_cubic_colors['z'],
-                        linewidth=2.4,
-                        alpha=0.95,
-                        label='Averaged cubic fit',
-                    )
+                    fit_plot_b = model_plot_b(shared_z_cubic_model, all_b_ranges)
+                    if fit_plot_b is not None:
+                        ax_z_fit.plot(
+                            fit_plot_b,
+                            self._evaluate_curve_model(shared_z_cubic_model, fit_plot_b),
+                            color=avg_cubic_colors['z'],
+                            linewidth=2.4,
+                            alpha=0.95,
+                            label='Averaged cubic fit',
+                        )
 
-                if shared_offplane_y_model is not None and all_b_ranges:
-                    off_plot_b = np.linspace(min(all_b_ranges), max(all_b_ranges), 250)
-                    ax_off.plot(
-                        off_plot_b,
-                        self._evaluate_curve_model(shared_offplane_y_model, off_plot_b),
-                        color=avg_cubic_colors['offplane'],
-                        linewidth=2.2,
-                        label='Averaged linear fit (full B)',
-                    )
+                if shared_offplane_plot_model is not None and all_off_b:
+                    off_plot_b = model_plot_b(shared_offplane_plot_model, all_off_b)
+                    if off_plot_b is not None:
+                        ax_off.plot(
+                            off_plot_b,
+                            self._evaluate_curve_model(shared_offplane_plot_model, off_plot_b),
+                            color=avg_cubic_colors['offplane'],
+                            linewidth=2.2,
+                            label=f"Averaged {pretty_model_name(shared_offplane_plot_model).lower()} fit",
+                        )
 
                 mirror_x_vals = [
                     float(fr['dataset']['x_ref_mirror_line_mm'])
@@ -5161,7 +5535,10 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     default=float('nan'),
                 )
                 ax_angle.set_title(f'Attack Angle vs Motor (phase fit max R² = {0.0 if not np.isfinite(max_angle_r2) else max_angle_r2:.4f}; avg cubic R² = {0.0 if shared_tip_angle_r2 is None else shared_tip_angle_r2:.4f})')
-                ax_off.set_title(f'B-offset Linear Fit (full B, averaged) (R² = {0.0 if shared_offplane_y_r2 is None else shared_offplane_y_r2:.4f})')
+                ax_off.set_title(
+                    f"B-offset {pretty_model_name(shared_offplane_plot_model) if shared_offplane_plot_model is not None else offplane_fit_model.title()} "
+                    f"Fit (averaged) (R² = {0.0 if shared_offplane_plot_r2 is None else shared_offplane_plot_r2:.4f})"
+                )
                 ax_raw_xz.set_title('XZ before mirroring', fontsize=11)
                 ax_raw_yz.set_title('YZ before mirroring (±90)', fontsize=11)
 
@@ -5500,6 +5877,11 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     'tip_angle_cubic': fr['tip_angle_cubic_model'],
                     'tip_angle_avg_cubic': shared_tip_angle_model,
                     'offplane_y': fr['offplane_y_model'],
+                    'offplane_y_linear': fr['offplane_y_linear_model'],
+                    'offplane_y_cubic': fr['offplane_y_cubic_model'],
+                    'offplane_y_pchip': fr['offplane_y_pchip_model'],
+                    'offplane_y_avg_linear': shared_offplane_y_linear_model,
+                    'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
                     'r_avg_cubic': shared_r_cubic_model,
                     'z_avg_cubic': shared_z_cubic_model,
                 }
@@ -5517,6 +5899,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
 
             cubic_calibration_data = {
                 'selected_fit_model': fit_model,
+                'selected_offplane_fit_model': offplane_fit_model,
                 'default_phase_for_legacy_access': legacy_phase,
                 'fit_models': default_fit_models,
                 'fit_models_by_phase': fit_models_with_aliases,
@@ -5527,6 +5910,8 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                     'z_avg_cubic': shared_z_cubic_model,
                     'tip_angle_avg_cubic': shared_tip_angle_model,
                     'offplane_y': shared_offplane_y_model,
+                    'offplane_y_avg_linear': shared_offplane_y_linear_model,
+                    'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
                 },
                 'phase_fit_metrics': {
                     phase: {
@@ -5537,6 +5922,8 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                         'tip_angle_r2': fr['tip_angle_r2'],
                         'tip_angle_avg_cubic_r2': shared_tip_angle_r2,
                         'offplane_y_r2': shared_offplane_y_r2,
+                        'offplane_y_linear_r2': shared_offplane_y_linear_r2,
+                        'offplane_y_cubic_r2': shared_offplane_y_cubic_r2,
                     }
                     for phase, fr in fit_results.items()
                 },
@@ -5546,6 +5933,8 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
                 'shared_z_cubic_coefficients': shared_z_cubic_coefficients,
                 'tip_angle_coefficients': tip_angle_coefficients,
                 'offplane_y_coefficients': y_off_coefficients,
+                'offplane_y_linear_coefficients': y_off_linear_coefficients,
+                'offplane_y_cubic_coefficients': y_off_cubic_coefficients,
             }
             with open(f"{robot_name}_cubic_calibration.pkl", "wb") as f:
                 pickle.dump(cubic_calibration_data, f)
@@ -5587,14 +5976,21 @@ def get_fit_model(phase, fit_family='pchip'):
             'r': m.get('r_pchip') or m.get('r'),
             'z': m.get('z_pchip') or m.get('z'),
             'tip_angle': m.get('tip_angle_pchip') or m.get('tip_angle'),
-            'offplane_y': m.get('offplane_y'),
+            'offplane_y': m.get('offplane_y_pchip') or m.get('offplane_y'),
+        }}
+    if fit_family == 'linear':
+        return {{
+            'r': m.get('r'),
+            'z': m.get('z'),
+            'tip_angle': m.get('tip_angle'),
+            'offplane_y': m.get('offplane_y_linear') or m.get('offplane_y'),
         }}
     if fit_family == 'cubic':
         return {{
             'r': m.get('r_cubic') or m.get('r_avg_cubic'),
             'z': m.get('z_cubic') or m.get('z_avg_cubic'),
             'tip_angle': m.get('tip_angle_cubic') or m.get('tip_angle_avg_cubic'),
-            'offplane_y': m.get('offplane_y'),
+            'offplane_y': m.get('offplane_y_cubic') or m.get('offplane_y_avg_cubic') or m.get('offplane_y'),
         }}
     raise ValueError(f'Unsupported fit_family: {{fit_family}}')
 
@@ -5639,6 +6035,7 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                 'robot_name': robot_name,
                 'calibration_date': pd.Timestamp.now().isoformat(),
                 'selected_fit_model': fit_model,
+                'selected_offplane_fit_model': offplane_fit_model,
                 'default_phase_for_legacy_access': legacy_phase,
                 'orientation_map': {'0': 'C=0 deg', '1': 'C=180 deg', '2': 'C=+90 deg', '3': 'C=-90 deg'},
                 'motion_phase_map': {'0': 'pull', '1': 'release'},
@@ -5652,6 +6049,8 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                     'z_avg_cubic': shared_z_cubic_model,
                     'tip_angle_avg_cubic': shared_tip_angle_model,
                     'offplane_y': shared_offplane_y_model,
+                    'offplane_y_avg_linear': shared_offplane_y_linear_model,
+                    'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
                 },
                 'phase_fit_metrics': {
                     phase: {
@@ -5662,6 +6061,8 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                         'tip_angle_r_squared': fr['tip_angle_r2'],
                         'tip_angle_avg_cubic_r_squared': shared_tip_angle_r2,
                         'offplane_y_r_squared': shared_offplane_y_r2,
+                        'offplane_y_linear_r_squared': shared_offplane_y_linear_r2,
+                        'offplane_y_cubic_r_squared': shared_offplane_y_cubic_r2,
                     }
                     for phase, fr in fit_results.items()
                 },
@@ -5673,10 +6074,14 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                     'z_avg_coeffs': shared_z_cubic_coefficients.tolist() if shared_z_cubic_coefficients is not None else None,
                     'tip_angle_coeffs': tip_angle_coefficients.tolist() if tip_angle_coefficients is not None else None,
                     'offplane_y_coeffs': y_off_coefficients.tolist() if y_off_coefficients is not None else None,
+                    'offplane_y_linear_coeffs': y_off_linear_coefficients.tolist() if y_off_linear_coefficients is not None else None,
+                    'offplane_y_cubic_coeffs': y_off_cubic_coefficients.tolist() if y_off_cubic_coefficients is not None else None,
                     'r_avg_equation': None if shared_r_cubic_model is None else shared_r_cubic_model.get('equation'),
                     'z_avg_equation': None if shared_z_cubic_model is None else shared_z_cubic_model.get('equation'),
                     'tip_angle_equation': None if shared_tip_angle_model is None else shared_tip_angle_model.get('equation'),
                     'offplane_y_equation': None if shared_offplane_y_model is None else shared_offplane_y_model.get('equation'),
+                    'offplane_y_linear_equation': None if shared_offplane_y_linear_model is None else shared_offplane_y_linear_model.get('equation'),
+                    'offplane_y_cubic_equation': None if shared_offplane_y_cubic_model is None else shared_offplane_y_cubic_model.get('equation'),
                 },
                 'motor_setup': {
                     'b_motor_axis': 'B',
@@ -5690,7 +6095,7 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                 },
             }
             with open(f"{robot_name}_gcode_calibration.json", "w") as f:
-                json.dump(gcode_calibration_data, f, indent=2)
+                json.dump(_to_json_compatible(gcode_calibration_data), f, indent=2)
 
             print("\nDual-phase calibration export complete:")
             print(f" - {robot_name}_cubic_calibration.pkl")

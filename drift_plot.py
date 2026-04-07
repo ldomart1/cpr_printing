@@ -94,12 +94,14 @@ def _save_density_animation_gif(
     if max_seq < min_seq:
         return None
 
-    fps = 20
+    fps = 12
     idx_per_second = 100
     idx_per_frame = max(1, int(np.ceil(idx_per_second / float(fps))))
     frame_cutoffs = list(range(min_seq, max_seq + 1, idx_per_frame))
     if not frame_cutoffs or frame_cutoffs[-1] != max_seq:
         frame_cutoffs.append(max_seq)
+    final_hold_frames = max(1, len(frame_cutoffs) - 1)
+    frame_cutoffs.extend([max_seq] * final_hold_frames)
 
     global_x = pd.to_numeric(plot_df[x_col], errors="coerce").to_numpy(dtype=float)
     global_y = pd.to_numeric(plot_df[y_col], errors="coerce").to_numpy(dtype=float)
@@ -119,6 +121,13 @@ def _save_density_animation_gif(
     fig, axes = _make_checkpoint_grid(len(CHECKPOINT_ORDER))
     fig.patch.set_facecolor("none")
     fig.patch.set_alpha(0.0)
+    suptitle = fig.suptitle(
+        "",
+        color="#f7fbff",
+        fontsize=15,
+        weight="semibold",
+        y=0.99,
+    )
 
     def draw_frame(cutoff: int) -> None:
         for ax, checkpoint_name in zip(axes.flat, CHECKPOINT_ORDER):
@@ -165,13 +174,7 @@ def _save_density_animation_gif(
         for ax in axes.flat[len(CHECKPOINT_ORDER):]:
             ax.set_visible(False)
 
-        fig.suptitle(
-            f"Tracked tip position density by checkpoint | seq <= {cutoff}",
-            color="#f7fbff",
-            fontsize=15,
-            weight="semibold",
-            y=0.99,
-        )
+        suptitle.set_text(f"Tracked tip position density by checkpoint | seq <= {cutoff}")
 
     animation = FuncAnimation(fig, draw_frame, frames=frame_cutoffs, interval=1000 / fps, repeat=False)
     animation.save(output_path, writer=PillowWriter(fps=fps), dpi=160)

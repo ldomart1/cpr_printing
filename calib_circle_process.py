@@ -1,70 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-offline_fixed_tip_dual_c_checkerboard_error_analysis.py
+offline_run_checkerboard_circle_error_analysis.py
 
-Offline checkerboard-referenced tip error analysis tailored to the fixed-tip
-dual-C acquisition script.
+Offline CTR shadow calibration runner that:
+  1) Opens a project/raw image folder
+  2) Lets you choose crop bounds from the FIRST raw image
+  3) Uses a checkerboard reference image + camera calibration to define mm axes
+  4) Runs analyze_data_batch + existing tracking pipeline
+  5) Converts tracked tip pixels to checkerboard-referenced mm coordinates
+  6) Computes a reference tracked point = mean of all valid tracked points
+  7) Computes per-sample error distance to that mean (in mm)
+  8) Saves:
+       - CSV of tracked points and errors
+       - JSON metrics summary
+       - error-vs-sample plot
+       - desired-vs-actual circle plot
+       - histogram of error distance vs number of samples
+       - optional overlay on checkerboard image
+       - optional desired lookup from planned_command_sequence.csv when available
 
-What it does
-------------
-1) Opens a project/raw image folder from the fixed-tip dual-C acquisition run
-2) Lets you choose crop bounds from the first raw image
-3) Uses a checkerboard reference image + camera calibration to define mm axes
-4) Runs analyze_data_batch + existing tracking pipeline
-5) Converts tracked tip pixels to checkerboard-referenced mm coordinates
-6) Parses C orientation / tip angle / block metadata from image filenames
-7) Builds per-sample reference points from the predicted Cartesian targets
-   encoded in the filenames and aligns that target set into checkerboard mm
-   coordinates
-8) Computes:
-      - global RMSE to the corresponding per-sample reference points
-      - RMSE for each C orientation angle to those same per-sample references
-9) Saves:
-      - CSV with tracked points, filename metadata, errors
-      - JSON metrics summary including per-C RMSE
-      - error-vs-sample plot
-      - dark-theme histogram + side-by-side per-C density heatmaps
-      - optional checkerboard overlay
+Key outputs:
+  processed_image_data_folder/
+    tracked_tip_positions_mm.csv
+    tracked_tip_error_metrics.json
+    tracked_tip_error_vs_sample.png
+    tracked_tip_error_histogram.png
+    checkerboard_reference_annotated_analysis.png   (optional)
 
-Expected filename format
-------------------------
-The fixed-tip acquisition script saves images like:
-
-00001_tracked_block_X..._Y..._Z..._B..._C180.000_C180_TIP90.000_BPH0.50000_2026....png
-
-This script parses:
-  - stage X/Y/Z
-  - B
-  - C
-  - block name like C0 / C180
-  - TIP angle
-  - BPH block phase
-
-Usage example
--------------
-python3 offline_fixed_tip_dual_c_checkerboard_error_analysis.py \
-    --project_dir "/path/to/Point_Tracking_Run_2026-03-20_12-34-56" \
+Usage example:
+  python3 offline_run_checkerboard_circle_error_analysis.py \
+    --project_dir "/path/to/project" \
     --camera_calibration_file "/path/to/camera_calibration.npz" \
     --checkerboard_reference_image "/path/to/checkerboard_ref.png" \
     --threshold 200 \
     --save_plots \
     --tip_refine_mode edge_dt
 
-Notes
------
-- This expects shadow_calibration.py to be importable from the same folder or PYTHONPATH.
-- When per-sample predicted Cartesian targets are available from filename
-  metadata, each measured point is compared against its corresponding target
-  after centroid alignment into checkerboard mm coordinates.
-- If those predicted targets are unavailable, the script falls back to the
-  global measured centroid.
+Important:
+  - This script patches the filename parser used by shadow_calibration so that files named like:
+      00134_tracked_X90.604_Y31.876_Z-173.537_B-3.368_C-52.800_...
+    are parsed correctly.
+  - It uses X as the "ntnl_pos" placeholder and B as the "ss_pos" placeholder because
+    the existing pipeline expects a 3-value tuple from filename parsing.
 """
 
 import argparse
 import csv
 import json
-import math
 import os
 import re
 import shutil
@@ -76,17 +59,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
+import math
 import numpy as np
-from matplotlib.colors import LinearSegmentedColormap
-from matplotlib.collections import PathCollection
-from matplotlib.gridspec import GridSpec
 
-# -----------------------------------------------------------------------------
-# Import existing shadow calibration pipeline
-# -----------------------------------------------------------------------------
+# Add path to your shadow_calibration script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
+sys.path.append(SCRIPT_DIR)
 
 import shadow_calibration as shadow_calibration_module  # noqa: E402
 from shadow_calibration import CTR_Shadow_Calibration  # noqa: E402
@@ -97,21 +75,23 @@ _NEI8_W = [
     (0, -1, 1.0),                             (0, 1, 1.0),
     (1, -1, 2 ** 0.5),  (1, 0, 1.0),  (1, 1, 2 ** 0.5),
 ]
-DEFAULT_CHARUCO_BOARD = {
-    "squares_x": 10,
-    "squares_y": 14,
-    "square_size_mm": 15.0,
-    "marker_size_mm": 11.0,
-    "aruco_dictionary": "DICT_4X4",
-}
+CIRCLE_CENTER_X_DEFAULT = 100.0
+CIRCLE_CENTER_Z_DEFAULT = -125.0
+CIRCLE_RADIUS_DEFAULT = 18.0
+CIRCLE_SAMPLES_PER_QUARTER_DEFAULT = 50
+CIRCLE_RECORDED_PHASES = {"q1_pull", "q2_release", "q3_pull", "q4_release"}
+LEGACY_STAR_RECORDED_PHASES = {"right", "left"}
+_TRACKED_SAMPLE_RE = re.compile(
+    r"(?:^|_)(\d{5})_(q1_pull_start|q1_pull|pull_to_release_1|q2_release_start|q2_release|midpoint_c_flip|q3_pull_start|q3_pull|pull_to_release_2|q4_release_start|q4_release|final_recenter|right_start|right|mirror_flip|left|tracked)(?:_|$)"
+)
 
 
-# =============================================================================
+# -----------------------------
 # Utilities: IO and discovery
-# =============================================================================
+# -----------------------------
 def list_images(folder: Path) -> List[Path]:
     imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
-    imgs.sort()
+    imgs.sort(key=_image_sort_key)
     return imgs
 
 
@@ -159,27 +139,6 @@ def _json_ready(value: Any):
     return value
 
 
-def _board_reference_kwargs(cal: CTR_Shadow_Calibration, args) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {
-        "inner_corners": args.checkerboard_inner_corners,
-        "square_size_mm": args.checkerboard_square_size_mm,
-        "use_undistort": (not args.checkerboard_no_undistort),
-        "draw_debug": True,
-    }
-    meta = getattr(cal, "camera_calib_meta", None) or {}
-    board_type = str(meta.get("board_type", "checkerboard")).strip().lower()
-    if board_type == "charuco":
-        kwargs.update({
-            "squares_x": int(meta.get("squares_x", DEFAULT_CHARUCO_BOARD["squares_x"])),
-            "squares_y": int(meta.get("squares_y", DEFAULT_CHARUCO_BOARD["squares_y"])),
-            "marker_size_mm": float(meta.get("marker_size_mm", DEFAULT_CHARUCO_BOARD["marker_size_mm"])),
-            "aruco_dictionary": str(meta.get("aruco_dictionary", DEFAULT_CHARUCO_BOARD["aruco_dictionary"])),
-        })
-        if kwargs["square_size_mm"] is None:
-            kwargs["square_size_mm"] = float(meta.get("square_size_mm", DEFAULT_CHARUCO_BOARD["square_size_mm"]))
-    return kwargs
-
-
 def _parse_inner_corners_arg(value):
     if value is None:
         return None
@@ -215,6 +174,276 @@ def _scale_px_from_mm_homography(H: np.ndarray, mm_scale: float) -> np.ndarray:
     return H @ S_inv
 
 
+# -----------------------------------------
+# Filename parser patch for tracked_X..._B...
+# -----------------------------------------
+def robust_parse_positions_from_filename(file_name: str):
+    """
+    Supports filenames like:
+      00134_tracked_X90.604_Y31.876_Z-173.537_B-3.368_C-52.800_20260319_113124_658346.png
+
+    Returns:
+      orientation, ntnl_pos, ss_pos
+
+    Mapping used to keep compatibility with the existing pipeline:
+      - orientation = inferred from side token / C value / legacy numeric token
+      - ntnl_pos    = X value
+      - ss_pos      = B value
+    """
+    base = os.path.splitext(os.path.basename(file_name))[0]
+    parts = base.split("_")
+
+    orientation = None
+    side_token = None
+
+    values = {}
+    for p in parts:
+        p_lower = p.lower()
+        if p_lower in ("right", "left"):
+            side_token = p_lower
+        if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
+            key = p[0]
+            try:
+                values[key] = float(p[1:])
+            except Exception:
+                pass
+
+    if side_token == "right":
+        orientation = 0
+    elif side_token == "left":
+        orientation = 1
+
+    if orientation is None and "C" in values:
+        c_val = float(values["C"])
+        c_norm = ((c_val + 180.0) % 360.0) - 180.0
+        if abs(c_norm - 0.0) <= 5.0:
+            orientation = 0
+        elif abs(abs(c_norm) - 180.0) <= 5.0:
+            orientation = 1
+        elif abs(c_norm - 90.0) <= 5.0:
+            orientation = 2
+        elif abs(c_norm + 90.0) <= 5.0:
+            orientation = 3
+
+    if orientation is None and len(parts) > 0:
+        try:
+            candidate = int(parts[0])
+            if candidate in (0, 1, 2, 3):
+                orientation = candidate
+        except Exception:
+            pass
+
+    if orientation is None:
+        orientation = 0
+
+    if "X" not in values:
+        raise ValueError(f"Could not parse X value from filename: {file_name}")
+    if "B" not in values:
+        raise ValueError(f"Could not parse B value from filename: {file_name}")
+
+    ntnl_pos = float(values["X"])
+    ss_pos = float(values["B"])
+    return orientation, ntnl_pos, ss_pos
+
+
+def extract_named_values_from_filename(file_name: str) -> Dict[str, float]:
+    """
+    Extract numeric values from filename tokens such as X..., Y..., Z..., B..., C...
+    """
+    base = os.path.splitext(os.path.basename(file_name))[0]
+    values: Dict[str, float] = {}
+    for p in base.split("_"):
+        if len(p) < 2 or p[0] not in ("X", "Y", "Z", "B", "C"):
+            continue
+        try:
+            values[p[0]] = float(p[1:])
+        except Exception:
+            continue
+    return values
+
+
+def parse_tracked_sample_metadata(file_name: str) -> Tuple[Optional[int], Optional[str]]:
+    m = _TRACKED_SAMPLE_RE.search(os.path.basename(file_name))
+    if not m:
+        return None, None
+    return int(m.group(1)), str(m.group(2))
+
+
+def _image_sort_key(path: Path):
+    sample_idx, phase = parse_tracked_sample_metadata(path.name)
+    if sample_idx is not None:
+        return (0, int(sample_idx), str(phase), path.name)
+    return (1, path.name)
+
+
+def build_circle_tip_lookup(
+    center_x: float,
+    center_z: float,
+    radius: float,
+    samples_per_quarter: int,
+    capture_at_start: bool = False,
+    capture_every_n_circle_moves: int = 1,
+) -> Dict[int, Dict[str, float]]:
+    samples_per_quarter = int(max(2, samples_per_quarter))
+    capture_every_n_circle_moves = max(1, int(capture_every_n_circle_moves))
+
+    quarter_angles = [
+        np.linspace(-0.5 * math.pi, 0.0, samples_per_quarter, endpoint=True),
+        np.linspace(0.0, 0.5 * math.pi, samples_per_quarter, endpoint=True),
+        np.linspace(0.5 * math.pi, math.pi, samples_per_quarter, endpoint=True),
+        np.linspace(math.pi, 1.5 * math.pi, samples_per_quarter, endpoint=True),
+    ]
+
+    lookup: Dict[int, Dict[str, float]] = {}
+    sample_idx = 0
+    circle_move_counter = 0
+
+    if bool(capture_at_start):
+        a0 = float(quarter_angles[0][0])
+        sample_idx += 1
+        lookup[sample_idx] = {
+            "desired_tip_x_mm": float(center_x + radius * math.cos(a0)),
+            "desired_tip_z_mm": float(center_z + radius * math.sin(a0)),
+        }
+
+    for q_angles in quarter_angles:
+        for ang in q_angles[1:]:
+            circle_move_counter += 1
+            if (circle_move_counter % capture_every_n_circle_moves) != 0:
+                continue
+            sample_idx += 1
+            lookup[sample_idx] = {
+                "desired_tip_x_mm": float(center_x + radius * math.cos(float(ang))),
+                "desired_tip_z_mm": float(center_z + radius * math.sin(float(ang))),
+            }
+
+    return lookup
+
+
+def build_circle_tip_lookup_from_planned_csv(
+    planned_csv_path: Path,
+    capture_at_start: bool = False,
+    capture_every_n_circle_moves: int = 1,
+) -> Dict[int, Dict[str, float]]:
+    planned_csv_path = Path(planned_csv_path).expanduser().resolve()
+    if not planned_csv_path.exists():
+        raise FileNotFoundError(f"planned command CSV not found: {planned_csv_path}")
+
+    rows = []
+    with open(planned_csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    if not rows:
+        raise RuntimeError(f"planned command CSV is empty: {planned_csv_path}")
+
+    lookup: Dict[int, Dict[str, float]] = {}
+    sample_idx = 0
+    circle_move_counter = 0
+    capture_every_n_circle_moves = max(1, int(capture_every_n_circle_moves))
+
+    first = rows[0]
+    if bool(capture_at_start):
+        sample_idx += 1
+        lookup[sample_idx] = {
+            "desired_tip_x_mm": float(first["tip_x"]),
+            "desired_tip_z_mm": float(first["tip_z"]),
+        }
+
+    for row in rows[1:]:
+        phase = str(row.get("phase", "")).strip()
+        if phase not in CIRCLE_RECORDED_PHASES and phase not in LEGACY_STAR_RECORDED_PHASES:
+            continue
+        circle_move_counter += 1
+        if (circle_move_counter % capture_every_n_circle_moves) != 0:
+            continue
+        sample_idx += 1
+        lookup[sample_idx] = {
+            "desired_tip_x_mm": float(row["tip_x"]),
+            "desired_tip_z_mm": float(row["tip_z"]),
+        }
+
+    return lookup
+
+
+def resolve_desired_tip_lookup(project_dir: Path, args) -> Dict[int, Dict[str, float]]:
+    candidate_csvs = []
+    if getattr(args, "planned_command_csv", None):
+        candidate_csvs.append(Path(args.planned_command_csv).expanduser())
+    candidate_csvs.append(Path(project_dir) / "planned_command_sequence.csv")
+
+    for candidate in candidate_csvs:
+        try:
+            if candidate.exists():
+                lookup = build_circle_tip_lookup_from_planned_csv(
+                    candidate,
+                    capture_at_start=bool(args.capture_at_start),
+                    capture_every_n_circle_moves=int(args.capture_every_n_circle_moves),
+                )
+                print(f"[INFO] Using planned command CSV for desired lookup: {candidate}")
+                return lookup
+        except Exception as e:
+            print(f"[WARN] Failed to use planned command CSV {candidate}: {e}")
+
+    print("[INFO] planned_command_sequence.csv not found; using ideal circle lookup fallback.")
+    return build_circle_tip_lookup(
+        center_x=float(args.circle_center_x_mm),
+        center_z=float(args.circle_center_z_mm),
+        radius=float(args.circle_radius_mm),
+        samples_per_quarter=int(args.circle_samples_per_quarter),
+        capture_at_start=bool(args.capture_at_start),
+        capture_every_n_circle_moves=int(args.capture_every_n_circle_moves),
+    )
+
+
+def patch_filename_parser():
+    """
+    Patch shadow_calibration filename parsing so analyze_data_batch can read
+    filenames like:
+      00134_tracked_X90.604_Y31.876_Z-173.537_B-3.368_C-52.800_...
+    """
+    shadow_calibration_module._get_pos_from_file_name = robust_parse_positions_from_filename
+    print("[INFO] Patched filename parser for tracked_X..._B... style filenames.")
+
+
+def normalize_raw_filenames_for_shadow_parser(raw_folder: Path) -> List[Tuple[str, str]]:
+    """
+    Rename files in-place so shadow_calibration's legacy parser can read them.
+
+    Legacy parser requirement:
+      {orientation}_{X}_{B}_...
+    """
+    rename_pairs: List[Tuple[str, str]] = []
+
+    for src in list_images(raw_folder):
+        try:
+            orientation, ntnl_pos, ss_pos = robust_parse_positions_from_filename(src.name)
+        except Exception:
+            continue
+
+        base = src.stem
+        legacy_prefix = f"{int(orientation)}_{float(ntnl_pos):.6f}_{float(ss_pos):.6f}_"
+        if base.startswith(legacy_prefix):
+            continue
+
+        dst_name = f"{legacy_prefix}{base}{src.suffix}"
+        dst = src.with_name(dst_name)
+        counter = 1
+        while dst.exists() and dst != src:
+            dst_name = f"{legacy_prefix}{base}__{counter}{src.suffix}"
+            dst = src.with_name(dst_name)
+            counter += 1
+
+        src.rename(dst)
+        rename_pairs.append((src.name, dst.name))
+
+    return rename_pairs
+
+
+# -----------------------------------------
+# Checkerboard reference correction helpers
+# -----------------------------------------
 def apply_checkerboard_reference_corrections(
     cal: CTR_Shadow_Calibration,
     mm_scale: float = 0.5,
@@ -328,9 +557,9 @@ def collect_board_reference_info(cal: CTR_Shadow_Calibration) -> Dict[str, Any]:
     }
 
 
-# =============================================================================
+# -------------------------------------------
 # GUI: crop selection from one image
-# =============================================================================
+# -------------------------------------------
 def interactive_crop_from_image(
     image_bgr: np.ndarray,
     default_crop=None,
@@ -485,9 +714,9 @@ def interactive_crop_from_image(
     return analysis_crop
 
 
-# =============================================================================
+# ------------------------------------------
 # Tip refinement helpers
-# =============================================================================
+# ------------------------------------------
 def _tip_angle_to_direction_xy(tip_angle_deg: float) -> np.ndarray:
     ang = np.deg2rad(float(tip_angle_deg))
     vx = float(np.sin(ang))
@@ -586,7 +815,7 @@ def _cross_section_boundaries(mask_fg: np.ndarray, center_xy: np.ndarray, normal
         p = center_xy + t * n
         x = int(round(float(p[0])))
         y = int(round(float(p[1])))
-        inside[i] = (0 <= x < w and 0 <= y < h and mask_fg[y, x] == 1)
+        inside[i] = (0 <= x < w) and (0 <= y < h) and (mask_fg[y, x] == 1)
 
     if not np.any(inside):
         return None
@@ -820,7 +1049,7 @@ def robust_tangent_from_path_window(xy: np.ndarray, s: np.ndarray, s0: float, s1
         return v / max(n, 1e-9)
 
     mu = pts.mean(axis=0)
-    _, _, vh = np.linalg.svd(pts - mu, full_matrices=False)
+    uu, ss, vh = np.linalg.svd(pts - mu, full_matrices=False)
     t = vh[0]
     if np.dot(t, xy[-1] - xy[0]) < 0:
         t = -t
@@ -1022,29 +1251,6 @@ def refine_tip_parallel_centerline(
     return float(tip_xy[1]), float(tip_xy[0]), dbg
 
 
-def _parallel_distance_tip_xy(dbg: Dict[str, Any]) -> Optional[np.ndarray]:
-    if not isinstance(dbg, dict):
-        return None
-
-    tip_xy = np.asarray(dbg.get("tip_xy", []), dtype=float).reshape(-1)
-    d_xy = np.asarray(dbg.get("d_xy", []), dtype=float).reshape(-1)
-    if tip_xy.size != 2 or d_xy.size != 2 or not np.all(np.isfinite(tip_xy)) or not np.all(np.isfinite(d_xy)):
-        return None
-
-    width_px = dbg.get("width_px")
-    radius_px = dbg.get("radius_px")
-    if width_px is not None and np.isfinite(float(width_px)):
-        backoff_px = 0.5 * float(width_px)
-    elif radius_px is not None and np.isfinite(float(radius_px)):
-        backoff_px = float(radius_px)
-    else:
-        return None
-
-    if backoff_px <= 0:
-        return None
-    return tip_xy - backoff_px * d_xy
-
-
 def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = ""):
     if axs is None or not isinstance(dbg, dict):
         return
@@ -1060,6 +1266,7 @@ def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = 
             target_axes = [axs]
 
         used_labels = set()
+        mode = str(dbg.get("mode", "tip_refine"))
         tip_xy = np.asarray(dbg.get("tip_xy", []), dtype=float).reshape(-1)
 
         for ax in target_axes:
@@ -1080,7 +1287,7 @@ def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = 
 
             _plot_line("parallel_left_line_xy", "#00ff66", "tube side lines")
             _plot_line("parallel_right_line_xy", "#00ff66", "tube side lines")
-            _plot_line("center_line_xy", "#ffd400", "center line")
+            _plot_line("center_line_xy", "#ffd400", "center parallel line")
             _plot_line("center_line_full_xy", "#ffaa00", "center line (full)")
 
             if "path_window_xy" in dbg:
@@ -1110,12 +1317,12 @@ def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = 
                 ax.scatter([p[0]], [p[1]], s=40, c="#ffffff", edgecolors="#000000", label=lbl, zorder=5)
 
             if tip_xy.size == 2 and np.all(np.isfinite(tip_xy)):
-                lbl = "refined tip" if "refined tip" not in used_labels else None
+                lbl = f"refined tip ({mode})" if f"refined tip ({mode})" not in used_labels else None
                 if lbl is not None:
-                    used_labels.add("refined tip")
+                    used_labels.add(lbl)
                 ax.scatter([tip_xy[0]], [tip_xy[1]], s=55, c="#ff3b30", edgecolors="#ffffff", label=lbl, zorder=6)
                 ax.annotate(
-                    "tip",
+                    f"tip{title_suffix}",
                     (tip_xy[0], tip_xy[1]),
                     xytext=(6, -8),
                     textcoords="offset points",
@@ -1124,52 +1331,12 @@ def annotate_tip_geometry_on_axes(axs, dbg: Dict[str, Any], title_suffix: str = 
                     bbox=dict(boxstyle="round,pad=0.2", fc="black", ec="none", alpha=0.55),
                 )
 
+            try:
+                ax.legend(loc="best", fontsize=8)
+            except Exception:
+                pass
     except Exception as e:
         print(f"[WARN] Failed to annotate analysis axes: {e}")
-
-
-def _remove_zoom_coarse_tip_markers(axs):
-    if axs is None or not isinstance(axs, np.ndarray) or axs.size < 4:
-        return
-
-    for ax in (axs[1, 0], axs[1, 1]):
-        for coll in list(ax.collections):
-            if not isinstance(coll, PathCollection):
-                continue
-            try:
-                offsets = np.asarray(coll.get_offsets(), dtype=float)
-            except Exception:
-                continue
-            if offsets.ndim == 2 and offsets.shape[0] == 1:
-                coll.remove()
-
-        legend = ax.get_legend()
-        if legend is not None:
-            legend.remove()
-
-    try:
-        axs[1, 0].set_title("Refined tip geometry")
-    except Exception:
-        pass
-
-
-def _remove_analysis_legends(axs):
-    if axs is None:
-        return
-
-    if isinstance(axs, np.ndarray):
-        target_axes = list(axs.flat)
-    elif isinstance(axs, (list, tuple)):
-        target_axes = list(axs)
-    else:
-        target_axes = [axs]
-
-    for ax in target_axes:
-        if ax is None:
-            continue
-        legend = ax.get_legend()
-        if legend is not None:
-            legend.remove()
 
 
 def _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min: int, zoom_x_max: int, zoom_y_min: int, zoom_y_max: int):
@@ -1353,138 +1520,21 @@ def patch_analyze_data_for_tip_refinement(
         dbg_local["image_file_name"] = image_file_name
         dbg_local["tip_angle_deg"] = tip_angle_deg
         dbg_local["coarse_tip_before_local_xy"] = [float(tip_x), float(tip_y)]
-        dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
-
-        if refine_mode == "parallel_centerline":
-            analysis_tip_xy = _parallel_distance_tip_xy(dbg_local)
-            if analysis_tip_xy is not None:
-                dbg_local["branch_end_tip_xy"] = _json_ready(dbg_local.get("tip_xy"))
-                dbg_local["parallel_distance_tip_xy"] = analysis_tip_xy.tolist()
-                dbg_local["tip_xy"] = analysis_tip_xy.tolist()
-                center_line_xy = np.asarray(dbg_local.get("center_line_xy", []), dtype=float).reshape(-1, 2)
-                if center_line_xy.shape[0] >= 1:
-                    dbg_local["center_line_xy"] = [center_line_xy[0].tolist(), analysis_tip_xy.tolist()]
-                xx = float(analysis_tip_xy[0])
-                yy = float(analysis_tip_xy[1])
-
         dbg_local["coarse_tip_after_local_xy"] = [float(xx), float(yy)]
+        dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
         cal.tip_refine_debug_records[image_file_name] = _json_ready(dbg_local)
 
         _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
-        _remove_zoom_coarse_tip_markers(axs)
-        _remove_analysis_legends(axs)
-        if refine_mode != "parallel_centerline":
-            annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=f" ({refine_mode})")
-            _remove_analysis_legends(axs)
-
-        coarse_row_refined[0] = yy + crop_y_min_img
-        coarse_row_refined[1] = xx + crop_x_min_img
+        annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=f" ({refine_mode})")
         return fig, axs, coarse_row_refined, fine_row
 
     cal.analyze_data = analyze_data_patched
     return cal
 
 
-# =============================================================================
-# Filename metadata parsing for the first script
-# =============================================================================
-_NUM = r"[-+]?\d+(?:\.\d+)?"
-
-RE_STAGE_X = re.compile(rf"_X({_NUM})")
-RE_STAGE_Y = re.compile(rf"_Y({_NUM})")
-RE_STAGE_Z = re.compile(rf"_Z({_NUM})")
-RE_B_VAL = re.compile(rf"_B({_NUM})")
-RE_C_VAL = re.compile(rf"_C({_NUM})")
-RE_TIP_VAL = re.compile(rf"_TIP({_NUM})")
-RE_BPH_VAL = re.compile(rf"_BPH({_NUM})")
-RE_SAMPLE_IDX = re.compile(r"^(\d+)_")
-RE_PHASE = re.compile(r"^\d+_([^_]+)")
-RE_BLOCK_NAME = re.compile(r"_(C0|C180)(?:_|$)")
-
-
-def _safe_float_from_match(regex: re.Pattern, text: str) -> Optional[float]:
-    m = regex.search(text)
-    if not m:
-        return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
-
-
-def _safe_int_from_match(regex: re.Pattern, text: str) -> Optional[int]:
-    m = regex.search(text)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def _safe_str_from_match(regex: re.Pattern, text: str) -> Optional[str]:
-    m = regex.search(text)
-    if not m:
-        return None
-    return str(m.group(1))
-
-
-def canonicalize_c_orientation(c_deg: Optional[float], round_decimals: int = 3) -> Optional[float]:
-    if c_deg is None or not np.isfinite(c_deg):
-        return None
-    return float(np.round(float(c_deg), int(round_decimals)))
-
-
-def infer_block_name_from_c(c_deg: Optional[float]) -> Optional[str]:
-    if c_deg is None or not np.isfinite(c_deg):
-        return None
-    c = canonicalize_c_orientation(c_deg)
-    if abs(c - 0.0) < 1e-6:
-        return "C0"
-    if abs(c - 180.0) < 1e-6:
-        return "C180"
-    return f"C{c:g}"
-
-
-def parse_fixed_tip_filename_metadata(image_name: str) -> Dict[str, Any]:
-    """
-    Parse metadata embedded in filenames produced by the first script.
-    """
-    stem = Path(image_name).stem
-
-    sample_index = _safe_int_from_match(RE_SAMPLE_IDX, stem)
-    phase = _safe_str_from_match(RE_PHASE, stem)
-    stage_x = _safe_float_from_match(RE_STAGE_X, stem)
-    stage_y = _safe_float_from_match(RE_STAGE_Y, stem)
-    stage_z = _safe_float_from_match(RE_STAGE_Z, stem)
-    b_val = _safe_float_from_match(RE_B_VAL, stem)
-    c_val = _safe_float_from_match(RE_C_VAL, stem)
-    tip_angle_deg = _safe_float_from_match(RE_TIP_VAL, stem)
-    block_phase_01 = _safe_float_from_match(RE_BPH_VAL, stem)
-    block_name = _safe_str_from_match(RE_BLOCK_NAME, stem)
-
-    c_orientation_deg = canonicalize_c_orientation(c_val)
-    if block_name is None:
-        block_name = infer_block_name_from_c(c_orientation_deg)
-
-    return {
-        "sample_index_from_name": sample_index,
-        "phase_name": phase,
-        "stage_x_cmd": stage_x,
-        "stage_y_cmd": stage_y,
-        "stage_z_cmd": stage_z,
-        "b_cmd": b_val,
-        "c_cmd_deg": c_val,
-        "c_orientation_deg": c_orientation_deg,
-        "tip_angle_deg_from_name": tip_angle_deg,
-        "block_phase_01": block_phase_01,
-        "block_name": block_name,
-    }
-
-
-# =============================================================================
-# Overlay helper
-# =============================================================================
+# -----------------------------------------
+# Visualization helpers
+# -----------------------------------------
 def draw_checkerboard_analysis_overlay(
     cal: CTR_Shadow_Calibration,
     output_path: Path,
@@ -1562,17 +1612,26 @@ def draw_checkerboard_analysis_overlay(
     return output_path
 
 
-# =============================================================================
-# Core mm conversion + error analysis
-# =============================================================================
+# -----------------------------------------
+# Error analysis in checkerboard mm frame
+# -----------------------------------------
+def _extract_b_value_from_row(row: np.ndarray) -> float:
+    if row is None or len(row) < 4:
+        return float("nan")
+    try:
+        return float(row[3])
+    except Exception:
+        return float("nan")
+
+
 def compute_tracked_tip_positions_mm(
     cal: CTR_Shadow_Calibration,
     tracked_rows: np.ndarray,
     image_files: List[Path],
+    desired_tip_lookup: Optional[Dict[int, Dict[str, float]]] = None,
 ) -> Dict[str, Any]:
     """
-    Convert tracked tip pixel coordinates to checkerboard-referenced mm and
-    attach metadata parsed from fixed-tip dual-C filenames.
+    Convert tracked tip pixel coordinates to checkerboard-referenced mm.
     """
     if getattr(cal, "board_pose", None) is None:
         raise RuntimeError("Checkerboard board_pose is not available.")
@@ -1584,21 +1643,25 @@ def compute_tracked_tip_positions_mm(
     records = []
     mm_points = []
     valid_indices = []
+    matched_measured_mm_points = []
+    desired_mm_points = []
+    matched_valid_indices = []
 
     for i, row in enumerate(np.asarray(tracked_rows, dtype=float)):
         file_name = image_files[i].name if i < len(image_files) else f"sample_{i:04d}"
-        meta = parse_fixed_tip_filename_metadata(file_name)
-
-        if not np.all(np.isfinite(row[:2])):
+        tracked_sample_idx, tracked_phase = parse_tracked_sample_metadata(file_name)
+        csv_sample_index = int(tracked_sample_idx) if tracked_sample_idx is not None else int(i)
+        if row.size < 2 or not np.all(np.isfinite(row[:2])):
             records.append({
-                "sample_index": i,
+                "sample_index": csv_sample_index,
                 "image_name": file_name,
                 "tip_y_px": None,
                 "tip_x_px": None,
                 "u_mm": None,
                 "z_mm": None,
+                "b_pull_mm": None,
+                "phase": tracked_phase,
                 "valid": False,
-                **meta,
             })
             continue
 
@@ -1619,98 +1682,116 @@ def compute_tracked_tip_positions_mm(
             valid = False
 
         rec = {
-            "sample_index": i,
+            "sample_index": csv_sample_index,
             "image_name": file_name,
             "tip_y_px": y_px,
             "tip_x_px": x_px,
             "u_mm": u_mm if valid else None,
             "z_mm": z_mm if valid else None,
+            "b_pull_mm": _extract_b_value_from_row(row),
+            "phase": tracked_phase,
             "valid": bool(valid),
-            **meta,
         }
+        named_values = extract_named_values_from_filename(file_name)
+        rec["stage_x_mm"] = float(named_values["X"]) if "X" in named_values else None
+        rec["stage_y_mm"] = float(named_values["Y"]) if "Y" in named_values else None
+        rec["stage_z_mm"] = float(named_values["Z"]) if "Z" in named_values else None
+        desired_tip = desired_tip_lookup.get(tracked_sample_idx) if (desired_tip_lookup and tracked_sample_idx is not None) else None
+        rec["desired_x_mm"] = float(desired_tip["desired_tip_x_mm"]) if desired_tip is not None else rec["stage_x_mm"]
+        rec["desired_y_mm"] = rec["stage_y_mm"]
+        rec["desired_z_mm"] = float(desired_tip["desired_tip_z_mm"]) if desired_tip is not None else rec["stage_z_mm"]
         records.append(rec)
 
         if valid:
             mm_points.append([u_mm, z_mm])
             valid_indices.append(i)
+            if rec["desired_x_mm"] is not None and rec["desired_z_mm"] is not None:
+                matched_measured_mm_points.append([u_mm, z_mm])
+                desired_mm_points.append([float(rec["desired_x_mm"]), float(rec["desired_z_mm"])])
+                matched_valid_indices.append(i)
 
     mm_points = np.asarray(mm_points, dtype=float) if len(mm_points) else np.empty((0, 2), dtype=float)
+    matched_measured_mm_points = (
+        np.asarray(matched_measured_mm_points, dtype=float)
+        if len(matched_measured_mm_points) else np.empty((0, 2), dtype=float)
+    )
+    desired_mm_points = (
+        np.asarray(desired_mm_points, dtype=float) if len(desired_mm_points) else np.empty((0, 2), dtype=float)
+    )
 
     return {
         "records": records,
         "valid_indices": valid_indices,
         "mm_points": mm_points,
+        "matched_measured_mm_points": matched_measured_mm_points,
+        "desired_mm_points": desired_mm_points,
+        "matched_valid_indices": matched_valid_indices,
     }
 
 
-def build_reference_points_mm(
-    records: List[Dict[str, Any]],
-    valid_indices: List[int],
-    mm_points: np.ndarray,
-) -> Dict[str, Any]:
+def _closest_points_on_polyline(points_xy: np.ndarray, polyline_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    points_xy = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+    polyline_xy = np.asarray(polyline_xy, dtype=float).reshape(-1, 2)
+    if points_xy.shape[0] == 0:
+        return np.empty((0, 2), dtype=float), np.empty((0,), dtype=int)
+    if polyline_xy.shape[0] == 0:
+        raise RuntimeError("Desired curve is empty.")
+    if polyline_xy.shape[0] == 1:
+        nearest = np.repeat(polyline_xy, points_xy.shape[0], axis=0)
+        return nearest, np.zeros((points_xy.shape[0],), dtype=int)
+
+    seg_starts = polyline_xy[:-1]
+    seg_ends = polyline_xy[1:]
+    seg_vecs = seg_ends - seg_starts
+    seg_len_sq = np.sum(seg_vecs * seg_vecs, axis=1)
+
+    nearest_points = np.empty_like(points_xy)
+    nearest_seg_indices = np.zeros((points_xy.shape[0],), dtype=int)
+
+    for i, p in enumerate(points_xy):
+        best_dist_sq = float("inf")
+        best_proj = None
+        best_seg_idx = 0
+        for seg_idx, (a, v, vv) in enumerate(zip(seg_starts, seg_vecs, seg_len_sq)):
+            if vv <= 1e-12:
+                proj = a
+            else:
+                t = float(np.dot(p - a, v) / vv)
+                t = min(1.0, max(0.0, t))
+                proj = a + t * v
+            dist_sq = float(np.sum((p - proj) ** 2))
+            if dist_sq < best_dist_sq:
+                best_dist_sq = dist_sq
+                best_proj = proj
+                best_seg_idx = seg_idx
+        nearest_points[i] = best_proj
+        nearest_seg_indices[i] = best_seg_idx
+
+    return nearest_points, nearest_seg_indices
+
+
+def compute_error_metrics(measured_mm_points: np.ndarray, desired_mm_points: np.ndarray) -> Dict[str, Any]:
     """
-    Use the centroid of each sample's C-orientation group as that sample's
-    reference point.
-    """
-    mm_points = np.asarray(mm_points, dtype=float).reshape(-1, 2)
-    if mm_points.shape[0] == 0:
-        raise RuntimeError("No valid mm points available for error analysis.")
-
-    if len(valid_indices) != mm_points.shape[0]:
-        raise RuntimeError("valid_indices must match mm_points rows.")
-
-    grouped_points: Dict[str, List[np.ndarray]] = {}
-    local_keys: List[str] = []
-    for global_idx, pt_mm in zip(valid_indices, mm_points):
-        rec = records[global_idx] if 0 <= global_idx < len(records) else {}
-        c_orientation_deg = rec.get("c_orientation_deg", None)
-        key = "unknown" if c_orientation_deg is None else f"{float(c_orientation_deg):.3f}"
-        grouped_points.setdefault(key, []).append(np.asarray(pt_mm, dtype=float))
-        local_keys.append(key)
-
-    group_centroids = {
-        key: np.mean(np.asarray(pts, dtype=float).reshape(-1, 2), axis=0)
-        for key, pts in grouped_points.items()
-    }
-    reference_points = np.asarray([group_centroids[key] for key in local_keys], dtype=float).reshape(-1, 2)
-    ref_mean = np.mean(reference_points, axis=0)
-    return {
-        "reference_points_mm": reference_points,
-        "reference_point_mm": {
-            "u_mean_mm": float(ref_mean[0]),
-            "z_mean_mm": float(ref_mean[1]),
-        },
-        "reference_points_raw_mm": None,
-        "reference_mode": "per_c_centroid",
-        "reference_description": (
-            "Each measured point is compared to the centroid of its own valid "
-            "C-orientation group in checkerboard-referenced coordinates."
-        ),
-        "alignment_shift_mm": {
-            "u_mm": 0.0,
-            "z_mm": 0.0,
-        },
-    }
-
-
-def compute_global_error_metrics(
-    mm_points: np.ndarray,
-    reference_points_mm: np.ndarray,
-    reference_meta: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Error = Euclidean distance between each measured point and its corresponding
-    reference point.
+    Align measured points to desired points by matching their mean centers.
+    Error for each sample = Euclidean distance to the closest point on the desired curve.
     RMSE = sqrt(mean(error^2))
     """
-    mm_points = np.asarray(mm_points, dtype=float).reshape(-1, 2)
-    reference_points_mm = np.asarray(reference_points_mm, dtype=float).reshape(-1, 2)
-    if mm_points.shape[0] == 0:
-        raise RuntimeError("No valid mm points available for error analysis.")
-    if reference_points_mm.shape != mm_points.shape:
-        raise RuntimeError("Reference points must match measured mm_points shape.")
+    measured_mm_points = np.asarray(measured_mm_points, dtype=float).reshape(-1, 2)
+    desired_mm_points = np.asarray(desired_mm_points, dtype=float).reshape(-1, 2)
+    if measured_mm_points.shape[0] == 0:
+        raise RuntimeError("No valid measured mm points available for error analysis.")
+    if desired_mm_points.shape[0] == 0:
+        raise RuntimeError("No desired mm points available for aligned error analysis.")
 
-    deltas = mm_points - reference_points_mm
+    measured_mean = np.mean(measured_mm_points, axis=0)
+    desired_mean = np.mean(desired_mm_points, axis=0)
+    alignment_offset = desired_mean - measured_mean
+    aligned_measured_points = measured_mm_points + alignment_offset[None, :]
+    closest_desired_points, closest_segment_indices = _closest_points_on_polyline(
+        aligned_measured_points,
+        desired_mm_points,
+    )
+    deltas = aligned_measured_points - closest_desired_points
     dist_mm = np.linalg.norm(deltas, axis=1)
 
     rmse_mm = float(np.sqrt(np.mean(dist_mm ** 2)))
@@ -1721,153 +1802,149 @@ def compute_global_error_metrics(
     median_err_mm = float(np.median(dist_mm))
 
     return {
-        "reference_point_mm": reference_meta["reference_point_mm"],
-        "reference_points_mm": reference_points_mm,
-        "reference_points_raw_mm": reference_meta.get("reference_points_raw_mm"),
-        "reference_mode": str(reference_meta.get("reference_mode", "unknown")),
-        "reference_description": str(reference_meta.get("reference_description", "")),
-        "alignment_shift_mm": dict(reference_meta.get("alignment_shift_mm", {})),
+        "reference_point_mm": {
+            "u_mean_mm": float(desired_mean[0]),
+            "z_mean_mm": float(desired_mean[1]),
+        },
+        "measured_mean_mm": {
+            "u_mean_mm": float(measured_mean[0]),
+            "z_mean_mm": float(measured_mean[1]),
+        },
+        "desired_mean_mm": {
+            "u_mean_mm": float(desired_mean[0]),
+            "z_mean_mm": float(desired_mean[1]),
+        },
+        "alignment_offset_mm": {
+            "du_mm": float(alignment_offset[0]),
+            "dz_mm": float(alignment_offset[1]),
+        },
         "errors_mm": dist_mm,
         "deltas_mm": deltas,
+        "aligned_measured_mm_points": aligned_measured_points,
+        "desired_mm_points": desired_mm_points,
+        "closest_desired_mm_points": closest_desired_points,
+        "closest_desired_segment_indices": closest_segment_indices,
         "rmse_mm": rmse_mm,
         "mean_error_mm": mean_err_mm,
         "std_error_mm": std_err_mm,
         "median_error_mm": median_err_mm,
         "min_error_mm": min_err_mm,
         "max_error_mm": max_err_mm,
-        "num_samples": int(mm_points.shape[0]),
+        "num_samples": int(measured_mm_points.shape[0]),
     }
 
 
 def attach_errors_to_records(
     records: List[Dict[str, Any]],
     valid_indices: List[int],
-    reference_points_mm: np.ndarray,
-    reference_points_raw_mm: Optional[np.ndarray],
     deltas_mm: np.ndarray,
     errors_mm: np.ndarray,
+    aligned_measured_mm_points: np.ndarray,
+    closest_desired_mm_points: np.ndarray,
 ):
     idx_to_local = {global_idx: k for k, global_idx in enumerate(valid_indices)}
 
     for i, rec in enumerate(records):
         if i not in idx_to_local:
-            rec["du_to_reference_mm"] = None
-            rec["dz_to_reference_mm"] = None
-            rec["reference_u_mm"] = None
-            rec["reference_z_mm"] = None
-            rec["reference_u_raw_mm"] = None
-            rec["reference_z_raw_mm"] = None
-            rec["du_from_global_mean_mm"] = None
-            rec["dz_from_global_mean_mm"] = None
-            rec["du_from_c_centroid_mm"] = None
-            rec["dz_from_c_centroid_mm"] = None
+            rec["aligned_u_mm"] = None
+            rec["aligned_z_mm"] = None
+            rec["closest_desired_u_mm"] = None
+            rec["closest_desired_z_mm"] = None
+            rec["du_aligned_to_desired_mm"] = None
+            rec["dz_aligned_to_desired_mm"] = None
             rec["error_distance_mm"] = None
             continue
 
         k = idx_to_local[i]
-        rec["reference_u_mm"] = float(reference_points_mm[k, 0])
-        rec["reference_z_mm"] = float(reference_points_mm[k, 1])
-        if reference_points_raw_mm is None:
-            rec["reference_u_raw_mm"] = None
-            rec["reference_z_raw_mm"] = None
-        else:
-            rec["reference_u_raw_mm"] = float(reference_points_raw_mm[k, 0])
-            rec["reference_z_raw_mm"] = float(reference_points_raw_mm[k, 1])
-        rec["du_to_reference_mm"] = float(deltas_mm[k, 0])
-        rec["dz_to_reference_mm"] = float(deltas_mm[k, 1])
-        rec["du_from_global_mean_mm"] = float(deltas_mm[k, 0])
-        rec["dz_from_global_mean_mm"] = float(deltas_mm[k, 1])
-        rec["du_from_c_centroid_mm"] = float(deltas_mm[k, 0])
-        rec["dz_from_c_centroid_mm"] = float(deltas_mm[k, 1])
+        rec["aligned_u_mm"] = float(aligned_measured_mm_points[k, 0])
+        rec["aligned_z_mm"] = float(aligned_measured_mm_points[k, 1])
+        rec["closest_desired_u_mm"] = float(closest_desired_mm_points[k, 0])
+        rec["closest_desired_z_mm"] = float(closest_desired_mm_points[k, 1])
+        rec["du_aligned_to_desired_mm"] = float(deltas_mm[k, 0])
+        rec["dz_aligned_to_desired_mm"] = float(deltas_mm[k, 1])
         rec["error_distance_mm"] = float(errors_mm[k])
 
     return records
 
 
-def compute_per_orientation_metrics(
-    records: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    Compute metrics grouped by C orientation using the same per-sample reference
-    definition already attached to each record.
-    """
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
+def _phase_to_quarter_label(phase: Optional[str]) -> Optional[str]:
+    phase_str = str(phase).strip() if phase is not None else ""
+    if phase_str.startswith("q1_pull"):
+        return "q1_pull"
+    if phase_str.startswith("q2_release"):
+        return "q2_release"
+    if phase_str.startswith("q3_pull"):
+        return "q3_pull"
+    if phase_str.startswith("q4_release"):
+        return "q4_release"
+    return None
+
+
+def compute_quarter_error_stats(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    quarter_errors: Dict[str, List[float]] = {
+        "q1_pull": [],
+        "q2_release": [],
+        "q3_pull": [],
+        "q4_release": [],
+    }
+
     for rec in records:
-        if not rec.get("valid", False) or rec.get("error_distance_mm") is None:
+        err = rec.get("error_distance_mm")
+        if err is None:
             continue
-        c_orientation_deg = rec.get("c_orientation_deg", None)
-        if c_orientation_deg is None or not np.isfinite(c_orientation_deg):
-            key = "unknown"
-        else:
-            key = f"{float(c_orientation_deg):.3f}"
-        grouped.setdefault(key, []).append(rec)
-
-    out = {}
-    for key, recs in sorted(grouped.items(), key=lambda kv: kv[0]):
-        pts = np.asarray([[float(r["u_mm"]), float(r["z_mm"])] for r in recs], dtype=float)
-        if pts.size == 0:
+        quarter = _phase_to_quarter_label(rec.get("phase"))
+        if quarter is None:
             continue
+        quarter_errors[quarter].append(float(err))
 
-        refs = np.asarray(
-            [[float(r["reference_u_mm"]), float(r["reference_z_mm"])] for r in recs],
-            dtype=float,
-        )
-        deltas = pts - refs
-        errs = np.asarray([float(r["error_distance_mm"]) for r in recs], dtype=float)
-        c_vals = [r.get("c_orientation_deg") for r in recs if r.get("c_orientation_deg") is not None]
-        tip_vals = [r.get("tip_angle_deg_from_name") for r in recs if r.get("tip_angle_deg_from_name") is not None]
-
-        out[key] = {
-            "c_orientation_deg": None if not c_vals else float(np.median(np.asarray(c_vals, dtype=float))),
-            "num_samples": int(len(recs)),
-            "rmse_mm": float(np.sqrt(np.mean(errs ** 2))),
-            "mean_error_mm": float(np.mean(errs)),
-            "std_error_mm": float(np.std(errs)),
-            "median_error_mm": float(np.median(errs)),
-            "min_error_mm": float(np.min(errs)),
-            "max_error_mm": float(np.max(errs)),
-            "mean_u_mm": float(np.mean(pts[:, 0])),
-            "mean_z_mm": float(np.mean(pts[:, 1])),
-            "mean_reference_u_mm": float(np.mean(refs[:, 0])),
-            "mean_reference_z_mm": float(np.mean(refs[:, 1])),
-            "centroid_offset_from_reference_centroid_mm": float(
-                np.linalg.norm(np.mean(pts, axis=0) - np.mean(refs, axis=0))
-            ),
-            "tip_angle_range_deg": None if not tip_vals else [float(np.min(tip_vals)), float(np.max(tip_vals))],
+    stats: Dict[str, Dict[str, Any]] = {}
+    for quarter, values in quarter_errors.items():
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            stats[quarter] = {
+                "num_samples": 0,
+                "rmse_mm": None,
+                "mean_error_mm": None,
+                "std_error_mm": None,
+                "median_error_mm": None,
+                "min_error_mm": None,
+                "max_error_mm": None,
+            }
+            continue
+        stats[quarter] = {
+            "num_samples": int(arr.size),
+            "rmse_mm": float(np.sqrt(np.mean(arr ** 2))),
+            "mean_error_mm": float(np.mean(arr)),
+            "std_error_mm": float(np.std(arr)),
+            "median_error_mm": float(np.median(arr)),
+            "min_error_mm": float(np.min(arr)),
+            "max_error_mm": float(np.max(arr)),
         }
-
-    return out
+    return stats
 
 
 def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
     fieldnames = [
         "sample_index",
-        "sample_index_from_name",
         "image_name",
-        "phase_name",
-        "block_name",
-        "block_phase_01",
-        "stage_x_cmd",
-        "stage_y_cmd",
-        "stage_z_cmd",
-        "b_cmd",
-        "c_cmd_deg",
-        "c_orientation_deg",
-        "tip_angle_deg_from_name",
+        "phase",
         "tip_y_px",
         "tip_x_px",
         "u_mm",
         "z_mm",
-        "reference_u_mm",
-        "reference_z_mm",
-        "reference_u_raw_mm",
-        "reference_z_raw_mm",
-        "du_to_reference_mm",
-        "dz_to_reference_mm",
-        "du_from_global_mean_mm",
-        "dz_from_global_mean_mm",
-        "du_from_c_centroid_mm",
-        "dz_from_c_centroid_mm",
+        "b_pull_mm",
+        "stage_x_mm",
+        "stage_y_mm",
+        "stage_z_mm",
+        "desired_x_mm",
+        "desired_y_mm",
+        "desired_z_mm",
+        "aligned_u_mm",
+        "aligned_z_mm",
+        "closest_desired_u_mm",
+        "closest_desired_z_mm",
+        "du_aligned_to_desired_mm",
+        "dz_aligned_to_desired_mm",
         "error_distance_mm",
         "valid",
     ]
@@ -1878,461 +1955,220 @@ def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
             writer.writerow(r)
 
 
-# =============================================================================
-# Plot styling
-# =============================================================================
-def _apply_dark_axes_style(ax, title: str, xlabel: str, ylabel: str):
-    ax.set_title(title, color="#f4f7fb", fontsize=12.5, pad=10, weight="semibold")
-    ax.set_xlabel(xlabel, color="#d7e2ee")
-    ax.set_ylabel(ylabel, color="#d7e2ee")
-    ax.tick_params(colors="#c8d5e3", labelsize=10)
-    for spine in ax.spines.values():
-        spine.set_color((0.75, 0.84, 0.93, 0.25))
-        spine.set_linewidth(1.1)
-    ax.grid(True, color=(0.75, 0.84, 0.93, 0.10), linewidth=0.8)
-    ax.set_facecolor("#0f1723")
-
-
-def _make_dark_density_cmap() -> LinearSegmentedColormap:
-    return LinearSegmentedColormap.from_list(
-        "sleek_density_dark",
-        [
-            "#0a0f18",
-            "#122033",
-            "#17324d",
-            "#1c4f73",
-            "#1f6fa8",
-            "#26a0b8",
-            "#79d9cf",
-            "#f3d67a",
-        ],
-        N=256,
-    )
-
-
 def save_error_plot(error_plot_path: Path, records: List[Dict[str, Any]], title_prefix: str = ""):
     valid_recs = [r for r in records if r.get("valid", False) and r.get("error_distance_mm") is not None]
     if not valid_recs:
         raise RuntimeError("No valid records available for error plot.")
+    valid_recs = sorted(valid_recs, key=lambda r: int(r["sample_index"]))
 
     sample_idx = [int(r["sample_index"]) for r in valid_recs]
     errors_mm = [float(r["error_distance_mm"]) for r in valid_recs]
-    c_vals = [r.get("c_orientation_deg") for r in valid_recs]
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.4))
-    fig.patch.set_facecolor("#0b1118")
-    fig.patch.set_alpha(1.0)
-
-    # Subtle segment coloring by C group
-    c0_x, c0_y, c180_x, c180_y, other_x, other_y = [], [], [], [], [], []
-    for x, y, c in zip(sample_idx, errors_mm, c_vals):
-        if c is None:
-            other_x.append(x)
-            other_y.append(y)
-        elif abs(float(c) - 0.0) < 1e-6:
-            c0_x.append(x)
-            c0_y.append(y)
-        elif abs(float(c) - 180.0) < 1e-6:
-            c180_x.append(x)
-            c180_y.append(y)
-        else:
-            other_x.append(x)
-            other_y.append(y)
-
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor="none")
+    ax.set_facecolor("none")
     ax.plot(
         sample_idx,
         errors_mm,
-        color="#bcd2e8",
-        linewidth=1.5,
-        alpha=0.7,
-        zorder=1,
+        marker="o",
+        linestyle="-",
+        color="white",
+        markerfacecolor="white",
+        markeredgecolor="white",
+        linewidth=1.8,
+        markersize=4.5,
     )
-    if c0_x:
-        ax.scatter(c0_x, c0_y, s=22, color="#5ec8ff", edgecolors="none", label="C = 0°", zorder=3)
-    if c180_x:
-        ax.scatter(c180_x, c180_y, s=22, color="#f7a8ff", edgecolors="none", label="C = 180°", zorder=3)
-    if other_x:
-        ax.scatter(other_x, other_y, s=20, color="#d6dee8", edgecolors="none", label="other C", zorder=3)
+    ax.set_xlabel("Sample index", color="white")
+    ax.set_ylabel("Aligned distance to closest desired-curve point (mm)", color="white")
+    ax.set_title(f"{title_prefix}Aligned tracked tip error vs sample".strip(), color="white")
+    ax.grid(True, alpha=0.22, color="white")
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("white")
+    plt.tight_layout()
+    plt.savefig(error_plot_path, dpi=200, transparent=True)
+    plt.close()
 
-    _apply_dark_axes_style(
-        ax,
-        title=f"{title_prefix}Tracked tip error vs sample".strip(),
-        xlabel="Sample index",
-        ylabel="Error distance to corresponding reference point (mm)",
+
+def save_error_histogram(
+    hist_path: Path,
+    errors_mm: np.ndarray,
+    rmse_mm: float,
+    title_prefix: str = "",
+    bins: int = 20,
+):
+    errors_mm = np.asarray(errors_mm, dtype=float).reshape(-1)
+    if errors_mm.size == 0:
+        raise RuntimeError("No error values available for histogram.")
+
+    fig, ax = plt.subplots(figsize=(8, 5), facecolor="none")
+    ax.set_facecolor("none")
+    ax.hist(
+        errors_mm,
+        bins=int(max(5, bins)),
+        color="white",
+        edgecolor="white",
+        linewidth=1.0,
+        alpha=0.9,
     )
-    leg = ax.legend(loc="upper right", frameon=True, fontsize=9)
-    leg.get_frame().set_facecolor("#121c28")
-    leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.20))
-    for txt in leg.get_texts():
-        txt.set_color("#e5edf6")
-
-    fig.tight_layout()
-    fig.savefig(error_plot_path, dpi=220, facecolor=fig.get_facecolor())
-    plt.close(fig)
-
-
-def _orientation_display_label(c_deg: Optional[float]) -> str:
-    if c_deg is None or not np.isfinite(c_deg):
-        return "C = unknown"
-    if abs(float(c_deg) - round(float(c_deg))) < 1e-9:
-        return f"C = {int(round(float(c_deg)))}°"
-    return f"C = {float(c_deg):.3f}°"
+    ax.set_xlabel("Error distance (mm)", color="white")
+    ax.set_ylabel("Number of samples", color="white")
+    ax.set_title(
+        f"{title_prefix}Histogram of tracked tip error | RMSE = {float(rmse_mm):.4f} mm".strip(),
+        color="white",
+    )
+    ax.grid(True, alpha=0.18, color="white")
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("white")
+    plt.tight_layout()
+    plt.savefig(hist_path, dpi=200, transparent=True)
+    plt.close()
 
 
-def _record_b_value(rec: Dict[str, Any]) -> Optional[float]:
-    b_val = rec.get("b_cmd")
-    if b_val is None:
-        return None
-    try:
-        b_val_f = float(b_val)
-    except Exception:
-        return None
-    return b_val_f if np.isfinite(b_val_f) else None
-
-
-def save_bpull_error_components_plot(plot_path: Path, records: List[Dict[str, Any]], title_prefix: str = ""):
+def save_desired_vs_actual_plot(
+    plot_path: Path,
+    records: List[Dict[str, Any]],
+    reference_point_mm: Dict[str, float],
+    alignment_offset_mm: Dict[str, float],
+    title_prefix: str = "",
+):
     valid_recs = [
         r for r in records
         if r.get("valid", False)
-        and r.get("du_to_reference_mm") is not None
-        and r.get("dz_to_reference_mm") is not None
-        and _record_b_value(r) is not None
+        and r.get("aligned_u_mm") is not None
+        and r.get("aligned_z_mm") is not None
     ]
+    desired_recs = [r for r in valid_recs if r.get("desired_x_mm") is not None and r.get("desired_z_mm") is not None]
     if not valid_recs:
-        raise RuntimeError("No valid records available for B-value error component plot.")
+        raise RuntimeError("No valid tracked records available for desired-vs-actual plot.")
+    if not desired_recs:
+        raise RuntimeError("Desired tip X/Z values could not be parsed from filenames.")
 
-    groups = [
-        (0.0, "#5ec8ff", "C = 0°"),
-        (180.0, "#f7a8ff", "C = 180°"),
-    ]
+    valid_recs = sorted(valid_recs, key=lambda r: int(r["sample_index"]))
+    desired_recs = sorted(desired_recs, key=lambda r: int(r["sample_index"]))
 
-    fig, axs = plt.subplots(2, 1, figsize=(11.2, 8.0), sharex=True)
-    fig.patch.set_facecolor("none")
-    fig.patch.set_alpha(0.0)
+    actual_u = np.asarray([float(r["aligned_u_mm"]) for r in valid_recs], dtype=float)
+    actual_z = np.asarray([float(r["aligned_z_mm"]) for r in valid_recs], dtype=float)
+    desired_tip_x = np.asarray([float(r["desired_x_mm"]) for r in desired_recs], dtype=float)
+    desired_tip_z = np.asarray([float(r["desired_z_mm"]) for r in desired_recs], dtype=float)
 
-    component_specs = [
-        ("du_to_reference_mm", "u error to mean of all points (mm)"),
-        ("dz_to_reference_mm", "z error to mean of all points (mm)"),
-    ]
+    ref_u = float(reference_point_mm["u_mean_mm"])
+    ref_z = float(reference_point_mm["z_mean_mm"])
 
-    any_group = False
-    for ax, (field, ylabel) in zip(axs, component_specs):
-        for c_deg, color, label in groups:
-            group_recs = []
-            for rec in valid_recs:
-                c_val = rec.get("c_orientation_deg")
-                if c_val is None:
-                    continue
-                try:
-                    c_val_f = float(c_val)
-                except Exception:
-                    continue
-                if abs(c_val_f - c_deg) >= 1e-6:
-                    continue
-                x_val = _record_b_value(rec)
-                if x_val is None:
-                    continue
-                y_val = float(rec[field])
-                if not np.isfinite(y_val):
-                    continue
-                group_recs.append((x_val, y_val))
+    desired_u = desired_tip_x
+    desired_z = desired_tip_z
 
-            if not group_recs:
-                continue
+    fig, ax = plt.subplots(figsize=(8.5, 7.0), facecolor="none")
+    ax.set_facecolor("none")
 
-            any_group = True
-            group_recs.sort(key=lambda item: item[0])
-            xs = np.asarray([p[0] for p in group_recs], dtype=float)
-            ys = np.asarray([p[1] for p in group_recs], dtype=float)
-
-            ax.plot(xs, ys, color=color, linewidth=1.8, alpha=0.92, label=label, zorder=2)
-            ax.scatter(xs, ys, s=26, color=color, edgecolors="none", zorder=3)
-
-        ax.axhline(0.0, color=(0.93, 0.97, 1.0, 0.28), linestyle="--", linewidth=1.1, zorder=1)
-        _apply_dark_axes_style(
-            ax,
-            title=f"{title_prefix}{ylabel} vs B value".strip(),
-            xlabel="B value",
-            ylabel=ylabel,
-        )
-        ax.set_facecolor("none")
-
-    if not any_group:
-        plt.close(fig)
-        raise RuntimeError("No C = 0° or C = 180° records available for B-pull error component plot.")
-
-    axs[-1].set_xlabel("B value", color="#d7e2ee")
-    leg = axs[0].legend(loc="upper right", frameon=True, fontsize=9)
-    leg.get_frame().set_facecolor("#121c28")
-    leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.20))
-    for txt in leg.get_texts():
-        txt.set_color("#e5edf6")
-
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=220, transparent=True)
-    plt.close(fig)
-
-
-def save_error_histogram_and_dual_orientation_heatmaps(
-    plot_path: Path,
-    records: List[Dict[str, Any]],
-    global_metrics: Dict[str, Any],
-    per_orientation_metrics: Dict[str, Any],
-    title_prefix: str = "",
-    bins: int = 24,
-):
-    valid_recs = [r for r in records if r.get("valid", False) and r.get("u_mm") is not None and r.get("z_mm") is not None]
-    if not valid_recs:
-        raise RuntimeError("No valid records available for summary plot.")
-
-    errors_mm = np.asarray([float(r["error_distance_mm"]) for r in valid_recs if r.get("error_distance_mm") is not None], dtype=float)
-    if errors_mm.size == 0:
-        raise RuntimeError("No valid error values available.")
-
-    global_rmse = float(global_metrics["rmse_mm"])
-
-    # Group valid records by C orientation
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for rec in valid_recs:
-        c_deg = rec.get("c_orientation_deg", None)
-        key = "unknown" if c_deg is None else f"{float(c_deg):.3f}"
-        grouped.setdefault(key, []).append(rec)
-
-    # Sort orientations numerically when possible
-    def _sort_key(k: str):
-        try:
-            return (0, float(k))
-        except Exception:
-            return (1, k)
-
-    group_items = sorted(grouped.items(), key=lambda kv: _sort_key(kv[0]))
-
-    # Prefer side-by-side for first two groups, matching the dual-C run
-    if len(group_items) == 0:
-        raise RuntimeError("No grouped records found.")
-    if len(group_items) == 1:
-        group_items = [group_items[0], group_items[0]]
-    elif len(group_items) > 2:
-        # Keep the first two numeric groups for the summary figure; all groups remain in JSON/CSV.
-        group_items = group_items[:2]
-
-    all_u = np.asarray([float(r["u_mm"]) for r in valid_recs], dtype=float)
-    all_z = np.asarray([float(r["z_mm"]) for r in valid_recs], dtype=float)
-    u_span = float(np.ptp(all_u))
-    z_span = float(np.ptp(all_z))
-    u_pad = max(0.35, 0.10 * max(u_span, 1.0))
-    z_pad = max(0.35, 0.10 * max(z_span, 1.0))
-    xlim = (float(np.min(all_u) - u_pad), float(np.max(all_u) + u_pad))
-    ylim = (float(np.min(all_z) - z_pad), float(np.max(all_z) + z_pad))
-
-    fig = plt.figure(figsize=(13.6, 8.7), facecolor="none")
-    fig.patch.set_alpha(0.0)
-    gs = GridSpec(2, 2, height_ratios=[0.92, 1.35], hspace=0.28, wspace=0.16, figure=fig)
-
-    ax_hist = fig.add_subplot(gs[0, :])
-    ax_left = fig.add_subplot(gs[1, 0])
-    ax_right = fig.add_subplot(gs[1, 1])
-
-    # Histogram
-    ax_hist.hist(
-        errors_mm,
-        bins=int(max(6, bins)),
-        color=(0.44, 0.81, 1.0, 0.85),
-        edgecolor=(0.93, 0.97, 1.0, 0.95),
-        linewidth=0.95,
+    ax.plot(
+        desired_u,
+        desired_z,
+        color="#8cf7ff",
+        linewidth=2.2,
+        alpha=0.95,
+        label="Desired circle",
+        zorder=3,
     )
-    ax_hist.axvline(global_rmse, color="#ffd166", linestyle="--", linewidth=1.8, alpha=0.95, label=f"Global RMSE = {global_rmse:.4f} mm")
-    _apply_dark_axes_style(
-        ax_hist,
-        title=f"{title_prefix}Tracked tip error distribution".strip(),
-        xlabel="Error distance to corresponding reference point (mm)",
-        ylabel="Number of samples",
+    ax.scatter(
+        desired_u,
+        desired_z,
+        s=20,
+        color="#f8fafc",
+        edgecolors="#8cf7ff",
+        linewidths=0.6,
+        alpha=0.95,
+        label="Desired sampled points",
+        zorder=4,
     )
-    ax_hist.set_facecolor("none")
-    leg_hist = ax_hist.legend(loc="upper right", frameon=True, fontsize=10)
-    leg_hist.get_frame().set_facecolor("#121c28")
-    leg_hist.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.20))
-    for txt in leg_hist.get_texts():
-        txt.set_color("#e5edf6")
-
-    def _draw_group_points(ax, group_key: str, group_recs: List[Dict[str, Any]], point_color: str):
-        pts = np.asarray([[float(r["u_mm"]), float(r["z_mm"])] for r in group_recs], dtype=float)
-        c_deg = None
-        for r in group_recs:
-            if r.get("c_orientation_deg") is not None:
-                c_deg = float(r["c_orientation_deg"])
-                break
-
-        rmse_txt = ""
-        if group_key in per_orientation_metrics:
-            rmse_txt = f"  |  RMSE = {float(per_orientation_metrics[group_key]['rmse_mm']):.4f} mm"
-
-        ax.scatter(
-            pts[:, 0],
-            pts[:, 1],
-            s=28,
-            color=point_color,
-            alpha=0.82,
-            edgecolors="#f3f8ff",
-            linewidths=0.35,
-            zorder=3,
-            label="Measured points",
-        )
-        refs = np.asarray(
-            [[float(r["reference_u_mm"]), float(r["reference_z_mm"])] for r in group_recs],
-            dtype=float,
-        )
-        ax.scatter(
-            refs[:, 0],
-            refs[:, 1],
-            s=54,
-            marker="s",
-            facecolors="none",
-            edgecolors="#8fd3ff",
-            linewidths=1.2,
-            zorder=4,
-            label="Reference points",
-        )
-
-        for p_ref, p_meas in zip(refs, pts):
-            ax.plot(
-                [p_ref[0], p_meas[0]],
-                [p_ref[1], p_meas[1]],
-                color=(0.74, 0.88, 1.0, 0.42),
-                linewidth=0.9,
-                zorder=2,
-            )
-
-        ref_center = np.mean(refs, axis=0)
-        meas_center = np.mean(pts, axis=0)
-        ax.scatter(
-            [ref_center[0]],
-            [ref_center[1]],
-            s=115,
-            marker="s",
-            facecolors="none",
-            edgecolors="#00e5ff",
-            linewidths=1.8,
-            zorder=5,
-            label="Reference center",
-        )
-        ax.scatter(
-            [meas_center[0]],
-            [meas_center[1]],
-            s=85,
-            marker="+",
-            color="#ff66c4",
-            linewidths=2.0,
-            zorder=5,
-            label="Measured center",
-        )
-
-        _apply_dark_axes_style(
-            ax,
-            title=f"{_orientation_display_label(c_deg)}{rmse_txt}",
-            xlabel="u (mm)",
-            ylabel="z (mm)",
-        )
-        ax.set_facecolor("none")
-        ax.set_xlim(*xlim)
-        ax.set_ylim(*ylim)
-
-        if u_span > 1e-12 and z_span > 1e-12:
-            ax.set_box_aspect((ylim[1] - ylim[0]) / max(xlim[1] - xlim[0], 1e-12))
-
-        leg = ax.legend(loc="upper right", frameon=True, fontsize=9)
-        leg.get_frame().set_facecolor("#121c28")
-        leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
-        for txt in leg.get_texts():
-            txt.set_color("#e8f0f8")
-
-    _draw_group_points(ax_left, group_items[0][0], group_items[0][1], "#7fd6ff")
-    _draw_group_points(ax_right, group_items[1][0], group_items[1][1], "#ffb0d9")
-
-    fig.suptitle(
-        f"{title_prefix}Desired vs measured tracked tip points by C orientation".strip(),
-        color="#f7fbff",
-        fontsize=14.2,
-        weight="semibold",
-        y=0.985,
+    ax.scatter(
+        actual_u,
+        actual_z,
+        s=26,
+        color="#ff8fab",
+        edgecolors="#fff1f5",
+        linewidths=0.5,
+        alpha=0.9,
+        label="Measured tracked points (mean-aligned)",
+        zorder=5,
+    )
+    ax.scatter(
+        desired_u[:1],
+        desired_z[:1],
+        s=64,
+        color="#f4d35e",
+        edgecolors="none",
+        label="Trajectory start",
+        zorder=6,
     )
 
-    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.972])
-    fig.savefig(plot_path, dpi=230, transparent=True)
-    plt.close(fig)
+    all_u = np.concatenate([actual_u, desired_u, np.asarray([ref_u])])
+    all_z = np.concatenate([actual_z, desired_z, np.asarray([ref_z])])
+    center_u = 0.5 * float(np.min(all_u) + np.max(all_u))
+    center_z = 0.5 * float(np.min(all_z) + np.max(all_z))
+    span_u = max(float(np.max(np.abs(all_u - center_u))), 1.0)
+    span_z = max(float(np.max(np.abs(all_z - center_z))), 1.0)
+    span = 1.08 * max(span_u, span_z)
 
+    ax.set_xlim(center_u - span, center_u + span)
+    ax.set_ylim(center_z - span, center_z + span)
+    ax.set_aspect("equal", adjustable="box")
 
-def annotate_analysis_output_images(analysis_output_dir: Path, records: List[Dict[str, Any]]):
-    analysis_output_dir = Path(analysis_output_dir)
-    if not analysis_output_dir.is_dir():
-        return
+    ax.set_xlabel("u / desired X (mm)", color="#e8f3ff")
+    ax.set_ylabel("z / desired tip Z (mm)", color="#e8f3ff")
+    ax.set_title(
+        f"{title_prefix}Desired circle trajectory vs mean-aligned tracked points".strip(),
+        color="#f8fbff",
+    )
+    ax.grid(True, color="#8eb8d8", alpha=0.12, linewidth=0.8)
+    ax.tick_params(colors="#dceaf7")
+    for spine in ax.spines.values():
+        spine.set_color("#6b92b3")
 
-    for rec in records:
-        image_name = rec.get("image_name")
-        if not image_name:
-            continue
+    legend = ax.legend(frameon=True, facecolor="#102131", edgecolor="#6b92b3")
+    for txt in legend.get_texts():
+        txt.set_color("#f8fbff")
 
-        analysis_image_path = analysis_output_dir / f"{Path(image_name).stem}_analysis.png"
-        if not analysis_image_path.is_file():
-            continue
+    ax.text(
+        0.02,
+        0.98,
+        (
+            "Applied mean alignment "
+            f"(du={float(alignment_offset_mm['du_mm']):.3f} mm, "
+            f"dz={float(alignment_offset_mm['dz_mm']):.3f} mm)"
+        ),
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        color="#f8fbff",
+        fontsize=9.5,
+        bbox={"facecolor": "#102131", "edgecolor": "#6b92b3", "alpha": 0.75, "pad": 6},
+    )
 
-        image = cv2.imread(str(analysis_image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            continue
-
-        err = rec.get("error_distance_mm")
-        c_txt = rec.get("c_orientation_deg")
-        tip_txt = rec.get("tip_angle_deg_from_name")
-
-        if err is None:
-            err_str = "Error: n/a"
-        else:
-            err_str = f"Error: {float(err):.3f} mm"
-
-        c_str = "C: n/a" if c_txt is None else f"C: {float(c_txt):.3f} deg"
-        tip_str = "TIP: n/a" if tip_txt is None else f"TIP: {float(tip_txt):.3f} deg"
-
-        h, w = image.shape[:2]
-        banner_h = max(62, int(round(0.09 * h)))
-        banner = np.full((banner_h, w, 3), 255, dtype=np.uint8)
-
-        cv2.putText(
-            banner, err_str, (18, int(round(banner_h * 0.43))),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.84, (20, 20, 20), 2, lineType=cv2.LINE_AA
-        )
-        cv2.putText(
-            banner, f"{c_str}   |   {tip_str}", (18, int(round(banner_h * 0.80))),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (40, 40, 40), 2, lineType=cv2.LINE_AA
-        )
-
-        annotated = np.vstack([banner, image])
-        cv2.imwrite(str(analysis_image_path), annotated)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=220, transparent=True)
+    plt.close()
 
 
 def save_metrics_json(
     json_path: Path,
-    global_metrics: Dict[str, Any],
-    per_orientation_metrics: Dict[str, Any],
+    metrics: Dict[str, Any],
     cal: CTR_Shadow_Calibration,
     args,
 ):
     payload = {
-        "reference_point_mm": global_metrics["reference_point_mm"],
-        "reference_mode": global_metrics["reference_mode"],
-        "reference_description": global_metrics["reference_description"],
-        "alignment_shift_mm": global_metrics["alignment_shift_mm"],
-        "reference_points_mm": global_metrics["reference_points_mm"],
-        "reference_points_raw_mm": global_metrics["reference_points_raw_mm"],
-        "global_metrics": {
-            "rmse_mm": global_metrics["rmse_mm"],
-            "mean_error_mm": global_metrics["mean_error_mm"],
-            "std_error_mm": global_metrics["std_error_mm"],
-            "median_error_mm": global_metrics["median_error_mm"],
-            "min_error_mm": global_metrics["min_error_mm"],
-            "max_error_mm": global_metrics["max_error_mm"],
-            "num_samples": global_metrics["num_samples"],
-        },
-        "per_c_orientation_metrics": per_orientation_metrics,
+        "reference_point_mm": metrics["reference_point_mm"],
+        "measured_mean_mm": metrics["measured_mean_mm"],
+        "desired_mean_mm": metrics["desired_mean_mm"],
+        "alignment_offset_mm": metrics["alignment_offset_mm"],
+        "quarter_error_stats": metrics.get("quarter_error_stats", {}),
+        "rmse_mm": metrics["rmse_mm"],
+        "mean_error_mm": metrics["mean_error_mm"],
+        "std_error_mm": metrics["std_error_mm"],
+        "median_error_mm": metrics["median_error_mm"],
+        "min_error_mm": metrics["min_error_mm"],
+        "max_error_mm": metrics["max_error_mm"],
+        "num_samples": metrics["num_samples"],
         "analysis_crop": getattr(cal, "analysis_crop", None),
         "board_reference": collect_board_reference_info(cal),
         "settings": {
@@ -2354,6 +2190,13 @@ def save_metrics_json(
             "tip_refine_parallel_cross_step_px": float(args.tip_refine_parallel_cross_step_px),
             "tip_refine_parallel_ray_step_px": float(args.tip_refine_parallel_ray_step_px),
             "tip_refine_parallel_ray_max_len_r": float(args.tip_refine_parallel_ray_max_len_r),
+            "circle_center_x_mm": float(args.circle_center_x_mm),
+            "circle_center_z_mm": float(args.circle_center_z_mm),
+            "circle_radius_mm": float(args.circle_radius_mm),
+            "circle_samples_per_quarter": int(args.circle_samples_per_quarter),
+            "planned_command_csv": (None if args.planned_command_csv is None else str(args.planned_command_csv)),
+            "capture_at_start": bool(args.capture_at_start),
+            "capture_every_n_circle_moves": int(args.capture_every_n_circle_moves),
             "hist_bins": int(args.hist_bins),
         },
     }
@@ -2361,9 +2204,9 @@ def save_metrics_json(
         json.dump(_json_ready(payload), f, indent=2)
 
 
-# =============================================================================
+# -----------------------------
 # Main
-# =============================================================================
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--project_dir", type=str, default=None,
@@ -2392,7 +2235,7 @@ def main():
     ap.add_argument("--link_mode", type=str, default="symlink", choices=["symlink", "copy"])
     ap.add_argument("--save_analysis_config", action="store_true")
 
-    ap.add_argument("--tip_refine_mode", type=str, default="parallel_centerline",
+    ap.add_argument("--tip_refine_mode", type=str, default="none",
                     choices=["none", "edge_dt", "edge_grad", "mainray", "parallel_centerline"],
                     help="Refine tip position using the same distal tip analysis modes as offline_run_calibration.py.")
     ap.add_argument("--tip_refine_dt_step_px", type=float, default=1.0)
@@ -2412,11 +2255,22 @@ def main():
     ap.add_argument("--tip_refine_parallel_ray_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_max_len_r", type=float, default=8.0)
 
-    ap.add_argument("--hist_bins", type=int, default=24,
+    ap.add_argument("--circle_center_x_mm", type=float, default=CIRCLE_CENTER_X_DEFAULT)
+    ap.add_argument("--circle_center_z_mm", type=float, default=CIRCLE_CENTER_Z_DEFAULT)
+    ap.add_argument("--circle_radius_mm", type=float, default=CIRCLE_RADIUS_DEFAULT)
+    ap.add_argument("--circle_samples_per_quarter", type=int, default=CIRCLE_SAMPLES_PER_QUARTER_DEFAULT,
+                    help="Fallback ideal-circle sampling used only when planned_command_sequence.csv is unavailable.")
+    ap.add_argument("--planned_command_csv", type=str, default=None,
+                    help="Optional path to planned_command_sequence.csv from the circle acquisition run. Defaults to <project_dir>/planned_command_sequence.csv when present.")
+    ap.add_argument("--capture_at_start", action="store_true",
+                    help="Match acquisition runs that also captured the initial q1_pull_start point.")
+    ap.add_argument("--capture_every_n_circle_moves", type=int, default=1,
+                    help="Match acquisition subsampling: one saved image every N recorded circle moves.")
+
+    ap.add_argument("--hist_bins", type=int, default=20,
                     help="Number of histogram bins.")
 
     args = ap.parse_args()
-    print(f"[INFO] Using shadow_calibration module: {shadow_calibration_module.__file__}")
 
     if args.project_dir is None and args.raw_dir is None:
         raise SystemExit("Provide --project_dir or --raw_dir")
@@ -2443,6 +2297,14 @@ def main():
     project_dir = project_dir.resolve()
     raw_folder = raw_folder.resolve()
 
+    renamed_files = normalize_raw_filenames_for_shadow_parser(raw_folder)
+    if renamed_files:
+        print(f"[INFO] Normalized {len(renamed_files)} raw image filenames for shadow_calibration.")
+        for old_name, new_name in renamed_files[:10]:
+            print(f"  - {old_name} -> {new_name}")
+        if len(renamed_files) > 10:
+            print(f"  ... and {len(renamed_files) - 10} more")
+
     cal = CTR_Shadow_Calibration(
         parent_directory=str(project_dir.parent),
         project_name=project_dir.name,
@@ -2450,15 +2312,12 @@ def main():
         add_date=False,
     )
     cal.calibration_data_folder = str(project_dir)
-    cal.tip_parallel_section_near_r = float(args.tip_refine_parallel_section_near_r)
-    cal.tip_parallel_section_far_r = float(args.tip_refine_parallel_section_far_r)
-    cal.tip_parallel_scan_half_r = float(args.tip_refine_parallel_scan_half_r)
-    cal.tip_parallel_num_sections = int(args.tip_refine_parallel_num_sections)
-    cal.tip_parallel_cross_step_px = float(args.tip_refine_parallel_cross_step_px)
-    cal.tip_parallel_ray_step_px = float(args.tip_refine_parallel_ray_step_px)
-    cal.tip_parallel_ray_max_len_r = float(args.tip_refine_parallel_ray_max_len_r)
 
-    if args.tip_refine_mode not in ("none", "parallel_centerline"):
+    patch_filename_parser()
+
+    desired_tip_lookup = resolve_desired_tip_lookup(project_dir, args)
+
+    if args.tip_refine_mode != "none":
         patch_analyze_data_for_tip_refinement(
             cal,
             refine_mode=str(args.tip_refine_mode),
@@ -2480,11 +2339,6 @@ def main():
             parallel_ray_max_len_r=float(args.tip_refine_parallel_ray_max_len_r),
         )
         print(f"[INFO] Tip refinement enabled: {args.tip_refine_mode}")
-    else:
-        print(
-            "[INFO] Using native shadow_calibration analyze_data image processing "
-            f"and annotation flow ({args.tip_refine_mode})."
-        )
 
     imgs = list_images(raw_folder)
     if not imgs:
@@ -2507,11 +2361,13 @@ def main():
     processed_dir.mkdir(parents=True, exist_ok=True)
     checkerboard_debug_path = processed_dir / "checkerboard_reference_debug.png"
 
-    board_ref_kwargs = _board_reference_kwargs(cal, args)
     board_result = cal.estimate_board_reference_from_image(
         str(board_ref_path),
+        inner_corners=args.checkerboard_inner_corners,
+        square_size_mm=args.checkerboard_square_size_mm,
+        use_undistort=(not args.checkerboard_no_undistort),
+        draw_debug=True,
         save_debug_path=str(checkerboard_debug_path),
-        **board_ref_kwargs,
     )
     board_reference_debug_image = board_result.get("debug_image")
 
@@ -2543,71 +2399,92 @@ def main():
     cal.analyze_data_batch(threshold=int(args.threshold))
 
     tracked_rows = np.asarray(cal.tip_locations_array_coarse, dtype=float)
+
     if tracked_rows.size == 0:
-        raise RuntimeError("No tracked tip data found in cal.tip_locations_array_coarse after analyze_data_batch.")
+        raise RuntimeError(
+            "Batch analysis completed, but tip_locations_array_coarse is empty. "
+            "Check filename parsing, image access, and tracking settings."
+        )
+
+    valid_mask = np.all(np.isfinite(tracked_rows[:, :2]), axis=1) if tracked_rows.ndim == 2 and tracked_rows.shape[1] >= 2 else np.zeros((0,), dtype=bool)
+    num_valid = int(np.sum(valid_mask))
+
+    print(f"[INFO] Total tracked rows: {tracked_rows.shape[0]}")
+    print(f"[INFO] Valid tracked rows: {num_valid}")
+
+    if num_valid == 0:
+        raise RuntimeError(
+            "Batch analysis completed, but no valid tracked tip points were produced. "
+            "Filename parsing is now patched, so the next things to check are threshold/crop/tracking quality."
+        )
 
     print("[INFO] Converting tracked tips to checkerboard-referenced mm...")
-    tip_data = compute_tracked_tip_positions_mm(cal, tracked_rows, imgs)
-
-    print("[INFO] Building per-sample reference points and error metrics...")
-    reference_meta = build_reference_points_mm(
-        records=tip_data["records"],
-        valid_indices=tip_data["valid_indices"],
-        mm_points=tip_data["mm_points"],
+    tip_data = compute_tracked_tip_positions_mm(
+        cal,
+        tracked_rows,
+        imgs,
+        desired_tip_lookup=desired_tip_lookup,
     )
-    global_metrics = compute_global_error_metrics(
-        mm_points=tip_data["mm_points"],
-        reference_points_mm=reference_meta["reference_points_mm"],
-        reference_meta=reference_meta,
+
+    if tip_data["mm_points"].shape[0] == 0:
+        raise RuntimeError(
+            "Tracked rows exist, but none could be converted into checkerboard-referenced mm coordinates."
+        )
+
+    if tip_data["desired_mm_points"].shape[0] == 0:
+        raise RuntimeError(
+            "Tracked rows exist, but no desired tip points were available for mean-aligned error analysis."
+        )
+
+    print("[INFO] Computing mean-aligned nearest-curve error metrics...")
+    metrics = compute_error_metrics(
+        tip_data["matched_measured_mm_points"],
+        tip_data["desired_mm_points"],
     )
 
     records = attach_errors_to_records(
         records=tip_data["records"],
-        valid_indices=tip_data["valid_indices"],
-        reference_points_mm=global_metrics["reference_points_mm"],
-        reference_points_raw_mm=global_metrics["reference_points_raw_mm"],
-        deltas_mm=global_metrics["deltas_mm"],
-        errors_mm=global_metrics["errors_mm"],
+        valid_indices=tip_data["matched_valid_indices"],
+        deltas_mm=metrics["deltas_mm"],
+        errors_mm=metrics["errors_mm"],
+        aligned_measured_mm_points=metrics["aligned_measured_mm_points"],
+        closest_desired_mm_points=metrics["closest_desired_mm_points"],
     )
-
-    print("[INFO] Computing per-C orientation metrics...")
-    per_orientation_metrics = compute_per_orientation_metrics(records=records)
+    metrics["quarter_error_stats"] = compute_quarter_error_stats(records)
 
     csv_path = processed_dir / "tracked_tip_positions_mm.csv"
     metrics_json_path = processed_dir / "tracked_tip_error_metrics.json"
     error_plot_path = processed_dir / "tracked_tip_error_vs_sample.png"
-    bpull_error_plot_path = processed_dir / "tracked_tip_error_components_vs_bpull.png"
-    hist_hexbin_path = processed_dir / "tracked_tip_error_histogram_dual_c_heatmaps.png"
+    hist_path = processed_dir / "tracked_tip_error_histogram.png"
+    desired_vs_actual_plot_path = processed_dir / "tracked_tip_desired_vs_actual.png"
 
     save_tracked_tip_csv(csv_path, records)
-    save_metrics_json(metrics_json_path, global_metrics, per_orientation_metrics, cal, args)
-
+    save_metrics_json(metrics_json_path, metrics, cal, args)
     save_error_plot(
         error_plot_path,
         records,
         title_prefix="Checkerboard-referenced ",
     )
-    save_bpull_error_components_plot(
-        bpull_error_plot_path,
-        records,
-        title_prefix="Checkerboard-referenced ",
-    )
-    save_error_histogram_and_dual_orientation_heatmaps(
-        hist_hexbin_path,
-        records=records,
-        global_metrics=global_metrics,
-        per_orientation_metrics=per_orientation_metrics,
+    save_error_histogram(
+        hist_path,
+        metrics["errors_mm"],
+        rmse_mm=metrics["rmse_mm"],
         title_prefix="Checkerboard-referenced ",
         bins=int(args.hist_bins),
     )
-    annotate_analysis_output_images(processed_dir / "analysis_outputs", records)
+    save_desired_vs_actual_plot(
+        desired_vs_actual_plot_path,
+        records,
+        reference_point_mm=metrics["reference_point_mm"],
+        alignment_offset_mm=metrics["alignment_offset_mm"],
+        title_prefix="Checkerboard-referenced ",
+    )
 
     print(f"[INFO] Saved CSV: {csv_path}")
     print(f"[INFO] Saved metrics JSON: {metrics_json_path}")
     print(f"[INFO] Saved error plot: {error_plot_path}")
-    print(f"[INFO] Saved B-pull error component plot: {bpull_error_plot_path}")
-    print(f"[INFO] Saved histogram + per-C heatmap plot: {hist_hexbin_path}")
-    print(f"[INFO] Updated analysis outputs with per-sample error titles: {processed_dir / 'analysis_outputs'}")
+    print(f"[INFO] Saved histogram: {hist_path}")
+    print(f"[INFO] Saved desired-vs-actual plot: {desired_vs_actual_plot_path}")
 
     if board_reference_debug_image is not None:
         try:
@@ -2624,38 +2501,42 @@ def main():
             print(f"[WARN] Failed to create annotated checkerboard analysis image: {e}")
 
     print("\n========== RESULTS ==========")
-    print(f"Valid samples: {global_metrics['num_samples']}")
+    print(f"Valid samples: {metrics['num_samples']}")
     print(
-        "Mean assigned per-C reference point: "
-        f"u = {global_metrics['reference_point_mm']['u_mean_mm']:.6f} mm, "
-        f"z = {global_metrics['reference_point_mm']['z_mean_mm']:.6f} mm"
+        "Shared mean reference (desired mean / aligned tracked mean): "
+        f"u = {metrics['reference_point_mm']['u_mean_mm']:.6f} mm, "
+        f"z = {metrics['reference_point_mm']['z_mean_mm']:.6f} mm"
     )
-    print(f"Reference mode: {global_metrics['reference_mode']}")
-    print(f"Global RMSE:   {global_metrics['rmse_mm']:.6f} mm")
-    print(f"Mean error:    {global_metrics['mean_error_mm']:.6f} mm")
-    print(f"Std error:     {global_metrics['std_error_mm']:.6f} mm")
-    print(f"Median error:  {global_metrics['median_error_mm']:.6f} mm")
-    print(f"Min error:     {global_metrics['min_error_mm']:.6f} mm")
-    print(f"Max error:     {global_metrics['max_error_mm']:.6f} mm")
-
-    print("\nPer-C RMSE (to the corresponding per-sample reference points):")
-    if not per_orientation_metrics:
-        print("  No valid per-orientation groups found.")
-    else:
-        for _, pm in sorted(
-            per_orientation_metrics.items(),
-            key=lambda kv: (999999.0 if kv[1]["c_orientation_deg"] is None else kv[1]["c_orientation_deg"])
-        ):
-            c_val = pm["c_orientation_deg"]
-            c_label = "unknown" if c_val is None else f"{float(c_val):.3f} deg"
-            print(
-                f"  C = {c_label:<12} "
-                f"RMSE = {pm['rmse_mm']:.6f} mm   "
-                f"N = {pm['num_samples']}"
-            )
+    print(
+        "Applied alignment offset to measured points: "
+        f"du = {metrics['alignment_offset_mm']['du_mm']:.6f} mm, "
+        f"dz = {metrics['alignment_offset_mm']['dz_mm']:.6f} mm"
+    )
+    print("Error definition: distance from each aligned measured point to the closest point on the desired curve.")
+    print(f"RMSE:         {metrics['rmse_mm']:.6f} mm")
+    print(f"Mean error:   {metrics['mean_error_mm']:.6f} mm")
+    print(f"Std error:    {metrics['std_error_mm']:.6f} mm")
+    print(f"Median error: {metrics['median_error_mm']:.6f} mm")
+    print(f"Min error:    {metrics['min_error_mm']:.6f} mm")
+    print(f"Max error:    {metrics['max_error_mm']:.6f} mm")
+    print("Per-quarter error stats:")
+    for quarter in ("q1_pull", "q2_release", "q3_pull", "q4_release"):
+        qstats = metrics["quarter_error_stats"].get(quarter, {})
+        if int(qstats.get("num_samples", 0)) == 0:
+            print(f"  {quarter}: no samples")
+            continue
+        print(
+            f"  {quarter}: n={int(qstats['num_samples'])}, "
+            f"rmse={float(qstats['rmse_mm']):.6f} mm, "
+            f"mean={float(qstats['mean_error_mm']):.6f} mm, "
+            f"std={float(qstats['std_error_mm']):.6f} mm, "
+            f"median={float(qstats['median_error_mm']):.6f} mm, "
+            f"min={float(qstats['min_error_mm']):.6f} mm, "
+            f"max={float(qstats['max_error_mm']):.6f} mm"
+        )
     print("=============================\n")
 
-    print("[DONE] Offline fixed-tip dual-C checkerboard tip error analysis complete.")
+    print("[DONE] Offline checkerboard tip error analysis complete.")
     print(f"Outputs are in: {processed_dir}")
 
 

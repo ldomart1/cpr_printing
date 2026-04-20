@@ -81,7 +81,7 @@ DEFAULT_MACHINE_START_C = 0.0
 
 DEFAULT_MACHINE_END_X = 100.0
 DEFAULT_MACHINE_END_Y = 60.0
-DEFAULT_MACHINE_END_Z = -50.0
+DEFAULT_MACHINE_END_Z = -20.0
 DEFAULT_MACHINE_END_B = 0.0
 DEFAULT_MACHINE_END_C = 0.0
 
@@ -113,6 +113,7 @@ DEFAULT_TRAVEL_EDGE_CLEARANCE = 5.0
 DEFAULT_FINE_APPROACH_DISTANCE = 5.0
 DEFAULT_TANGENT_SMOOTH_WINDOW = 6
 DEFAULT_CENTERLINE_SMOOTH_WINDOW = 0
+DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW = 0
 DEFAULT_PATH_RESAMPLE_SPACING = 0.0
 DEFAULT_SKELETON_COLLISION_CLEARANCE = 0.25
 DEFAULT_SKELETON_COLLISION_SAMPLE_STEP_MM = 1.0
@@ -124,6 +125,7 @@ DEFAULT_MIN_TANGENT_XY = 0.05
 DEFAULT_MIN_PATH_POINTS = 2
 DEFAULT_C_MAX_STEP_DEG = 15.0
 DEFAULT_MIN_GROUP_LENGTH_MM = 0.0
+DEFAULT_BRANCH_OVERLAP_TANGENT_WINDOW_MM = 5.0
 
 DEFAULT_BBOX_X_MIN = -1e9
 DEFAULT_BBOX_X_MAX =  1e9
@@ -234,6 +236,17 @@ class PlannedTipMove:
     feed: float
     comment: str
     allow_tip_segment_contact: bool = False
+
+
+@dataclass
+class GroupDisplacement:
+    group_number: int
+    delta_stage_xyz: np.ndarray
+    delta_b_deg: float = 0.0
+    delta_c_deg: float = 0.0
+    feed: Optional[float] = None
+    enabled: bool = True
+    note: str = ""
 
 
 # ---------------- Calibration helpers ----------------
@@ -566,6 +579,56 @@ def calibration_model_range_warnings(cal: Calibration) -> List[str]:
     return warnings
 
 
+def parse_group_displacements_file(path: str) -> Dict[int, GroupDisplacement]:
+    out: Dict[int, GroupDisplacement] = {}
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Group displacement file not found: {path}")
+
+    with p.open("r") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            note = ""
+            if "#" in line:
+                line, note = line.split("#", 1)
+                line = line.strip()
+                note = note.strip()
+            if not line:
+                continue
+
+            parts = [tok for tok in re.split(r"[\s,]+", line) if tok]
+            if len(parts) < 4:
+                raise ValueError(
+                    f"Invalid group displacement row at {path}:{line_no}. "
+                    "Expected: group_number dx dy dz [db_deg] [dc_deg] [feed_mm_min] [enabled]"
+                )
+
+            group_number = int(parts[0])
+            dx = float(parts[1])
+            dy = float(parts[2])
+            dz = float(parts[3])
+            db = float(parts[4]) if len(parts) >= 5 else 0.0
+            dc = float(parts[5]) if len(parts) >= 6 else 0.0
+            feed = float(parts[6]) if len(parts) >= 7 else None
+            enabled = True
+            if len(parts) >= 8:
+                enabled = str(parts[7]).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
+
+            out[group_number] = GroupDisplacement(
+                group_number=group_number,
+                delta_stage_xyz=np.array([dx, dy, dz], dtype=float),
+                delta_b_deg=db,
+                delta_c_deg=dc,
+                feed=feed,
+                enabled=enabled,
+                note=note,
+            )
+    return out
+
+
 def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float) -> np.ndarray:
     """
     Physical tip offset from stage origin:
@@ -583,6 +646,10 @@ def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float) -> np.ndarr
 
 def stage_xyz_for_tip(cal: Calibration, tip_xyz: np.ndarray, b: float, c_deg: float) -> np.ndarray:
     return np.asarray(tip_xyz, dtype=float) - predict_tip_offset_xyz(cal, b, c_deg)
+
+
+def tip_xyz_for_stage(cal: Calibration, stage_xyz: np.ndarray, b: float, c_deg: float) -> np.ndarray:
+    return np.asarray(stage_xyz, dtype=float) + predict_tip_offset_xyz(cal, b, c_deg)
 
 
 def compute_tracked_skeleton_world(
@@ -1354,12 +1421,16 @@ def prepare_print_path_points(
     points: np.ndarray,
     point_merge_tol: float = DEFAULT_POINT_MERGE_TOL,
     resample_spacing: float = DEFAULT_PATH_RESAMPLE_SPACING,
+    geometry_smooth_window: int = DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW,
 ) -> np.ndarray:
     pts = deduplicate_polyline_points(points, tol=point_merge_tol)
     if len(pts) <= 1:
         return pts
     if float(resample_spacing) > 0.0:
         pts = resample_polyline_by_spacing(pts, spacing=float(resample_spacing))
+        pts = deduplicate_polyline_points(pts, tol=point_merge_tol)
+    if int(geometry_smooth_window) > 0 and len(pts) > 2:
+        pts = smooth_centerline_points(pts, window=int(geometry_smooth_window))
         pts = deduplicate_polyline_points(pts, tol=point_merge_tol)
     return pts
 
@@ -1629,6 +1700,7 @@ class GCodeWriter:
         travel_clearance_above_printed_z: float,
         travel_bbox_margin: float,
         travel_edge_clearance: float,
+        enable_travel_bbox_clearance: bool,
         fine_approach_distance: float,
         robot_skeleton_ref: Optional[RobotSkeletonReference],
         skeleton_collision_clearance: float,
@@ -1661,6 +1733,7 @@ class GCodeWriter:
         self.travel_clearance_above_printed_z = float(travel_clearance_above_printed_z)
         self.travel_bbox_margin = float(travel_bbox_margin)
         self.travel_edge_clearance = float(travel_edge_clearance)
+        self.enable_travel_bbox_clearance = bool(enable_travel_bbox_clearance)
         self.fine_approach_distance = float(fine_approach_distance)
         self.robot_skeleton_ref = robot_skeleton_ref
         self.skeleton_collision_clearance = max(0.0, float(skeleton_collision_clearance))
@@ -1786,6 +1859,49 @@ class GCodeWriter:
         self.write_move(p_stage, b, c, feed, comment=comment)
         self.cur_tip_xyz = np.asarray(p_tip, dtype=float).copy()
         self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
+
+    def sync_tip_state_from_stage(self, tangent: Optional[np.ndarray] = None) -> None:
+        if self.cur_stage_xyz is None:
+            self.cur_tip_xyz = None
+            self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
+            return
+        if self.write_mode == "cartesian":
+            self.cur_tip_xyz = np.asarray(self.cur_stage_xyz, dtype=float).copy()
+        else:
+            self.cur_tip_xyz = tip_xyz_for_stage(self.cal, self.cur_stage_xyz, self.cur_b, self.cur_c)
+        self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
+
+    def apply_group_displacement(self, displacement: GroupDisplacement, default_feed: float, label: str) -> None:
+        if not displacement.enabled:
+            return
+        if self.cur_stage_xyz is None:
+            raise RuntimeError(f"Cannot apply group displacement for {label} before any stage pose has been established.")
+
+        delta_stage = np.asarray(displacement.delta_stage_xyz, dtype=float)
+        if (
+            float(np.linalg.norm(delta_stage)) <= 1e-12
+            and abs(float(displacement.delta_b_deg)) <= 1e-12
+            and abs(float(displacement.delta_c_deg)) <= 1e-12
+        ):
+            return
+        target_stage = np.asarray(self.cur_stage_xyz, dtype=float) + delta_stage
+        target_b = float(self.cur_b) + float(displacement.delta_b_deg)
+        target_c = float(self.cur_c) + float(displacement.delta_c_deg)
+        feed = float(default_feed if displacement.feed is None else displacement.feed)
+        note_suffix = f" ({displacement.note})" if displacement.note else ""
+        self.write_move(
+            self.clamp_stage(target_stage, f"{label}_post_group_displacement"),
+            target_b,
+            target_c,
+            feed,
+            comment=(
+                f"{label}: manual post-group displacement "
+                f"dXYZ=[{delta_stage[0]:.3f}, {delta_stage[1]:.3f}, {delta_stage[2]:.3f}] "
+                f"dB={float(displacement.delta_b_deg):.3f} dC={float(displacement.delta_c_deg):.3f}"
+                f"{note_suffix}"
+            ),
+        )
+        self.sync_tip_state_from_stage(tangent=None)
 
     def current_equation_phase(self) -> str:
         return _normalize_phase_key(self.cal.active_phase)
@@ -1972,7 +2088,12 @@ class GCodeWriter:
         start_tip_arr = self.cur_tip_xyz if start_tip is None else np.asarray(start_tip, dtype=float)
         start_tangent_arr = self.last_tip_tangent if start_tangent is None else np.asarray(start_tangent, dtype=float)
         bbox = self.printed_tip_bbox()
-        if start_tip_arr is None or bbox is None or not self.travel_crosses_printed_bbox_from(start_tip_arr, target):
+        if (
+            not self.enable_travel_bbox_clearance
+            or start_tip_arr is None
+            or bbox is None
+            or not self.travel_crosses_printed_bbox_from(start_tip_arr, target)
+        ):
             return [
                 PlannedTipMove(
                     tip_xyz=target,
@@ -2246,10 +2367,12 @@ def build_print_paths(
     simplify_paths: bool,
     chain_merge_threshold: float,
     path_resample_spacing: float,
+    path_geometry_smooth_window: int,
     point_merge_tol: float,
     min_group_length_mm: float = DEFAULT_MIN_GROUP_LENGTH_MM,
     force_bottom_to_top: bool = False,
     branch_start_overlap_mm: float = 0.0,
+    branch_overlap_tangent_window_mm: float = DEFAULT_BRANCH_OVERLAP_TANGENT_WINDOW_MM,
     preferred_main_vessel_ids: Optional[List[int]] = None,
 ) -> List[PrintPath]:
     ordered_vessels = vessel_print_order(vessels, order_mode=vessel_order_mode)
@@ -2283,6 +2406,7 @@ def build_print_paths(
             np.asarray(path.points, dtype=float),
             point_merge_tol=point_merge_tol,
             resample_spacing=path_resample_spacing,
+            geometry_smooth_window=path_geometry_smooth_window,
         )
         if len(pts) < 2:
             continue
@@ -2310,6 +2434,7 @@ def build_print_paths(
         prepared_paths,
         overlap_mm=float(branch_start_overlap_mm),
         point_merge_tol=float(point_merge_tol),
+        tangent_window_mm=float(branch_overlap_tangent_window_mm),
     )
     min_len = max(0.0, float(min_group_length_mm))
     if min_len <= 0.0:
@@ -2346,15 +2471,46 @@ def polyline_length(points: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
 
 
-def nearest_point_and_tangent_on_polyline(point: np.ndarray, polyline: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+def polyline_arc_lengths(points: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return np.zeros(0, dtype=float)
+    if len(pts) == 1:
+        return np.zeros(1, dtype=float)
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    return np.concatenate([[0.0], np.cumsum(seg)])
+
+
+def point_on_polyline_at_arclength(polyline: np.ndarray, s_query: float) -> np.ndarray:
+    pts = np.asarray(polyline, dtype=float)
+    if len(pts) == 0:
+        return np.zeros(3, dtype=float)
+    if len(pts) == 1:
+        return pts[0].copy()
+
+    arc = polyline_arc_lengths(pts)
+    total = float(arc[-1])
+    s = float(np.clip(float(s_query), 0.0, total))
+    idx = int(np.searchsorted(arc, s, side="right") - 1)
+    idx = min(max(idx, 0), len(pts) - 2)
+    seg_len = float(arc[idx + 1] - arc[idx])
+    if seg_len <= 1e-12:
+        return pts[idx].copy()
+    t = (s - float(arc[idx])) / seg_len
+    return pts[idx] + t * (pts[idx + 1] - pts[idx])
+
+
+def projected_point_and_arclength_on_polyline(point: np.ndarray, polyline: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray, float]:
     p = np.asarray(point, dtype=float).reshape(3)
     pts = np.asarray(polyline, dtype=float)
     if len(pts) == 0:
-        return p.copy(), np.array([0.0, 0.0, 1.0], dtype=float), float("inf")
+        return p.copy(), 0.0, np.array([0.0, 0.0, 1.0], dtype=float), float("inf")
     if len(pts) == 1:
-        return pts[0].copy(), np.array([0.0, 0.0, 1.0], dtype=float), float(np.linalg.norm(p - pts[0]))
+        return pts[0].copy(), 0.0, np.array([0.0, 0.0, 1.0], dtype=float), float(np.linalg.norm(p - pts[0]))
 
+    arc = polyline_arc_lengths(pts)
     best_point = pts[0].copy()
+    best_s = 0.0
     best_tangent = normalize(pts[1] - pts[0])
     best_dist = float("inf")
     for i in range(len(pts) - 1):
@@ -2370,11 +2526,22 @@ def nearest_point_and_tangent_on_polyline(point: np.ndarray, polyline: np.ndarra
         if d < best_dist:
             best_dist = d
             best_point = q
+            best_s = float(arc[i] + t * (arc[i + 1] - arc[i]))
             best_tangent = normalize(ab)
+    return best_point, best_s, best_tangent, best_dist
+
+
+def nearest_point_and_tangent_on_polyline(point: np.ndarray, polyline: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
+    best_point, _, best_tangent, best_dist = projected_point_and_arclength_on_polyline(point, polyline)
     return best_point, best_tangent, best_dist
 
 
-def extend_branch_starts_into_printed_tree(paths: List[PrintPath], overlap_mm: float, point_merge_tol: float) -> List[PrintPath]:
+def extend_branch_starts_into_printed_tree(
+    paths: List[PrintPath],
+    overlap_mm: float,
+    point_merge_tol: float,
+    tangent_window_mm: float,
+) -> List[PrintPath]:
     overlap = float(overlap_mm)
     if overlap <= 0.0 or not paths:
         return paths
@@ -2390,16 +2557,25 @@ def extend_branch_starts_into_printed_tree(paths: List[PrintPath], overlap_mm: f
 
         start = path.connection_xyz if path.connection_xyz is not None else pts[0]
         best_point = start.copy()
-        best_tangent = np.array([0.0, 0.0, 1.0], dtype=float)
+        best_projected_s = 0.0
+        best_polyline: Optional[np.ndarray] = None
         best_dist = float("inf")
         for printed in printed_paths:
-            q, tangent, dist = nearest_point_and_tangent_on_polyline(start, printed)
+            q, projected_s, _, dist = projected_point_and_arclength_on_polyline(start, printed)
             if dist < best_dist:
                 best_point = q
-                best_tangent = tangent
+                best_projected_s = projected_s
+                best_polyline = printed
                 best_dist = dist
 
-        overlap_point = best_point - best_tangent * overlap
+        overlap_point = best_point.copy()
+        if best_polyline is not None and len(best_polyline) >= 2:
+            tangent_window = max(float(tangent_window_mm), float(overlap))
+            upstream_s = max(0.0, float(best_projected_s) - tangent_window)
+            upstream_point = point_on_polyline_at_arclength(best_polyline, upstream_s)
+            averaged_tangent = normalize(best_point - upstream_point)
+            if float(np.linalg.norm(averaged_tangent)) > 1e-12:
+                overlap_point = best_point - averaged_tangent * overlap
         branch_pts = pts.copy()
         if float(np.linalg.norm(branch_pts[0] - best_point)) > float(point_merge_tol):
             branch_pts = np.vstack([best_point, branch_pts])
@@ -2555,18 +2731,22 @@ def write_vessel_gcode(
     simplify_paths: bool,
     chain_merge_threshold: float,
     path_resample_spacing: float,
+    path_geometry_smooth_window: int,
     point_merge_tol: float,
     min_group_length_mm: float = DEFAULT_MIN_GROUP_LENGTH_MM,
     force_bottom_to_top: bool = False,
     branch_start_overlap_mm: float = 0.0,
+    branch_overlap_tangent_window_mm: float = DEFAULT_BRANCH_OVERLAP_TANGENT_WINDOW_MM,
     preferred_main_vessel_ids: Optional[List[int]] = None,
     travel_clearance_above_printed_z: float = DEFAULT_TRAVEL_CLEARANCE_ABOVE_PRINTED_Z,
     travel_bbox_margin: float = DEFAULT_TRAVEL_BBOX_MARGIN,
     travel_edge_clearance: float = DEFAULT_TRAVEL_EDGE_CLEARANCE,
+    enable_travel_bbox_clearance: bool = True,
     fine_approach_distance: float = DEFAULT_FINE_APPROACH_DISTANCE,
     robot_skeleton_ref: Optional[RobotSkeletonReference] = None,
     skeleton_collision_clearance: float = DEFAULT_SKELETON_COLLISION_CLEARANCE,
     skeleton_collision_sample_step_mm: float = DEFAULT_SKELETON_COLLISION_SAMPLE_STEP_MM,
+    group_displacements: Optional[Dict[int, GroupDisplacement]] = None,
 ) -> Dict[str, Tuple[float, float]]:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     emit_extrusion = float(extrusion_per_mm) != 0.0
@@ -2577,10 +2757,12 @@ def write_vessel_gcode(
         simplify_paths=simplify_paths,
         chain_merge_threshold=chain_merge_threshold,
         path_resample_spacing=path_resample_spacing,
+        path_geometry_smooth_window=path_geometry_smooth_window,
         point_merge_tol=point_merge_tol,
         min_group_length_mm=min_group_length_mm,
         force_bottom_to_top=force_bottom_to_top,
         branch_start_overlap_mm=branch_start_overlap_mm,
+        branch_overlap_tangent_window_mm=branch_overlap_tangent_window_mm,
         preferred_main_vessel_ids=preferred_main_vessel_ids,
     )
     if not paths:
@@ -2622,6 +2804,7 @@ def write_vessel_gcode(
             f.write(f"; preferred_main_vessel_ids = {preferred_main_vessel_ids}\n")
         f.write(f"; tangent_smooth_window = {tangent_smooth_window}\n")
         f.write(f"; centerline_smooth_window = {centerline_smooth_window}\n")
+        f.write(f"; path_geometry_smooth_window = {int(path_geometry_smooth_window)}\n")
         f.write(f"; b_max_step_deg = {float(b_max_step_deg):.6f}\n")
         f.write(f"; c_max_step_deg = {float(c_max_step_deg):.6f}\n")
         f.write(f"; b_smoothing_alpha = {float(b_smoothing_alpha):.6f}\n")
@@ -2633,15 +2816,19 @@ def write_vessel_gcode(
         f.write(f"; chain_merge_threshold = {chain_merge_threshold:.6f}\n")
         f.write(f"; min_group_length_mm = {float(min_group_length_mm):.6f}\n")
         f.write(f"; branch_start_overlap_mm = {float(branch_start_overlap_mm):.6f}\n")
+        f.write(f"; branch_overlap_tangent_window_mm = {float(branch_overlap_tangent_window_mm):.6f}\n")
         f.write(f"; travel_clearance_above_printed_z = {float(travel_clearance_above_printed_z):.6f}\n")
         f.write(f"; travel_bbox_margin = {float(travel_bbox_margin):.6f}\n")
         f.write(f"; travel_edge_clearance = {float(travel_edge_clearance):.6f}\n")
+        f.write(f"; enable_travel_bbox_clearance = {int(bool(enable_travel_bbox_clearance))}\n")
         f.write(f"; fine_approach_distance = {float(fine_approach_distance):.6f}\n")
         if robot_skeleton_ref is not None:
             f.write(f"; robot_skeleton_file = {robot_skeleton_ref.source_path}\n")
             f.write(f"; robot_skeleton_diameter_mm = {float(robot_skeleton_ref.diameter_mm):.6f}\n")
             f.write(f"; skeleton_collision_clearance = {float(skeleton_collision_clearance):.6f}\n")
             f.write(f"; skeleton_collision_sample_step_mm = {float(skeleton_collision_sample_step_mm):.6f}\n")
+        if group_displacements:
+            f.write(f"; manual_group_displacements = {len(group_displacements)} configured groups\n")
         f.write(f"; selected_fit_model = {cal.selected_fit_model or 'legacy-polynomial'}\n")
         f.write(f"; active_phase = {cal.active_phase}\n")
         for warning in calibration_model_range_warnings(cal):
@@ -2683,6 +2870,7 @@ def write_vessel_gcode(
             travel_clearance_above_printed_z=travel_clearance_above_printed_z,
             travel_bbox_margin=travel_bbox_margin,
             travel_edge_clearance=travel_edge_clearance,
+            enable_travel_bbox_clearance=enable_travel_bbox_clearance,
             fine_approach_distance=fine_approach_distance,
             robot_skeleton_ref=robot_skeleton_ref,
             skeleton_collision_clearance=skeleton_collision_clearance,
@@ -2694,7 +2882,7 @@ def write_vessel_gcode(
 
         g.write_move(np.array([msx, msy, msz], dtype=float), msb, msc, travel_feed, comment="startup: move to anchored machine start pose")
 
-        for path in paths:
+        for group_idx, path in enumerate(paths, start=1):
             points = np.asarray(path.points, dtype=float)
             if len(points) < 2:
                 continue
@@ -2702,6 +2890,7 @@ def write_vessel_gcode(
             mult = extrusion_multiplier_main if path.is_main else extrusion_multiplier_branch
 
             f.write("; ------------------------------------------------------------\n")
+            f.write(f"; group_number = {group_idx}\n")
             f.write(f"; {path.path_id}: source_vessels={path.source_vessel_ids}, depth={path.depth}, parent={path.parent_vessel_id}, is_main={path.is_main}\n")
             f.write(f"; centerline polyline points = {len(points)}\n")
             f.write("; this vessel/path is emitted as a single continuous print pass\n")
@@ -2722,6 +2911,13 @@ def write_vessel_gcode(
                 label=path.path_id,
                 path_radius_mm=max(0.0, float(path.radius_like) * float(geometry_scale)),
             )
+            displacement = None if group_displacements is None else group_displacements.get(group_idx)
+            if displacement is not None:
+                g.apply_group_displacement(
+                    displacement=displacement,
+                    default_feed=travel_feed,
+                    label=f"group_{group_idx:03d}_{path.path_id}",
+                )
 
         g.write_move(np.array([mex, mey, mez], dtype=float), meb, mec, travel_feed, comment="shutdown: move to anchored machine end pose")
         if emit_extrusion:
@@ -2759,6 +2955,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--robot-skeleton-file", default=None, help="Optional tracked robot skeleton JSON exported by shadow_calibration.py. When provided, side-approach travel is replanned to keep the robot body clear of already printed vasculature.")
     ap.add_argument("--out", default=DEFAULT_OUT, help="Output G-code file.")
     ap.add_argument("--groups-out", default=None, help="Optional text file listing generated print groups and vessel IDs in print order.")
+    ap.add_argument(
+        "--group-displacements-file",
+        default=None,
+        help=(
+            "Optional text file defining one manual post-group displacement per generated print group. "
+            "Each non-comment row must be: group_number dx dy dz [db_deg] [dc_deg] [feed_mm_min] [enabled]. "
+            "The displacement is applied in machine/stage coordinates immediately after that group is printed."
+        ),
+    )
     ap.add_argument("--rotate-y-deg", type=float, default=0.0, help="Rotate input vessel tip geometry around the Y axis before ordering and writing.")
     ap.add_argument("--rotate-origin-x", type=float, default=0.0)
     ap.add_argument("--rotate-origin-y", type=float, default=0.0)
@@ -2797,6 +3002,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--orientation-mode", choices=["tangent", "fixed"], default="tangent", help="tangent = align B/C to the local 3D vessel tangent; fixed = hold a constant orientation.")
     ap.add_argument("--tangent-smooth-window", type=int, default=DEFAULT_TANGENT_SMOOTH_WINDOW, help="Neighborhood size used when differentiating the smoothed 3D centerline into local tangents.")
     ap.add_argument("--centerline-smooth-window", type=int, default=DEFAULT_CENTERLINE_SMOOTH_WINDOW, help="Optional moving-average half-window applied in XYZ before tangent estimation. 0 keeps the vessel geometry exact.")
+    ap.add_argument("--path-geometry-smooth-window", type=int, default=DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW, help="Optional moving-average half-window applied to the actual emitted XYZ path after resampling. Increase this to reduce local line oscillations.")
     ap.add_argument("--b-max-step-deg", type=float, default=DEFAULT_B_MAX_STEP_DEG, help="Maximum allowed B change per emitted move in tangent mode. Use 0 to disable B step limiting.")
     ap.add_argument("--c-max-step-deg", type=float, default=DEFAULT_C_MAX_STEP_DEG, help="Maximum allowed C change per emitted move in tangent mode. Use 0 to disable C step limiting.")
     ap.add_argument("--b-smoothing-alpha", type=float, default=DEFAULT_B_SMOOTHING_ALPHA, help="Low-pass smoothing alpha for B commands in tangent mode. 1 disables smoothing; smaller values damp local B oscillation.")
@@ -2812,6 +3018,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--chain-merge-threshold", type=float, default=DEFAULT_NODE_ATTACH_THRESHOLD, help="Endpoint distance threshold for merging adjacent vessel segments into a continuous main branch.")
     ap.add_argument("--force-bottom-to-top", action="store_true", help="Reverse each generated print path when needed so it starts at the lower-Z endpoint and ends at the higher-Z endpoint.")
     ap.add_argument("--branch-start-overlap-mm", type=float, default=0.0, help="For branch paths, prepend this much axial overlap into the already printed tree at the connection node.")
+    ap.add_argument("--branch-overlap-tangent-window-mm", type=float, default=DEFAULT_BRANCH_OVERLAP_TANGENT_WINDOW_MM, help="Distance upstream from a branch attachment used to estimate the general branch direction for --branch-start-overlap-mm.")
 
     ap.add_argument("--extrusion-per-mm", type=float, default=DEFAULT_EXTRUSION_PER_MM)
     ap.add_argument("--prime-mm", type=float, default=DEFAULT_PRIME_MM)
@@ -2832,6 +3039,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--travel-clearance-above-printed-z", type=float, default=DEFAULT_TRAVEL_CLEARANCE_ABOVE_PRINTED_Z, help="When a travel move crosses the printed XY bounding box, lift to this many mm above the highest printed tip Z before crossing.")
     ap.add_argument("--travel-bbox-margin", type=float, default=DEFAULT_TRAVEL_BBOX_MARGIN, help="XY margin added around the already printed vasculature bounding box for travel-crossing checks.")
     ap.add_argument("--travel-edge-clearance", type=float, default=DEFAULT_TRAVEL_EDGE_CLEARANCE, help="Extra XY clearance outside the already printed bounding box used for edge-routing travel moves.")
+    ap.add_argument("--enable-travel-bbox-clearance", dest="enable_travel_bbox_clearance", action="store_true", help="Enable printed-bounding-box-aware travel rerouting.")
+    ap.add_argument("--disable-travel-bbox-clearance", dest="enable_travel_bbox_clearance", action="store_false", help="Disable printed-bounding-box-aware travel rerouting and use direct travel moves.")
+    ap.set_defaults(enable_travel_bbox_clearance=True)
     ap.add_argument("--fine-approach-distance", type=float, default=DEFAULT_FINE_APPROACH_DISTANCE, help="Distance from the vessel start/node over which approach moves use --fine-approach-feed.")
     ap.add_argument("--skeleton-collision-clearance", type=float, default=DEFAULT_SKELETON_COLLISION_CLEARANCE, help="Additional radial clearance added between the robot skeleton body and already printed vessel centerlines during side-approach replanning.")
     ap.add_argument("--skeleton-collision-sample-step-mm", type=float, default=DEFAULT_SKELETON_COLLISION_SAMPLE_STEP_MM, help="Sampling step used to check robot-skeleton collisions along candidate travel and side-approach routes.")
@@ -2848,6 +3058,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(args: argparse.Namespace) -> None:
     write_mode = str(args.write_mode).strip().lower()
     robot_skeleton_ref: Optional[RobotSkeletonReference] = None
+    group_displacements = None if args.group_displacements_file is None else parse_group_displacements_file(str(args.group_displacements_file))
     vessels = parse_vessel_file(args.vessels)
     selected_vessel_ids = parse_vessel_id_selection(args.vessel_ids)
     vessels = filter_vessels_by_id(vessels, selected_vessel_ids)
@@ -2906,10 +3117,12 @@ def main(args: argparse.Namespace) -> None:
         simplify_paths=bool(args.simplify_endpoint_chains),
         chain_merge_threshold=float(args.chain_merge_threshold),
         path_resample_spacing=float(args.path_resample_spacing),
+        path_geometry_smooth_window=int(args.path_geometry_smooth_window),
         point_merge_tol=float(args.point_merge_tol),
         min_group_length_mm=float(args.min_group_length_mm),
         force_bottom_to_top=bool(args.force_bottom_to_top),
         branch_start_overlap_mm=float(args.branch_start_overlap_mm),
+        branch_overlap_tangent_window_mm=float(args.branch_overlap_tangent_window_mm),
         preferred_main_vessel_ids=preferred_main_vessel_ids,
     )
     if not preview_paths:
@@ -2988,18 +3201,22 @@ def main(args: argparse.Namespace) -> None:
         simplify_paths=bool(args.simplify_endpoint_chains),
         chain_merge_threshold=float(args.chain_merge_threshold),
         path_resample_spacing=float(args.path_resample_spacing),
+        path_geometry_smooth_window=int(args.path_geometry_smooth_window),
         point_merge_tol=float(args.point_merge_tol),
         min_group_length_mm=float(args.min_group_length_mm),
         force_bottom_to_top=bool(args.force_bottom_to_top),
         branch_start_overlap_mm=float(args.branch_start_overlap_mm),
+        branch_overlap_tangent_window_mm=float(args.branch_overlap_tangent_window_mm),
         preferred_main_vessel_ids=preferred_main_vessel_ids,
         travel_clearance_above_printed_z=float(args.travel_clearance_above_printed_z),
         travel_bbox_margin=float(args.travel_bbox_margin),
         travel_edge_clearance=float(args.travel_edge_clearance),
+        enable_travel_bbox_clearance=bool(args.enable_travel_bbox_clearance),
         fine_approach_distance=float(args.fine_approach_distance),
         robot_skeleton_ref=robot_skeleton_ref,
         skeleton_collision_clearance=float(args.skeleton_collision_clearance),
         skeleton_collision_sample_step_mm=float(args.skeleton_collision_sample_step_mm),
+        group_displacements=group_displacements,
     )
 
     if args.groups_out:
@@ -3012,6 +3229,8 @@ def main(args: argparse.Namespace) -> None:
         print(f"Robot skeleton collision avoidance enabled from {robot_skeleton_ref.source_path}")
     if args.groups_out:
         print(f"Wrote print groups to {args.groups_out}")
+    if group_displacements:
+        print(f"Loaded manual post-group displacements for {len(group_displacements)} groups from {args.group_displacements_file}")
     if abs(float(geometry_scale) - 1.0) > 1e-12:
         print(
             "Scaled vasculature XYZ geometry "

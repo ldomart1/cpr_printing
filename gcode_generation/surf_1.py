@@ -1,30 +1,44 @@
+
 #!/usr/bin/env python3
 """
-Generate Duet/RRF-friendly G-code for a single Gaussian-modulated sine wave in
-the XZ plane.
+Generate Duet/RRF-friendly G-code for a stylized surf wave traced in the XZ plane.
 
-Highlights
-----------
+Shape
+-----
+The generated tip path is a single continuous surf-wave stroke:
+
+1) left horizontal lead-in
+2) smooth concave backside rise
+3) curl into the lip toward a *planned* XZ heading of 220 deg
+   (equivalently -140 deg in the local unwrap used here), so the crest hooks
+   back down inside like a breaking wave
+4) smooth inside lip that goes back down while uncurling
+5) right horizontal run-out on the same Z level as the left horizontal
+
+Motion / orientation
+--------------------
 - Desired tip path lies in the XZ plane at constant Y.
-- Default tip-space box matches the request:
-    X in [50, 150]
-    Z in [-170, -120]
-    Y = 52
-- Tangent-following orientation:
-    * B = 0 deg   -> tip points straight up (+Z)
-    * B = 90 deg  -> tip is horizontal
-    * B = 180 deg -> tip points straight down (-Z)
+- In tangent mode, B follows the local XZ-path tangent using the same convention
+  as the reference generator:
+      B = 0 deg   -> tip points straight up (+Z)
+      B = 90 deg  -> tip is horizontal
+      B = 180 deg -> tip points straight down (-Z)
 - Default C is held at 180 deg so the tool stays in the XZ plane.
-- Supports both:
-    1) calibrated tip tracking, using
-         stage_xyz = desired_tip_xyz - offset_tip(B, C)
-    2) direct Cartesian stage motion
+- In calibrated mode, the stage XYZ is solved from the desired tip XYZ using the
+  calibration tip-offset model, so the *robot tip tracks the lip trajectory*
+  even during the aggressive curl / lip-writing section.
+- The lip geometry is prioritized over exact tangent matching: the path planner
+  aims for a 220 deg lip heading in XZ, and the B solve uses as much curl as the
+  calibration allows. If the calibration cannot realize the full tangent demand,
+  the stage still follows the requested tip trajectory and B simply saturates at
+  the nearest achievable value.
+- Travel moves are routed through a clearance height above the full printed
+  envelope, with start/end anchors outside the wave span, so travel does not
+  cross the already printed path.
 
-The calibration loading / tip-offset planning logic follows the same structure
-as the provided reference script: it keeps the same pull-axis calibration model
-selection, `predict_tip_offset_xyz(...)`, `stage_xyz_for_tip(...)`,
-`solve_b_for_target_tip_angle(...)`, and the same B-angle convention
-(0=up, 90=horizontal, 180=down).
+This script keeps the same calibration loading / tip-offset planning structure
+as the uploaded Gaussian-wave reference generator, and adapts only the path
+construction and safe travel strategy.
 """
 
 from __future__ import annotations
@@ -40,27 +54,37 @@ import numpy as np
 
 
 # ---------------- Defaults ----------------
-DEFAULT_OUT = "gcode_generation/gaussian_wave_xz.gcode"
+DEFAULT_OUT = "gcode_generation/surf_wave_xz.gcode"
 
-# Path placement
+# Tip-space placement
 DEFAULT_X_START = 50.0
-DEFAULT_X_END = 110.0
+DEFAULT_X_TIP = 98.0
+DEFAULT_X_END = 150.0
 DEFAULT_Y = 52.0
-DEFAULT_Z_MIN = -160.0
-DEFAULT_Z_MAX = -120.0
-DEFAULT_Z_BASELINE = 0.5 * (DEFAULT_Z_MIN + DEFAULT_Z_MAX)
 
-# Wave shape
-DEFAULT_Z_AMPLITUDE = 18.0
-DEFAULT_CYCLES = 2.5
-DEFAULT_PHASE_DEG = 0.0
-DEFAULT_X_CENTER = 0.5 * (DEFAULT_X_START + DEFAULT_X_END)
-DEFAULT_GAUSSIAN_SIGMA = 18.0
-DEFAULT_WINDOW_POWER = 1.0
-DEFAULT_LEAD_IN = 4.0
-DEFAULT_LEAD_OUT = 4.0
-DEFAULT_POINTS = 501
-DEFAULT_TANGENT_SMOOTH_WINDOW = 4
+DEFAULT_Z_LEFT = -170.0
+DEFAULT_Z_CREST = -128.0
+DEFAULT_Z_RIGHT = DEFAULT_Z_LEFT
+
+DEFAULT_LEFT_FLAT_LEN = 10.0
+DEFAULT_RIGHT_FLAT_LEN = 18.0
+
+# Backside shaping
+DEFAULT_BACKSIDE_HANDLE_START_FRAC = 0.35
+DEFAULT_BACKSIDE_HANDLE_END_FRAC = 0.30
+
+# Curl / lip shaping
+DEFAULT_CURL_ARC_LEN = 18.0
+DEFAULT_LIP_TARGET_HEADING_DEG = 220.0
+DEFAULT_CURL_ANGLE_MARGIN_DEG = 2.0
+DEFAULT_MIN_CURL_TIP_ANGLE_DEG = 120.0
+DEFAULT_CARTESIAN_CURL_TIP_ANGLE_DEG = 165.0
+DEFAULT_LIP_START_HANDLE_MM = 10.0
+DEFAULT_LIP_END_HANDLE_MM = 10.0
+
+# Sampling
+DEFAULT_SAMPLE_STEP_MM = 0.50
+DEFAULT_TANGENT_SMOOTH_WINDOW = 3
 DEFAULT_CENTERLINE_SMOOTH_WINDOW = 0
 DEFAULT_MIN_TANGENT_XY = 1e-9
 DEFAULT_POINT_MERGE_TOL = 1e-9
@@ -73,14 +97,15 @@ DEFAULT_FIXED_C = 180.0
 DEFAULT_C_DEG = 180.0
 DEFAULT_B_ANGLE_BIAS_DEG = 0.0
 DEFAULT_BC_SOLVE_SAMPLES = 5001
-DEFAULT_Y_OFFPLANE_SIGN = -1.0
+DEFAULT_Y_OFFPLANE_SIGN = 1.0
 
 # Motion
 DEFAULT_TRAVEL_FEED = 1000.0
 DEFAULT_APPROACH_FEED = 400.0
 DEFAULT_FINE_APPROACH_FEED = 80.0
 DEFAULT_PRINT_FEED = 250.0
-DEFAULT_TRAVEL_LIFT_Z = 8.0
+DEFAULT_TRAVEL_CLEARANCE_Z = 8.0
+DEFAULT_TRAVEL_OUTSIDE_X_MARGIN = 10.0
 DEFAULT_APPROACH_SIDE_MM = 4.0
 DEFAULT_EDGE_SAMPLES = 1
 
@@ -130,6 +155,14 @@ class Calibration:
     selected_offplane_fit_model: Optional[str] = None
     active_phase: str = "pull"
     offplane_y_sign: float = 1.0
+
+
+@dataclass
+class SegmentSpan:
+    name: str
+    start_idx: int
+    end_idx: int
+    lip_tracking: bool = False
 
 
 # ---------------- Math / geometry helpers ----------------
@@ -192,6 +225,13 @@ def build_tangents_for_points(
     return tangents
 
 
+def polyline_length(points: np.ndarray) -> float:
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return 0.0
+    return float(np.sum(np.linalg.norm(pts[1:] - pts[:-1], axis=1)))
+
+
 def desired_physical_b_angle_from_tangent(tangent: np.ndarray) -> float:
     """
     B-angle convention:
@@ -229,6 +269,167 @@ def side_vector_from_tangent(
             return np.array([0.0, 1.0, 0.0], dtype=float)
     tx, ty = xy / nxy
     return np.array([-ty, tx, 0.0], dtype=float)
+
+
+def line_points(p0: np.ndarray, p1: np.ndarray, step_mm: float) -> np.ndarray:
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    dist = float(np.linalg.norm(p1 - p0))
+    n = max(2, int(math.ceil(max(dist, 1e-9) / max(step_mm, 1e-6))) + 1)
+    return np.linspace(p0, p1, n)
+
+
+def cubic_bezier_eval(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, t: np.ndarray) -> np.ndarray:
+    t = np.asarray(t, dtype=float).reshape(-1, 1)
+    omt = 1.0 - t
+    return (
+        (omt ** 3) * p0.reshape(1, 3)
+        + (3.0 * omt * omt * t) * p1.reshape(1, 3)
+        + (3.0 * omt * t * t) * p2.reshape(1, 3)
+        + (t ** 3) * p3.reshape(1, 3)
+    )
+
+
+def cubic_bezier_points(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, step_mm: float) -> np.ndarray:
+    p0 = np.asarray(p0, dtype=float)
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    p3 = np.asarray(p3, dtype=float)
+    approx_len = (
+        float(np.linalg.norm(p1 - p0))
+        + float(np.linalg.norm(p2 - p1))
+        + float(np.linalg.norm(p3 - p2))
+    )
+    n = max(4, int(math.ceil(max(approx_len, 1e-9) / max(step_mm, 1e-6))) + 1)
+    tt = np.linspace(0.0, 1.0, n)
+    return cubic_bezier_eval(p0, p1, p2, p3, tt)
+
+
+def cosine_ease(s: np.ndarray) -> np.ndarray:
+    s = np.clip(np.asarray(s, dtype=float), 0.0, 1.0)
+    return 0.5 - 0.5 * np.cos(np.pi * s)
+
+
+def integrate_angle_segment(
+    start_point: np.ndarray,
+    start_tangent_deg: float,
+    end_tangent_deg: float,
+    arc_len_mm: float,
+    step_mm: float,
+) -> np.ndarray:
+    """
+    Integrate a planar XZ segment whose tangent angle changes smoothly from
+    start_tangent_deg to end_tangent_deg.
+
+    Tangent angle here is measured in the XZ plane from +X toward +Z.
+    So:
+      0 deg   -> +X
+      +90 deg -> +Z
+      -90 deg -> -Z
+    """
+    if arc_len_mm <= 0.0:
+        return np.asarray(start_point, dtype=float).reshape(1, 3)
+
+    n = max(4, int(math.ceil(float(arc_len_mm) / max(step_mm, 1e-6))) + 1)
+    s = np.linspace(0.0, 1.0, n)
+    w = cosine_ease(s)
+    theta_deg = float(start_tangent_deg) + (float(end_tangent_deg) - float(start_tangent_deg)) * w
+
+    pts = np.zeros((n, 3), dtype=float)
+    pts[0] = np.asarray(start_point, dtype=float)
+
+    ds = float(arc_len_mm) / float(n - 1)
+    for i in range(1, n):
+        th_mid = math.radians(0.5 * (theta_deg[i - 1] + theta_deg[i]))
+        dx = ds * math.cos(th_mid)
+        dz = ds * math.sin(th_mid)
+        pts[i] = pts[i - 1] + np.array([dx, 0.0, dz], dtype=float)
+
+    return pts
+
+
+def append_segment(parts: List[np.ndarray], spans: List[SegmentSpan], name: str, pts: np.ndarray, lip_tracking: bool = False) -> None:
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) == 0:
+        return
+
+    if not parts:
+        start_idx = 0
+        parts.append(pts)
+        end_idx = len(pts) - 1
+    else:
+        if float(np.linalg.norm(parts[-1][-1] - pts[0])) <= DEFAULT_POINT_MERGE_TOL:
+            pts_use = pts[1:]
+            start_idx = sum(len(p) for p in parts) - 1
+        else:
+            pts_use = pts
+            start_idx = sum(len(p) for p in parts)
+        if len(pts_use) == 0:
+            end_idx = start_idx
+        else:
+            parts.append(pts_use)
+            end_idx = start_idx + len(pts_use) - 1
+
+    spans.append(SegmentSpan(name=name, start_idx=start_idx, end_idx=end_idx, lip_tracking=lip_tracking))
+
+
+def _orient2d_xz(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    return float((b[0] - a[0]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[0] - a[0]))
+
+
+def _segments_intersect_xz(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray, tol: float = 1e-9) -> bool:
+    def on_segment(p: np.ndarray, q: np.ndarray, r: np.ndarray) -> bool:
+        return (
+            min(p[0], q[0]) - tol <= r[0] <= max(p[0], q[0]) + tol
+            and min(p[2], q[2]) - tol <= r[2] <= max(p[2], q[2]) + tol
+        )
+
+    o1 = _orient2d_xz(a, b, c)
+    o2 = _orient2d_xz(a, b, d)
+    o3 = _orient2d_xz(c, d, a)
+    o4 = _orient2d_xz(c, d, b)
+
+    if ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol)) and ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol)):
+        return True
+
+    if abs(o1) <= tol and on_segment(a, b, c):
+        return True
+    if abs(o2) <= tol and on_segment(a, b, d):
+        return True
+    if abs(o3) <= tol and on_segment(c, d, a):
+        return True
+    if abs(o4) <= tol and on_segment(c, d, b):
+        return True
+    return False
+
+
+def polyline_self_intersections_xz(points: np.ndarray, tol: float = 1e-9) -> List[Tuple[int, int]]:
+    pts = np.asarray(points, dtype=float)
+    hits: List[Tuple[int, int]] = []
+    if len(pts) < 4:
+        return hits
+
+    for i in range(len(pts) - 1):
+        a = pts[i]
+        b = pts[i + 1]
+        for j in range(i + 2, len(pts) - 1):
+            if j == i or j == i + 1:
+                continue
+            if i == 0 and j == len(pts) - 2:
+                continue
+            c = pts[j]
+            d = pts[j + 1]
+            shared_endpoint = (
+                np.linalg.norm(a - c) <= tol
+                or np.linalg.norm(a - d) <= tol
+                or np.linalg.norm(b - c) <= tol
+                or np.linalg.norm(b - d) <= tol
+            )
+            if shared_endpoint:
+                continue
+            if _segments_intersect_xz(a, b, c, d, tol=tol):
+                hits.append((i, j))
+    return hits
 
 
 # ---------------- Calibration helpers ----------------
@@ -554,84 +755,155 @@ def solve_b_for_target_tip_angle(cal: Calibration, target_angle_deg: float, sear
     return b_best_abs
 
 
-# ---------------- Wave construction ----------------
-def smoothstep01(s: np.ndarray) -> np.ndarray:
-    s = np.clip(np.asarray(s, dtype=float), 0.0, 1.0)
-    return s * s * (3.0 - 2.0 * s)
+def max_available_tip_angle_deg(cal: Calibration, search_samples: int = DEFAULT_BC_SOLVE_SAMPLES) -> float:
+    bb = np.linspace(float(cal.b_min), float(cal.b_max), int(max(101, search_samples)))
+    aa = np.asarray(eval_tip_angle_deg(cal, bb), dtype=float)
+    return float(np.max(aa))
 
 
-def build_gaussian_sine_wave_points(
+# ---------------- Surf-wave path construction ----------------
+def build_surf_wave_points(
+    cal: Optional[Calibration],
+    write_mode: str,
     x_start: float,
+    x_tip: float,
     x_end: float,
     y: float,
-    z_baseline: float,
-    z_amplitude: float,
-    cycles: float,
-    phase_deg: float,
-    x_center: float,
-    gaussian_sigma: float,
-    no_gaussian: bool,
-    lead_in: float,
-    lead_out: float,
-    points: int,
-    window_power: float,
-) -> np.ndarray:
-    x0 = float(x_start)
-    x1 = float(x_end)
-    if not x1 > x0:
-        raise ValueError("--x-end must be greater than --x-start")
-    if float(lead_in) < 0.0 or float(lead_out) < 0.0:
-        raise ValueError("--lead-in and --lead-out must be >= 0")
-    if float(lead_in + lead_out) >= (x1 - x0):
-        raise ValueError("--lead-in + --lead-out must be smaller than the total X span")
-    if (not bool(no_gaussian)) and float(gaussian_sigma) <= 0.0:
-        raise ValueError("--gaussian-sigma must be > 0 unless --no-gaussian is used")
-    if int(points) < 5:
-        raise ValueError("--points must be >= 5")
+    z_left: float,
+    z_crest: float,
+    z_right: float,
+    left_flat_len: float,
+    right_flat_len: float,
+    backside_handle_start_frac: float,
+    backside_handle_end_frac: float,
+    curl_arc_len: float,
+    lip_target_heading_deg: float,
+    curl_angle_margin_deg: float,
+    min_curl_tip_angle_deg: float,
+    cartesian_curl_tip_angle_deg: float,
+    lip_start_handle_mm: float,
+    lip_end_handle_mm: float,
+    sample_step_mm: float,
+    bc_solve_samples: int,
+) -> Tuple[np.ndarray, List[SegmentSpan], Dict[str, float]]:
+    write_mode = str(write_mode).strip().lower()
 
-    wave_x0 = x0 + float(lead_in)
-    wave_x1 = x1 - float(lead_out)
+    if not (x_start < x_tip < x_end):
+        raise ValueError("Require x_start < x_tip < x_end.")
+    if left_flat_len < 0.0 or right_flat_len < 0.0:
+        raise ValueError("left_flat_len and right_flat_len must be >= 0.")
+    if x_start + left_flat_len >= x_tip:
+        raise ValueError("left_flat_len is too large for the requested x_start/x_tip.")
+    if x_tip >= x_end - right_flat_len:
+        raise ValueError("right_flat_len leaves no room for the lip to exit before x_end.")
+    if z_crest <= z_left:
+        raise ValueError("z_crest must be greater than z_left for the backside rise.")
+    if sample_step_mm <= 0.0:
+        raise ValueError("sample_step_mm must be > 0.")
+    if curl_arc_len <= 0.0:
+        raise ValueError("curl_arc_len must be > 0.")
 
-    n_total = int(points)
-    n_lead_in = max(2, int(round(n_total * (lead_in / (x1 - x0))))) if lead_in > 0.0 else 0
-    n_lead_out = max(2, int(round(n_total * (lead_out / (x1 - x0))))) if lead_out > 0.0 else 0
-    n_wave = max(5, n_total - n_lead_in - n_lead_out)
+    target_lip_heading_deg = float(lip_target_heading_deg)
+    unwrapped_lip_heading_deg = unwrap_angle_deg_near(target_lip_heading_deg, 0.0)
+
+    if write_mode == "calibrated":
+        if cal is None:
+            raise ValueError("Calibration is required in calibrated mode.")
+        max_tip_angle_deg = max_available_tip_angle_deg(cal, search_samples=bc_solve_samples)
+        effective_max_tip_angle_deg = min(max_tip_angle_deg - float(curl_angle_margin_deg), 179.0)
+        effective_max_tip_angle_deg = max(effective_max_tip_angle_deg, float(min_curl_tip_angle_deg))
+    else:
+        max_tip_angle_deg = float(cartesian_curl_tip_angle_deg)
+        effective_max_tip_angle_deg = float(cartesian_curl_tip_angle_deg)
+
+    p0 = np.array([float(x_start), float(y), float(z_left)], dtype=float)
+    p1 = np.array([float(x_start + left_flat_len), float(y), float(z_left)], dtype=float)
+    p_tip = np.array([float(x_tip), float(y), float(z_crest)], dtype=float)
+    p_tail = np.array([float(x_end), float(y), float(z_right)], dtype=float)
+    p_exit = np.array([float(x_end - right_flat_len), float(y), float(z_right)], dtype=float)
+
+    back_dx = float(p_tip[0] - p1[0])
+    c1 = p1 + np.array([float(backside_handle_start_frac) * back_dx, 0.0, 0.0], dtype=float)
+    c2 = p_tip - np.array([float(backside_handle_end_frac) * back_dx, 0.0, 0.0], dtype=float)
 
     parts: List[np.ndarray] = []
+    spans: List[SegmentSpan] = []
 
-    if n_lead_in > 0:
-        xs = np.linspace(x0, wave_x0, n_lead_in, endpoint=False)
-        zs = np.full_like(xs, float(z_baseline), dtype=float)
-        ys = np.full_like(xs, float(y), dtype=float)
-        parts.append(np.column_stack([xs, ys, zs]))
+    append_segment(parts, spans, "left_horizontal", line_points(p0, p1, sample_step_mm), lip_tracking=False)
+    append_segment(parts, spans, "backside_rise", cubic_bezier_points(p1, c1, c2, p_tip, sample_step_mm), lip_tracking=False)
 
-    xs = np.linspace(wave_x0, wave_x1, n_wave, endpoint=(n_lead_out == 0))
-    s = np.zeros_like(xs) if wave_x1 == wave_x0 else (xs - wave_x0) / (wave_x1 - wave_x0)
-    phase = math.radians(float(phase_deg))
-    sinusoid = np.sin(2.0 * math.pi * float(cycles) * s + phase)
-    if bool(no_gaussian):
-        gaussian = np.ones_like(xs, dtype=float)
-    else:
-        gaussian = np.exp(-0.5 * ((xs - float(x_center)) / float(gaussian_sigma)) ** 2)
+    curl_pts = integrate_angle_segment(
+        start_point=p_tip,
+        start_tangent_deg=0.0,
+        end_tangent_deg=float(unwrapped_lip_heading_deg),
+        arc_len_mm=float(curl_arc_len),
+        step_mm=sample_step_mm,
+    )
+    append_segment(parts, spans, "curl_to_lip_heading", curl_pts, lip_tracking=True)
 
-    # Endpoint taper makes the wave smoothly leave and rejoin the horizontal baseline
-    # while still reaching full strength near the middle of the write.
-    taper = np.sin(np.pi * np.clip(s, 0.0, 1.0)) ** 2
-    if float(window_power) != 1.0:
-        taper = np.power(np.clip(taper, 0.0, 1.0), float(window_power))
+    p_curl_end = parts[-1][-1].copy()
+    chord_len = float(np.linalg.norm(p_exit - p_curl_end))
+    dx_to_exit = float(p_exit[0] - p_curl_end[0])
+    if chord_len <= 1e-6 or dx_to_exit <= -0.25 * chord_len:
+        raise ValueError(
+            "The planned lip hook leaves no clean path to the exit. Increase x_end, "
+            "reduce curl_arc_len, or choose a less aggressive lip heading."
+        )
 
-    zs = float(z_baseline) + float(z_amplitude) * gaussian * taper * sinusoid
-    ys = np.full_like(xs, float(y), dtype=float)
-    parts.append(np.column_stack([xs, ys, zs]))
+    lip_dir = np.array(
+        [
+            math.cos(math.radians(unwrapped_lip_heading_deg)),
+            0.0,
+            math.sin(math.radians(unwrapped_lip_heading_deg)),
+        ],
+        dtype=float,
+    )
 
-    if n_lead_out > 0:
-        xs = np.linspace(wave_x1, x1, n_lead_out)
-        zs = np.full_like(xs, float(z_baseline), dtype=float)
-        ys = np.full_like(xs, float(y), dtype=float)
-        parts.append(np.column_stack([xs, ys, zs]))
+    best_lip_pts: Optional[np.ndarray] = None
+    best_scale = None
+    for scale in np.linspace(1.0, 0.20, 17):
+        start_handle = min(float(lip_start_handle_mm) * float(scale), 0.48 * max(chord_len, 1e-9))
+        end_handle = min(float(lip_end_handle_mm) * float(scale), 0.48 * max(chord_len, 1e-9))
+        c3 = p_curl_end + start_handle * lip_dir
+        c4 = p_exit - np.array([end_handle, 0.0, 0.0], dtype=float)
+        lip_pts = cubic_bezier_points(p_curl_end, c3, c4, p_exit, sample_step_mm)
 
-    out = np.vstack(parts)
-    return deduplicate_polyline_points(out)
+        test_pts = deduplicate_polyline_points(np.vstack(parts + [lip_pts, line_points(p_exit, p_tail, sample_step_mm)]))
+        if not polyline_self_intersections_xz(test_pts):
+            best_lip_pts = lip_pts
+            best_scale = float(scale)
+            break
+
+    if best_lip_pts is None:
+        raise ValueError(
+            "Unable to build a non-self-intersecting inside lip for the requested lip heading. "
+            "Increase x_end, reduce curl_arc_len, or reduce lip handle lengths."
+        )
+
+    append_segment(parts, spans, "inside_lip_uncurl", best_lip_pts, lip_tracking=True)
+    append_segment(parts, spans, "right_horizontal", line_points(p_exit, p_tail, sample_step_mm), lip_tracking=False)
+
+    pts = deduplicate_polyline_points(np.vstack(parts))
+    intersections = polyline_self_intersections_xz(pts)
+    if intersections:
+        raise ValueError(
+            "Generated surf-wave path self-intersects in XZ. Adjust curl_arc_len / lip handles / x_end."
+        )
+
+    tangents = build_tangents_for_points(pts, smooth_window=1)
+    requested_tip_b_deg = np.array([desired_physical_b_angle_from_tangent(t) for t in tangents], dtype=float)
+
+    info = {
+        "lip_target_heading_deg": float(target_lip_heading_deg),
+        "lip_unwrapped_heading_deg": float(unwrapped_lip_heading_deg),
+        "requested_tip_b_range_deg_min": float(np.min(requested_tip_b_deg)),
+        "requested_tip_b_range_deg_max": float(np.max(requested_tip_b_deg)),
+        "max_available_tip_angle_deg": float(max_tip_angle_deg),
+        "effective_max_tip_angle_deg": float(effective_max_tip_angle_deg),
+        "path_len_mm": float(polyline_length(pts)),
+        "lip_handle_scale_used": float(best_scale if best_scale is not None else 1.0),
+    }
+    return pts, spans, info
 
 
 # ---------------- G-code helpers ----------------
@@ -704,9 +976,6 @@ class GCodeWriter:
 
         if self.write_mode == "calibrated" and self.cal is None:
             raise ValueError("Calibration is required for calibrated mode.")
-
-        if self.write_mode == "calibrated" and self.orientation_mode == "fixed" and self.fixed_b is None:
-            self.fixed_b = solve_b_for_target_tip_angle(self.cal, 90.0, search_samples=self.bc_solve_samples)
 
     @property
     def x_axis(self) -> str:
@@ -823,39 +1092,63 @@ class GCodeWriter:
             self.f.write("; pressure release after print pass\n")
             self.f.write(f"G1 {self.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_retract_feed:.0f}\n")
 
-    def approach_start(
+    def safe_approach_start(
         self,
         start_tip: np.ndarray,
         start_tangent: np.ndarray,
-        travel_lift_z: float,
+        envelope: Dict[str, float],
+        travel_clearance_z: float,
+        travel_outside_x_margin: float,
         approach_side_mm: float,
     ) -> None:
         start_tip = np.asarray(start_tip, dtype=float)
         start_tangent = normalize(np.asarray(start_tangent, dtype=float))
         side = side_vector_from_tangent(start_tangent, fallback=self.last_tip_tangent)
-        far_tip = start_tip - side * float(approach_side_mm) + np.array([0.0, 0.0, float(travel_lift_z)], dtype=float)
-        near_tip = start_tip - side * (0.5 * float(approach_side_mm))
 
-        if self.cur_tip_xyz is None:
-            self.move_to_tip(far_tip, tangent=start_tangent, feed=self.travel_feed, comment="travel above and to the side of wave start")
-            self.move_to_tip(near_tip, tangent=start_tangent, feed=self.approach_feed, comment="approach near the wave start")
-            self.move_to_tip(start_tip, tangent=start_tangent, feed=self.fine_approach_feed, comment="fine approach to wave start")
-            return
+        clearance_z = float(envelope["z_max"] + travel_clearance_z)
+        left_anchor = np.array([float(envelope["x_min"] - travel_outside_x_margin), start_tip[1], clearance_z], dtype=float)
+        side_air = start_tip - side * float(approach_side_mm)
+        side_air[2] = clearance_z
+        side_near = start_tip - side * (0.5 * float(approach_side_mm))
 
-        retreat_side = side_vector_from_tangent(self.last_tip_tangent if self.last_tip_tangent is not None else start_tangent, fallback=side)
-        retreat_tip = np.asarray(self.cur_tip_xyz, dtype=float) + retreat_side * float(approach_side_mm) + np.array([0.0, 0.0, float(travel_lift_z)], dtype=float)
-        retreat_tangent = self.last_tip_tangent if self.last_tip_tangent is not None else start_tangent
-        self.move_to_tip(retreat_tip, tangent=retreat_tangent, feed=self.approach_feed, comment="retreat from previous end")
-        self.move_to_tip(far_tip, tangent=start_tangent, feed=self.travel_feed, comment="travel above and to the side of wave start")
-        self.move_to_tip(near_tip, tangent=start_tangent, feed=self.approach_feed, comment="approach near the wave start")
-        self.move_to_tip(start_tip, tangent=start_tangent, feed=self.fine_approach_feed, comment="fine approach to wave start")
+        self.move_to_tip(left_anchor, tangent=start_tangent, feed=self.travel_feed, comment="safe travel anchor left of printed envelope")
+        self.move_to_tip(side_air, tangent=start_tangent, feed=self.travel_feed, comment="approach above start from outside; does not cross printed path")
+        self.move_to_tip(side_near, tangent=start_tangent, feed=self.approach_feed, comment="descend beside start from outside")
+        self.move_to_tip(start_tip, tangent=start_tangent, feed=self.fine_approach_feed, comment="fine approach to start")
 
-    def print_polyline(self, points: np.ndarray, tangents: np.ndarray) -> None:
+    def safe_retreat_end(
+        self,
+        end_tip: np.ndarray,
+        end_tangent: np.ndarray,
+        envelope: Dict[str, float],
+        travel_clearance_z: float,
+        travel_outside_x_margin: float,
+        approach_side_mm: float,
+    ) -> None:
+        end_tip = np.asarray(end_tip, dtype=float)
+        end_tangent = normalize(np.asarray(end_tangent, dtype=float))
+        side = side_vector_from_tangent(end_tangent, fallback=self.last_tip_tangent)
+
+        clearance_z = float(envelope["z_max"] + travel_clearance_z)
+        side_near = end_tip + side * (0.5 * float(approach_side_mm))
+        side_air = end_tip + side * float(approach_side_mm)
+        side_air[2] = clearance_z
+        right_anchor = np.array([float(envelope["x_max"] + travel_outside_x_margin), end_tip[1], clearance_z], dtype=float)
+
+        self.move_to_tip(side_near, tangent=end_tangent, feed=self.approach_feed, comment="retreat beside end before non-print travel")
+        self.move_to_tip(side_air, tangent=end_tangent, feed=self.approach_feed, comment="lift above printed envelope")
+        self.move_to_tip(right_anchor, tangent=end_tangent, feed=self.travel_feed, comment="safe travel anchor right of printed envelope")
+
+    def print_polyline(self, points: np.ndarray, tangents: np.ndarray, spans: List[SegmentSpan]) -> None:
         if len(points) < 2:
             return
 
+        boundary_comments: Dict[int, Tuple[str, bool]] = {}
+        for s in spans:
+            boundary_comments[int(s.start_idx)] = (s.name, s.lip_tracking)
+
         self.f.write(
-            "; WAVE_WRITE_START "
+            "; SURF_WAVE_WRITE_START "
             f"point_count={len(points)} "
             f"tip_start_x={float(points[0, 0]):.6f} tip_start_y={float(points[0, 1]):.6f} tip_start_z={float(points[0, 2]):.6f} "
             f"tip_end_x={float(points[-1, 0]):.6f} tip_end_y={float(points[-1, 1]):.6f} tip_end_z={float(points[-1, 2]):.6f} "
@@ -864,11 +1157,25 @@ class GCodeWriter:
 
         self.pressure_preload_before_print()
 
+        if 0 in boundary_comments:
+            seg_name, lip_tracking = boundary_comments[0]
+            if lip_tracking:
+                self.f.write(f"; SEGMENT {seg_name} (lip-tracking enabled; stage solve follows the lip point)\n")
+            else:
+                self.f.write(f"; SEGMENT {seg_name}\n")
+
         last_tip = np.asarray(points[0], dtype=float).copy()
         self.cur_tip_xyz = last_tip.copy()
         self.last_tip_tangent = np.asarray(tangents[0], dtype=float).copy()
 
         for i in range(1, len(points)):
+            if i in boundary_comments:
+                seg_name, lip_tracking = boundary_comments[i]
+                if lip_tracking:
+                    self.f.write(f"; SEGMENT {seg_name} (lip-tracking enabled; stage solve follows the lip point)\n")
+                else:
+                    self.f.write(f"; SEGMENT {seg_name}\n")
+
             p0 = np.asarray(points[i - 1], dtype=float)
             p1 = np.asarray(points[i], dtype=float)
             t0 = np.asarray(tangents[i - 1], dtype=float)
@@ -892,40 +1199,35 @@ class GCodeWriter:
                 last_tip = p_tip.copy()
 
         self.pressure_release_after_print()
-        self.f.write("; WAVE_WRITE_END\n")
-
-    def finish(self, travel_lift_z: float) -> None:
-        if self.cur_tip_xyz is None or self.last_tip_tangent is None:
-            return
-        end_tip = np.asarray(self.cur_tip_xyz, dtype=float)
-        retreat_side = side_vector_from_tangent(self.last_tip_tangent)
-        retreat_tip = end_tip + retreat_side * 4.0 + np.array([0.0, 0.0, float(travel_lift_z)], dtype=float)
-        self.move_to_tip(retreat_tip, tangent=self.last_tip_tangent, feed=self.approach_feed, comment="retreat after wave")
+        self.f.write("; SURF_WAVE_WRITE_END\n")
 
 
 # ---------------- Top-level generation ----------------
-def write_gaussian_wave_gcode(
+def write_surf_wave_gcode(
     out: str,
     calibration: Optional[str],
     write_mode: str,
     orientation_mode: str,
     y_offplane_sign: float,
     x_start: float,
+    x_tip: float,
     x_end: float,
     y: float,
-    z_min: float,
-    z_max: float,
-    z_baseline: float,
-    z_amplitude: float,
-    cycles: float,
-    phase_deg: float,
-    x_center: float,
-    gaussian_sigma: float,
-    no_gaussian: bool,
-    lead_in: float,
-    lead_out: float,
-    points: int,
-    window_power: float,
+    z_left: float,
+    z_crest: float,
+    z_right: float,
+    left_flat_len: float,
+    right_flat_len: float,
+    backside_handle_start_frac: float,
+    backside_handle_end_frac: float,
+    curl_arc_len: float,
+    lip_target_heading_deg: float,
+    curl_angle_margin_deg: float,
+    min_curl_tip_angle_deg: float,
+    cartesian_curl_tip_angle_deg: float,
+    lip_start_handle_mm: float,
+    lip_end_handle_mm: float,
+    sample_step_mm: float,
     tangent_smooth_window: int,
     centerline_smooth_window: int,
     fixed_b: float,
@@ -937,7 +1239,8 @@ def write_gaussian_wave_gcode(
     approach_feed: float,
     fine_approach_feed: float,
     print_feed: float,
-    travel_lift_z: float,
+    travel_clearance_z: float,
+    travel_outside_x_margin: float,
     approach_side_mm: float,
     edge_samples: int,
     emit_extrusion: bool,
@@ -978,21 +1281,29 @@ def write_gaussian_wave_gcode(
         "z_max": float(bbox_z_max),
     }
 
-    pts = build_gaussian_sine_wave_points(
+    pts, spans, path_info = build_surf_wave_points(
+        cal=cal,
+        write_mode=write_mode,
         x_start=x_start,
+        x_tip=x_tip,
         x_end=x_end,
         y=y,
-        z_baseline=z_baseline,
-        z_amplitude=z_amplitude,
-        cycles=cycles,
-        phase_deg=phase_deg,
-        x_center=x_center,
-        gaussian_sigma=gaussian_sigma,
-        no_gaussian=no_gaussian,
-        lead_in=lead_in,
-        lead_out=lead_out,
-        points=points,
-        window_power=window_power,
+        z_left=z_left,
+        z_crest=z_crest,
+        z_right=z_right,
+        left_flat_len=left_flat_len,
+        right_flat_len=right_flat_len,
+        backside_handle_start_frac=backside_handle_start_frac,
+        backside_handle_end_frac=backside_handle_end_frac,
+        curl_arc_len=curl_arc_len,
+        lip_target_heading_deg=lip_target_heading_deg,
+        curl_angle_margin_deg=curl_angle_margin_deg,
+        min_curl_tip_angle_deg=min_curl_tip_angle_deg,
+        cartesian_curl_tip_angle_deg=cartesian_curl_tip_angle_deg,
+        lip_start_handle_mm=lip_start_handle_mm,
+        lip_end_handle_mm=lip_end_handle_mm,
+        sample_step_mm=sample_step_mm,
+        bc_solve_samples=bc_solve_samples,
     )
     tangents = build_tangents_for_points(
         pts,
@@ -1000,18 +1311,12 @@ def write_gaussian_wave_gcode(
         centerline_smooth_window=centerline_smooth_window,
     )
 
-    # Validate requested tip-space box.
-    z_lo = float(np.min(pts[:, 2]))
-    z_hi = float(np.max(pts[:, 2]))
-    x_lo = float(np.min(pts[:, 0]))
-    x_hi = float(np.max(pts[:, 0]))
-    if x_lo < float(x_start) - 1e-6 or x_hi > float(x_end) + 1e-6:
-        raise ValueError("Generated X coordinates exceed the requested [x-start, x-end] range.")
-    if z_lo < float(z_min) - 1e-6 or z_hi > float(z_max) + 1e-6:
-        raise ValueError(
-            f"Generated Z coordinates [{z_lo:.3f}, {z_hi:.3f}] exceed the requested "
-            f"[{float(z_min):.3f}, {float(z_max):.3f}] range. Reduce --z-amplitude or adjust baseline / sigma / cycles."
-        )
+    envelope = {
+        "x_min": float(np.min(pts[:, 0])),
+        "x_max": float(np.max(pts[:, 0])),
+        "z_min": float(np.min(pts[:, 2])),
+        "z_max": float(np.max(pts[:, 2])),
+    }
 
     out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1043,49 +1348,54 @@ def write_gaussian_wave_gcode(
     with out_path.open("w", encoding="utf-8") as fh:
         writer.f = fh
 
-        fh.write("; Gaussian-modulated sine wave in the XZ plane\n")
-        fh.write("; Generated by gaussian_wave_xz_generator.py\n")
+        fh.write("; Stylized surf-wave write in the XZ plane\n")
+        fh.write("; Generated by surf_wave_xz_generator.py\n")
         fh.write(f"; write_mode={write_mode} orientation_mode={orientation_mode}\n")
+        fh.write(f"; B-angle convention: 0=up, 90=horizontal, 180=down\n")
+        fh.write(f"; C held constant at {float(c_deg):.3f} deg in tangent mode\n")
         fh.write(
-            "; requested_tip_box "
-            f"x=[{float(x_start):.3f},{float(x_end):.3f}] "
+            "; surf_wave_parameters "
+            f"x_start={float(x_start):.3f} x_tip={float(x_tip):.3f} x_end={float(x_end):.3f} "
             f"y={float(y):.3f} "
-            f"z=[{float(z_min):.3f},{float(z_max):.3f}]\n"
+            f"z_left={float(z_left):.3f} z_crest={float(z_crest):.3f} z_right={float(z_right):.3f} "
+            f"left_flat_len={float(left_flat_len):.3f} right_flat_len={float(right_flat_len):.3f} "
+            f"curl_arc_len={float(curl_arc_len):.3f} "
+            f"lip_target_heading_deg={float(path_info['lip_target_heading_deg']):.3f} "
+            f"lip_unwrapped_heading_deg={float(path_info['lip_unwrapped_heading_deg']):.3f} "
+            f"max_available_tip_angle_deg={float(path_info['max_available_tip_angle_deg']):.3f}\n"
         )
         fh.write(
-            "; wave_parameters "
-            f"z_baseline={float(z_baseline):.3f} "
-            f"z_amplitude={float(z_amplitude):.3f} "
-            f"cycles={float(cycles):.6f} "
-            f"phase_deg={float(phase_deg):.3f} "
-            f"x_center={float(x_center):.3f} "
-            f"gaussian_sigma={float(gaussian_sigma):.3f} "
-            f"no_gaussian={int(bool(no_gaussian))} "
-            f"lead_in={float(lead_in):.3f} "
-            f"lead_out={float(lead_out):.3f} "
-            f"window_power={float(window_power):.3f}\n"
+            "; safe_travel "
+            f"clearance_z_above_envelope={float(travel_clearance_z):.3f} "
+            f"outside_x_margin={float(travel_outside_x_margin):.3f}\n"
         )
         fh.write("G21\n")
         fh.write("G90\n")
-        fh.write(f"; B-angle convention: 0=up, 90=horizontal, 180=down\n")
-        fh.write(f"; C held constant at {float(c_deg):.3f} deg by default\n")
 
-        start_tip = pts[0]
-        start_tangent = tangents[0]
-        writer.approach_start(
-            start_tip=start_tip,
-            start_tangent=start_tangent,
-            travel_lift_z=travel_lift_z,
+        writer.safe_approach_start(
+            start_tip=pts[0],
+            start_tangent=tangents[0],
+            envelope=envelope,
+            travel_clearance_z=travel_clearance_z,
+            travel_outside_x_margin=travel_outside_x_margin,
             approach_side_mm=approach_side_mm,
         )
-        writer.print_polyline(pts, tangents)
-        writer.finish(travel_lift_z=travel_lift_z)
+        writer.print_polyline(pts, tangents, spans)
+        writer.safe_retreat_end(
+            end_tip=pts[-1],
+            end_tangent=tangents[-1],
+            envelope=envelope,
+            travel_clearance_z=travel_clearance_z,
+            travel_outside_x_margin=travel_outside_x_margin,
+            approach_side_mm=approach_side_mm,
+        )
 
         fh.write("; End of file\n")
 
     tip_b = np.array([desired_physical_b_angle_from_tangent(t) for t in tangents], dtype=float)
     if orientation_mode == "fixed":
         b_used = np.full_like(tip_b, float(fixed_b), dtype=float)
+        c_used = np.full_like(tip_b, float(fixed_c), dtype=float)
     elif write_mode == "calibrated":
         assert cal is not None
         b_used = np.array(
@@ -1095,8 +1405,10 @@ def write_gaussian_wave_gcode(
             ],
             dtype=float,
         )
+        c_used = np.full_like(tip_b, float(c_deg), dtype=float)
     else:
         b_used = np.clip(tip_b + float(b_angle_bias_deg), 0.0, 180.0)
+        c_used = np.full_like(tip_b, float(c_deg), dtype=float)
 
     summary = {
         "out": str(out_path),
@@ -1107,8 +1419,17 @@ def write_gaussian_wave_gcode(
         "tip_z_range": (float(np.min(pts[:, 2])), float(np.max(pts[:, 2]))),
         "tip_b_target_range_deg": (float(np.min(tip_b)), float(np.max(tip_b))),
         "b_command_range_deg": (float(np.min(b_used)), float(np.max(b_used))),
-        "c_command_deg": float(c_deg if orientation_mode == "tangent" else fixed_c),
-        "no_gaussian": bool(no_gaussian),
+        "c_command_range_deg": (float(np.min(c_used)), float(np.max(c_used))),
+        "lip_target_heading_deg": float(path_info["lip_target_heading_deg"]),
+        "lip_unwrapped_heading_deg": float(path_info["lip_unwrapped_heading_deg"]),
+        "requested_tip_b_range_deg": (
+            float(path_info["requested_tip_b_range_deg_min"]),
+            float(path_info["requested_tip_b_range_deg_max"]),
+        ),
+        "max_available_tip_angle_deg": float(path_info["max_available_tip_angle_deg"]),
+        "effective_max_tip_angle_deg": float(path_info["effective_max_tip_angle_deg"]),
+        "lip_handle_scale_used": float(path_info["lip_handle_scale_used"]),
+        "path_len_mm": float(path_info["path_len_mm"]),
         "stage_xyz_range": {
             "x": (float(writer.stage_min[0]), float(writer.stage_max[0])),
             "y": (float(writer.stage_min[1]), float(writer.stage_max[1])),
@@ -1123,10 +1444,12 @@ def write_gaussian_wave_gcode(
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
-            "Generate calibrated or Cartesian G-code for a Gaussian-modulated sine wave in the XZ plane. "
-            "Default tip-space box is X=[50,130], Y=52, Z=[-190,-150]. "
-            "In tangent mode, B follows the local path tangent with 0 deg=up, 90 deg=horizontal, 180 deg=down; "
-            "C is held constant at 180 deg by default."
+            "Generate calibrated or Cartesian G-code for a stylized surf wave in the XZ plane. "
+            "The wave starts with a left horizontal run, rises on a smooth concave backside, "
+            "then curls the lip toward a planned 220 deg XZ heading while the stage keeps the "
+            "tip on that trajectory. If the calibration cannot realize the full tangent demand, "
+            "the B solve uses the maximum curl available and the tip trajectory is still tracked. "
+            "Travel moves are routed outside and above the printed envelope."
         )
     )
     ap.add_argument("--out", default=DEFAULT_OUT, help="Output G-code file.")
@@ -1136,21 +1459,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--y-offplane-sign", type=float, default=DEFAULT_Y_OFFPLANE_SIGN, help="Multiplier applied to the calibration off-plane Y term in calibrated mode. Use -1 to flip the sign.")
 
     ap.add_argument("--x-start", type=float, default=DEFAULT_X_START)
+    ap.add_argument("--x-tip", type=float, default=DEFAULT_X_TIP, help="Tip/crest X location where the curl begins.")
     ap.add_argument("--x-end", type=float, default=DEFAULT_X_END)
     ap.add_argument("--y", type=float, default=DEFAULT_Y)
-    ap.add_argument("--z-min", type=float, default=DEFAULT_Z_MIN, help="Requested lower tip-space Z bound. The generated path must stay within this range.")
-    ap.add_argument("--z-max", type=float, default=DEFAULT_Z_MAX, help="Requested upper tip-space Z bound. The generated path must stay within this range.")
-    ap.add_argument("--z-baseline", type=float, default=DEFAULT_Z_BASELINE, help="Baseline Z around which the wave oscillates.")
-    ap.add_argument("--z-amplitude", type=float, default=DEFAULT_Z_AMPLITUDE, help="Peak amplitude multiplier before tapering / Gaussian weighting.")
-    ap.add_argument("--cycles", type=float, default=DEFAULT_CYCLES, help="Number of sine cycles across the active wave interval.")
-    ap.add_argument("--phase-deg", type=float, default=DEFAULT_PHASE_DEG, help="Phase offset in degrees.")
-    ap.add_argument("--x-center", type=float, default=DEFAULT_X_CENTER, help="Center of the Gaussian envelope in X.")
-    ap.add_argument("--gaussian-sigma", type=float, default=DEFAULT_GAUSSIAN_SIGMA, help="Sigma of the Gaussian envelope in X units.")
-    ap.add_argument("--no-gaussian", action="store_true", help="Disable Gaussian modulation and use a pure sine-wave envelope.")
-    ap.add_argument("--lead-in", type=float, default=DEFAULT_LEAD_IN, help="Horizontal lead-in segment length at the start of the wave.")
-    ap.add_argument("--lead-out", type=float, default=DEFAULT_LEAD_OUT, help="Horizontal lead-out segment length at the end of the wave.")
-    ap.add_argument("--window-power", type=float, default=DEFAULT_WINDOW_POWER, help="Endpoint taper exponent. Higher values sharpen the fade-in / fade-out.")
-    ap.add_argument("--points", type=int, default=DEFAULT_POINTS, help="Number of tip-space sample points before edge subdivision.")
+    ap.add_argument("--z-left", type=float, default=DEFAULT_Z_LEFT, help="Z level of the left horizontal segment.")
+    ap.add_argument("--z-crest", type=float, default=DEFAULT_Z_CREST, help="Z level of the crest / lip point.")
+    ap.add_argument("--z-right", type=float, default=DEFAULT_Z_RIGHT, help="Z level of the right horizontal segment after the lip. Defaults to the same level as --z-left.")
+    ap.add_argument("--left-flat-len", type=float, default=DEFAULT_LEFT_FLAT_LEN, help="Horizontal lead-in length on the left.")
+    ap.add_argument("--right-flat-len", type=float, default=DEFAULT_RIGHT_FLAT_LEN, help="Horizontal run-out length on the right.")
+    ap.add_argument("--backside-handle-start-frac", type=float, default=DEFAULT_BACKSIDE_HANDLE_START_FRAC, help="Fraction of backside span used by the first cubic handle.")
+    ap.add_argument("--backside-handle-end-frac", type=float, default=DEFAULT_BACKSIDE_HANDLE_END_FRAC, help="Fraction of backside span used by the second cubic handle.")
+    ap.add_argument("--curl-arc-len", type=float, default=DEFAULT_CURL_ARC_LEN, help="Arc length used to curl from the crest into the lip hook.")
+    ap.add_argument("--lip-target-heading-deg", type=float, default=DEFAULT_LIP_TARGET_HEADING_DEG, help="Preferred full XZ heading of the lip curl. Default 220 deg. Geometry is prioritized; the calibration-limited B solve follows as far as it can.")
+    ap.add_argument("--curl-angle-margin-deg", type=float, default=DEFAULT_CURL_ANGLE_MARGIN_DEG, help="Safety margin subtracted when reporting the effective calibration-limited curl capability.")
+    ap.add_argument("--min-curl-tip-angle-deg", type=float, default=DEFAULT_MIN_CURL_TIP_ANGLE_DEG, help="Lower bound for the physically requested curl tip angle in calibrated mode.")
+    ap.add_argument("--cartesian-curl-tip-angle-deg", type=float, default=DEFAULT_CARTESIAN_CURL_TIP_ANGLE_DEG, help="Fallback max curl tip angle used when --write-mode cartesian.")
+    ap.add_argument("--lip-start-handle-mm", type=float, default=DEFAULT_LIP_START_HANDLE_MM, help="Bezier handle length at the start of the inside lip.")
+    ap.add_argument("--lip-end-handle-mm", type=float, default=DEFAULT_LIP_END_HANDLE_MM, help="Bezier handle length at the end of the inside lip.")
+    ap.add_argument("--sample-step-mm", type=float, default=DEFAULT_SAMPLE_STEP_MM, help="Nominal sample spacing along the planned tip path.")
+
     ap.add_argument("--tangent-smooth-window", type=int, default=DEFAULT_TANGENT_SMOOTH_WINDOW)
     ap.add_argument("--centerline-smooth-window", type=int, default=DEFAULT_CENTERLINE_SMOOTH_WINDOW)
 
@@ -1164,7 +1491,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--approach-feed", type=float, default=DEFAULT_APPROACH_FEED)
     ap.add_argument("--fine-approach-feed", type=float, default=DEFAULT_FINE_APPROACH_FEED)
     ap.add_argument("--print-feed", type=float, default=DEFAULT_PRINT_FEED)
-    ap.add_argument("--travel-lift-z", type=float, default=DEFAULT_TRAVEL_LIFT_Z)
+    ap.add_argument("--travel-clearance-z", type=float, default=DEFAULT_TRAVEL_CLEARANCE_Z, help="Tip-space clearance above the full printed envelope for non-print travel.")
+    ap.add_argument("--travel-outside-x-margin", type=float, default=DEFAULT_TRAVEL_OUTSIDE_X_MARGIN, help="Tip-space X margin outside the printed envelope used for safe travel anchors.")
     ap.add_argument("--approach-side-mm", type=float, default=DEFAULT_APPROACH_SIDE_MM)
     ap.add_argument("--edge-samples", type=int, default=DEFAULT_EDGE_SAMPLES, help="Subdivide each polyline segment into this many printed G1 moves.")
 
@@ -1189,7 +1517,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     ap = build_arg_parser()
     args = ap.parse_args()
-    summary = write_gaussian_wave_gcode(**vars(args))
+    summary = write_surf_wave_gcode(**vars(args))
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

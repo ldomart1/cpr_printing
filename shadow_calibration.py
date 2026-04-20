@@ -8,6 +8,7 @@ Created on Tue Sep 9 13:59:28 2025
 # importing libraries
 import cv2
 import os
+import sys
 import time
 import pandas as pd
 import pickle
@@ -30,6 +31,33 @@ from scipy.interpolate import CubicSpline
 from scipy.interpolate import PchipInterpolator
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import curve_fit
+
+
+def _disable_opencv_opencl_if_needed():
+    """
+    Avoid macOS ARM OpenCV crashes in checkerboard SB detection via OpenCL/Metal.
+    """
+    if sys.platform != "darwin":
+        return
+    if not hasattr(cv2, "ocl"):
+        return
+    try:
+        cv2.ocl.setUseOpenCL(False)
+        print("OpenCV OpenCL disabled on macOS to avoid Metal/OpenCL checkerboard crashes.")
+    except Exception:
+        pass
+
+
+def _should_use_chessboard_sb():
+    """
+    `findChessboardCornersSB` is faster/more robust, but on macOS ARM OpenCV 4.13
+    it can segfault in the OpenCL/Metal backend. Prefer the classic detector there.
+    """
+    return sys.platform != "darwin"
+
+
+_disable_opencv_opencl_if_needed()
+
 
 def _to_json_compatible(value):
     if isinstance(value, np.ndarray):
@@ -227,6 +255,94 @@ def _extract_main_trunk_skeleton(skel_u8: np.ndarray, seeds_yx: np.ndarray) -> t
     trunk = _prune_short_spurs(trunk, min_branch_len=3, max_iters=20)
     trunk_dist = _multisource_bfs_geodesic(trunk, np.asarray(seeds_yx, dtype=int).reshape(-1, 2))
     return trunk, trunk_dist
+
+
+def _trace_ordered_skeleton_path_yx(skel_u8: np.ndarray, dist: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Trace a single ordered skeleton path from the visible base to the distal tip
+    by walking monotonically down the geodesic-distance map.
+    Returns points in base -> tip order.
+    """
+    sk = (np.asarray(skel_u8, dtype=np.uint8) > 0).astype(np.uint8)
+    dist_arr = np.asarray(dist, dtype=int)
+    valid = (sk == 1) & (dist_arr >= 0)
+    if not np.any(valid):
+        return []
+
+    ys, xs = np.where(valid)
+    idx_tip = int(np.argmax(dist_arr[ys, xs]))
+    cy, cx = int(ys[idx_tip]), int(xs[idx_tip])
+    path_tip_to_base = [(cy, cx)]
+    dirs = [
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1),           (0, 1),
+        (1, -1),  (1, 0),  (1, 1),
+    ]
+
+    max_steps = int(np.sum(valid)) + 5
+    for _ in range(max_steps):
+        d_here = int(dist_arr[cy, cx])
+        if d_here <= 0:
+            break
+
+        best = None
+        best_score = None
+        for dy, dx in dirs:
+            ny, nx = cy + dy, cx + dx
+            if 0 <= ny < sk.shape[0] and 0 <= nx < sk.shape[1] and sk[ny, nx] == 1:
+                nd = int(dist_arr[ny, nx])
+                if nd < 0 or nd >= d_here:
+                    continue
+                step_len = float(np.hypot(dx, dy))
+                # Prefer the largest geodesic drop, then the longest spatial step.
+                score = (d_here - nd, step_len, -abs(nd))
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best = (ny, nx)
+
+        if best is None:
+            break
+
+        cy, cx = best
+        path_tip_to_base.append((cy, cx))
+
+    return list(reversed(path_tip_to_base))
+
+
+def _sample_polyline_equal_arclength_xy(path_yx, n_points: int) -> np.ndarray:
+    path = np.asarray(path_yx, dtype=float).reshape(-1, 2)
+    n_points = int(max(2, n_points))
+    if path.shape[0] == 0:
+        return np.full((n_points, 2), np.nan, dtype=float)
+
+    pts_xy = path[:, ::-1]
+    if pts_xy.shape[0] == 1:
+        return np.repeat(pts_xy, n_points, axis=0)
+
+    seg = np.diff(pts_xy, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg_len)])
+    total_len = float(arc[-1])
+    if total_len < 1e-9:
+        return np.repeat(pts_xy[:1], n_points, axis=0)
+
+    target = np.linspace(0.0, total_len, n_points)
+    xq = np.interp(target, arc, pts_xy[:, 0])
+    yq = np.interp(target, arc, pts_xy[:, 1])
+    return np.column_stack([xq, yq]).astype(float)
+
+
+def _sample_visible_skeleton_points_xy(
+    skel_u8: np.ndarray,
+    dist: np.ndarray,
+    n_points: int,
+    tip_xy: tuple[float, float] | None = None,
+) -> np.ndarray:
+    path_yx = _trace_ordered_skeleton_path_yx(skel_u8, dist)
+    pts_xy = _sample_polyline_equal_arclength_xy(path_yx, int(n_points))
+    if tip_xy is not None and pts_xy.shape[0] > 0:
+        pts_xy[-1, :] = np.asarray(tip_xy, dtype=float).reshape(2)
+    return pts_xy
 
 
 def _tip_angle_from_vertical_deg(skel_u8: np.ndarray, dist: np.ndarray, tip_y: int, tip_x: int, path_len: int = 12, return_path: bool = False):
@@ -1156,6 +1272,12 @@ class CTR_Shadow_Calibration:
                       "or set allow_existing=True.")
                 return
 
+        # Skeleton-export smoothing is kept separate from tip detection and
+        # calibration fitting so only the tracked-body export becomes less
+        # sensitive to per-point oscillation noise.
+        self.skeleton_export_spatial_smoothing_window = 1
+        self.skeleton_export_b_smoothing_window = 1
+
         self.calibration_data_folder = os.path.join(parent_directory, self.calibration_data_folder)
         os.chdir(self.calibration_data_folder)
 
@@ -1187,6 +1309,7 @@ class CTR_Shadow_Calibration:
         self.board_px_per_mm_local = None
         self.board_mm_per_px_local = None
         self.board_planar_x_sign = 1.0
+        self.board_xz_axis_sign = 1.0
         self.board_reference_correction_meta = None
         self.board_reference_image_path = None
         self.default_charuco_config = {
@@ -1222,6 +1345,8 @@ class CTR_Shadow_Calibration:
         self.tip_refiner_softargmax_temperature = None
         self.tip_refiner_enabled = False
         self._last_tip_locations_cnn = None
+        self.skeleton_tracking_point_count = 20
+        self._last_skeleton_points_selected_xy = None
 
         print("Calibration object initialized successfully!")
 
@@ -1556,7 +1681,7 @@ class CTR_Shadow_Calibration:
         found = False
         corners = None
 
-        if use_sb and hasattr(cv2, "findChessboardCornersSB"):
+        if use_sb and _should_use_chessboard_sb() and hasattr(cv2, "findChessboardCornersSB"):
             try:
                 flags_sb = cv2.CALIB_CB_EXHAUSTIVE + cv2.CALIB_CB_ACCURACY
                 found, corners = cv2.findChessboardCornersSB(gray, pattern_size, flags=flags_sb)
@@ -1711,6 +1836,7 @@ class CTR_Shadow_Calibration:
         squares_x=None,
         squares_y=None,
         aruco_dictionary=None,
+        board_xz_axis_sign=1.0,
         use_undistort=True,
         draw_debug=False,
         save_debug_path=None,
@@ -1723,10 +1849,17 @@ class CTR_Shadow_Calibration:
         - Board coordinates are (x_mm, y_mm) in the board plane.
         - "True vertical" in image is defined as projection of board +Y axis.
           Therefore +z_mm returned by pixel_point_to_calibrated_axes corresponds to +Y_board.
+        - board_xz_axis_sign can be set to -1 to flip both calibrated x and z axes.
         """
         if self.camera_K is None or self.camera_dist is None:
             raise RuntimeError(
                 "Camera calibration is not loaded. Call load_camera_calibration(...) first."
+            )
+
+        board_xz_axis_sign = float(board_xz_axis_sign)
+        if board_xz_axis_sign not in (-1.0, 1.0):
+            raise ValueError(
+                f"board_xz_axis_sign must be either 1 or -1, got {board_xz_axis_sign!r}"
             )
 
         if isinstance(image_or_path, str):
@@ -1951,6 +2084,7 @@ class CTR_Shadow_Calibration:
         self.board_px_per_mm_local = float(board_px_per_mm_local)
         self.board_mm_per_px_local = float(board_mm_per_px_local)
         self.board_planar_x_sign = 1.0
+        self.board_xz_axis_sign = board_xz_axis_sign
         self.board_reference_correction_meta = None
         self.board_pose = {
             "board_type": board_type,
@@ -1969,6 +2103,7 @@ class CTR_Shadow_Calibration:
             "board_px_per_mm_local": self.board_px_per_mm_local,
             "board_mm_per_px_local": self.board_mm_per_px_local,
             "board_planar_x_sign": self.board_planar_x_sign,
+            "board_xz_axis_sign": self.board_xz_axis_sign,
         }
         if board_type == "checkerboard":
             self.board_pose["inner_corners"] = inner_corners
@@ -2006,6 +2141,7 @@ class CTR_Shadow_Calibration:
             "square_size_mm": float(square_size_mm),
             "image_shape": tuple(image_for_detection.shape),
             "board_planar_x_sign": self.board_planar_x_sign,
+            "board_xz_axis_sign": self.board_xz_axis_sign,
             "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
             "undistorted_image": image_for_detection.copy(),
         }
@@ -2141,6 +2277,7 @@ class CTR_Shadow_Calibration:
             "ruler_axis_unit": None if self.ruler_axis_unit is None else np.asarray(self.ruler_axis_unit, dtype=float).copy(),
             "ruler_axis_perp_unit": None if self.ruler_axis_perp_unit is None else np.asarray(self.ruler_axis_perp_unit, dtype=float).copy(),
             "ruler_calib_meta": None if self.ruler_calib_meta is None else dict(self.ruler_calib_meta),
+            "board_xz_axis_sign": self.board_xz_axis_sign,
             "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
         }
 
@@ -2310,7 +2447,7 @@ class CTR_Shadow_Calibration:
                 "True vertical image direction is unavailable. Estimate board reference first."
             )
         delta = np.array([float(dx_px), float(dy_px)], dtype=np.float64)
-        return float(np.dot(delta, self.true_vertical_img_unit))
+        return float(np.dot(delta, self.true_vertical_img_unit) * float(self.board_xz_axis_sign))
 
     def project_points_onto_true_vertical(self, pts_xy_px, origin_xy_px=None):
         """
@@ -2333,7 +2470,7 @@ class CTR_Shadow_Calibration:
             origin = np.asarray(origin_xy_px, dtype=np.float64).reshape(1, 2)
 
         deltas = pts - origin
-        return (deltas @ self.true_vertical_img_unit.reshape(2, 1)).reshape(-1)
+        return (deltas @ self.true_vertical_img_unit.reshape(2, 1)).reshape(-1) * float(self.board_xz_axis_sign)
 
     def pixel_point_to_calibrated_axes(self, x_px, y_px, origin_px=None):
         """
@@ -2360,8 +2497,8 @@ class CTR_Shadow_Calibration:
             pt_mm = self.board_px_to_mm(pt_px[0], pt_px[1])
             origin_mm = self.board_px_to_mm(origin_px_vec[0], origin_px_vec[1])
             delta_mm = pt_mm - origin_mm
-            u_mm = float(delta_mm[0]) * float(self.board_planar_x_sign) * scale_fix
-            z_mm = float(delta_mm[1]) * scale_fix
+            u_mm = float(delta_mm[0]) * float(self.board_planar_x_sign) * float(self.board_xz_axis_sign) * scale_fix
+            z_mm = float(delta_mm[1]) * float(self.board_xz_axis_sign) * scale_fix
             return u_mm, z_mm
 
         if self.true_vertical_img_unit is None or self.board_mm_per_px_local is None:
@@ -2373,8 +2510,19 @@ class CTR_Shadow_Calibration:
         v_hat = self.true_vertical_img_unit.astype(np.float64).reshape(2)
         u_hat = np.array([v_hat[1], -v_hat[0]], dtype=np.float64)
 
-        u_mm = float(np.dot(delta_px, u_hat) * self.board_mm_per_px_local * float(self.board_planar_x_sign) * scale_fix)
-        z_mm = float(np.dot(delta_px, v_hat) * self.board_mm_per_px_local * scale_fix)
+        u_mm = float(
+            np.dot(delta_px, u_hat)
+            * self.board_mm_per_px_local
+            * float(self.board_planar_x_sign)
+            * float(self.board_xz_axis_sign)
+            * scale_fix
+        )
+        z_mm = float(
+            np.dot(delta_px, v_hat)
+            * self.board_mm_per_px_local
+            * float(self.board_xz_axis_sign)
+            * scale_fix
+        )
         return u_mm, z_mm
 
     def setup_analysis_crop(self, enable_manual_adjustment=False, cam_port=None):
@@ -3621,6 +3769,19 @@ class CTR_Shadow_Calibration:
         else:
             self._last_tip_locations_cnn = None
 
+        n_skeleton_points = int(max(2, getattr(self, "skeleton_tracking_point_count", 20)))
+        sampled_skeleton_xy = _sample_visible_skeleton_points_xy(
+            skel_u8=skel,
+            dist=dist,
+            n_points=n_skeleton_points,
+            tip_xy=(float(xx_selected), float(yy_selected)),
+        )
+        if sampled_skeleton_xy.size > 0:
+            sampled_skeleton_xy = sampled_skeleton_xy.astype(float)
+            sampled_skeleton_xy[:, 0] += float(crop_x_min_img)
+            sampled_skeleton_xy[:, 1] += float(crop_y_min_img)
+        self._last_skeleton_points_selected_xy = sampled_skeleton_xy
+
         dbg_local = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
         dbg_local["image_file_name"] = image_file_name
         dbg_local["tip_angle_deg"] = float(tip_angle_deg)
@@ -3628,6 +3789,9 @@ class CTR_Shadow_Calibration:
         dbg_local["coarse_tip_after_local_xy"] = [float(xx_refined), float(yy_refined)]
         dbg_local["legacy_tip_xy"] = [float(tip_col_legacy), float(tip_row_legacy)]
         dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
+        dbg_local["sampled_skeleton_points_xy_abs"] = (
+            None if sampled_skeleton_xy.size == 0 else sampled_skeleton_xy.tolist()
+        )
         if cnn_tip_dbg is not None:
             dbg_local["cnn_tip_refiner"] = cnn_tip_dbg
             dbg_local["cnn_tip_abs_yx"] = None if cnn_tip_abs is None else [float(cnn_tip_abs[0]), float(cnn_tip_abs[1])]
@@ -3772,6 +3936,8 @@ class CTR_Shadow_Calibration:
         self.tip_locations_array_coarse = np.zeros((num_images, 8))
         self.tip_locations_array_selected = np.zeros((num_images, 8))
         self.tip_locations_array_cnn = np.full((num_images, 8), np.nan)
+        n_skeleton_points = int(max(2, getattr(self, "skeleton_tracking_point_count", 20)))
+        self.skeleton_points_array_selected_xy = np.full((num_images, n_skeleton_points, 2), np.nan, dtype=float)
 
         successful_analyses = 0
         failed_analyses = 0
@@ -3794,6 +3960,10 @@ class CTR_Shadow_Calibration:
                     self.tip_locations_array_cnn[i, :] = self._last_tip_locations_cnn
                     if self.tip_refiner_use_as_selected:
                         self.tip_locations_array_selected[i, :] = self._last_tip_locations_cnn
+                if self._last_skeleton_points_selected_xy is not None:
+                    pts_xy = np.asarray(self._last_skeleton_points_selected_xy, dtype=float).reshape(-1, 2)
+                    if pts_xy.shape[0] == n_skeleton_points:
+                        self.skeleton_points_array_selected_xy[i, :, :] = pts_xy
 
                 output_filename = f"{self._safe_output_stem(image_file)}_analysis.png"
                 output_path = os.path.join(analysis_output_folder, output_filename)
@@ -3809,14 +3979,19 @@ class CTR_Shadow_Calibration:
                 failed_analyses += 1
                 self.tip_locations_array_coarse[i, :] = np.nan
                 self.tip_locations_array_selected[i, :] = np.nan
+                self.tip_locations_array_cnn[i, :] = np.nan
+                self.skeleton_points_array_selected_xy[i, :, :] = np.nan
 
         try:
             coarse_file = os.path.join(processed_folder, "tip_locations_coarse.npy")
             selected_file = os.path.join(processed_folder, "tip_locations_selected.npy")
+            skeleton_points_file = os.path.join(processed_folder, "skeleton_points_selected_xy_px.npy")
             np.save(coarse_file, self.tip_locations_array_coarse)
             np.save(selected_file, self.tip_locations_array_selected)
+            np.save(skeleton_points_file, self.skeleton_points_array_selected_xy)
             print(f"\n✓ Saved coarse tip locations to: {coarse_file}")
             print(f"✓ Saved selected tip locations to: {selected_file}")
+            print(f"✓ Saved tracked skeleton points to: {skeleton_points_file}")
             if self.tip_refiner_enabled:
                 cnn_file = os.path.join(processed_folder, "tip_locations_cnn.npy")
                 np.save(cnn_file, self.tip_locations_array_cnn)
@@ -3834,6 +4009,17 @@ class CTR_Shadow_Calibration:
                 df_selected.to_csv(selected_csv, index=False)
                 print(f"✓ Saved CSV file: {coarse_csv}")
                 print(f"✓ Saved CSV file: {selected_csv}")
+                skeleton_cols = []
+                for point_idx in range(n_skeleton_points):
+                    skeleton_cols.extend([f"p{point_idx:02d}_x_px", f"p{point_idx:02d}_y_px"])
+                df_skeleton = pd.DataFrame(
+                    self.skeleton_points_array_selected_xy.reshape(num_images, -1),
+                    columns=skeleton_cols,
+                )
+                df_skeleton['image_file'] = image_files
+                skeleton_csv = os.path.join(processed_folder, "skeleton_points_selected_xy_px.csv")
+                df_skeleton.to_csv(skeleton_csv, index=False)
+                print(f"✓ Saved CSV file: {skeleton_csv}")
                 if self.tip_refiner_enabled:
                     df_cnn = pd.DataFrame(self.tip_locations_array_cnn, columns=columns)
                     df_cnn['image_file'] = image_files
@@ -4381,14 +4567,22 @@ class CTR_Shadow_Calibration:
                 f.write(p2.astype(np.float32).tobytes())
                 f.write(np.uint16(0).tobytes())
 
-    def export_parametric_skeleton_model(self, robot_name, n_links=6, diameter_mm=3.0, b_ref=0.0, stl_reference_pose=True):
+    def export_parametric_skeleton_model(
+        self,
+        robot_name,
+        skeleton_points_mm,
+        metadata_rows,
+        n_links=20,
+        diameter_mm=1.51,
+        b_ref=0.0,
+        stl_reference_pose=True,
+    ):
         """
-        Export the fitted calibration curve as a parametric link-chain model plus predictor.
+        Export a tracked visible-skeleton model built from per-image centerline
+        points sampled during image analysis.
 
-        Outputs in processed_image_data_folder:
-        - <robot_name>_skeleton_parametric.json
-        - <robot_name>_skeleton_predict.py
-        - optionally <robot_name>_robot_skeleton_reference.stl
+        Each tracked point gets its own displacement-vs-B fit(s), rather than
+        generating a synthetic link chain from the tip curve.
         """
         processed = Path(self.calibration_data_folder) / "processed_image_data_folder"
         gcode_json_path = processed / f"{robot_name}_gcode_calibration.json"
@@ -4398,97 +4592,458 @@ class CTR_Shadow_Calibration:
         with open(gcode_json_path, "r") as f:
             cal_json = json.load(f)
 
-        fit_models = cal_json.get("fit_models", {})
-        r_model = fit_models.get("r") or self._legacy_curve_model_from_calibration_json(cal_json, "r")
-        z_model = fit_models.get("z") or self._legacy_curve_model_from_calibration_json(cal_json, "z")
-        y_model = fit_models.get("offplane_y") or self._legacy_curve_model_from_calibration_json(cal_json, "offplane_y")
-        if r_model is None or z_model is None:
-            raise ValueError("Calibration JSON missing r/z fit models.")
+        rows = np.asarray(metadata_rows, dtype=float)
+        points_mm = np.asarray(skeleton_points_mm, dtype=float)
+        if rows.ndim != 2 or rows.shape[1] < 8:
+            raise ValueError("metadata_rows must have at least 8 columns.")
+        if points_mm.ndim != 3 or points_mm.shape[0] != rows.shape[0] or points_mm.shape[2] != 2:
+            raise ValueError("skeleton_points_mm must have shape (num_images, num_points, 2).")
+
+        ORI_COL = 2
+        B_PULL_COL = 3
+        PHASE_COL = 6
+        PASS_COL = 7
+
+        n_points = int(max(2, n_links))
+        if points_mm.shape[1] != n_points:
+            if points_mm.shape[1] < 2:
+                raise ValueError("At least two tracked skeleton points are required for export.")
+            n_points = int(points_mm.shape[1])
+
+        diameter_mm = float(diameter_mm)
+        point_t = np.linspace(0.0, 1.0, n_points)
 
         motor_setup = cal_json.get("motor_setup", {})
         coeffs = cal_json.get("cubic_coefficients", {})
         b_rng = motor_setup.get("b_motor_position_range") or coeffs.get("b_motor_range")
         if b_rng is None or len(b_rng) != 2:
             raise ValueError("Calibration JSON missing b_motor_position_range.")
-
         b_min = float(b_rng[0])
         b_max = float(b_rng[1])
-        n_links = int(max(1, n_links))
-        diameter_mm = float(diameter_mm)
-        t = np.linspace(0.0, 1.0, n_links + 1)
-        b_knots = b_min + t * (b_max - b_min)
 
-        pts_ref = self._sample_curve_xyz_from_calibration_json(cal_json, b_knots)
+        phase_name_map = {0: "pull", 1: "release"}
+        valid_meta_mask = np.all(np.isfinite(rows[:, [ORI_COL, B_PULL_COL, PHASE_COL, PASS_COL]]), axis=1)
+        valid_points_mask = np.any(np.isfinite(points_mm[:, :, 0]) & np.isfinite(points_mm[:, :, 1]), axis=1)
+        valid_mask = valid_meta_mask & valid_points_mask
+        rows = rows[valid_mask].copy()
+        points_mm = points_mm[valid_mask].copy()
+        if rows.size == 0:
+            raise ValueError("No valid tracked skeleton rows are available for export.")
 
-        origin = np.array([0.0, 0.0, 0.0], dtype=float)
-        if np.linalg.norm(pts_ref[-1] - origin) > 1e-9:
-            pts_ref_with_origin = np.vstack([pts_ref, origin])
-        else:
-            pts_ref_with_origin = pts_ref.copy()
+        def smooth_series_nanaware(values, window):
+            arr = np.asarray(values, dtype=float).copy()
+            w = int(max(0, window))
+            if w <= 0 or arr.size <= 2:
+                return arr
+            out = arr.copy()
+            for idx in range(arr.size):
+                i0 = max(0, idx - w)
+                i1 = min(arr.size, idx + w + 1)
+                neighborhood = arr[i0:i1]
+                finite = neighborhood[np.isfinite(neighborhood)]
+                if finite.size > 0:
+                    out[idx] = float(np.mean(finite))
+            return out
 
-        frames_ref = self._compute_link_frames(pts_ref_with_origin)
+        def smooth_point_matrix_by_axis(points_arr, window, axis_name):
+            pts = np.asarray(points_arr, dtype=float).copy()
+            if pts.ndim != 2:
+                return pts
+            w = int(max(0, window))
+            if w <= 0:
+                return pts
+            out = pts.copy()
+            if axis_name == "body":
+                for row_idx in range(pts.shape[0]):
+                    out[row_idx, :] = smooth_series_nanaware(pts[row_idx, :], w)
+                return out
+            if axis_name == "b":
+                for point_idx in range(pts.shape[1]):
+                    out[:, point_idx] = smooth_series_nanaware(pts[:, point_idx], w)
+                return out
+            return pts
+
+        body_window = int(max(0, getattr(self, "skeleton_export_spatial_smoothing_window", 1)))
+        b_window = int(max(0, getattr(self, "skeleton_export_b_smoothing_window", 1)))
+
+        def smooth_body_samples(x_vals, z_vals):
+            x_use = smooth_point_matrix_by_axis(np.asarray(x_vals, dtype=float), body_window, "body")
+            z_use = smooth_point_matrix_by_axis(np.asarray(z_vals, dtype=float), body_window, "body")
+            return x_use, z_use
+
+        def smooth_b_trajectories(x_vals, z_vals):
+            x_use = smooth_point_matrix_by_axis(np.asarray(x_vals, dtype=float), b_window, "b")
+            z_use = smooth_point_matrix_by_axis(np.asarray(z_vals, dtype=float), b_window, "b")
+            return x_use, z_use
+
+        def fit_displacement_model(b_vals, y_vals, value_name):
+            b_use = np.asarray(b_vals, dtype=float)
+            y_use = smooth_series_nanaware(np.asarray(y_vals, dtype=float), b_window)
+            model = self._fit_curve_model(b_use, y_use, "pchip", value_name)
+            if model is None:
+                model = self._fit_curve_model(b_use, y_use, "cubic", value_name)
+            if model is None:
+                model = self._fit_curve_model(b_use, y_use, "linear", value_name)
+            return model
+
+        def collapse_points_by_bpull(rows_phase, points_phase):
+            if rows_phase.size == 0 or points_phase.size == 0:
+                return None, None
+            unique_b = np.unique(rows_phase[:, B_PULL_COL])
+            out_b = []
+            out_pts = []
+            for b_val in np.sort(unique_b):
+                mask = np.isclose(rows_phase[:, B_PULL_COL], b_val, atol=1e-12)
+                if not np.any(mask):
+                    continue
+                out_b.append(float(b_val))
+                out_pts.append(np.nanmean(points_phase[mask], axis=0))
+            if not out_pts:
+                return None, None
+            return np.asarray(out_b, dtype=float), np.stack(out_pts, axis=0).astype(float)
+
+        def process_point_orientation_pair(rows_a, pts_a, rows_b, pts_b, pair_name):
+            b_a, pts_a_collapsed = collapse_points_by_bpull(rows_a, pts_a)
+            b_b, pts_b_collapsed = collapse_points_by_bpull(rows_b, pts_b)
+            if b_a is None or b_b is None:
+                return None
+
+            common_b = np.intersect1d(b_a, b_b)
+            if common_b.size == 0:
+                return None
+
+            idx_a = np.searchsorted(b_a, common_b)
+            idx_b = np.searchsorted(b_b, common_b)
+            pts_a_aligned = pts_a_collapsed[idx_a]
+            pts_b_aligned = pts_b_collapsed[idx_b]
+
+            mirror_line = np.nanmean(
+                np.concatenate([pts_a_aligned[:, :, 0], pts_b_aligned[:, :, 0]], axis=0),
+                axis=0,
+            )
+            pts_b_primary_mirrored = mirror_line[None, :] - (pts_b_aligned[:, :, 0] - mirror_line[None, :])
+            avg_primary = 0.5 * (pts_a_aligned[:, :, 0] + pts_b_primary_mirrored)
+            avg_secondary = 0.5 * (pts_a_aligned[:, :, 1] + pts_b_aligned[:, :, 1])
+
+            return {
+                "pair_name": str(pair_name),
+                "common_b": common_b.astype(float),
+                "mirror_line_mm": mirror_line.astype(float),
+                "a_points": pts_a_aligned.astype(float),
+                "b_points": pts_b_aligned.astype(float),
+                "b_primary_mirrored": pts_b_primary_mirrored.astype(float),
+                "avg_primary": avg_primary.astype(float),
+                "avg_secondary": avg_secondary.astype(float),
+            }
+
+        def nearest_b_index(b_vals, b_target):
+            b_arr = np.asarray(b_vals, dtype=float).ravel()
+            if b_arr.size == 0:
+                return None
+            return int(np.argmin(np.abs(b_arr - float(b_target))))
+
+        def build_phase_point_dataset(phase_code, pass_idx=1):
+            phase_mask = (
+                np.isclose(rows[:, PHASE_COL], phase_code)
+                & np.isclose(rows[:, PASS_COL], pass_idx)
+            )
+            if not np.any(phase_mask):
+                return None
+
+            phase_rows = rows[phase_mask]
+            phase_points = points_mm[phase_mask]
+
+            planar_pair = process_point_orientation_pair(
+                phase_rows[np.isclose(phase_rows[:, ORI_COL], 0)],
+                phase_points[np.isclose(phase_rows[:, ORI_COL], 0)],
+                phase_rows[np.isclose(phase_rows[:, ORI_COL], 1)],
+                phase_points[np.isclose(phase_rows[:, ORI_COL], 1)],
+                pair_name="C0_C180",
+            )
+            if planar_pair is None:
+                return None
+
+            common_b = planar_pair["common_b"]
+            x_abs, z_abs = smooth_body_samples(planar_pair["avg_primary"], planar_pair["avg_secondary"])
+            x_abs, z_abs = smooth_b_trajectories(x_abs, z_abs)
+            zero_idx = nearest_b_index(common_b, b_ref)
+            x_ref = x_abs[zero_idx].astype(float)
+            z_ref = z_abs[zero_idx].astype(float)
+            x_disp = x_abs - x_ref[None, :]
+            z_disp = z_abs - z_ref[None, :]
+
+            offplane_pair = process_point_orientation_pair(
+                phase_rows[np.isclose(phase_rows[:, ORI_COL], 2)],
+                phase_points[np.isclose(phase_rows[:, ORI_COL], 2)],
+                phase_rows[np.isclose(phase_rows[:, ORI_COL], 3)],
+                phase_points[np.isclose(phase_rows[:, ORI_COL], 3)],
+                pair_name="C90_C-90",
+            )
+            if offplane_pair is not None:
+                common_b_off = offplane_pair["common_b"]
+                y_abs = smooth_point_matrix_by_axis(np.asarray(offplane_pair["avg_primary"], dtype=float), body_window, "body")
+                y_abs = smooth_point_matrix_by_axis(y_abs, b_window, "b")
+                zero_idx_off = nearest_b_index(common_b_off, b_ref)
+                y_ref = y_abs[zero_idx_off].astype(float)
+                y_disp = y_abs - y_ref[None, :]
+            else:
+                common_b_off = None
+                y_abs = None
+                y_ref = np.zeros((n_points,), dtype=float)
+                y_disp = None
+
+            ref_points = np.column_stack([x_ref, y_ref, z_ref]).astype(float)
+            return {
+                "phase_code": int(phase_code),
+                "pass_idx": int(pass_idx),
+                "phase_base_name": phase_name_map.get(int(phase_code), f"phase_{int(phase_code)}"),
+                "phase_name": f"{phase_name_map.get(int(phase_code), f'phase_{int(phase_code)}')}_{int(pass_idx)}",
+                "common_b": common_b.astype(float),
+                "common_b_offplane": None if common_b_off is None else common_b_off.astype(float),
+                "x_abs_mm": x_abs.astype(float),
+                "z_abs_mm": z_abs.astype(float),
+                "y_abs_mm": None if y_abs is None else y_abs.astype(float),
+                "x_disp_mm": x_disp.astype(float),
+                "z_disp_mm": z_disp.astype(float),
+                "y_disp_mm": None if y_disp is None else y_disp.astype(float),
+                "reference_points_xyz_mm": ref_points.astype(float),
+                "planar_pair": planar_pair,
+                "offplane_pair": offplane_pair,
+            }
+
+        def combine_point_phase_pair(base_phase_name, datasets):
+            ds_1 = datasets.get(f"{base_phase_name}_1")
+            ds_2 = datasets.get(f"{base_phase_name}_2")
+            if ds_1 is None or ds_2 is None:
+                return None
+
+            common_b = np.intersect1d(
+                np.asarray(ds_1["common_b"], dtype=float),
+                np.asarray(ds_2["common_b"], dtype=float),
+            )
+            if common_b.size == 0:
+                return None
+
+            idx_1 = np.searchsorted(np.asarray(ds_1["common_b"], dtype=float), common_b)
+            idx_2 = np.searchsorted(np.asarray(ds_2["common_b"], dtype=float), common_b)
+            x_abs = 0.5 * (
+                np.asarray(ds_1["x_abs_mm"], dtype=float)[idx_1]
+                + np.asarray(ds_2["x_abs_mm"], dtype=float)[idx_2]
+            )
+            z_abs = 0.5 * (
+                np.asarray(ds_1["z_abs_mm"], dtype=float)[idx_1]
+                + np.asarray(ds_2["z_abs_mm"], dtype=float)[idx_2]
+            )
+            zero_idx = nearest_b_index(common_b, b_ref)
+            x_ref = x_abs[zero_idx].astype(float)
+            z_ref = z_abs[zero_idx].astype(float)
+
+            common_b_off = None
+            y_abs = None
+            y_ref = np.zeros((n_points,), dtype=float)
+            if ds_1.get("common_b_offplane") is not None and ds_2.get("common_b_offplane") is not None:
+                common_b_off = np.intersect1d(
+                    np.asarray(ds_1["common_b_offplane"], dtype=float),
+                    np.asarray(ds_2["common_b_offplane"], dtype=float),
+                )
+                if common_b_off.size > 0:
+                    id1 = np.searchsorted(np.asarray(ds_1["common_b_offplane"], dtype=float), common_b_off)
+                    id2 = np.searchsorted(np.asarray(ds_2["common_b_offplane"], dtype=float), common_b_off)
+                    y_abs = 0.5 * (
+                        np.asarray(ds_1["y_abs_mm"], dtype=float)[id1]
+                        + np.asarray(ds_2["y_abs_mm"], dtype=float)[id2]
+                    )
+                    zero_idx_off = nearest_b_index(common_b_off, b_ref)
+                    y_ref = y_abs[zero_idx_off].astype(float)
+                else:
+                    common_b_off = None
+
+            ref_points = np.column_stack([x_ref, y_ref, z_ref]).astype(float)
+            return {
+                "phase_code": int(ds_1["phase_code"]),
+                "pass_idx": None,
+                "phase_base_name": str(base_phase_name),
+                "phase_name": f"{base_phase_name}_combined",
+                "common_b": common_b.astype(float),
+                "common_b_offplane": None if common_b_off is None else common_b_off.astype(float),
+                "x_abs_mm": x_abs.astype(float),
+                "z_abs_mm": z_abs.astype(float),
+                "y_abs_mm": None if y_abs is None else y_abs.astype(float),
+                "x_disp_mm": (x_abs - x_ref[None, :]).astype(float),
+                "z_disp_mm": (z_abs - z_ref[None, :]).astype(float),
+                "y_disp_mm": None if y_abs is None else (y_abs - y_ref[None, :]).astype(float),
+                "reference_points_xyz_mm": ref_points.astype(float),
+                "combined_from_passes": [1, 2],
+            }
+
+        datasets = {}
+        available_phase_codes = sorted(np.unique(rows[:, PHASE_COL]).astype(int))
+        available_pass_indices = sorted(np.unique(rows[:, PASS_COL]).astype(int))
+        for phase_code in available_phase_codes:
+            for pass_idx in available_pass_indices:
+                ds = build_phase_point_dataset(phase_code, pass_idx=pass_idx)
+                if ds is not None:
+                    datasets[ds["phase_name"]] = ds
+
+        if not datasets:
+            raise ValueError("Could not construct any tracked skeleton datasets from the sampled points.")
+
+        combine_redundant_passes = bool(getattr(self, "_combine_redundant_passes", True))
+        redundant_pass_combination = str(getattr(self, "_redundant_pass_combination", "average")).strip().lower()
+        if redundant_pass_combination not in {"average", "keep_separate"}:
+            redundant_pass_combination = "average"
+
+        combined_datasets = {}
+        if combine_redundant_passes and redundant_pass_combination == "average":
+            if "pull_2" in datasets:
+                combined_ds = combine_point_phase_pair("pull", datasets)
+                if combined_ds is not None:
+                    combined_datasets[combined_ds["phase_name"]] = combined_ds
+            if "release_2" in datasets:
+                combined_ds = combine_point_phase_pair("release", datasets)
+                if combined_ds is not None:
+                    combined_datasets[combined_ds["phase_name"]] = combined_ds
+
+        datasets_for_export = dict(datasets)
+        datasets_for_export.update(combined_datasets)
+
+        phase_aliases = {}
+        if "pull_combined" in datasets_for_export:
+            phase_aliases["pull"] = "pull_combined"
+        elif "pull_1" in datasets_for_export:
+            phase_aliases["pull"] = "pull_1"
+        if "release_combined" in datasets_for_export:
+            phase_aliases["release"] = "release_combined"
+        elif "release_1" in datasets_for_export:
+            phase_aliases["release"] = "release_1"
+
+        legacy_default_phase = str(
+            cal_json.get("default_phase_for_legacy_access")
+            or coeffs.get("default_phase")
+            or "pull"
+        ).strip().lower()
+        default_phase = phase_aliases.get(legacy_default_phase)
+        if default_phase is None:
+            if legacy_default_phase in datasets_for_export:
+                default_phase = legacy_default_phase
+            elif f"{legacy_default_phase}_1" in datasets_for_export:
+                default_phase = f"{legacy_default_phase}_1"
+            else:
+                default_phase = list(datasets_for_export.keys())[0]
+
+        phase_models = {}
+        for phase_name, ds in datasets_for_export.items():
+            point_models = []
+            for point_idx in range(n_points):
+                x_model = fit_displacement_model(
+                    ds["common_b"],
+                    np.asarray(ds["x_disp_mm"], dtype=float)[:, point_idx],
+                    f"point_{point_idx:02d}_x_disp_mm",
+                )
+                z_model = fit_displacement_model(
+                    ds["common_b"],
+                    np.asarray(ds["z_disp_mm"], dtype=float)[:, point_idx],
+                    f"point_{point_idx:02d}_z_disp_mm",
+                )
+                y_model = None
+                if ds.get("common_b_offplane") is not None and ds.get("y_disp_mm") is not None:
+                    y_model = fit_displacement_model(
+                        ds["common_b_offplane"],
+                        np.asarray(ds["y_disp_mm"], dtype=float)[:, point_idx],
+                        f"point_{point_idx:02d}_y_disp_mm",
+                    )
+
+                point_models.append({
+                    "point_index": int(point_idx),
+                    "point_fraction": float(point_t[point_idx]),
+                    "reference_position_mm": np.asarray(ds["reference_points_xyz_mm"], dtype=float)[point_idx].round(6).tolist(),
+                    "displacement_models": {
+                        "x_mm": x_model,
+                        "y_mm": y_model,
+                        "z_mm": z_model,
+                    },
+                    "samples": {
+                        "b_planar_mm": np.asarray(ds["common_b"], dtype=float).round(6).tolist(),
+                        "x_disp_mm": np.asarray(ds["x_disp_mm"], dtype=float)[:, point_idx].round(6).tolist(),
+                        "z_disp_mm": np.asarray(ds["z_disp_mm"], dtype=float)[:, point_idx].round(6).tolist(),
+                        "b_offplane_mm": None if ds.get("common_b_offplane") is None else np.asarray(ds["common_b_offplane"], dtype=float).round(6).tolist(),
+                        "y_disp_mm": None if ds.get("y_disp_mm") is None else np.asarray(ds["y_disp_mm"], dtype=float)[:, point_idx].round(6).tolist(),
+                    },
+                })
+
+            phase_models[phase_name] = {
+                "phase_name": phase_name,
+                "phase_base_name": ds.get("phase_base_name"),
+                "reference_b_pull_mm": float(b_ref),
+                "reference_positions_xyz_mm": np.asarray(ds["reference_points_xyz_mm"], dtype=float).round(6).tolist(),
+                "point_models": point_models,
+                "b_planar_range_mm": [
+                    float(np.min(np.asarray(ds["common_b"], dtype=float))),
+                    float(np.max(np.asarray(ds["common_b"], dtype=float))),
+                ],
+                "b_offplane_range_mm": None if ds.get("common_b_offplane") is None else [
+                    float(np.min(np.asarray(ds["common_b_offplane"], dtype=float))),
+                    float(np.max(np.asarray(ds["common_b_offplane"], dtype=float))),
+                ],
+            }
+
+        phase_models_with_aliases = dict(phase_models)
+        for alias_name, canonical_name in phase_aliases.items():
+            if canonical_name in phase_models:
+                phase_models_with_aliases[alias_name] = phase_models[canonical_name]
+        default_phase_payload = phase_models_with_aliases[default_phase]
+        ref_points = np.asarray(default_phase_payload["reference_positions_xyz_mm"], dtype=float)
 
         skel_param = {
             "robot_name": robot_name,
-            "type": "parametric_link_chain",
+            "type": "tracked_visible_skeleton_points",
             "units": "mm",
             "diameter_mm": diameter_mm,
             "radius_mm": diameter_mm / 2.0,
-            "n_links_curve": n_links,
-            "unknown_tail_to_origin": True,
+            "n_skeleton_points": int(n_points),
             "b_range": [b_min, b_max],
             "reference_b_pull_mm": float(b_ref),
-            "knot_definition": {
-                "t_i": t.tolist(),
-                "b_i": b_knots.tolist(),
-                "meaning": "Curve knots are sampled along the full calibrated B range; each knot is a point on the fitted curve.",
+            "default_phase_for_legacy_access": default_phase,
+            "phase_aliases": phase_aliases,
+            "point_definition": {
+                "t_i": point_t.round(6).tolist(),
+                "meaning": (
+                    "Tracked points are sampled at equal arc-length spacing along the visible skeleton "
+                    "from the top-most visible trunk point (t=0) to the distal tip (t=1) in each image."
+                ),
             },
-            "curve_equations": {
-                "x_mm": {"fit_model": r_model, "definition": "x = r(b) signed planar radial deflection"},
-                "z_mm": {"fit_model": z_model, "definition": "z = z(b) axial position"},
-                "y_mm": {
-                    "fit_model": y_model,
-                    "definition": "y = y_offplane(b) if available else 0",
-                    "available": y_model is not None,
-                },
+            "smoothing": {
+                "body_window_points": int(body_window),
+                "b_window_samples": int(b_window),
+                "note": "Measured skeleton samples are smoothed along body index and across neighboring B samples before per-point PCHIP fitting.",
             },
             "reference_pose": {
-                "points_xyz_mm": pts_ref_with_origin.round(6).tolist(),
-                "link_frames": frames_ref,
-                "note": "Reference pose uses knots sampled across B-range and a final link to origin. Use predictor to get poses for arbitrary b.",
+                "points_xyz_mm": ref_points.round(6).tolist(),
+                "note": "Reference pose stores the tracked skeleton point positions at reference_b_pull_mm.",
             },
+            "phase_point_models": phase_models_with_aliases,
             "predictor_convention": {
-                "inputs": ["b_pull_mm"],
+                "inputs": ["b_pull_mm", "phase"],
                 "outputs": [
-                    "points_xyz_mm (N+2 points including origin)",
-                    "link_frames (per-link origin, direction, length, rotation matrix)",
+                    "points_xyz_mm (tracked visible skeleton points)",
+                    "point_displacements_xyz_mm relative to reference_b_pull_mm",
                 ],
-                "base_rule": "Append final segment to (0,0,0) if last point isn't already origin.",
+                "coordinate_convention": "X/Y/Z are mirrored-and-averaged calibration coordinates in millimeters.",
             },
         }
 
         param_path = processed / f"{robot_name}_skeleton_parametric.json"
         with open(param_path, "w") as f:
-            json.dump(skel_param, f, indent=2)
+            json.dump(_to_json_compatible(skel_param), f, indent=2)
 
         py_path = processed / f"{robot_name}_skeleton_predict.py"
-        predictor_code = f"""# Auto-generated parametric skeleton predictor for {robot_name}
+        predictor_code = """# Auto-generated tracked skeleton predictor for {robot_name}
 # Units: mm
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
-R_MODEL = {json.dumps(r_model)}
-Z_MODEL = {json.dumps(z_model)}
-Y_MODEL = {json.dumps(y_model)}
-
-B_MIN = {b_min:.10f}
-B_MAX = {b_max:.10f}
-
-T_KNOTS = np.array({json.dumps(t.tolist())}, dtype=float)
-B_KNOTS = B_MIN + T_KNOTS * (B_MAX - B_MIN)
-
-DIAMETER_MM = {diameter_mm:.6f}
-RADIUS_MM = {diameter_mm / 2.0:.6f}
+PHASE_POINT_MODELS = {phase_models_json}
+DEFAULT_PHASE = {default_phase_json}
 
 def _polyval(c, b):
     if c is None:
@@ -4513,75 +5068,54 @@ def _evaluate_curve_model(model_descriptor, b):
         return PchipInterpolator(np.asarray(x_knots, dtype=float), np.asarray(y_knots, dtype=float), extrapolate=True)(b_arr)
     raise ValueError(f"Unsupported model_type: {{model_type}}")
 
-def curve_point_xyz(b):
-    x = float(_evaluate_curve_model(R_MODEL, b))
-    z = float(_evaluate_curve_model(Z_MODEL, b))
-    if Y_MODEL is None:
-        y = 0.0
-    else:
-        y = float(_evaluate_curve_model(Y_MODEL, b))
-    return np.array([x, y, z], dtype=float)
+def _phase_key(phase=None):
+    phase_key = DEFAULT_PHASE if phase is None else str(phase).lower()
+    if phase_key not in PHASE_POINT_MODELS:
+        raise KeyError(f"Unknown phase {{phase_key}}. Available: {{list(PHASE_POINT_MODELS)}}")
+    return phase_key
 
-def skeleton_points(b_pull_mm, include_origin=True):
-    pts = np.stack([curve_point_xyz(bi) for bi in B_KNOTS], axis=0)
-    if include_origin:
-        if np.linalg.norm(pts[-1] - np.array([0.0, 0.0, 0.0])) > 1e-9:
-            pts = np.vstack([pts, np.array([0.0, 0.0, 0.0])])
-    return pts
+def skeleton_reference_points(phase=None):
+    payload = PHASE_POINT_MODELS[_phase_key(phase)]
+    return np.asarray(payload["reference_positions_xyz_mm"], dtype=float)
 
-def _compute_link_frames(points_xyz):
-    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
-    frames = []
-    world_up = np.array([0.0, 0.0, 1.0], dtype=float)
-    for i in range(pts.shape[0] - 1):
-        p0 = pts[i]
-        p1 = pts[i+1]
-        d = p1 - p0
-        L = float(np.linalg.norm(d))
-        if L < 1e-9:
-            frames.append({{
-                "origin_mm": p0.tolist(),
-                "direction_unit": [0.0, 0.0, 1.0],
-                "length_mm": 0.0,
-                "R_world_from_link": np.eye(3).tolist(),
-            }})
-            continue
-        z = d / L
-        up = world_up
-        if abs(float(np.dot(up, z))) > 0.95:
-            up = np.array([0.0, 1.0, 0.0], dtype=float)
-        x = np.cross(up, z)
-        xn = float(np.linalg.norm(x))
-        if xn < 1e-12:
-            x = np.array([1.0, 0.0, 0.0], dtype=float)
-        else:
-            x /= xn
-        y = np.cross(z, x)
-        yn = float(np.linalg.norm(y))
-        if yn < 1e-12:
-            y = np.array([0.0, 1.0, 0.0], dtype=float)
-        else:
-            y /= yn
-        R = np.column_stack([x, y, z])
-        frames.append({{
-            "origin_mm": p0.tolist(),
-            "direction_unit": z.tolist(),
-            "length_mm": L,
-            "R_world_from_link": R.tolist(),
-        }})
-    return frames
+def skeleton_point_displacements(b_pull_mm, phase=None):
+    payload = PHASE_POINT_MODELS[_phase_key(phase)]
+    point_models = payload["point_models"]
+    b_arr = np.asarray(b_pull_mm, dtype=float)
+    scalar = (b_arr.ndim == 0)
+    b_eval = np.atleast_1d(b_arr)
+    out = np.zeros((b_eval.size, len(point_models), 3), dtype=float)
+    for point_idx, point_model in enumerate(point_models):
+        disp_models = point_model.get("displacement_models", {{}})
+        x_model = disp_models.get("x_mm")
+        y_model = disp_models.get("y_mm")
+        z_model = disp_models.get("z_mm")
+        if x_model is not None:
+            out[:, point_idx, 0] = np.asarray(_evaluate_curve_model(x_model, b_eval), dtype=float)
+        if y_model is not None:
+            out[:, point_idx, 1] = np.asarray(_evaluate_curve_model(y_model, b_eval), dtype=float)
+        if z_model is not None:
+            out[:, point_idx, 2] = np.asarray(_evaluate_curve_model(z_model, b_eval), dtype=float)
+    return out[0] if scalar else out
 
-def skeleton_link_frames(b_pull_mm, include_origin=True):
-    pts = skeleton_points(b_pull_mm, include_origin=include_origin)
-    return _compute_link_frames(pts)
-"""
+def skeleton_points(b_pull_mm, phase=None):
+    ref = skeleton_reference_points(phase=phase)
+    disp = skeleton_point_displacements(b_pull_mm, phase=phase)
+    if np.asarray(b_pull_mm).ndim == 0:
+        return ref + disp
+    return ref[None, :, :] + disp
+""".format(
+            robot_name=robot_name,
+            phase_models_json=json.dumps(_to_json_compatible(phase_models_with_aliases), indent=2),
+            default_phase_json=json.dumps(default_phase),
+        )
         with open(py_path, "w") as f:
             f.write(predictor_code)
 
         stl_path = None
-        if stl_reference_pose:
+        if stl_reference_pose and ref_points.shape[0] >= 2:
             verts, faces = self.polyline_to_cylinder_mesh(
-                pts_ref_with_origin,
+                ref_points,
                 radius_mm=diameter_mm / 2.0,
                 sides=16,
             )
@@ -4600,15 +5134,16 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             "predictor_py": py_path.name,
             "reference_stl": stl_path.name if stl_path is not None else None,
             "diameter_mm": diameter_mm,
-            "n_links": n_links,
-            "note": "Use predictor to generate link endpoints/frames for any B pull; includes final link to origin for unknown parts.",
+            "n_skeleton_points": int(n_points),
+            "reference_b_pull_mm": float(b_ref),
+            "note": "Tracked visible-skeleton points with per-point displacement equations versus B pull.",
         }
         with open(gcode_json_path, "w") as f:
-            json.dump(cal_json, f, indent=2)
+            json.dump(_to_json_compatible(cal_json), f, indent=2)
 
         return param_path, py_path, stl_path, gcode_json_path
 
-    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=3.0, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="linear"):
+    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=1.51, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="linear"):
         """Postprocess calibration data and export separate pull/release fits."""
         if not hasattr(self, 'tip_locations_array_selected'):
             print("Tip location data not found in memory, attempting to load from saved files...")
@@ -4679,6 +5214,7 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             # fitting, or all exported mm-valued fits end up 2x too small.
             board_measurement_scale = 1.0
             tip_mm = arr.copy()
+            origin_px = None
 
             if has_calibrated_axes:
                 conversion_mode = "board_reference_calibrated"
@@ -4709,6 +5245,41 @@ def skeleton_link_frames(b_pull_mm, include_origin=True):
             tip_mm[:, 1] = z_mm
             pd.DataFrame(tip_mm).to_excel('tip_locations_selected_mm.xlsx', index=False, header=False)
             print(f"Physical conversion mode: {conversion_mode} | representative mm/px={pixel_to_mm_scale:.6f}")
+
+            skeleton_points_mm = None
+            if export_skeleton:
+                if not hasattr(self, 'skeleton_points_array_selected_xy'):
+                    skeleton_points_file = os.path.join(processed_folder, "skeleton_points_selected_xy_px.npy")
+                    if os.path.exists(skeleton_points_file):
+                        self.skeleton_points_array_selected_xy = np.load(skeleton_points_file)
+                        print(f"✓ Loaded tracked skeleton points from {skeleton_points_file}")
+                skeleton_px = getattr(self, 'skeleton_points_array_selected_xy', None)
+                if skeleton_px is None:
+                    print("Warning: tracked skeleton points were not found; skipping skeleton export.")
+                else:
+                    skeleton_px = np.asarray(skeleton_px, dtype=float)
+                    if skeleton_px.ndim != 3 or skeleton_px.shape[0] != arr.shape[0] or skeleton_px.shape[2] != 2:
+                        print("Warning: tracked skeleton point data has an unexpected shape; skipping skeleton export.")
+                    else:
+                        skeleton_points_mm = np.full_like(skeleton_px, np.nan, dtype=float)
+                        if has_calibrated_axes:
+                            for row_idx in range(skeleton_px.shape[0]):
+                                for point_idx in range(skeleton_px.shape[1]):
+                                    x_px = float(skeleton_px[row_idx, point_idx, 0])
+                                    y_px = float(skeleton_px[row_idx, point_idx, 1])
+                                    if not (np.isfinite(x_px) and np.isfinite(y_px)):
+                                        continue
+                                    uu, zz = self.pixel_point_to_calibrated_axes(
+                                        x_px=x_px, y_px=y_px, origin_px=origin_px
+                                    )
+                                    skeleton_points_mm[row_idx, point_idx, 0] = uu * board_measurement_scale
+                                    skeleton_points_mm[row_idx, point_idx, 1] = zz * board_measurement_scale
+                        elif self.ruler_mm_per_px is not None:
+                            skeleton_points_mm[:, :, 0] = skeleton_px[:, :, 0] * pixel_to_mm_scale
+                            skeleton_points_mm[:, :, 1] = -skeleton_px[:, :, 1] * pixel_to_mm_scale
+                        else:
+                            skeleton_points_mm[:, :, 0] = skeleton_px[:, :, 0] / float(width_in_pixels) * float(width_in_mm)
+                            skeleton_points_mm[:, :, 1] = -skeleton_px[:, :, 1] / float(width_in_pixels) * float(width_in_mm)
 
             valid_rows = tip_mm[np.all(np.isfinite(tip_mm[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL, PASS_COL]]), axis=1)].copy()
             if valid_rows.size == 0:
@@ -6355,14 +6926,17 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
             print(" - 12_mirrored_phase_overlays.png")
             print(f" - {robot_name}_phase_fit_summary.xlsx")
 
-            if export_skeleton:
+            if export_skeleton and skeleton_points_mm is not None:
                 param_path, py_path, stl_path, _patched_json = self.export_parametric_skeleton_model(
                     robot_name=robot_name,
+                    skeleton_points_mm=skeleton_points_mm,
+                    metadata_rows=arr,
                     n_links=int(skeleton_links),
                     diameter_mm=float(skeleton_diameter_mm),
+                    b_ref=0.0,
                     stl_reference_pose=bool(skeleton_reference_stl),
                 )
-                print("\nParametric skeleton export complete:")
+                print("\nTracked skeleton export complete:")
                 print(f" - {param_path.name}")
                 print(f" - {py_path.name}")
                 if stl_path is not None:

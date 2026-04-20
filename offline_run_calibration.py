@@ -444,6 +444,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--board_reference_image", type=str, default=None, help="Path to checkerboard/board reference image")
     parser.add_argument("--board_inner_corners", type=str, default=None, help="Checkerboard inner corners as Nx,Ny")
     parser.add_argument("--board_square_size_mm", type=float, default=None)
+    parser.add_argument("--board_xz_axis_sign", type=int, choices=[-1, 1], default=1, help="Set to -1 to flip the calibrated checkerboard-reference x and z axes.")
     parser.add_argument("--board_no_undistort", action="store_true")
 
     parser.add_argument("--tip_parallel_section_near_r", type=float, default=1.0)
@@ -458,7 +459,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tip_refiner_compare_only", action="store_true", help="Save tip_locations_cnn.* but keep classical selected tips for postprocessing.")
 
     parser.add_argument("--export_skeleton", action="store_true")
-    parser.add_argument("--skeleton_diameter_mm", type=float, default=3.0)
+    parser.add_argument("--skeleton_diameter_mm", type=float, default=1.51)
     parser.add_argument("--skeleton_links", type=int, default=6)
     parser.add_argument("--skeleton_reference_stl", action="store_true")
     return parser
@@ -519,6 +520,7 @@ def main() -> None:
                 str(Path(args.board_reference_image).expanduser().resolve()),
                 inner_corners=parse_inner_corners(args.board_inner_corners),
                 square_size_mm=args.board_square_size_mm,
+                board_xz_axis_sign=float(args.board_xz_axis_sign),
                 use_undistort=(not args.board_no_undistort),
                 draw_debug=True,
                 save_debug_path=str(processed_dir / "board_reference_debug.png"),
@@ -550,6 +552,7 @@ def main() -> None:
             "board_homography_mm_from_px": cal.board_homography_mm_from_px,
             "board_px_per_mm_local": cal.board_px_per_mm_local,
             "board_mm_per_px_local": cal.board_mm_per_px_local,
+            "board_xz_axis_sign": cal.board_xz_axis_sign,
         }
         config_path = project_dir / "analysis_reference.json"
         with open(config_path, "w", encoding="utf-8") as handle:
@@ -566,15 +569,11 @@ def main() -> None:
         robot_name=str(args.robot_name),
         save_plots=bool(args.save_plots),
         fit_model=str(args.fit_model),
+        export_skeleton=bool(args.export_skeleton),
+        skeleton_diameter_mm=float(args.skeleton_diameter_mm),
+        skeleton_links=int(args.skeleton_links),
+        skeleton_reference_stl=bool(args.skeleton_reference_stl),
     )
-
-    if args.export_skeleton:
-        cal.export_parametric_skeleton_model(
-            robot_name=str(args.robot_name),
-            n_links=int(args.skeleton_links),
-            diameter_mm=float(args.skeleton_diameter_mm),
-            stl_reference_pose=bool(args.skeleton_reference_stl),
-        )
 
     print(f"\nDone. Outputs are in {project_dir / 'processed_image_data_folder'}")
 

@@ -7,35 +7,23 @@ Generate Duet/RRF-friendly G-code for the planar node figures using either:
 
   2) direct Cartesian stage motion
 
-Compared with the original working node script, this version adds:
-  - exact calibration-based tip tracking using the same PCHIP / polynomial pull
-    calibration logic used in the vasculature script
-  - a second figure set rotated -90 degrees around each figure's local vertical
-    trunk and offset in Y (default row-2 offset: -20 mm)
-  - a third-row XZ-plane duplicate offset farther in -Y (default row-3 offset:
-    -40 mm), split so figures 1-3 are on row 3 and figures 4-6 continue on
-    row 4 at another Y offset
-  - figure write ordering that prints vertical trunks from bottom -> top, then
-    prints secondary branches from the trunk-side node outward/upward
-  - optional fixed-orientation or tangent-following calibrated motion
-  - side-approach travel planning between print paths, adapted from the
-    vasculature script
+Compared with the original working node script, this version keeps the same
+calibrated tip tracking, travel moves, feeds, dwell, pressure, and primitive
+geometry, but changes only the build-plate arrangement to two rows:
+
+  - row 1: original row-1 subfigures 1, 2, 3, 4 in the XZ plane
+  - row 2: original row-3 subfigures 1, 2, 3 plus original row-4 subfigure 1
+    (the horizontal 90-degree branch figure), arranged as four XZ subfigures
 
 Notes
 -----
-* The original figure set remains in the XZ plane at constant Y = origin_y.
-* The rotated duplicate keeps the same station X positions, shifts the trunk
-  baseline by `rotated_plane_y_offset`, and rotates each figure's lateral
-  geometry from local +X into local -Y around its own trunk.
-* Default calibrated orientation mode is `fixed`, which uses the pull-axis
-  calibration to hold a constant tool orientation while still following the tip
-  path exactly through the calibration model. Use `--orientation-mode tangent`
-  if you want local tangent following like the vasculature writer.
-* The added third/fourth-row XZ-plane copy pre-extends each branch / curve / arc
-  start into the trunk, then dwells at the original trunk junction before
-  continuing outward.
-* Use `--rows` to choose which rows are emitted: `all` (default), `1`, `2`,
-  `3`, `4`, or comma-separated subsets such as `1,3,4`.
+* Both rows use the existing station spacing, so each row has four subfigures.
+* Row 1 is printed with fixed B / physical tip angle 0 and C=180 degrees.
+* Row 2 uses tangent-following B and C=180 degrees.
+* Row 2 keeps the previous branch-start overextend behavior, but it can now be
+  controlled independently for each row-2 subfigure.
+* Use `--rows` to choose which rows are emitted: `all` (default), `1`, `2`, or
+  comma-separated subsets such as `1,2`.
 """
 
 from __future__ import annotations
@@ -57,11 +45,19 @@ DEFAULT_OUT = "gcode_generation/node_calibrated_pattern.gcode"
 DEFAULT_ORIGIN_X = 65.0
 DEFAULT_ORIGIN_Y = 80.0
 DEFAULT_ORIGIN_Z = -190.0 #190
-DEFAULT_ROTATED_PLANE_Y_OFFSET = -20.0
-DEFAULT_INCLUDE_ROTATED_PLANE = True
-DEFAULT_THIRD_ROW_XZ_PLANE_Y_OFFSET = -40.0
-DEFAULT_INCLUDE_THIRD_ROW_XZ_PLANE = True
-DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM = 1.0
+DEFAULT_ROTATED_PLANE_Y_OFFSET = -20.0  # retained for CLI compatibility
+DEFAULT_INCLUDE_ROTATED_PLANE = False   # retained for CLI compatibility
+DEFAULT_THIRD_ROW_XZ_PLANE_Y_OFFSET = -40.0  # now used as the second-row XZ offset
+DEFAULT_INCLUDE_THIRD_ROW_XZ_PLANE = True    # retained for CLI compatibility
+DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM = 1.5
+DEFAULT_ROW2_SUBFIG1_OVEREXTEND = True
+DEFAULT_ROW2_SUBFIG2_OVEREXTEND = True
+DEFAULT_ROW2_SUBFIG3_OVEREXTEND = True
+DEFAULT_ROW2_SUBFIG4_OVEREXTEND = True
+DEFAULT_ROW2_SUBFIG1_BRANCH_START_EXTENSION_MM = DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM
+DEFAULT_ROW2_SUBFIG2_BRANCH_START_EXTENSION_MM = DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM
+DEFAULT_ROW2_SUBFIG3_BRANCH_START_EXTENSION_MM = DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM
+DEFAULT_ROW2_SUBFIG4_BRANCH_START_EXTENSION_MM = DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM
 DEFAULT_ROWS = "all"
 # Backward-compatible aliases from the previous revision.
 DEFAULT_SECONDARY_XZ_PLANE_Y_OFFSET = DEFAULT_THIRD_ROW_XZ_PLANE_Y_OFFSET
@@ -79,6 +75,7 @@ DEFAULT_MACHINE_END_Y = 80.0
 DEFAULT_MACHINE_END_Z = -30.0
 DEFAULT_MACHINE_END_B = 0.0
 DEFAULT_MACHINE_END_C = 0.0
+DEFAULT_ROW_TRANSITION_LIFT_Z = -50.0
 
 # Motion
 DEFAULT_TRAVEL_FEED = 1000.0
@@ -111,8 +108,8 @@ DEFAULT_PRIME_MM = 0.2
 DEFAULT_PRESSURE_OFFSET_MM = 4.0
 DEFAULT_PRESSURE_ADVANCE_FEED = 120.0
 DEFAULT_PRESSURE_RETRACT_FEED = 240.0
-DEFAULT_PREFLOW_DWELL_MS = 500
-DEFAULT_NODE_DWELL_MS = 1000
+DEFAULT_PREFLOW_DWELL_MS = 300
+DEFAULT_NODE_DWELL_MS = 500
 DEFAULT_EXTRUSION_MULTIPLIER_VERTICAL = 1.0
 DEFAULT_EXTRUSION_MULTIPLIER_BRANCH = 1.0
 
@@ -958,9 +955,9 @@ def parse_row_selection(rows: Any) -> Optional[Tuple[int, ...]]:
         try:
             row = int(piece)
         except ValueError as exc:
-            raise ValueError(f"Unsupported row selector {piece!r}; use all or a comma-separated subset of 1,2,3,4.") from exc
-        if row not in {1, 2, 3, 4}:
-            raise ValueError(f"Unsupported row selector {piece!r}; allowed rows are 1, 2, 3, 4, or all.")
+            raise ValueError(f"Unsupported row selector {piece!r}; use all or a comma-separated subset of 1,2.") from exc
+        if row not in {1, 2}:
+            raise ValueError(f"Unsupported row selector {piece!r}; allowed rows are 1, 2, or all.")
         if row not in seen:
             out.append(row)
             seen.add(row)
@@ -985,14 +982,25 @@ def build_plane_pattern(
     branch_start_extension_mm: float = 0.0,
     figure_indices: Optional[Sequence[int]] = None,
     station_index_by_figure: Optional[Dict[int, int]] = None,
+    branch_start_extension_by_figure: Optional[Dict[int, float]] = None,
 ) -> List[PrimitivePath]:
     ops: List[PrimitivePath] = []
     y = float(plane_y)
     ox = float(origin_x)
     oz = float(origin_z)
     branch_start_extension_mm = max(0.0, float(branch_start_extension_mm))
-    enabled_figures = set(range(1, 7)) if figure_indices is None else {int(i) for i in figure_indices}
+    ordered_figures = tuple(range(1, 7)) if figure_indices is None else tuple(int(i) for i in figure_indices)
+    enabled_figures = set(ordered_figures)
+    figure_order = {int(fig_num): idx for idx, fig_num in enumerate(ordered_figures)}
     station_index_by_figure = {} if station_index_by_figure is None else {int(k): int(v) for k, v in station_index_by_figure.items()}
+    branch_start_extension_by_figure = (
+        {}
+        if branch_start_extension_by_figure is None
+        else {int(k): max(0.0, float(v)) for k, v in branch_start_extension_by_figure.items()}
+    )
+
+    def extension_for_figure(fig_num: int) -> float:
+        return float(branch_start_extension_by_figure.get(int(fig_num), branch_start_extension_mm))
 
     def x_for_figure(fig_num: int, default_station_idx: int) -> float:
         station_idx = station_index_by_figure.get(int(fig_num), int(default_station_idx))
@@ -1018,16 +1026,17 @@ def build_plane_pattern(
             junction_dwell_indices=tuple(int(i) for i in junction_dwell_indices),
         )
 
-    def prepend_tangent_extension(points: Sequence[Point3]) -> Tuple[Tuple[Point3, ...], Tuple[int, ...]]:
+    def prepend_tangent_extension(points: Sequence[Point3], fig_num: int) -> Tuple[Tuple[Point3, ...], Tuple[int, ...]]:
         pts = tuple(points)
-        if len(pts) < 2 or branch_start_extension_mm <= 0.0:
+        ext_mm = extension_for_figure(int(fig_num))
+        if len(pts) < 2 or ext_mm <= 0.0:
             return pts, ()
         p0 = np.array([pts[0].x, pts[0].y, pts[0].z], dtype=float)
         p1 = np.array([pts[1].x, pts[1].y, pts[1].z], dtype=float)
         tangent = normalize(p1 - p0)
         if float(np.linalg.norm(tangent)) <= 1e-12:
             return pts, ()
-        ext_xyz = p0 - float(branch_start_extension_mm) * tangent
+        ext_xyz = p0 - float(ext_mm) * tangent
         ext = p3(ext_xyz[0], ext_xyz[1], ext_xyz[2])
         return (ext,) + pts, (1,)
 
@@ -1037,7 +1046,9 @@ def build_plane_pattern(
         (15.0, 20.706, "fig3", 3),
         (90.0, 10.0, "fig4", 4),
     ]
-    for idx, (angle_deg, length_mm, tag, fig_num) in enumerate(angled_specs):
+    for idx, (angle_deg, length_mm, tag, fig_num) in enumerate(
+        sorted(angled_specs, key=lambda spec: figure_order.get(int(spec[3]), int(spec[3])))
+    ):
         if fig_num not in enabled_figures:
             continue
         x_base = x_for_figure(fig_num, idx)
@@ -1048,7 +1059,7 @@ def build_plane_pattern(
         node = local_point(x_base, y, 0.0, oz + node_z, lateral_axis)
         d_lateral, dz = angle_from_vertical_to_dx_dz(length_mm, angle_deg)
         free = local_point(x_base, y, d_lateral, oz + node_z + dz, lateral_axis)
-        branch_pts, dwell_idx = prepend_tangent_extension((node, free))
+        branch_pts, dwell_idx = prepend_tangent_extension((node, free), fig_num)
         ops.append(make_path(f"{plane_name}_{tag}_branch_{angle_deg:.0f}deg", branch_pts, "branch", tag, junction_dwell_indices=dwell_idx))
 
     if 5 in enabled_figures:
@@ -1072,7 +1083,7 @@ def build_plane_pattern(
             end_handle_len=DEFAULT_FIG5_END_TANGENT_DZ,
         )
         fig5_curve_then_vertical_branch = tuple(list(fig5_curve_pts) + [stub_top])
-        fig5_curve_then_vertical_branch, fig5_dwell_idx = prepend_tangent_extension(fig5_curve_then_vertical_branch)
+        fig5_curve_then_vertical_branch, fig5_dwell_idx = prepend_tangent_extension(fig5_curve_then_vertical_branch, 5)
         ops.append(make_path(
             f"{plane_name}_fig5_curve_then_vertical_branch",
             fig5_curve_then_vertical_branch,
@@ -1106,7 +1117,7 @@ def build_plane_pattern(
             samples=arc_samples,
         )
         fig6_arc_then_branch = tuple(list(fig6_arc_pts) + [branch_tip])
-        fig6_arc_then_branch, fig6_dwell_idx = prepend_tangent_extension(fig6_arc_then_branch)
+        fig6_arc_then_branch, fig6_dwell_idx = prepend_tangent_extension(fig6_arc_then_branch, 6)
         ops.append(make_path(
             f"{plane_name}_fig6_arc_then_slanted_branch",
             fig6_arc_then_branch,
@@ -1134,23 +1145,51 @@ def build_all_patterns(
     node_z: float,
     curve_samples: int,
     arc_samples: int,
+    row2_subfig1_overextend: bool = DEFAULT_ROW2_SUBFIG1_OVEREXTEND,
+    row2_subfig2_overextend: bool = DEFAULT_ROW2_SUBFIG2_OVEREXTEND,
+    row2_subfig3_overextend: bool = DEFAULT_ROW2_SUBFIG3_OVEREXTEND,
+    row2_subfig4_overextend: bool = DEFAULT_ROW2_SUBFIG4_OVEREXTEND,
+    row2_subfig1_branch_start_extension_mm: Optional[float] = None,
+    row2_subfig2_branch_start_extension_mm: Optional[float] = None,
+    row2_subfig3_branch_start_extension_mm: Optional[float] = None,
+    row2_subfig4_branch_start_extension_mm: Optional[float] = None,
 ) -> List[PrimitivePath]:
-    selected_rows = parse_row_selection(rows)
-    rows_override_legacy_includes = selected_rows is not None
-    fourth_row_xz_plane_y_offset = float(third_row_xz_plane_y_offset) + float(rotated_plane_y_offset)
+    """Build the requested two-row build-plate layout.
 
-    def row_enabled(row_num: int, legacy_enabled: bool = True) -> bool:
-        if rows_override_legacy_includes:
-            return row_num in selected_rows
-        return bool(legacy_enabled)
+    Row 1 is the original row-1 XZ set, subfigures 1-4.
+    Row 2 is the old row-3 subfigures 1-3 plus the old row-4 subfigure 1,
+    represented by figure 4, arranged at the fourth station.
+
+    The legacy include/offset arguments are retained so old command lines do not
+    break. Only `third_row_xz_plane_y_offset` is still used; it is the Y offset
+    for the second XZ row.
+    """
+    selected_rows = parse_row_selection(rows)
+
+    def row_enabled(row_num: int) -> bool:
+        return selected_rows is None or int(row_num) in selected_rows
+
+    def row2_extension(explicit_mm: Optional[float], enabled: bool) -> float:
+        if explicit_mm is not None:
+            return max(0.0, float(explicit_mm))
+        return float(third_row_branch_start_extension_mm) if bool(enabled) else 0.0
+
+    row2_extension_by_figure = {
+        1: row2_extension(row2_subfig1_branch_start_extension_mm, row2_subfig1_overextend),
+        2: row2_extension(row2_subfig2_branch_start_extension_mm, row2_subfig2_overextend),
+        3: row2_extension(row2_subfig3_branch_start_extension_mm, row2_subfig3_overextend),
+        4: row2_extension(row2_subfig4_branch_start_extension_mm, row2_subfig4_overextend),
+    }
+    row_subfig_station_index_by_figure = {4: 0, 2: 1, 1: 2, 3: 3}
 
     ops: List[PrimitivePath] = []
-    if row_enabled(1, True):
+
+    if row_enabled(1):
         ops.extend(build_plane_pattern(
             origin_x=origin_x,
             plane_y=origin_y,
             origin_z=origin_z,
-            plane_name="plane0_xz",
+            plane_name="row1_xz_c180_subfigs_1_2_3_4",
             row_num=1,
             lateral_axis="x",
             first_vertical_x=first_vertical_x,
@@ -1160,64 +1199,30 @@ def build_all_patterns(
             curve_samples=curve_samples,
             arc_samples=arc_samples,
             branch_start_extension_mm=0.0,
+            figure_indices=(4, 2, 1, 3),
+            station_index_by_figure=row_subfig_station_index_by_figure,
         ))
-    if row_enabled(2, include_rotated_plane):
-        ops.extend(
-            build_plane_pattern(
-                origin_x=origin_x,
-                plane_y=origin_y + float(rotated_plane_y_offset),
-                origin_z=origin_z,
-                plane_name="plane1_rotm90",
-                row_num=2,
-                lateral_axis="y_neg",
-                first_vertical_x=first_vertical_x,
-                station_spacing=station_spacing,
-                main_vertical_height=main_vertical_height,
-                node_z=node_z,
-                curve_samples=curve_samples,
-                arc_samples=arc_samples,
-                branch_start_extension_mm=0.0,
-            )
-        )
-    if row_enabled(3, include_third_row_xz_plane):
-        ops.extend(
-            build_plane_pattern(
-                origin_x=origin_x,
-                plane_y=origin_y + float(third_row_xz_plane_y_offset),
-                origin_z=origin_z,
-                plane_name="plane2_xz_first3",
-                row_num=3,
-                lateral_axis="x",
-                first_vertical_x=first_vertical_x,
-                station_spacing=station_spacing,
-                main_vertical_height=main_vertical_height,
-                node_z=node_z,
-                curve_samples=curve_samples,
-                arc_samples=arc_samples,
-                branch_start_extension_mm=third_row_branch_start_extension_mm,
-                figure_indices=(1, 2, 3),
-            )
-        )
-    if row_enabled(4, include_third_row_xz_plane):
-        ops.extend(
-            build_plane_pattern(
-                origin_x=origin_x,
-                plane_y=origin_y + fourth_row_xz_plane_y_offset,
-                origin_z=origin_z,
-                plane_name="plane3_xz_last3",
-                row_num=4,
-                lateral_axis="x",
-                first_vertical_x=first_vertical_x,
-                station_spacing=station_spacing,
-                main_vertical_height=main_vertical_height,
-                node_z=node_z,
-                curve_samples=curve_samples,
-                arc_samples=arc_samples,
-                branch_start_extension_mm=third_row_branch_start_extension_mm,
-                figure_indices=(4, 5, 6),
-                station_index_by_figure={4: 0, 5: 1, 6: 2},
-            )
-        )
+
+    if row_enabled(2):
+        ops.extend(build_plane_pattern(
+            origin_x=origin_x,
+            plane_y=origin_y + float(third_row_xz_plane_y_offset),
+            origin_z=origin_z,
+            plane_name="row2_xz_from_old_row3_123_old_row4_1",
+            row_num=2,
+            lateral_axis="x",
+            first_vertical_x=first_vertical_x,
+            station_spacing=station_spacing,
+            main_vertical_height=main_vertical_height,
+            node_z=node_z,
+            curve_samples=curve_samples,
+            arc_samples=arc_samples,
+            branch_start_extension_mm=0.0,
+            branch_start_extension_by_figure=row2_extension_by_figure,
+            figure_indices=(4, 2, 1, 3),
+            station_index_by_figure=row_subfig_station_index_by_figure,
+        ))
+
     return ops
 
 
@@ -1313,13 +1318,11 @@ class GCodeWriter:
             search_samples=self.bc_solve_samples,
             motion_phase=self.cur_motion_phase,
         ) if self.write_mode == "calibrated" else 0.0
-        self.fixed_c = 90.0
+        self.fixed_c = 180.0
 
     def c_for_row(self, row_num: Optional[int] = None) -> float:
-        row_val = None if row_num is None else int(row_num)
-        if row_val in {3, 4}:
-            return 180.0
-        return float(self.fixed_c)
+        # The requested two-row layout prints all emitted rows at C=180.
+        return 180.0
 
     def orientation_mode_for_path(self, kind: Optional[str] = None, row_num: Optional[int] = None) -> str:
         mode = str(self.orientation_mode).strip().lower()
@@ -1328,7 +1331,7 @@ class GCodeWriter:
         row_val = None if row_num is None else int(row_num)
         if row_val == 1:
             return "fixed"
-        if row_val in {2, 3, 4}:
+        if row_val is not None and row_val >= 2:
             return "tangent"
         return mode
 
@@ -1535,6 +1538,7 @@ class GCodeWriter:
         kind: str,
         row_num: int,
         lateral_axis: str,
+        skip_initial_retreat: bool = False,
     ) -> None:
         start_tip = np.asarray(start_tip, dtype=float)
         start_tangent = normalize(np.asarray(start_tangent, dtype=float))
@@ -1548,7 +1552,7 @@ class GCodeWriter:
             near_tip = start_tip + approach_dir * float(near_clearance)
             angled_rotated_branch = str(lateral_axis).strip().lower() != "x" and abs(float(start_tangent[2])) < 0.999
 
-            if self.cur_tip_xyz is not None:
+            if self.cur_tip_xyz is not None and not bool(skip_initial_retreat):
                 retreat_tip = np.asarray(self.cur_tip_xyz, dtype=float) + retreat_axis * float(retreat_clearance) + np.array([0.0, 0.0, -float(side_lift_z)])
                 retreat_tangent = self.last_tip_tangent if self.last_tip_tangent is not None else start_tangent
                 if str(lateral_axis).strip().lower() != "x":
@@ -1569,7 +1573,7 @@ class GCodeWriter:
         far_tip = start_tip - side * float(far_clearance) + np.array([0.0, 0.0, float(side_lift_z)])
         near_tip = start_tip - side * float(near_clearance)
 
-        if self.cur_tip_xyz is not None:
+        if self.cur_tip_xyz is not None and not bool(skip_initial_retreat):
             retreat_dir = self.last_tip_tangent if self.last_tip_tangent is not None else start_tangent
             cur_side = side_vector_from_tangent(retreat_dir, fallback=side)
             retreat_tip = np.asarray(self.cur_tip_xyz, dtype=float) + cur_side * float(retreat_clearance) + np.array([0.0, 0.0, float(side_lift_z)])
@@ -1730,9 +1734,9 @@ def machine_pose_for_tip(
         return (float(p_tip[0]), float(p_tip[1]), float(p_tip[2]), 0.0, 0.0)
     if tangent is None or orientation_mode == "fixed":
         b = solve_b_for_target_tip_angle(cal, 0.0, search_samples=bc_solve_samples)
-        c = 90.0
+        c = 180.0
     else:
-        c = 90.0
+        c = 180.0
         b = solve_b_for_target_tip_angle(cal, desired_physical_b_angle_from_tangent(tangent), search_samples=bc_solve_samples)
     p_stage = stage_xyz_for_tip(cal, np.asarray(p_tip, dtype=float), float(b), float(c))
     return (float(p_stage[0]), float(p_stage[1]), float(p_stage[2]), float(b), float(c))
@@ -1753,6 +1757,14 @@ def write_node_gcode(
     include_third_row_xz_plane: bool,
     third_row_xz_plane_y_offset: float,
     third_row_branch_start_extension_mm: float,
+    row2_subfig1_overextend: bool,
+    row2_subfig2_overextend: bool,
+    row2_subfig3_overextend: bool,
+    row2_subfig4_overextend: bool,
+    row2_subfig1_branch_start_extension_mm: Optional[float],
+    row2_subfig2_branch_start_extension_mm: Optional[float],
+    row2_subfig3_branch_start_extension_mm: Optional[float],
+    row2_subfig4_branch_start_extension_mm: Optional[float],
     rows: Any,
     machine_start_x: float,
     machine_start_y: float,
@@ -1853,6 +1865,14 @@ def write_node_gcode(
         include_third_row_xz_plane=bool(include_third_row_xz_plane),
         third_row_xz_plane_y_offset=third_row_xz_plane_y_offset,
         third_row_branch_start_extension_mm=third_row_branch_start_extension_mm,
+        row2_subfig1_overextend=row2_subfig1_overextend,
+        row2_subfig2_overextend=row2_subfig2_overextend,
+        row2_subfig3_overextend=row2_subfig3_overextend,
+        row2_subfig4_overextend=row2_subfig4_overextend,
+        row2_subfig1_branch_start_extension_mm=row2_subfig1_branch_start_extension_mm,
+        row2_subfig2_branch_start_extension_mm=row2_subfig2_branch_start_extension_mm,
+        row2_subfig3_branch_start_extension_mm=row2_subfig3_branch_start_extension_mm,
+        row2_subfig4_branch_start_extension_mm=row2_subfig4_branch_start_extension_mm,
         rows=rows,
         first_vertical_x=first_vertical_x,
         station_spacing=station_spacing,
@@ -1886,31 +1906,41 @@ def write_node_gcode(
     out_path = str(out)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     emit_extrusion = float(extrusion_per_mm) != 0.0
+    row2_effective_extensions = {
+        1: max(0.0, float(row2_subfig1_branch_start_extension_mm)) if row2_subfig1_branch_start_extension_mm is not None else (float(third_row_branch_start_extension_mm) if bool(row2_subfig1_overextend) else 0.0),
+        2: max(0.0, float(row2_subfig2_branch_start_extension_mm)) if row2_subfig2_branch_start_extension_mm is not None else (float(third_row_branch_start_extension_mm) if bool(row2_subfig2_overextend) else 0.0),
+        3: max(0.0, float(row2_subfig3_branch_start_extension_mm)) if row2_subfig3_branch_start_extension_mm is not None else (float(third_row_branch_start_extension_mm) if bool(row2_subfig3_overextend) else 0.0),
+        4: max(0.0, float(row2_subfig4_branch_start_extension_mm)) if row2_subfig4_branch_start_extension_mm is not None else (float(third_row_branch_start_extension_mm) if bool(row2_subfig4_overextend) else 0.0),
+    }
 
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("; generated by node_calibrated_pattern.py\n")
+        f.write("; generated by node_two_row_layout.py\n")
         f.write("; based on the working node pattern plus vasculature-style exact tip planning\n")
+        f.write("; build-plate layout: row 1 = old row 1 subfigures 1-4; row 2 = old row 3 subfigures 1-3 plus old row 4 subfigure 1\n")
         if write_mode == "calibrated":
             f.write("; calibration-based tip-position planning: stage = tip - offset_tip(B,C)\n")
         else:
             f.write("; Cartesian writing mode: stage XYZ follows the path XYZ directly\n")
         f.write("; verticals are written bottom->top; branches/arcs/curves are written from the trunk-side node outward\n")
         f.write(f"; origin = ({origin_x:.3f}, {origin_y:.3f}, {origin_z:.3f})\n")
-        f.write(f"; include_rotated_plane = {bool(include_rotated_plane)}\n")
-        f.write(f"; rotated_plane_y_offset = {float(rotated_plane_y_offset):.3f}\n")
         f.write(f"; rows = {rows}\n")
-        f.write(f"; include_third_row_xz_plane = {bool(include_third_row_xz_plane)}\n")
-        f.write(f"; third_row_xz_plane_y_offset = {float(third_row_xz_plane_y_offset):.3f}\n")
-        f.write(f"; fourth_row_xz_plane_y_offset = {float(third_row_xz_plane_y_offset) + float(rotated_plane_y_offset):.3f}\n")
-        f.write(f"; third_row_branch_start_extension_mm = {float(third_row_branch_start_extension_mm):.3f}\n")
+        f.write(f"; row2_xz_plane_y_offset = {float(third_row_xz_plane_y_offset):.3f}\n")
+        f.write(f"; row2_branch_start_extension_mm_default = {float(third_row_branch_start_extension_mm):.3f}\n")
+        f.write(
+            "; row2_branch_start_extension_mm_by_subfig = "
+            f"[1:{row2_effective_extensions[1]:.3f}, 2:{row2_effective_extensions[2]:.3f}, 3:{row2_effective_extensions[3]:.3f}, 4:{row2_effective_extensions[4]:.3f}]\n"
+        )
+        f.write(f"; row2_subfig_overextend_legacy_flags = [1:{bool(row2_subfig1_overextend)}, 2:{bool(row2_subfig2_overextend)}, 3:{bool(row2_subfig3_overextend)}, 4:{bool(row2_subfig4_overextend)}]\n")
+        f.write(f"; legacy include_rotated_plane argument ignored = {bool(include_rotated_plane)}\n")
+        f.write(f"; legacy include_third_row_xz_plane argument ignored = {bool(include_third_row_xz_plane)}\n")
         f.write(f"; path_count = {summary['path_count']} (vertical={summary['vertical_count']}, branch={summary['branch_count']})\n")
         f.write(f"; planes = {summary['planes']}\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
         f.write(f"; write_mode = {write_mode}\n")
         f.write(f"; orientation_mode = {orientation_mode}\n")
         f.write(f"; pull_phase_only = {bool(pull_phase_only)}\n")
-        f.write("; calibrated motion uses row-specific C targets during approach and printing (rows 1-2 at 90 deg; rows 3-4 at 180 deg)\n; calibrated stage-tip kinematics include the off-plane calibration term when write_mode=calibrated\n")
-        f.write("; row 1 paths are fixed-B XZ rows; rows 2, 3, and 4 paths solve tangent B from the calibration pull/tip-angle model\n; node junction dwell uses the original trunk-attachment dwell points only; end-of-pass dwell is disabled\n")
+        f.write("; calibrated motion uses C=180 deg for all emitted rows during approach and printing\n; calibrated stage-tip kinematics include the off-plane calibration term when write_mode=calibrated\n")
+        f.write("; row 1 paths are fixed-B / physical tip-angle 0; row 2 paths solve tangent B from the calibration pull/tip-angle model\n; node junction dwell uses the original trunk-attachment dwell points only; end-of-pass dwell is disabled\n")
         f.write("; startup always uses the configured machine-start coordinates; shutdown always uses the configured machine-end coordinates\n")
         f.write(f"; selected_fit_model = {cal.selected_fit_model or 'legacy-polynomial'}\n")
         f.write(f"; selected_offplane_fit_model = {cal.selected_offplane_fit_model or cal.selected_fit_model or 'legacy-polynomial'}\n")
@@ -1960,12 +1990,15 @@ def write_node_gcode(
         g.write_move(np.array([msx, msy, msz], dtype=float), msb, msc, travel_feed, comment="startup: move to anchored machine start pose")
 
         startup_c_prepositioned = False
+        prev_path_row_num: Optional[int] = None
         for path in paths:
             points = deduplicate_polyline_points(points_to_array(path.points))
             if len(points) < 2:
                 continue
             tangents = build_tangents_for_points(points, smooth_window=tangent_smooth_window, centerline_smooth_window=centerline_smooth_window)
             mult = extrusion_multiplier_vertical if path.kind == "vertical" else extrusion_multiplier_branch
+            skip_initial_retreat = False
+            is_row_start = prev_path_row_num is None or int(prev_path_row_num) != int(path.row_num)
 
             f.write("; ------------------------------------------------------------\n")
             f.write(f"; {path.label}: plane={path.plane}, figure={path.figure}, kind={path.kind}, points={len(points)}\n")
@@ -1973,6 +2006,91 @@ def write_node_gcode(
                 startup_c_target = g.c_for_row(path.row_num)
                 g.pre_rotate_c_at_current_pose(startup_c_target, comment=f"startup: pre-rotate C to {startup_c_target:.0f} before descending")
                 startup_c_prepositioned = True
+            if prev_path_row_num == 1 and int(path.row_num) == 2 and g.cur_stage_xyz is not None:
+                transition_stage = np.asarray(g.cur_stage_xyz, dtype=float).copy()
+                transition_stage[2] = float(DEFAULT_ROW_TRANSITION_LIFT_Z)
+                transition_stage = g.clamp_stage(transition_stage, "row1_to_row2_transition_lift")
+                g.write_move(
+                    transition_stage,
+                    g.cur_b,
+                    g.cur_c,
+                    travel_feed,
+                    comment=f"{path.label}: row transition immediate Z lift to {float(DEFAULT_ROW_TRANSITION_LIFT_Z):.0f}",
+                )
+                transition_orientation_mode = g.orientation_mode_for_path(kind=path.kind, row_num=path.row_num)
+                transition_b, transition_c, _ = g.bc_for_tangent(
+                    tangents[0],
+                    prev_c=g.cur_c,
+                    orientation_mode_override=transition_orientation_mode,
+                    row_num=path.row_num,
+                )
+                bc_release_feed = g.b_uncurl_feed if abs(float(g.cur_b) - float(transition_b)) > 1e-9 else g.c_feed
+                g.pre_orient_bc_at_current_pose(
+                    transition_b,
+                    transition_c,
+                    comment=f"{path.label}: row transition pre-orient B/C after Z lift",
+                    feed=bc_release_feed,
+                )
+                skip_initial_retreat = True
+            if is_row_start and path.kind == "vertical":
+                start_stage, start_b, start_c, start_phase = g.tip_to_stage(
+                    points[0],
+                    tangent=tangents[0],
+                    prev_c=g.cur_c,
+                    orientation_mode_override=g.orientation_mode_for_path(kind=path.kind, row_num=path.row_num),
+                    row_num=path.row_num,
+                )
+                overhead_stage = np.asarray(start_stage, dtype=float).copy()
+                current_stage_z = float(g.cur_stage_xyz[2]) if g.cur_stage_xyz is not None else float(overhead_stage[2] + side_lift_z)
+                overhead_stage[2] = current_stage_z
+                coarse_stage = np.asarray(start_stage, dtype=float).copy()
+                fine_z_window = max(0.5, float(side_approach_near))
+                coarse_stage[2] = min(float(overhead_stage[2]), float(start_stage[2]) + fine_z_window)
+                bc_release_feed = g.b_uncurl_feed if abs(float(g.cur_b) - float(start_b)) > 1e-9 else g.c_feed
+                g.pre_orient_bc_at_current_pose(
+                    start_b,
+                    start_c,
+                    comment=f"{path.label}: row start pre-orient B/C before XY reposition",
+                    feed=bc_release_feed,
+                )
+                g.write_move(
+                    overhead_stage,
+                    start_b,
+                    start_c,
+                    g.travel_feed,
+                    comment=f"{path.label}: row start move in XY at current Z above start",
+                )
+                g.write_move(
+                    coarse_stage,
+                    start_b,
+                    start_c,
+                    g.approach_feed,
+                    comment=f"{path.label}: row start bulk straight Z descent above vertical start",
+                )
+                g.write_move(
+                    np.asarray(start_stage, dtype=float),
+                    start_b,
+                    start_c,
+                    g.fine_approach_feed,
+                    comment=f"{path.label}: row start straight Z descent to vertical start",
+                )
+                g.cur_tip_xyz = np.asarray(points[0], dtype=float).copy()
+                g.cur_motion_phase = start_phase
+                g.last_tip_tangent = np.asarray(tangents[0], dtype=float).copy()
+                g.print_polyline(
+                    points,
+                    tangents,
+                    extrusion_multiplier=mult,
+                    label=path.label,
+                    kind=path.kind,
+                    plane=path.plane,
+                    figure=path.figure,
+                    row_num=path.row_num,
+                    end_is_node=path.end_is_node,
+                    junction_dwell_indices=path.junction_dwell_indices,
+                )
+                prev_path_row_num = int(path.row_num)
+                continue
             g.approach_start_from_side(
                 start_tip=points[0],
                 start_tangent=tangents[0],
@@ -1984,6 +2102,7 @@ def write_node_gcode(
                 kind=path.kind,
                 row_num=path.row_num,
                 lateral_axis=path.lateral_axis,
+                skip_initial_retreat=skip_initial_retreat,
             )
             g.print_polyline(
                 points,
@@ -1997,6 +2116,7 @@ def write_node_gcode(
                 end_is_node=path.end_is_node,
                 junction_dwell_indices=path.junction_dwell_indices,
             )
+            prev_path_row_num = int(path.row_num)
 
         g.write_move(np.array([mex, mey, mez], dtype=float), meb, mec, travel_feed, comment="shutdown: move to anchored machine end pose")
         if emit_extrusion:
@@ -2036,14 +2156,14 @@ def write_node_gcode(
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=(
-            "Generate calibrated or Cartesian G-code for the planar node figures, including a second -90-degree rotated duplicate row and split third/fourth XZ rows, "
-            "with exact tip-position planning adapted from the vasculature writer. Calibrated motion holds C at 90 degrees."
+            "Generate calibrated or Cartesian G-code for the planar node figures in the requested two-row build-plate layout. "
+            "Row 1 is fixed-B at C=180; row 2 is tangent-following at C=180."
         )
     )
     ap.add_argument("--out", default=DEFAULT_OUT, help="Output G-code file.")
     ap.add_argument("--calibration", default=None, help="Calibration JSON. Required for --write-mode calibrated.")
     ap.add_argument("--write-mode", choices=["calibrated", "cartesian"], default="calibrated")
-    ap.add_argument("--orientation-mode", choices=["fixed", "tangent"], default="fixed", help="fixed = use pull-axis calibration with constant tip angle; tangent = solve B from the calibration tip-angle model so vertical up is 0 deg and horizontal is 90 deg, while holding C at 90 degrees.")
+    ap.add_argument("--orientation-mode", choices=["fixed", "tangent"], default="fixed", help="Base orientation mode. In the two-row layout, row 1 is forced fixed-B at physical tip-angle 0 and row 2 is forced tangent-following; C is held at 180 degrees.")
     ap.add_argument("--pull-phase-only", action="store_true", help="Force calibrated kinematics to stay on the pull-phase models by reusing them for release-phase evaluation too.")
     ap.add_argument("--y-offplane-sign", type=float, default=1.0, help="Multiplier applied to the calibration off-plane Y term during calibrated kinematics. Use -1 to flip the sign.")
 
@@ -2053,12 +2173,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--include-rotated-plane", dest="include_rotated_plane", action="store_true", default=DEFAULT_INCLUDE_ROTATED_PLANE)
     ap.add_argument("--no-include-rotated-plane", dest="include_rotated_plane", action="store_false")
-    ap.add_argument("--rotated-plane-y-offset", type=float, default=DEFAULT_ROTATED_PLANE_Y_OFFSET, help="Y offset applied to the second figure set before rotating each figure -90 degrees around its own trunk.")
+    ap.add_argument("--rotated-plane-y-offset", type=float, default=DEFAULT_ROTATED_PLANE_Y_OFFSET, help="Retained for compatibility; ignored by the two-row layout.")
     ap.add_argument("--include-third-row-xz-plane", dest="include_third_row_xz_plane", action="store_true", default=DEFAULT_INCLUDE_THIRD_ROW_XZ_PLANE)
     ap.add_argument("--no-include-third-row-xz-plane", dest="include_third_row_xz_plane", action="store_false")
-    ap.add_argument("--third-row-xz-plane-y-offset", type=float, default=DEFAULT_THIRD_ROW_XZ_PLANE_Y_OFFSET, help="Absolute row-3 Y offset relative to origin_y for the added XZ figure set. Row 4 uses the next Y offset.")
-    ap.add_argument("--third-row-branch-start-extension-mm", type=float, default=DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM, help="For the added third/fourth XZ rows, extend each branch-like path backward along its local starting tangent by this amount so it crosses the trunk, then dwell at the original junction.")
-    ap.add_argument("--rows", default=DEFAULT_ROWS, help="Rows to emit: all (default), 1, 2, 3, 4, or comma-separated subsets such as 1,3,4. When a subset is given, it overrides the legacy include-row booleans.")
+    ap.add_argument("--third-row-xz-plane-y-offset", type=float, default=DEFAULT_THIRD_ROW_XZ_PLANE_Y_OFFSET, help="Y offset for the second XZ row relative to origin_y. Name retained for compatibility with previous command lines.")
+    ap.add_argument("--third-row-branch-start-extension-mm", type=float, default=DEFAULT_THIRD_ROW_BRANCH_START_EXTENSION_MM, help="Default row-2 overextend length used when a row-2 subfigure-specific extension is not provided.")
+    ap.add_argument("--row2-subfig1-overextend", dest="row2_subfig1_overextend", action="store_true", default=DEFAULT_ROW2_SUBFIG1_OVEREXTEND, help="Enable branch-start overextend for row 2 subfigure 1 (old row 3 subfigure 1).")
+    ap.add_argument("--no-row2-subfig1-overextend", dest="row2_subfig1_overextend", action="store_false")
+    ap.add_argument("--row2-subfig2-overextend", dest="row2_subfig2_overextend", action="store_true", default=DEFAULT_ROW2_SUBFIG2_OVEREXTEND, help="Enable branch-start overextend for row 2 subfigure 2 (old row 3 subfigure 2).")
+    ap.add_argument("--no-row2-subfig2-overextend", dest="row2_subfig2_overextend", action="store_false")
+    ap.add_argument("--row2-subfig3-overextend", dest="row2_subfig3_overextend", action="store_true", default=DEFAULT_ROW2_SUBFIG3_OVEREXTEND, help="Enable branch-start overextend for row 2 subfigure 3 (old row 3 subfigure 3).")
+    ap.add_argument("--no-row2-subfig3-overextend", dest="row2_subfig3_overextend", action="store_false")
+    ap.add_argument("--row2-subfig4-overextend", dest="row2_subfig4_overextend", action="store_true", default=DEFAULT_ROW2_SUBFIG4_OVEREXTEND, help="Enable branch-start overextend for row 2 subfigure 4 (old row 4 subfigure 1).")
+    ap.add_argument("--no-row2-subfig4-overextend", dest="row2_subfig4_overextend", action="store_false")
+    ap.add_argument("--row2-subfig1-branch-start-extension-mm", type=float, default=None, help="Explicit branch-start overextend length for row 2 subfigure 1 in mm. Overrides the shared row-2 length and legacy on/off flag; use 0 to disable.")
+    ap.add_argument("--row2-subfig2-branch-start-extension-mm", type=float, default=None, help="Explicit branch-start overextend length for row 2 subfigure 2 in mm. Overrides the shared row-2 length and legacy on/off flag; use 0 to disable.")
+    ap.add_argument("--row2-subfig3-branch-start-extension-mm", type=float, default=None, help="Explicit branch-start overextend length for row 2 subfigure 3 in mm. Overrides the shared row-2 length and legacy on/off flag; use 0 to disable.")
+    ap.add_argument("--row2-subfig4-branch-start-extension-mm", type=float, default=None, help="Explicit branch-start overextend length for row 2 subfigure 4 in mm. Overrides the shared row-2 length and legacy on/off flag; use 0 to disable.")
+    ap.add_argument("--rows", default=DEFAULT_ROWS, help="Rows to emit: all (default), 1, 2, or comma-separated subset 1,2.")
     # Backward-compatible aliases from the previous revision.
     ap.add_argument("--include-secondary-xz-plane", dest="include_third_row_xz_plane", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--no-include-secondary-xz-plane", dest="include_third_row_xz_plane", action="store_false", help=argparse.SUPPRESS)

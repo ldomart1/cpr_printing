@@ -85,18 +85,18 @@ DEFAULT_POINT_Y = 52.0
 DEFAULT_POINT_Z = -145.0
 
 DEFAULT_TRAVEL_FEED = 1000.0
-DEFAULT_FINE_APPROACH_FEED = 150.0
-DEFAULT_PROBE_FEED = 1000.0
+DEFAULT_FINE_APPROACH_FEED = 800.0
+DEFAULT_PROBE_FEED = 3000.0
 DEFAULT_C_FEED = 15000.0
 DEFAULT_C_MAX_FEED = 15000.0
-DEFAULT_C_ACCEL_TIME_S = 0.2
-DEFAULT_C_DECEL_TIME_S = 0.2
+DEFAULT_C_ACCEL_TIME_S = 0.1
+DEFAULT_C_DECEL_TIME_S = 0.1
 
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
 DEFAULT_CYCLE_REPEATS = 1
-DEFAULT_LEG_MOVE_STEPS = 1200
-DEFAULT_LEG_CAPTURE_STEPS = 60
+DEFAULT_LEG_MOVE_STEPS = 400
+DEFAULT_LEG_CAPTURE_STEPS = 50
 DEFAULT_PHASE_TRANSITION_STEPS = 20
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
@@ -129,7 +129,7 @@ DEFAULT_END_C = 0.0
 
 DEFAULT_SAFE_APPROACH_Z = -145.0
 
-DEFAULT_DWELL_BEFORE_MS = 0.3
+DEFAULT_DWELL_BEFORE_MS = 0.1
 DEFAULT_DWELL_AFTER_MS = 0
 DEFAULT_INITIAL_SWEEP_WAIT_S = 6.0
 
@@ -151,18 +151,17 @@ DEFAULT_TRACKED_MOVE_SETTLE_S = 0.0
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
 DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_CAPTURE_AT_START = False
-DEFAULT_INTER_COMMAND_DELAY_S = 0.005
+DEFAULT_INTER_COMMAND_DELAY_S = 0.002
+DEFAULT_SETTLED_CAPTURE_MODE = True
+DEFAULT_SETTLED_CAPTURE_BUFFER_S = 0.05
+DEFAULT_MIN_ESTIMATED_MOVE_TIME_S = 0.008
 
 DEFAULT_FLIP_RZ_SIGN = True
 
 DEFAULT_POST_CAMERA_CALIBRATION_FILE = "../captures/calibration_webcam_20260406_104136.npz"
-DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "../captures/photo_20260406_104134.png"
+DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "../captures/photo_20260428_162904.png"
 DEFAULT_POST_THRESHOLD = 200
 DEFAULT_POST_TIP_REFINE_MODE = "none"
-DEFAULT_POST_TIP_REFINER_MODEL = (
-    "Test_Calibration_2026-04-07_02_daq/"
-    "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
-)
 
 OFFPLANE_SIGN = -1.0
 
@@ -1287,6 +1286,172 @@ def _clamp_stage_xyz_to_bbox(
     return xc, yc, zc
 
 
+def build_absolute_move_gcode(feedrate: float, **axes_targets) -> str:
+    parts = ["G90", "G1"]
+    for ax, val in axes_targets.items():
+        if val is None:
+            continue
+        parts.append(f"{ax}{float(val):.3f}")
+    parts.append(f"F{float(feedrate):.3f}")
+    return " ".join(parts)
+
+
+def _append_safe_pose_moves(
+    commands: List[str],
+    cal: Calibration,
+    pose: Tuple[float, float, float, float, float],
+    safe_approach_z: float,
+    travel_feed: float,
+):
+    x, y, z, b, c = [float(v) for v in pose]
+    commands.append(
+        build_absolute_move_gcode(
+            travel_feed,
+            **{
+                cal.z_axis: float(safe_approach_z),
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            },
+        )
+    )
+    commands.append("M400")
+    commands.append(
+        build_absolute_move_gcode(
+            travel_feed,
+            **{
+                cal.x_axis: x,
+                cal.y_axis: y,
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            },
+        )
+    )
+    commands.append("M400")
+    commands.append(
+        build_absolute_move_gcode(
+            travel_feed,
+            **{
+                cal.z_axis: z,
+                cal.b_axis: b,
+                cal.c_axis: clamp_c_bounded(c),
+            },
+        )
+    )
+    commands.append("M400")
+
+
+def export_commanded_gcode(
+    output_path: Path,
+    cal: Calibration,
+    traj: List[TrajectoryPoint],
+    start_pose: Tuple[float, float, float, float, float],
+    end_pose: Tuple[float, float, float, float, float],
+    safe_approach_z: float,
+    travel_feed: float,
+    fine_approach_feed: float,
+    probe_feed: float,
+    virtual_bbox: dict,
+    dwell_before_ms: int = 0,
+    dwell_after_ms: int = 0,
+    initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
+) -> dict:
+    commands: List[str] = [
+        "; Exported by calib_point_track_daq.py",
+        "; Motion-only program derived from the commanded execution sequence",
+    ]
+    bbox_warnings: List[str] = []
+
+    _append_safe_pose_moves(
+        commands=commands,
+        cal=cal,
+        pose=start_pose,
+        safe_approach_z=float(safe_approach_z),
+        travel_feed=float(travel_feed),
+    )
+
+    if traj:
+        p0 = traj[0]
+        x0, y0, z0 = _clamp_stage_xyz_to_bbox(
+            p0.stage_xyz[0], p0.stage_xyz[1], p0.stage_xyz[2],
+            virtual_bbox,
+            "move to tracked start",
+            bbox_warnings,
+        )
+        commands.append(
+            build_absolute_move_gcode(
+                travel_feed,
+                **{
+                    cal.x_axis: x0,
+                    cal.y_axis: y0,
+                    cal.z_axis: z0,
+                    cal.b_axis: p0.b,
+                    cal.c_axis: clamp_c_bounded(p0.c),
+                },
+            )
+        )
+        commands.append("M400")
+        commands.append(
+            build_absolute_move_gcode(
+                fine_approach_feed,
+                **{
+                    cal.x_axis: x0,
+                    cal.y_axis: y0,
+                    cal.z_axis: z0,
+                    cal.b_axis: float(p0.b),
+                    cal.c_axis: clamp_c_bounded(float(p0.c)),
+                },
+            )
+        )
+        commands.append("M400")
+
+        if float(initial_sweep_wait_s) > 0:
+            commands.append(f"G4 S{float(initial_sweep_wait_s):.3f}")
+        if int(dwell_before_ms) > 0:
+            commands.append(f"G4 P{int(dwell_before_ms)}")
+
+        for i, point in enumerate(traj[1:], start=1):
+            x, y, z = _clamp_stage_xyz_to_bbox(
+                point.stage_xyz[0], point.stage_xyz[1], point.stage_xyz[2],
+                virtual_bbox,
+                f"tracked sample {i}",
+                bbox_warnings,
+            )
+            feed = max(float(probe_feed), float(travel_feed)) if point.segment_kind == "phase_transition" else float(probe_feed)
+            commands.append(
+                build_absolute_move_gcode(
+                    feed,
+                    **{
+                        cal.x_axis: x,
+                        cal.y_axis: y,
+                        cal.z_axis: z,
+                        cal.b_axis: point.b,
+                        cal.c_axis: clamp_c_bounded(point.c),
+                    },
+                )
+            )
+
+        if len(traj) > 1:
+            commands.append("M400")
+
+        if int(dwell_after_ms) > 0:
+            commands.append(f"G4 P{int(dwell_after_ms)}")
+
+    _append_safe_pose_moves(
+        commands=commands,
+        cal=cal,
+        pose=end_pose,
+        safe_approach_z=float(safe_approach_z),
+        travel_feed=float(travel_feed),
+    )
+
+    output_path.write_text("\n".join(commands) + "\n", encoding="utf-8")
+    return {
+        "path": str(output_path),
+        "command_count": len(commands),
+        "bbox_warnings": bbox_warnings,
+    }
+
+
 # =========================
 # Acquisition runner
 # =========================
@@ -1328,6 +1493,7 @@ class FixedTipPointTracker:
         self.rrf = None
         self.cam_port = None
         self.commanded_axes: dict = {}
+        self.estimated_motion_done_at: float = time.monotonic()
 
         print(f"Using run folder: {self.run_folder}")
         print(f"Using point-tracking folder: {self.point_tracking_folder}")
@@ -1454,45 +1620,42 @@ class FixedTipPointTracker:
     def disconnect_robot(self):
         self.rrf = None
 
-    def _estimate_move_time_s(self, feedrate: float, axes_targets: dict) -> float:
-        feed = max(1e-6, float(feedrate))
-        deltas = []
-        for ax, val in axes_targets.items():
-            if val is None:
-                continue
-            prev = self.commanded_axes.get(str(ax))
-            if prev is None:
-                continue
-            deltas.append(abs(float(val) - float(prev)))
-
-        if not deltas:
-            return 0.0
-
-        return 60.0 * max(deltas) / feed
-
-    def _compute_inter_command_wait_s(
+    def _estimate_move_time_s(
         self,
-        est_move_time_s: float,
-        configured_floor_s: float = 0.0,
+        cal: Calibration,
+        previous_axes: dict,
+        axes_targets: dict,
+        feedrate: float,
+        c_max_feed: float,
+        min_move_time_s: float = DEFAULT_MIN_ESTIMATED_MOVE_TIME_S,
     ) -> float:
-        est = max(0.0, float(est_move_time_s))
-        floor_s = max(0.0, float(configured_floor_s))
-        if est <= 0.0:
-            return floor_s
-        paced_wait = min(2.0, max(0.05, 0.95 * est))
-        return max(floor_s, paced_wait)
+        feed_s = max(1e-9, float(feedrate) / 60.0)
+        c_feed_s = max(1e-9, float(c_max_feed) / 60.0)
 
-    def _compute_transition_wait_s(
-        self,
-        est_move_time_s: float,
-        configured_floor_s: float = 0.0,
-    ) -> float:
-        est = max(0.0, float(est_move_time_s))
-        floor_s = max(0.0, float(configured_floor_s))
-        if est <= 0.0:
-            return floor_s
-        paced_wait = min(0.2, max(0.01, 0.25 * est))
-        return max(floor_s, paced_wait)
+        xyz_sq = 0.0
+        for axis in (cal.x_axis, cal.y_axis, cal.z_axis):
+            prev = previous_axes.get(str(axis))
+            tgt = axes_targets.get(str(axis))
+            if prev is None or tgt is None:
+                continue
+            delta = float(tgt) - float(prev)
+            xyz_sq += delta * delta
+        xyz_t = math.sqrt(xyz_sq) / feed_s if xyz_sq > 0 else 0.0
+
+        c_t = 0.0
+        prev_c = previous_axes.get(str(cal.c_axis))
+        tgt_c = axes_targets.get(str(cal.c_axis))
+        if prev_c is not None and tgt_c is not None:
+            c_t = abs(float(tgt_c) - float(prev_c)) / c_feed_s
+
+        b_t = 0.0
+        prev_b = previous_axes.get(str(cal.b_axis))
+        tgt_b = axes_targets.get(str(cal.b_axis))
+        if prev_b is not None and tgt_b is not None:
+            b_t = abs(float(tgt_b) - float(prev_b)) / feed_s
+
+        est = max(xyz_t, c_t, b_t)
+        return max(float(est), float(min_move_time_s)) if est > 0 else 0.0
 
     def wait_for_duet_motion_complete(self, extra_settle: float = 0.0):
         if self.rrf is None:
@@ -1506,25 +1669,63 @@ class FixedTipPointTracker:
         if extra_settle > 0:
             time.sleep(extra_settle)
 
-    def send_absolute_move(self, feedrate: float, **axes_targets) -> float:
+    def _seed_commanded_pose(self, cal: Calibration, pose: Tuple[float, float, float, float, float]):
+        x, y, z, b, c = [float(v) for v in pose]
+        self.commanded_axes = {
+            cal.x_axis: x,
+            cal.y_axis: y,
+            cal.z_axis: z,
+            cal.b_axis: b,
+            cal.c_axis: clamp_c_bounded(c),
+        }
+        self.estimated_motion_done_at = time.monotonic()
+
+    def _record_estimated_motion(
+        self,
+        cal: Calibration,
+        command_record: dict,
+        c_max_feed: float,
+    ) -> float:
+        est_s = self._estimate_move_time_s(
+            cal=cal,
+            previous_axes=command_record["previous_axes"],
+            axes_targets=command_record["axes_targets"],
+            feedrate=command_record["feedrate"],
+            c_max_feed=float(c_max_feed),
+        )
+        now = time.monotonic()
+        self.estimated_motion_done_at = max(now, self.estimated_motion_done_at) + est_s
+        return est_s
+
+    def _wait_for_estimated_motion_complete(self, extra_settle: float = 0.0, reason: str = "motion"):
+        wait_s = max(0.0, self.estimated_motion_done_at - time.monotonic()) + max(0.0, float(extra_settle))
+        if wait_s > 0:
+            print(f" Estimated wait for {reason}: {wait_s:.3f} s")
+            time.sleep(wait_s)
+        self.estimated_motion_done_at = max(self.estimated_motion_done_at, time.monotonic())
+
+    def send_absolute_move(self, feedrate: float, **axes_targets) -> dict:
         if self.rrf is None:
             raise RuntimeError("Robot is not connected.")
 
-        est_move_time_s = self._estimate_move_time_s(feedrate, axes_targets)
-        parts = ["G90", "G1"]
-        for ax, val in axes_targets.items():
-            if val is None:
-                continue
-            parts.append(f"{ax}{float(val):.3f}")
-        parts.append(f"F{float(feedrate):.3f}")
-        gcode = " ".join(parts)
+        previous_axes = dict(self.commanded_axes)
+        gcode = build_absolute_move_gcode(feedrate, **axes_targets)
         print(f" Command: {gcode}")
         self.rrf.send_code(gcode)
         for ax, val in axes_targets.items():
             if val is None:
                 continue
             self.commanded_axes[str(ax)] = float(val)
-        return est_move_time_s
+        return {
+            "feedrate": float(feedrate),
+            "gcode": gcode,
+            "previous_axes": previous_axes,
+            "axes_targets": {
+                str(ax): float(val)
+                for ax, val in axes_targets.items()
+                if val is not None
+            },
+        }
 
     def _move_to_pose_safe(
         self,
@@ -1533,10 +1734,12 @@ class FixedTipPointTracker:
         safe_approach_z: float,
         travel_feed: float,
         settle_s: float,
+        use_estimated_waits: bool = False,
+        c_max_feed: float = DEFAULT_C_MAX_FEED,
     ):
         x, y, z, b, c = [float(v) for v in pose]
 
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             travel_feed,
             **{
                 cal.z_axis: float(safe_approach_z),
@@ -1544,9 +1747,13 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z approach")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             travel_feed,
             **{
                 cal.x_axis: x,
@@ -1555,9 +1762,13 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe XY approach")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             travel_feed,
             **{
                 cal.z_axis: z,
@@ -1565,7 +1776,11 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z landing")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
     def _fine_land_on_point(
         self,
@@ -1577,9 +1792,11 @@ class FixedTipPointTracker:
         c: float,
         fine_feed: float,
         settle_s: float,
+        use_estimated_waits: bool = False,
+        c_max_feed: float = DEFAULT_C_MAX_FEED,
     ):
         print(" Fine landing move for accuracy...")
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             fine_feed,
             **{
                 cal.x_axis: x,
@@ -1589,7 +1806,11 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="fine landing")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
     def execute_motion_and_capture(
         self,
@@ -1617,6 +1838,8 @@ class FixedTipPointTracker:
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
         initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
+        settled_capture_mode: bool = DEFAULT_SETTLED_CAPTURE_MODE,
+        settled_capture_buffer_s: float = DEFAULT_SETTLED_CAPTURE_BUFFER_S,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1626,6 +1849,7 @@ class FixedTipPointTracker:
         bbox_warnings: List[str] = []
         sample_counter = 0
         self.commanded_axes = {}
+        self._seed_commanded_pose(cal=cal, pose=start_pose)
 
         seg_feeds: List[float] = []
         sched_meta = {"est_total_time_s": 0.0, "max_est_c_speed_deg_min": 0.0, "mean_seg_time_ms": 0.0}
@@ -1651,6 +1875,11 @@ class FixedTipPointTracker:
                 "using controller-side acceleration with constant queued feed."
             )
         print(f"Tracked block feed: {float(probe_feed):.3f}")
+        if settled_capture_mode:
+            print(
+                f"Settled capture mode: streaming commands, waiting only at captures "
+                f"(buffer={float(settled_capture_buffer_s):.3f} s)."
+            )
 
         print("\nSafe startup approach...")
         self._move_to_pose_safe(
@@ -1659,6 +1888,8 @@ class FixedTipPointTracker:
             safe_approach_z=float(safe_approach_z),
             travel_feed=float(travel_feed),
             settle_s=float(travel_move_settle_s),
+            use_estimated_waits=bool(settled_capture_mode),
+            c_max_feed=float(c_max_feed),
         )
 
         if not traj:
@@ -1675,7 +1906,7 @@ class FixedTipPointTracker:
             )
 
             print("\nMoving to first tracked sample...")
-            self.send_absolute_move(
+            cmd = self.send_absolute_move(
                 travel_feed,
                 **{
                     cal.x_axis: x0,
@@ -1685,7 +1916,14 @@ class FixedTipPointTracker:
                     cal.c_axis: clamp_c_bounded(c0),
                 }
             )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+            if settled_capture_mode:
+                self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=float(c_max_feed))
+                self._wait_for_estimated_motion_complete(
+                    extra_settle=float(travel_move_settle_s),
+                    reason="tracked start transition",
+                )
+            else:
+                self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
 
             self._fine_land_on_point(
                 cal=cal,
@@ -1696,6 +1934,8 @@ class FixedTipPointTracker:
                 c=float(c0),
                 fine_feed=float(fine_approach_feed),
                 settle_s=max(float(tracked_move_settle_s), 0.05),
+                use_estimated_waits=bool(settled_capture_mode),
+                c_max_feed=float(c_max_feed),
             )
 
             if float(initial_sweep_wait_s) > 0:
@@ -1744,7 +1984,7 @@ class FixedTipPointTracker:
                 if point.segment_kind != "phase_transition":
                     fseg = float(probe_feed)
 
-                est_move_time_s = self.send_absolute_move(
+                cmd = self.send_absolute_move(
                     fseg,
                     **{
                         cal.x_axis: x,
@@ -1754,20 +1994,13 @@ class FixedTipPointTracker:
                         cal.c_axis: clamp_c_bounded(c),
                     }
                 )
-                if point.segment_kind == "phase_transition":
-                    wait_s = self._compute_transition_wait_s(
-                        est_move_time_s=est_move_time_s,
-                        configured_floor_s=0.0,
-                    )
-                else:
-                    wait_s = self._compute_inter_command_wait_s(
-                        est_move_time_s=est_move_time_s,
-                        configured_floor_s=float(inter_command_delay_s),
-                    )
-                if wait_s > 0.0:
-                    time.sleep(wait_s)
+                if settled_capture_mode:
+                    self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=float(c_max_feed))
+                if float(inter_command_delay_s) > 0:
+                    time.sleep(float(inter_command_delay_s))
 
                 if point.capture_image:
+                    self.wait_for_duet_motion_complete(extra_settle=float(settled_capture_buffer_s))
                     sample_counter += 1
                     self.capture_and_save(
                         sample_idx=sample_counter,
@@ -1785,7 +2018,13 @@ class FixedTipPointTracker:
                     )
 
             if len(traj) > 1:
-                self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
+                if settled_capture_mode:
+                    self._wait_for_estimated_motion_complete(
+                        extra_settle=float(tracked_move_settle_s),
+                        reason="tracked motion completion",
+                    )
+                else:
+                    self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
                 if float(b_extra_settle_s) > 0:
                     time.sleep(float(b_extra_settle_s))
 
@@ -1800,6 +2039,8 @@ class FixedTipPointTracker:
             safe_approach_z=float(safe_approach_z),
             travel_feed=float(travel_feed),
             settle_s=float(travel_move_settle_s),
+            use_estimated_waits=bool(settled_capture_mode),
+            c_max_feed=float(c_max_feed),
         )
 
         print("\n" + "=" * 72)
@@ -1929,6 +2170,31 @@ def main(args):
         add_date=bool(args.add_date),
     )
 
+    if bool(args.export_gcode_only):
+        export_path = Path(runner.run_folder) / "commanded_motion.gcode"
+        export_result = export_commanded_gcode(
+            output_path=export_path,
+            cal=cal,
+            traj=traj,
+            start_pose=start_pose,
+            end_pose=end_pose,
+            safe_approach_z=float(args.safe_approach_z),
+            travel_feed=float(args.travel_feed),
+            fine_approach_feed=float(args.fine_approach_feed),
+            probe_feed=float(args.probe_feed),
+            virtual_bbox=virtual_bbox,
+            dwell_before_ms=int(args.dwell_before_ms),
+            dwell_after_ms=int(args.dwell_after_ms),
+            initial_sweep_wait_s=float(args.initial_sweep_wait_s),
+        )
+        print("\nExport-only mode enabled; skipped camera, robot, acquisition, and post-processing.")
+        print(f"Exported commanded G-code: {export_result['path']}")
+        print(f"Exported command count: {export_result['command_count']}")
+        print(f"BBox warnings: {len(export_result['bbox_warnings'])}")
+        for msg in export_result["bbox_warnings"]:
+            print(msg)
+        return
+
     try:
         runner.connect_to_camera(
             cam_port=int(args.cam_port),
@@ -1966,15 +2232,14 @@ def main(args):
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
             initial_sweep_wait_s=float(args.initial_sweep_wait_s),
+            settled_capture_mode=bool(args.settled_capture_mode),
+            settled_capture_buffer_s=float(args.settled_capture_buffer_s),
         )
 
         print("\nFinal results:")
         print(results)
 
         if bool(args.enable_post):
-            post_tip_refiner_model = Path(args.post_tip_refiner_model).expanduser()
-            if not post_tip_refiner_model.is_absolute():
-                post_tip_refiner_model = script_dir / post_tip_refiner_model
             post_cmd = [
                 sys.executable,
                 str(script_dir / "calib_point_process.py"),
@@ -1988,8 +2253,6 @@ def main(args):
                 str(int(args.post_threshold)),
                 "--tip_refine_mode",
                 str(args.post_tip_refine_mode),
-                "--tip_refiner_model",
-                str(post_tip_refiner_model.resolve()),
             ]
             if bool(args.post_save_plots):
                 post_cmd.append("--save_plots")
@@ -2022,6 +2285,8 @@ if __name__ == "__main__":
                     help="Append timestamp to the run folder name.")
     ap.add_argument("--enable-post", action="store_true",
                     help="Run calib_point_process.py on the generated project directory after acquisition.")
+    ap.add_argument("--export-gcode-only", action="store_true",
+                    help="Only export the commanded motion G-code file and skip robot/camera execution.")
 
     # Connectivity
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet web address.")
@@ -2120,6 +2385,10 @@ if __name__ == "__main__":
                     help="Small delay between queued tracked commands.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
                     help="Legacy option; only used if the first trajectory point is marked for acquisition.")
+    ap.add_argument("--settled-capture-mode", action="store_true", default=DEFAULT_SETTLED_CAPTURE_MODE,
+                    help="Stream commands without M400 waits; wait only at capture points using estimated timing.")
+    ap.add_argument("--settled-capture-buffer-s", type=float, default=DEFAULT_SETTLED_CAPTURE_BUFFER_S,
+                    help="Extra idle time after estimated motion completion before each capture.")
 
     # Post-processing
     ap.add_argument("--post-camera-calibration-file", type=str, default=DEFAULT_POST_CAMERA_CALIBRATION_FILE,
@@ -2131,8 +2400,6 @@ if __name__ == "__main__":
                     help="Threshold passed to calib_point_process.py.")
     ap.add_argument("--post-tip-refine-mode", type=str, default=DEFAULT_POST_TIP_REFINE_MODE,
                     help="Tip refinement mode passed to calib_point_process.py.")
-    ap.add_argument("--post-tip-refiner-model", type=str, default=DEFAULT_POST_TIP_REFINER_MODEL,
-                    help="CNN tip refiner model passed to calib_point_process.py.")
     ap.add_argument("--post-save-plots", dest="post_save_plots", action="store_true", default=True,
                     help="Pass --save_plots to calib_point_process.py.")
     ap.add_argument("--no-post-save-plots", dest="post_save_plots", action="store_false",

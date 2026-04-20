@@ -3,13 +3,6 @@
 Interactive 3D tip-position visualizer for G-code using calibration JSON
 (+ optional robot-link overlay from a robot configuration JSON).
 
-UI fixes in this version:
-  ✅ Much smoother UI (debounced slider updates + cheaper redraw path)
-  ✅ Checkbox is visible + responds on single click (bigger hitbox, proper colors, higher z-order)
-  ✅ Sliders are far less laggy (precomputed extrude segments + debounced redraw)
-  ✅ Planar/ISO views no longer “pop out” when using sliders (camera preserved across updates)
-  ✅ Title moved further up; legend + controls moved further down
-
 Notes:
   - Matplotlib 3D is not true “blitting-capable” everywhere; so this script focuses on
     *reducing work per interaction* and *debouncing* slider callbacks.
@@ -24,8 +17,9 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, CheckButtons
-from mpl_toolkits.mplot3d.art3d import Line3DCollection
+from matplotlib.colors import to_rgb
+from matplotlib.widgets import Slider
+from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
 
 PULL_PHASE = "pull"
 RELEASE_PHASE = "release"
@@ -44,11 +38,15 @@ DEFAULT_OFFPLANE_SIGN = -1.0
 DEFAULT_ROBOT_DIAMETER_MM = 3.0
 DEFAULT_ROBOT_LINKS = 6
 DEFAULT_PRESSURE_TOGGLE_U_MM = 2.0
+DEFAULT_COLLISION_TIP_EXCLUSION_MM = 2.0
 
 # UI tuning
 UI_DEBOUNCE_MS_INDEX = 18
 UI_DEBOUNCE_MS_ZOOM = 18
 MAX_BACKGROUND_POINTS = 25000  # background path decimation for faster initial draw on huge files
+ROBOT_TUBE_RADIAL_SEGMENTS = 16
+ROBOT_TUBE_SAMPLES_PER_SEGMENT = 6
+ROBOT_TUBE_COLOR = "#d9d9d9"
 # -----------------------------------------
 
 
@@ -308,6 +306,19 @@ class RobotLinkConfig:
     tip_tangent_scale: float
 
 
+@dataclass
+class RobotSkeletonReference:
+    points_xyz_mm: np.ndarray
+    diameter_mm: float
+    source_path: Path
+    phase_point_models: Optional[Dict[str, dict]] = None
+    default_phase: Optional[str] = None
+
+
+def _normalize_phase_key(name: Optional[str]) -> str:
+    return str(name or PULL_PHASE).strip().lower()
+
+
 def _safe_float(x, default):
     try:
         return float(x)
@@ -381,6 +392,97 @@ def load_robot_config(robot_json_path: str) -> RobotLinkConfig:
         base_tangent_scale=float(base_tangent_scale),
         tip_tangent_scale=float(tip_tangent_scale),
     )
+
+
+def load_robot_skeleton_reference(robot_json_path: str) -> RobotSkeletonReference:
+    p = Path(robot_json_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Robot skeleton JSON not found: {robot_json_path}")
+
+    with p.open("r") as f:
+        data = json.load(f)
+
+    ref_pose = data.get("reference_pose", {})
+    pts_raw = ref_pose.get("points_xyz_mm")
+    if pts_raw is None:
+        raise ValueError(f"Robot skeleton JSON is missing reference_pose.points_xyz_mm: {robot_json_path}")
+
+    pts = np.asarray(pts_raw, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
+        raise ValueError(
+            f"Robot skeleton JSON must provide an Nx3 reference_pose.points_xyz_mm array with at least 2 points: {robot_json_path}"
+        )
+
+    diameter = _safe_float(data.get("diameter_mm", DEFAULT_ROBOT_DIAMETER_MM), DEFAULT_ROBOT_DIAMETER_MM)
+    phase_models_raw = data.get("phase_point_models")
+    phase_models = None
+    default_phase = None
+    if isinstance(phase_models_raw, dict) and len(phase_models_raw) > 0:
+        phase_models = {_normalize_phase_key(k): v for k, v in phase_models_raw.items() if isinstance(v, dict)}
+        default_phase = _normalize_phase_key(data.get("default_phase_for_legacy_access"))
+    return RobotSkeletonReference(
+        points_xyz_mm=pts,
+        diameter_mm=float(diameter),
+        source_path=p.resolve(),
+        phase_point_models=phase_models,
+        default_phase=default_phase,
+    )
+
+
+def _load_json_file(path: str) -> dict:
+    p = Path(path)
+    with p.open("r") as f:
+        return json.load(f)
+
+
+def _evaluate_descriptor(model_descriptor: Optional[dict], b_val: float) -> float:
+    if model_descriptor is None:
+        return 0.0
+    out = _eval_model(model_descriptor, np.asarray([float(b_val)], dtype=float))
+    return float(np.asarray(out, dtype=float).ravel()[0])
+
+
+def compute_tracked_skeleton_world(
+    skeleton_ref: RobotSkeletonReference,
+    b_cmd: float,
+    c_cmd_deg: float,
+    tip_world: Tuple[float, float, float],
+    equation_phase: str,
+) -> np.ndarray:
+    pts_local = np.asarray(skeleton_ref.points_xyz_mm, dtype=float).copy()
+    phase_models = skeleton_ref.phase_point_models or {}
+    phase_key = _normalize_phase_key(equation_phase)
+    payload = phase_models.get(phase_key)
+    if payload is None and skeleton_ref.default_phase is not None:
+        payload = phase_models.get(_normalize_phase_key(skeleton_ref.default_phase))
+    if payload is None and phase_models:
+        payload = next(iter(phase_models.values()))
+
+    if payload is not None:
+        ref_positions = np.asarray(payload.get("reference_positions_xyz_mm", pts_local), dtype=float)
+        if ref_positions.shape == pts_local.shape:
+            pts_local = ref_positions.copy()
+        point_models = payload.get("point_models", [])
+        for point_idx, point_model in enumerate(point_models[: pts_local.shape[0]]):
+            disp_models = point_model.get("displacement_models", {})
+            pts_local[point_idx, 0] += _evaluate_descriptor(disp_models.get("x_mm"), b_cmd)
+            pts_local[point_idx, 1] += _evaluate_descriptor(disp_models.get("y_mm"), b_cmd)
+            pts_local[point_idx, 2] += _evaluate_descriptor(disp_models.get("z_mm"), b_cmd)
+
+    if pts_local.shape[0] == 0:
+        return pts_local
+
+    tip_local = pts_local[-1, :].copy()
+    offsets = pts_local - tip_local[None, :]
+    c_rad = np.deg2rad(float(c_cmd_deg))
+    cosc = float(np.cos(c_rad))
+    sinc = float(np.sin(c_rad))
+    x_rot = offsets[:, 0] * cosc - offsets[:, 1] * sinc
+    y_rot = offsets[:, 0] * sinc + offsets[:, 1] * cosc
+    pts_world = np.column_stack([x_rot, y_rot, offsets[:, 2]]).astype(float)
+    pts_world += np.asarray(tip_world, dtype=float).reshape(1, 3)
+    pts_world[-1, :] = np.asarray(tip_world, dtype=float).reshape(3)
+    return pts_world
 
 
 def resolve_robot_config_from_calibration(calibration_path: str, cal_data: dict) -> Optional[Path]:
@@ -728,6 +830,7 @@ def compute_robot_polyline_world(
     y_off_tip: float,
     equation_phase: str = PULL_PHASE,
     offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
+    start_world: Optional[Tuple[float, float, float]] = None,
 ) -> np.ndarray:
     t = robot_cfg.t_knots
     b0 = float(cal.b_home)
@@ -823,11 +926,25 @@ def compute_robot_polyline_world(
     ]).astype(float)
 
     pts_world[0, :] = np.array([x_stage, y_stage, z_stage], dtype=float)
+    tip_world_vec = np.array(tip_world, dtype=float).reshape(3)
 
     if robot_cfg.anchor_mode == "tip":
-        tip_world_vec = np.array(tip_world, dtype=float).reshape(3)
         delta = tip_world_vec - pts_world[-1, :]
         pts_world = pts_world + delta[None, :]
+        # Keep the final point exactly on the reconstructed tip to avoid any
+        # visible mismatch from floating-point drift during redraws.
+        pts_world[-1, :] = tip_world_vec
+
+    if start_world is not None and pts_world.shape[0] >= 2:
+        start_world_vec = np.asarray(start_world, dtype=float).reshape(3)
+        delta0 = start_world_vec - pts_world[0, :]
+        # Pin the robot base to the first parsed motion position while
+        # preserving the already-computed end pose.
+        blend = np.linspace(1.0, 0.0, pts_world.shape[0], dtype=float)[:, None]
+        pts_world = pts_world + blend * delta0[None, :]
+        pts_world[0, :] = start_world_vec
+        if robot_cfg.anchor_mode == "tip":
+            pts_world[-1, :] = tip_world_vec
 
     return pts_world
 
@@ -840,6 +957,212 @@ def make_line_segments(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> np.nda
     if len(pts) < 2:
         return np.empty((0, 2, 3), dtype=float)
     return np.stack([pts[:-1], pts[1:]], axis=1)
+
+
+def smooth_polyline_points(points_xyz: np.ndarray, samples_per_segment: int = ROBOT_TUBE_SAMPLES_PER_SEGMENT) -> np.ndarray:
+    pts = np.asarray(points_xyz, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 3:
+        return pts
+
+    step = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    keep = np.concatenate([[True], step > 1e-9])
+    pts = pts[keep]
+    if pts.shape[0] < 2:
+        return np.asarray(points_xyz, dtype=float)
+
+    arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+    total_length = float(arc[-1])
+    if total_length <= 1e-9:
+        return pts
+
+    sample_count = max(
+        pts.shape[0],
+        int((pts.shape[0] - 1) * max(1, int(samples_per_segment))) + 1,
+    )
+    arc_q = np.linspace(0.0, total_length, sample_count)
+    smooth = np.column_stack([
+        _eval_pchip(arc, pts[:, dim], arc_q)
+        for dim in range(3)
+    ]).astype(float)
+    smooth[0, :] = pts[0, :]
+    smooth[-1, :] = pts[-1, :]
+    return smooth
+
+
+def _safe_unit_vector(vec: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    arr = np.asarray(vec, dtype=float)
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-12 or not np.isfinite(norm):
+        return np.asarray(fallback, dtype=float)
+    return arr / norm
+
+
+def _make_tube_faces(points_xyz: np.ndarray, radius_mm: float, color: str, alpha: float):
+    pts = np.asarray(points_xyz, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 3 or radius_mm <= 0.0:
+        return [], []
+
+    tangents = np.gradient(pts, axis=0)
+    tangents = np.asarray([
+        _safe_unit_vector(t, np.array([0.0, 0.0, 1.0], dtype=float))
+        for t in tangents
+    ], dtype=float)
+
+    normals = np.zeros_like(tangents)
+    binormals = np.zeros_like(tangents)
+
+    def _fallback_normal(tangent: np.ndarray) -> np.ndarray:
+        ref = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(tangent, ref))) > 0.92:
+            ref = np.array([0.0, 1.0, 0.0], dtype=float)
+        normal = np.cross(tangent, ref)
+        if float(np.linalg.norm(normal)) <= 1e-12:
+            normal = np.cross(tangent, np.array([1.0, 0.0, 0.0], dtype=float))
+        return _safe_unit_vector(normal, np.array([1.0, 0.0, 0.0], dtype=float))
+
+    normals[0, :] = _fallback_normal(tangents[0, :])
+    binormals[0, :] = _safe_unit_vector(
+        np.cross(tangents[0, :], normals[0, :]),
+        np.array([0.0, 1.0, 0.0], dtype=float),
+    )
+
+    for i in range(1, pts.shape[0]):
+        tangent = tangents[i, :]
+        normal = normals[i - 1, :] - np.dot(normals[i - 1, :], tangent) * tangent
+        if float(np.linalg.norm(normal)) <= 1e-12:
+            normal = _fallback_normal(tangent)
+        normal = _safe_unit_vector(normal, normals[i - 1, :])
+        binormal = _safe_unit_vector(np.cross(tangent, normal), binormals[i - 1, :])
+        normal = _safe_unit_vector(np.cross(binormal, tangent), normal)
+        normals[i, :] = normal
+        binormals[i, :] = binormal
+
+    theta = np.linspace(0.0, 2.0 * np.pi, ROBOT_TUBE_RADIAL_SEGMENTS, endpoint=False)
+    cos_t = np.cos(theta)[None, :, None]
+    sin_t = np.sin(theta)[None, :, None]
+    rings = pts[:, None, :] + radius_mm * (cos_t * normals[:, None, :] + sin_t * binormals[:, None, :])
+
+    base_rgb = np.asarray(to_rgb(color), dtype=float)
+    light_dir = _safe_unit_vector(np.array([0.35, -0.25, 0.90], dtype=float), np.array([0.0, 0.0, 1.0], dtype=float))
+    faces = []
+    facecolors = []
+
+    for i in range(pts.shape[0] - 1):
+        ring0 = rings[i]
+        ring1 = rings[i + 1]
+        for j in range(ROBOT_TUBE_RADIAL_SEGMENTS):
+            jn = (j + 1) % ROBOT_TUBE_RADIAL_SEGMENTS
+            tri_a = np.array([ring0[j], ring0[jn], ring1[jn]], dtype=float)
+            tri_b = np.array([ring0[j], ring1[jn], ring1[j]], dtype=float)
+            for tri in (tri_a, tri_b):
+                tri_normal = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+                tri_normal = _safe_unit_vector(tri_normal, np.array([0.0, 0.0, 1.0], dtype=float))
+                brightness = 0.48 + 0.52 * max(0.0, float(np.dot(tri_normal, light_dir)))
+                face_rgb = np.clip(base_rgb * brightness + 0.12, 0.0, 1.0)
+                faces.append(tri)
+                facecolors.append((face_rgb[0], face_rgb[1], face_rgb[2], alpha))
+
+    start_center = pts[0, :]
+    end_center = pts[-1, :]
+    start_rgb = tuple(np.clip(base_rgb * 0.75 + 0.08, 0.0, 1.0)) + (alpha,)
+    end_rgb = tuple(np.clip(base_rgb * 0.92 + 0.10, 0.0, 1.0)) + (alpha,)
+    for j in range(ROBOT_TUBE_RADIAL_SEGMENTS):
+        jn = (j + 1) % ROBOT_TUBE_RADIAL_SEGMENTS
+        faces.append(np.array([start_center, rings[0, jn], rings[0, j]], dtype=float))
+        facecolors.append(start_rgb)
+        faces.append(np.array([end_center, rings[-1, j], rings[-1, jn]], dtype=float))
+        facecolors.append(end_rgb)
+
+    return faces, facecolors
+
+
+def create_tube_artist(
+    ax,
+    points_xyz: np.ndarray,
+    diameter_mm: float,
+    color: str,
+    alpha: float = 0.96,
+):
+    smooth_points = smooth_polyline_points(points_xyz)
+    faces, facecolors = _make_tube_faces(smooth_points, radius_mm=0.5 * float(diameter_mm), color=color, alpha=alpha)
+    artist = Poly3DCollection(faces, facecolors=facecolors, edgecolors="none")
+    try:
+        artist.set_zsort("average")
+    except Exception:
+        pass
+    artist.set_antialiased(True)
+    ax.add_collection3d(artist)
+    return artist, smooth_points
+
+
+def update_tube_artist(
+    artist: Optional[Poly3DCollection],
+    points_xyz: np.ndarray,
+    diameter_mm: float,
+    color: str,
+    alpha: float = 0.96,
+) -> np.ndarray:
+    if artist is None:
+        return np.asarray(points_xyz, dtype=float)
+    smooth_points = smooth_polyline_points(points_xyz)
+    faces, facecolors = _make_tube_faces(smooth_points, radius_mm=0.5 * float(diameter_mm), color=color, alpha=alpha)
+    artist.set_verts(faces)
+    artist.set_facecolor(facecolors)
+    return smooth_points
+
+
+def _compute_collision_highlight_segments(
+    body_points_xyz: np.ndarray,
+    candidate_segments_xyz: np.ndarray,
+    collision_radius_mm: float,
+    tip_exclusion_mm: float = DEFAULT_COLLISION_TIP_EXCLUSION_MM,
+) -> Tuple[np.ndarray, np.ndarray, bool, float]:
+    body_pts = np.asarray(body_points_xyz, dtype=float)
+    candidate_segs = np.asarray(candidate_segments_xyz, dtype=float)
+    if body_pts.ndim != 2 or body_pts.shape[0] < 2 or body_pts.shape[1] != 3:
+        return np.empty((0, 2, 3), dtype=float), np.zeros((0,), dtype=bool), False, float("inf")
+    if candidate_segs.ndim != 3 or candidate_segs.shape[0] == 0 or candidate_segs.shape[1:] != (2, 3):
+        return np.empty((0, 2, 3), dtype=float), np.zeros((0,), dtype=bool), False, float("inf")
+
+    body_arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(body_pts, axis=0), axis=1))])
+    body_dist_to_tip = body_arc[-1] - body_arc
+    body_mask = body_dist_to_tip >= max(0.0, float(tip_exclusion_mm))
+    if not np.any(body_mask):
+        body_mask[:-1] = True
+    candidate_body_pts = body_pts[body_mask]
+    if candidate_body_pts.shape[0] == 0:
+        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, float("inf")
+
+    min_dist = float("inf")
+    seg_start = candidate_segs[:, 0, :]
+    seg_end = candidate_segs[:, 1, :]
+    seg_vec = seg_end - seg_start
+    seg_len_sq = np.sum(seg_vec * seg_vec, axis=1)
+    valid_seg_mask = seg_len_sq > 1e-12
+    if not np.any(valid_seg_mask):
+        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, float("inf")
+
+    seg_start_valid = seg_start[valid_seg_mask]
+    seg_vec_valid = seg_vec[valid_seg_mask]
+    seg_len_sq_valid = seg_len_sq[valid_seg_mask]
+    candidate_segs_valid = candidate_segs[valid_seg_mask]
+    hit_mask_any = np.zeros(candidate_segs_valid.shape[0], dtype=bool)
+
+    for body_pt in candidate_body_pts:
+        rel = body_pt[None, :] - seg_start_valid
+        t = np.sum(rel * seg_vec_valid, axis=1) / seg_len_sq_valid
+        t = np.clip(t, 0.0, 1.0)
+        proj = seg_start_valid + t[:, None] * seg_vec_valid
+        dists = np.linalg.norm(proj - body_pt[None, :], axis=1)
+        if dists.size:
+            min_dist = min(min_dist, float(np.min(dists)))
+        hit_mask_any |= (dists <= collision_radius_mm)
+
+    collision_mask = np.zeros(candidate_segs.shape[0], dtype=bool)
+    collision_mask[valid_seg_mask] = hit_mask_any
+    if not np.any(collision_mask):
+        return np.empty((0, 2, 3), dtype=float), collision_mask, False, min_dist
+    return np.asarray(candidate_segs[collision_mask], dtype=float), collision_mask, True, min_dist
 
 
 def compute_equal_box_center_radius(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, pad_frac: float = 0.04):
@@ -1021,6 +1344,15 @@ def estimate_print_time_seconds(states: List[MotionState], traj: TipTrajectory) 
     return elapsed, skipped_segments
 
 
+def print_gantry_ranges_used(traj: TipTrajectory, axis_names: Dict[str, str]) -> None:
+    print("Gantry ranges used:")
+    print(f"  {axis_names['x']}: {np.min(traj.x_stage):.4f} to {np.max(traj.x_stage):.4f}")
+    print(f"  {axis_names['y']}: {np.min(traj.y_stage):.4f} to {np.max(traj.y_stage):.4f}")
+    print(f"  {axis_names['z']}: {np.min(traj.z_stage):.4f} to {np.max(traj.z_stage):.4f}")
+    print(f"  {axis_names['b']}: {np.min(traj.b_cmd):.4f} to {np.max(traj.b_cmd):.4f}")
+    print(f"  {axis_names['c']}: {np.min(traj.c_cmd):.4f} to {np.max(traj.c_cmd):.4f}")
+
+
 # =========================
 # Interactive UI
 # =========================
@@ -1029,6 +1361,7 @@ def launch_interactive_plot(
     traj: TipTrajectory,
     cal: Calibration,
     robot_cfg: Optional[RobotLinkConfig] = None,
+    robot_skeleton_ref: Optional[RobotSkeletonReference] = None,
     c0_deg: float = DEFAULT_C0_DEG,
     offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
     show_stage: bool = False,
@@ -1044,8 +1377,18 @@ def launch_interactive_plot(
 
     n = len(states)
     idx0 = 0
+    robot_start_world = (
+        float(traj.x_stage[0]),
+        float(traj.y_stage[0]),
+        float(traj.z_stage[0]),
+    )
     elapsed_seconds, skipped_time_segments = estimate_print_time_seconds(states, traj)
     total_estimated_seconds = float(elapsed_seconds[-1]) if elapsed_seconds.size else 0.0
+    gantry_ranges = {
+        "x": (float(np.min(traj.x_stage)), float(np.max(traj.x_stage))),
+        "y": (float(np.min(traj.y_stage)), float(np.max(traj.y_stage))),
+        "z": (float(np.min(traj.z_stage)), float(np.max(traj.z_stage))),
+    }
 
     fig = plt.figure(figsize=DEFAULT_FIGSIZE)
     ax = fig.add_subplot(111, projection="3d")
@@ -1108,14 +1451,23 @@ def launch_interactive_plot(
         alpha=printed_line_alpha,
     )
     ax.add_collection3d(current_print_lc)
+    current_collision_seed = np.array(
+        [[[xs[idx0], ys[idx0], zs[idx0]], [xs[idx0], ys[idx0], zs[idx0]]]],
+        dtype=float,
+    )
+    current_collision_lc = Line3DCollection(
+        current_collision_seed,
+        colors=["red"],
+        linewidths=printed_line_width + 1.0,
+        alpha=1.0,
+    )
+    ax.add_collection3d(current_collision_lc)
 
-    # Robot links (optional)
+    # Robot overlays (optional)
     robot_lc = None
-    robot_joints = None
     robot_visible = {"value": False}
+    active_body_radius_mm = 0.0
     if robot_cfg is not None:
-        robot_visible["value"] = bool(robot_cfg.show_default)
-
         rp = compute_robot_polyline_world(
             cal, robot_cfg,
             x_stage=traj.x_stage[idx0],
@@ -1130,14 +1482,39 @@ def launch_interactive_plot(
             y_off_tip=traj.y_off_of_b[idx0],
             equation_phase=str(traj.equation_phase[idx0]),
             offplane_sign=offplane_sign,
+            start_world=robot_start_world,
         )
-        rsegs = np.stack([rp[:-1], rp[1:]], axis=1) if rp.shape[0] >= 2 else np.empty((0, 2, 3))
-        robot_lc = Line3DCollection(rsegs, colors=["orange"], linewidths=3.0, alpha=0.90)
-        ax.add_collection3d(robot_lc)
-        robot_joints = ax.scatter(rp[:, 0], rp[:, 1], rp[:, 2], s=18, color="orange", alpha=0.95)
-
+        robot_lc, _ = create_tube_artist(
+            ax,
+            rp,
+            diameter_mm=robot_cfg.diameter_mm,
+            color=ROBOT_TUBE_COLOR,
+            alpha=0.94,
+        )
+        robot_visible["value"] = bool(robot_cfg.show_default)
         robot_lc.set_visible(robot_visible["value"])
-        robot_joints.set_visible(robot_visible["value"])
+        active_body_radius_mm = 0.5 * float(robot_cfg.diameter_mm)
+
+    skeleton_ref_lc = None
+    if robot_skeleton_ref is not None:
+        pts_ref = compute_tracked_skeleton_world(
+            robot_skeleton_ref,
+            b_cmd=float(traj.b_cmd[idx0]),
+            c_cmd_deg=float(traj.c_cmd[idx0]),
+            tip_world=(float(traj.x_tip[idx0]), float(traj.y_tip[idx0]), float(traj.z_tip[idx0])),
+            equation_phase=str(traj.equation_phase[idx0]),
+        )
+        skeleton_ref_lc, _ = create_tube_artist(
+            ax,
+            pts_ref,
+            diameter_mm=robot_skeleton_ref.diameter_mm,
+            color=ROBOT_TUBE_COLOR,
+            alpha=0.97,
+        )
+        if robot_cfg is None:
+            robot_visible["value"] = True
+        skeleton_ref_lc.set_visible(robot_visible["value"])
+        active_body_radius_mm = 0.5 * float(robot_skeleton_ref.diameter_mm)
 
     # Title further up
     ax.set_title("Tip Trajectory from G-code and Calibration", pad=18)
@@ -1148,8 +1525,25 @@ def launch_interactive_plot(
     all_x = xs if not show_stage else np.concatenate([xs, traj.x_stage])
     all_y = ys if not show_stage else np.concatenate([ys, traj.y_stage])
     all_z = zs if not show_stage else np.concatenate([zs, traj.z_stage])
+    if robot_skeleton_ref is not None and robot_skeleton_ref.points_xyz_mm.size:
+        pts_ref = compute_tracked_skeleton_world(
+            robot_skeleton_ref,
+            b_cmd=float(traj.b_cmd[idx0]),
+            c_cmd_deg=float(traj.c_cmd[idx0]),
+            tip_world=(float(traj.x_tip[idx0]), float(traj.y_tip[idx0]), float(traj.z_tip[idx0])),
+            equation_phase=str(traj.equation_phase[idx0]),
+        )
+        all_x = np.concatenate([all_x, pts_ref[:, 0]])
+        all_y = np.concatenate([all_y, pts_ref[:, 1]])
+        all_z = np.concatenate([all_z, pts_ref[:, 2]])
 
     center, base_radius = compute_equal_box_center_radius(all_x, all_y, all_z, pad_frac=0.05)
+    overlay_radius = 0.0
+    if robot_cfg is not None:
+        overlay_radius = max(overlay_radius, 0.5 * float(robot_cfg.diameter_mm))
+    if robot_skeleton_ref is not None:
+        overlay_radius = max(overlay_radius, 0.5 * float(robot_skeleton_ref.diameter_mm))
+    base_radius += overlay_radius
     current_zoom = {"value": 1.0}
 
     def apply_view_limits():
@@ -1199,86 +1593,20 @@ def launch_interactive_plot(
     except Exception:
         pass
 
-    # ----- Toggle checkboxes -----
-    toggles = []
-    toggle_states = []
-    toggle_actions = {}
-
-    if robot_cfg is not None and robot_lc is not None and robot_joints is not None:
-        toggles.append("Robot links")
-        toggle_states.append(robot_visible["value"])
-
-        def _toggle_robot():
-            robot_visible["value"] = not robot_visible["value"]
+    def _apply_robot_visibility():
+        if robot_lc is not None:
             robot_lc.set_visible(robot_visible["value"])
-            robot_joints.set_visible(robot_visible["value"])
-        toggle_actions["Robot links"] = _toggle_robot
-
-    ref_check = None
-    if toggles:
-        ref_ax = fig.add_axes([0.70, 0.175, 0.26, 0.04], facecolor="#2a2a2a")
-        ref_ax.set_zorder(10)  # ensure it receives clicks
-        ref_check = CheckButtons(ref_ax, toggles, toggle_states)
-        try:
-            for txt in ref_check.labels:
-                txt.set_color("white")
-                txt.set_fontsize(12)
-            for rect in ref_check.rectangles:
-                rect.set_edgecolor("white")
-                rect.set_facecolor("#000000")
-                rect.set_linewidth(2.0)
-                # Make checkbox squares larger while keeping the panel compact.
-                x, y = rect.get_xy()
-                w, h = rect.get_width(), rect.get_height()
-                nw, nh = w * 1.75, h * 1.75
-                rect.set_width(nw)
-                rect.set_height(nh)
-                rect.set_xy((x, y - 0.5 * (nh - h)))
-            # Make the check marks obvious
-            for lines in ref_check.lines:
-                for ln in lines:
-                    ln.set_linewidth(3.4)
-                    ln.set_color("#66d17a")
-        except Exception:
-            pass
-
-        def on_check_clicked(label):
-            if label in toggle_actions:
-                toggle_actions[label]()
-            fig.canvas.draw_idle()
-
-        ref_check.on_clicked(on_check_clicked)
-
-        # Make the whole checkbox row clickable (not only the small checkbox artist).
-        def on_ref_ax_click(event):
-            if event.inaxes is not ref_ax or event.button != 1 or event.ydata is None:
-                return
-
-            # Let native CheckButtons handling process direct clicks on labels/boxes.
-            for rect in ref_check.rectangles:
-                contains, _ = rect.contains(event)
-                if contains:
-                    return
-            for txt in ref_check.labels:
-                contains, _ = txt.contains(event)
-                if contains:
-                    return
-
-            ys = np.array([txt.get_position()[1] for txt in ref_check.labels], dtype=float)
-            if ys.size == 0:
-                return
-            idx = int(np.argmin(np.abs(ys - float(event.ydata))))
-            ref_check.set_active(idx)
-
-        fig.canvas.mpl_connect("button_press_event", on_ref_ax_click)
+        if skeleton_ref_lc is not None:
+            skeleton_ref_lc.set_visible(robot_visible["value"])
 
     help_ax = fig.add_axes([0.70, 0.025, 0.28, 0.035], facecolor="black")
     help_ax.axis("off")
     help_ax.text(
         0.0, 1.0,
-        "Keys: left/right, j/k\n1=XY 2=XZ 3=YZ 0=ISO, +/- zoom",
+        "Keys: left/right, j/k, r=robot\n1=XY 2=XZ 3=YZ 0=ISO, +/- zoom",
         va="top", ha="left", fontsize=8, color="white"
     )
+    collision_state = {"active": False, "min_dist_mm": float("inf")}
 
     # ---------------------------
     # Fast redraw (precomputed extrude segments + debounced sliders)
@@ -1293,32 +1621,72 @@ def launch_interactive_plot(
                 f"robot_links: n={robot_cfg.n_links}  dia={robot_cfg.diameter_mm:.2f}mm  "
                 f"shape={robot_cfg.shape_mode}  anchor={robot_cfg.anchor_mode}  visible={robot_visible['value']}\n"
             )
+        skeleton_line = ""
+        if robot_skeleton_ref is not None:
+            skeleton_line = (
+                f"robot_skeleton: points={robot_skeleton_ref.points_xyz_mm.shape[0]}  "
+                f"dia={robot_skeleton_ref.diameter_mm:.2f}mm  tracked={bool(robot_skeleton_ref.phase_point_models)}  "
+                f"visible={robot_visible['value']}\n"
+            )
+        collision_line = ""
+        if robot_skeleton_ref is not None:
+            min_dist = collision_state["min_dist_mm"]
+            min_dist_text = f"{min_dist:.3f}mm" if np.isfinite(min_dist) else "---"
+            collision_line = (
+                f"body_path_collision={collision_state['active']}  "
+                f"threshold={active_body_radius_mm:.3f}mm  min_dist={min_dist_text}  "
+                f"highlight=full_print_move\n"
+            )
         return (
             f"idx={s.idx:6d}   gcode_line={s.gcode_line_no:6d}   motion={s.motion_code}   F={f_text}\n"
             f"est_time={format_duration(elapsed_seconds[i])} / {format_duration(total_estimated_seconds)}"
             f"  ({elapsed_seconds[i]:.1f}s / {total_estimated_seconds:.1f}s){time_note}\n"
             f"print_active={s.pressure_active}   equation_phase={traj.equation_phase[i]}   "
             f"default_phase={cal.default_phase}\n"
+            f"gantry_range: X=[{gantry_ranges['x'][0]: .3f}, {gantry_ranges['x'][1]: .3f}]  "
+            f"Y=[{gantry_ranges['y'][0]: .3f}, {gantry_ranges['y'][1]: .3f}]  "
+            f"Z=[{gantry_ranges['z'][0]: .3f}, {gantry_ranges['z'][1]: .3f}]\n"
             f"stage: X={traj.x_stage[i]: .4f}  Y={traj.y_stage[i]: .4f}  Z={traj.z_stage[i]: .4f}  "
             f"{cal.pull_axis}={traj.b_cmd[i]: .4f}  {cal.rot_axis}={traj.c_cmd[i]: .4f}\n"
             f"tip:   X={traj.x_tip[i]: .4f}  Y={traj.y_tip[i]: .4f}  Z={traj.z_tip[i]: .4f}    "
             f"r(B)={traj.r_of_b[i]: .4f}  y_off(B)={traj.y_off_of_b[i]: .4f}  z(B)={traj.z_of_b[i]: .4f}  "
             f"tip_angle={traj.tip_angle_deg[i]: .3f}°  sgn={int(traj.sgn[i]):+d}\n"
             f"{rob_line}"
+            f"{skeleton_line}"
+            f"{collision_line}"
             f"zoom={current_zoom['value']:.2f}x   raw: {s.gcode_raw}"
         )
 
     def _update_print_segments(i: int):
         if i <= 0 or extrude_segs.shape[0] == 0:
             current_print_lc.set_segments([])
-            return
+            return np.empty((0, 2, 3), dtype=float)
         # how many extrude segments end at/before i?
         k = int(np.searchsorted(extrude_end_idx, i, side="right"))
-        current_print_lc.set_segments(extrude_segs[:k])
+        visible_printed_segs = extrude_segs[:k]
+        current_print_lc.set_segments(visible_printed_segs)
         current_print_lc.set_color(printed_line_color)
+        return visible_printed_segs
+
+    def _update_collision_overlay(visible_printed_segs: np.ndarray, body_points_xyz: Optional[np.ndarray]):
+        collision_state["active"] = False
+        collision_state["min_dist_mm"] = float("inf")
+        if robot_skeleton_ref is None or body_points_xyz is None or active_body_radius_mm <= 0.0:
+            current_collision_lc.set_segments([])
+            return
+        hit_segments, collision_mask, is_collision, min_dist = _compute_collision_highlight_segments(
+            body_points_xyz=body_points_xyz,
+            candidate_segments_xyz=visible_printed_segs,
+            collision_radius_mm=active_body_radius_mm,
+        )
+        collision_state["active"] = bool(is_collision)
+        collision_state["min_dist_mm"] = float(min_dist)
+        if visible_printed_segs.shape[0] > 0:
+            current_print_lc.set_segments(visible_printed_segs[~collision_mask])
+        current_collision_lc.set_segments(hit_segments)
 
     def _update_robot(i: int):
-        if robot_cfg is None or robot_lc is None or robot_joints is None:
+        if robot_cfg is None or robot_lc is None:
             return
         rp = compute_robot_polyline_world(
             cal, robot_cfg,
@@ -1334,18 +1702,43 @@ def launch_interactive_plot(
             y_off_tip=traj.y_off_of_b[i],
             equation_phase=str(traj.equation_phase[i]),
             offplane_sign=offplane_sign,
+            start_world=robot_start_world,
         )
-        rsegs = np.stack([rp[:-1], rp[1:]], axis=1) if rp.shape[0] >= 2 else np.empty((0, 2, 3))
-        robot_lc.set_segments(rsegs)
-        robot_joints._offsets3d = (rp[:, 0], rp[:, 1], rp[:, 2])
+        update_tube_artist(
+            robot_lc,
+            rp,
+            diameter_mm=robot_cfg.diameter_mm,
+            color=ROBOT_TUBE_COLOR,
+            alpha=0.94,
+        )
+
+    def _update_skeleton(i: int) -> Optional[np.ndarray]:
+        if robot_skeleton_ref is None or skeleton_ref_lc is None:
+            return None
+        rp = compute_tracked_skeleton_world(
+            robot_skeleton_ref,
+            b_cmd=float(traj.b_cmd[i]),
+            c_cmd_deg=float(traj.c_cmd[i]),
+            tip_world=(float(traj.x_tip[i]), float(traj.y_tip[i]), float(traj.z_tip[i])),
+            equation_phase=str(traj.equation_phase[i]),
+        )
+        return update_tube_artist(
+            skeleton_ref_lc,
+            rp,
+            diameter_mm=robot_skeleton_ref.diameter_mm,
+            color=ROBOT_TUBE_COLOR,
+            alpha=0.97,
+        )
 
     def redraw(i: int):
         i = int(np.clip(i, 0, n - 1))
         view_state = capture_view_state(ax)
         current_tip_marker.set_data_3d([traj.x_tip[i]], [traj.y_tip[i]], [traj.z_tip[i]])
         current_stage_marker.set_data_3d([traj.x_stage[i]], [traj.y_stage[i]], [traj.z_stage[i]])
-        _update_print_segments(i)
+        visible_printed_segs = _update_print_segments(i)
         _update_robot(i)
+        body_points_xyz = _update_skeleton(i)
+        _update_collision_overlay(visible_printed_segs, body_points_xyz)
         info_text.set_text(fmt_state(i))
         restore_view_state(ax, view_state)
         fig.canvas.draw_idle()
@@ -1421,6 +1814,10 @@ def launch_interactive_plot(
             zoom_slider.set_val(min(8.0, float(zoom_slider.val) * 1.15))
         elif key in ("-", "_"):
             zoom_slider.set_val(max(0.25, float(zoom_slider.val) / 1.15))
+        elif key == "r":
+            robot_visible["value"] = not robot_visible["value"]
+            _apply_robot_visibility()
+            fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect("key_press_event", on_key)
 
@@ -1438,6 +1835,8 @@ def main():
     ap.add_argument("--robot-config", default=None,
                     help="Optional robot skeleton config JSON (e.g. *_skeleton_parametric.json). "
                          "If omitted, tries to auto-load from calibration JSON exported_models.")
+    ap.add_argument("--robot-skeleton-file", default=None,
+                    help="Optional exported skeleton JSON to overlay directly from reference_pose.points_xyz_mm in millimeters.")
     ap.add_argument("--y-axis", default="Y", help="Stage Y axis letter in G-code (default: Y).")
     ap.add_argument("--c0-deg", type=float, default=DEFAULT_C0_DEG,
                     help="C value corresponding to +X sign in calibration model (default: 0).")
@@ -1452,24 +1851,48 @@ def main():
     gcode_metadata = parse_gcode_metadata(args.gcode)
     write_mode = str(gcode_metadata.get("write_mode", "calibrated")).strip().lower()
 
-    # Robot config load (explicit or auto)
     robot_cfg = None
-    robot_path = None
-    if args.robot_config:
-        robot_path = Path(args.robot_config).expanduser().resolve()
-    else:
-        robot_path = resolve_robot_config_from_calibration(args.calibration, cal_data)
+    robot_skeleton_ref = None
 
-    if robot_path is not None and robot_path.exists():
-        try:
-            robot_cfg = load_robot_config(str(robot_path))
-            print(f"[INFO] Loaded robot config: {robot_path}")
-        except Exception as e:
-            print(f"[WARN] Failed to load robot config ({robot_path}): {e}")
-            robot_cfg = None
-    else:
-        if args.robot_config:
+    robot_cfg_path = Path(args.robot_config).expanduser().resolve() if args.robot_config else None
+    auto_robot_path = resolve_robot_config_from_calibration(args.calibration, cal_data) if not args.robot_config else None
+    skeleton_path = Path(args.robot_skeleton_file).expanduser().resolve() if args.robot_skeleton_file else None
+
+    if robot_cfg_path is not None:
+        if robot_cfg_path.exists():
+            try:
+                robot_cfg = load_robot_config(str(robot_cfg_path))
+                print(f"[INFO] Loaded robot config: {robot_cfg_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to load robot config ({robot_cfg_path}): {e}")
+        else:
             print(f"[WARN] Robot config path not found: {args.robot_config}")
+
+    if skeleton_path is None and auto_robot_path is not None and auto_robot_path.exists():
+        try:
+            auto_robot_data = _load_json_file(str(auto_robot_path))
+        except Exception:
+            auto_robot_data = {}
+        auto_type = str(auto_robot_data.get("type", "")).strip().lower()
+        if auto_type == "tracked_visible_skeleton_points":
+            skeleton_path = auto_robot_path
+        elif robot_cfg is None:
+            try:
+                robot_cfg = load_robot_config(str(auto_robot_path))
+                print(f"[INFO] Loaded robot config: {auto_robot_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to load robot config ({auto_robot_path}): {e}")
+
+    if skeleton_path is not None:
+        if skeleton_path.exists():
+            try:
+                robot_skeleton_ref = load_robot_skeleton_reference(str(skeleton_path))
+                print(f"[INFO] Loaded robot skeleton: {skeleton_path}")
+            except Exception as e:
+                print(f"[WARN] Failed to load robot skeleton ({skeleton_path}): {e}")
+                robot_skeleton_ref = None
+        else:
+            print(f"[WARN] Robot skeleton path not found: {skeleton_path}")
 
     y_axis = args.y_axis.upper()
 
@@ -1488,6 +1911,16 @@ def main():
         c0_deg=args.c0_deg,
         offplane_sign=float(args.offplane_sign),
         write_mode=write_mode,
+    )
+    print_gantry_ranges_used(
+        traj,
+        axis_names={
+            "x": cal.x_axis,
+            "y": y_axis,
+            "z": cal.z_axis,
+            "b": cal.pull_axis,
+            "c": cal.rot_axis,
+        },
     )
 
     if args.print_summary:
@@ -1508,12 +1941,24 @@ def main():
                 f"Robot links enabled: n_links={robot_cfg.n_links}, dia={robot_cfg.diameter_mm:.2f}mm, "
                 f"shape={robot_cfg.shape_mode}, anchor={robot_cfg.anchor_mode}, knots={len(robot_cfg.t_knots)}"
             )
+        if robot_skeleton_ref is not None:
+            mins = np.min(robot_skeleton_ref.points_xyz_mm, axis=0)
+            maxs = np.max(robot_skeleton_ref.points_xyz_mm, axis=0)
+            print(
+                f"Robot skeleton enabled: points={robot_skeleton_ref.points_xyz_mm.shape[0]}, "
+                f"dia={robot_skeleton_ref.diameter_mm:.2f}mm, "
+                f"tracked={bool(robot_skeleton_ref.phase_point_models)}, "
+                f"bounds_mm=X[{mins[0]:.4f}, {maxs[0]:.4f}] "
+                f"Y[{mins[1]:.4f}, {maxs[1]:.4f}] "
+                f"Z[{mins[2]:.4f}, {maxs[2]:.4f}]"
+            )
 
     launch_interactive_plot(
         states=states,
         traj=traj,
         cal=cal,
         robot_cfg=robot_cfg,
+        robot_skeleton_ref=robot_skeleton_ref,
         c0_deg=args.c0_deg,
         offplane_sign=float(args.offplane_sign),
         show_stage=args.show_stage,

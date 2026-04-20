@@ -78,16 +78,16 @@ DEFAULT_PROJECT_NAME = "Point_Tracking_Run"
 DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
-DEFAULT_POINT_X = 100.0
+DEFAULT_POINT_X = 90.0
 DEFAULT_POINT_Y = 52.0
 DEFAULT_POINT_Z = -130.0
 
 DEFAULT_TRAVEL_FEED = 8000.0
-DEFAULT_FINE_APPROACH_FEED = 150.0
-DEFAULT_PROBE_FEED = 150.0
+DEFAULT_FINE_APPROACH_FEED = 100.0
+DEFAULT_PROBE_FEED = 100.0
 DEFAULT_B_MAX_FEED = 500.0
-DEFAULT_B_ACCEL_TIME_S = 0.2
-DEFAULT_B_DECEL_TIME_S = 0.2
+DEFAULT_B_ACCEL_TIME_S = 0.05
+DEFAULT_B_DECEL_TIME_S = 0.05
 
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
@@ -140,13 +140,13 @@ DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_INTER_COMMAND_DELAY_S = 0.005
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_CAPTURE_EVERY_MOVE_POINT = False
-DEFAULT_SETTLED_CAPTURE_MODE = False
-DEFAULT_SETTLED_CAPTURE_BUFFER_S = 1.0
+DEFAULT_SETTLED_CAPTURE_MODE = True
+DEFAULT_SETTLED_CAPTURE_BUFFER_S = 4
 DEFAULT_MIN_ESTIMATED_MOVE_TIME_S = 0.008
 
 DEFAULT_FLIP_RZ_SIGN = True
 DEFAULT_POST_TIP_REFINER_MODEL = (
-    "Test_Calibration_2026-04-07_02_daq/"
+    "CNN_Calib/"
     "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
 )
 
@@ -1809,7 +1809,7 @@ def main(args):
                 "--camera_calibration_file",
                 str(script_dir / "captures/calibration_webcam_20260406_104136.npz"),
                 "--checkerboard_reference_image",
-                str(script_dir / "captures/photo_20260406_104134.png"),
+                str(script_dir / "captures/photo_20260428_162904.png"),
                 "--threshold",
                 "200",
                 "--tip_refine_mode",

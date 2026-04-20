@@ -15,7 +15,7 @@ Offline CTR shadow calibration runner that:
        - CSV of tracked points and errors
        - JSON metrics summary
        - error-vs-sample plot
-       - combined histogram + hexbin summary plot
+       - combined histogram + tracked-points summary plot
        - optional overlay on checkerboard image
 
 Key outputs:
@@ -23,7 +23,7 @@ Key outputs:
     tracked_tip_positions_mm.csv
     tracked_tip_error_metrics.json
     tracked_tip_error_vs_sample.png
-    tracked_tip_error_histogram_hexbin.png
+    tracked_tip_error_histogram_points.png
     checkerboard_reference_annotated_analysis.png   (optional)
 
 Usage example:
@@ -57,7 +57,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.collections import PathCollection
 
 # Add path to your shadow_calibration script
@@ -80,7 +79,7 @@ _NEI8_W = [
 # Utilities: IO and discovery
 # -----------------------------
 def list_images(folder: Path) -> List[Path]:
-    imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    imgs = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
     imgs.sort()
     return imgs
 
@@ -90,6 +89,8 @@ def ensure_project_from_raw(raw_dir: Path, project_dir: Path, link_mode: str = "
     Create a project_dir with raw_image_data_folder containing images from raw_dir.
     Returns raw_image_data_folder path.
     """
+    raw_dir = Path(raw_dir).expanduser().resolve()
+    project_dir = Path(project_dir).expanduser().resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     raw_out = project_dir / "raw_image_data_folder"
     raw_out.mkdir(parents=True, exist_ok=True)
@@ -99,9 +100,10 @@ def ensure_project_from_raw(raw_dir: Path, project_dir: Path, link_mode: str = "
         raise RuntimeError(f"No images found in raw_dir: {raw_dir}")
 
     for src in imgs:
-        dst = raw_out / src.name
+        dst = raw_out / src.relative_to(raw_dir)
         if dst.exists():
             continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
         if link_mode == "symlink":
             try:
                 os.symlink(src.resolve(), dst)
@@ -127,6 +129,48 @@ def _json_ready(value: Any):
     if isinstance(value, (list, tuple)):
         return [_json_ready(v) for v in value]
     return value
+
+
+def load_optional_tip_refiner(cal: CTR_Shadow_Calibration, args) -> None:
+    if not getattr(args, "tip_refiner_model", None):
+        return
+    model_path = Path(args.tip_refiner_model).expanduser().resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Tip refiner model not found: {model_path}")
+    cal.load_tip_refiner_model(
+        str(model_path),
+        anchor_name=args.tip_refiner_anchor,
+        use_as_selected=(not bool(args.tip_refiner_compare_only)),
+    )
+
+
+def select_tracked_rows_for_analysis(cal: CTR_Shadow_Calibration, args) -> Tuple[np.ndarray, str]:
+    source = str(getattr(args, "tracked_tip_source", "auto")).strip().lower()
+    if source == "auto":
+        if getattr(args, "tip_refiner_model", None) and not bool(getattr(args, "tip_refiner_compare_only", False)):
+            source = "selected"
+        else:
+            source = "coarse"
+
+    if source == "cnn":
+        arr = getattr(cal, "tip_locations_array_cnn", None)
+        if arr is None:
+            raise RuntimeError("tracked_tip_source=cnn requested, but tip_locations_array_cnn is unavailable.")
+        return np.asarray(arr, dtype=float), "cnn"
+
+    if source == "selected":
+        arr = getattr(cal, "tip_locations_array_selected", None)
+        if arr is None:
+            raise RuntimeError("tracked_tip_source=selected requested, but tip_locations_array_selected is unavailable.")
+        return np.asarray(arr, dtype=float), "selected"
+
+    if source == "coarse":
+        arr = getattr(cal, "tip_locations_array_coarse", None)
+        if arr is None:
+            raise RuntimeError("tracked_tip_source=coarse requested, but tip_locations_array_coarse is unavailable.")
+        return np.asarray(arr, dtype=float), "coarse"
+
+    raise ValueError(f"Unsupported tracked_tip_source: {source}")
 
 
 def _parse_inner_corners_arg(value):
@@ -1590,6 +1634,18 @@ def _style_transparent_light_axes(ax, title: str, xlabel: str, ylabel: str):
     ax.set_facecolor((0.0, 0.0, 0.0, 0.0))
 
 
+def _apply_dark_axes_style(ax, title: str, xlabel: str, ylabel: str):
+    ax.set_title(title, color="#f4f7fb", fontsize=12.5, pad=10, weight="semibold")
+    ax.set_xlabel(xlabel, color="#d7e2ee")
+    ax.set_ylabel(ylabel, color="#d7e2ee")
+    ax.tick_params(colors="#c8d5e3", labelsize=10)
+    for spine in ax.spines.values():
+        spine.set_color((0.75, 0.84, 0.93, 0.25))
+        spine.set_linewidth(1.1)
+    ax.grid(True, color=(0.75, 0.84, 0.93, 0.10), linewidth=0.8)
+    ax.set_facecolor("#0f1723")
+
+
 def save_error_plot(error_plot_path: Path, records: List[Dict[str, Any]], title_prefix: str = ""):
     valid_recs = [r for r in records if r.get("valid", False) and r.get("error_distance_mm") is not None]
     if not valid_recs:
@@ -1622,7 +1678,7 @@ def save_error_plot(error_plot_path: Path, records: List[Dict[str, Any]], title_
     plt.close(fig)
 
 
-def save_error_histogram_and_hexbin(
+def save_error_histogram_and_points(
     plot_path: Path,
     errors_mm: np.ndarray,
     mm_points: np.ndarray,
@@ -1642,13 +1698,8 @@ def save_error_histogram_and_hexbin(
     ref_z = float(reference_point_mm["z_mean_mm"])
     u_vals = mm_points[:, 0]
     z_vals = mm_points[:, 1]
-    cmap = LinearSegmentedColormap.from_list(
-        "sleek_actual_density",
-        ["#081018", "#12344d", "#1b6ca8", "#3ddbd9", "#f4d35e"],
-        N=256,
-    )
 
-    fig, (ax_hist, ax_hex) = plt.subplots(
+    fig, (ax_hist, ax_points) = plt.subplots(
         2,
         1,
         figsize=(8.5, 11.0),
@@ -1663,65 +1714,79 @@ def save_error_histogram_and_hexbin(
         edgecolor=(0.92, 0.98, 1.0, 1.0),
         linewidth=1.0,
     )
-    _style_transparent_light_axes(
+    ax_hist.axvline(
+        float(rmse_mm),
+        color="#ffd166",
+        linestyle="--",
+        linewidth=1.8,
+        alpha=0.95,
+        label=f"RMSE = {float(rmse_mm):.4f} mm",
+    )
+    _apply_dark_axes_style(
         ax_hist,
-        title=f"{title_prefix}Histogram of tracked tip error (RMSE = {float(rmse_mm):.3f} mm)".strip(),
+        title=f"{title_prefix}Tracked tip error distribution".strip(),
         xlabel="Error distance (mm)",
         ylabel="Number of samples",
     )
+    ax_hist.set_facecolor("none")
+    leg_hist = ax_hist.legend(loc="upper right", frameon=True, fontsize=10)
+    leg_hist.get_frame().set_facecolor("#121c28")
+    leg_hist.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.20))
+    for txt in leg_hist.get_texts():
+        txt.set_color("#e5edf6")
 
-    hb = ax_hex.hexbin(
-        mm_points[:, 0],
-        mm_points[:, 1],
-        gridsize=26,
-        mincnt=1,
-        cmap=cmap,
-        linewidths=0.0,
-    )
-    cbar = fig.colorbar(hb, ax=ax_hex, pad=0.02)
-    cbar.set_label("Actual point density", color="#dceaf7")
-    cbar.ax.yaxis.set_tick_params(color="#dceaf7")
-    plt.setp(cbar.ax.get_yticklabels(), color="#dceaf7")
-    cbar.outline.set_edgecolor("#8eb8d8")
-    cbar.ax.set_facecolor("none")
-    ax_hex.scatter(
-        mm_points[:, 0],
-        mm_points[:, 1],
-        s=8,
-        color=(0.86, 0.96, 1.0, 0.20),
-        edgecolors="none",
+    ax_points.scatter(
+        u_vals,
+        z_vals,
+        s=28,
+        color="#7fd6ff",
+        alpha=0.82,
+        edgecolors="#f3f8ff",
+        linewidths=0.35,
         zorder=3,
+        label="Measured points",
     )
-    ax_hex.scatter(
+    ax_points.scatter(
         [ref_u],
         [ref_z],
-        s=80,
-        marker="x",
-        linewidths=2.0,
-        color="#ff8fab",
-        zorder=4,
+        s=115,
+        marker="s",
+        facecolors="none",
+        edgecolors="#00e5ff",
+        linewidths=1.8,
+        zorder=5,
+        label="Reference point",
     )
-    _style_transparent_light_axes(
-        ax_hex,
-        title=f"{title_prefix}Desired tracked point and actual point density".strip(),
+    ax_points.scatter(
+        [float(np.mean(u_vals))],
+        [float(np.mean(z_vals))],
+        s=85,
+        marker="+",
+        color="#ff66c4",
+        linewidths=2.0,
+        zorder=5,
+        label="Measured center",
+    )
+    _apply_dark_axes_style(
+        ax_points,
+        title=f"{title_prefix}Desired vs measured tracked tip points".strip(),
         xlabel="u (mm)",
         ylabel="z (mm)",
     )
-    ax_hex.tick_params(colors="#dceaf7")
-    for spine in ax_hex.spines.values():
-        spine.set_color("#6b92b3")
-    ax_hex.xaxis.label.set_color("#e8f3ff")
-    ax_hex.yaxis.label.set_color("#e8f3ff")
-    ax_hex.title.set_color("#f8fbff")
-    ax_hex.grid(True, color="#8eb8d8", alpha=0.12, linewidth=0.8)
+    ax_points.set_facecolor("none")
     u_span = float(np.ptp(u_vals))
     z_span = float(np.ptp(z_vals))
     u_pad = max(0.5, 0.08 * max(u_span, 1.0))
     z_pad = max(0.5, 0.08 * max(z_span, 1.0))
-    ax_hex.set_xlim(float(np.min(u_vals) - u_pad), float(np.max(u_vals) + u_pad))
-    ax_hex.set_ylim(float(np.min(z_vals) - z_pad), float(np.max(z_vals) + z_pad))
+    ax_points.set_xlim(float(np.min(u_vals) - u_pad), float(np.max(u_vals) + u_pad))
+    ax_points.set_ylim(float(np.min(z_vals) - z_pad), float(np.max(z_vals) + z_pad))
     if u_span > 1e-9 and z_span > 1e-9:
-        ax_hex.set_box_aspect(z_span / u_span)
+        ax_points.set_box_aspect((2.0 * z_pad + z_span) / max(2.0 * u_pad + u_span, 1e-12))
+    leg = ax_points.legend(loc="upper right", frameon=True, fontsize=9)
+    leg.get_frame().set_facecolor("#121c28")
+    leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
+    for txt in leg.get_texts():
+        txt.set_color("#e8f0f8")
     fig.tight_layout()
     fig.savefig(plot_path, dpi=220, transparent=True)
     plt.close(fig)
@@ -1787,6 +1852,10 @@ def save_metrics_json(
         "board_reference": collect_board_reference_info(cal),
         "settings": {
             "threshold": int(args.threshold),
+            "tracked_tip_source": str(getattr(args, "tracked_tip_source", "auto")),
+            "tip_refiner_model": None if getattr(args, "tip_refiner_model", None) is None else str(Path(args.tip_refiner_model).expanduser().resolve()),
+            "tip_refiner_anchor": getattr(args, "tip_refiner_anchor", None),
+            "tip_refiner_compare_only": bool(getattr(args, "tip_refiner_compare_only", False)),
             "tip_refine_mode": str(args.tip_refine_mode),
             "tip_refine_dt_step_px": float(args.tip_refine_dt_step_px),
             "tip_refine_max_step_px": int(args.tip_refine_max_step_px),
@@ -1860,6 +1929,14 @@ def main():
     ap.add_argument("--tip_refine_parallel_cross_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_max_len_r", type=float, default=8.0)
+    ap.add_argument("--tip_refiner_model", type=str, default=None,
+                    help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt for CNN tip detection.")
+    ap.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"],
+                    help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
+    ap.add_argument("--tip_refiner_compare_only", action="store_true",
+                    help="Save CNN tips but keep non-CNN tips as the default tracked source.")
+    ap.add_argument("--tracked_tip_source", type=str, default="auto", choices=["auto", "coarse", "selected", "cnn"],
+                    help="Which tip rows to convert to mm. auto uses selected/CNN when --tip_refiner_model is active, otherwise coarse.")
 
     ap.add_argument("--hist_bins", type=int, default=20,
                     help="Number of histogram bins.")
@@ -1899,6 +1976,7 @@ def main():
         add_date=False,
     )
     cal.calibration_data_folder = str(project_dir)
+    load_optional_tip_refiner(cal, args)
 
     if args.tip_refine_mode != "none":
         patch_analyze_data_for_tip_refinement(
@@ -1981,9 +2059,10 @@ def main():
     print("\n[INFO] Running analyze_data_batch (offline)...")
     cal.analyze_data_batch(threshold=int(args.threshold))
 
-    tracked_rows = np.asarray(cal.tip_locations_array_coarse, dtype=float)
+    tracked_rows, tracked_source = select_tracked_rows_for_analysis(cal, args)
     if tracked_rows.size == 0:
-        raise RuntimeError("No tracked tip data found in cal.tip_locations_array_coarse after analyze_data_batch.")
+        raise RuntimeError(f"No tracked tip data found for source={tracked_source} after analyze_data_batch.")
+    print(f"[INFO] Using tracked tip source for mm analysis: {tracked_source}")
 
     print("[INFO] Converting tracked tips to checkerboard-referenced mm...")
     tip_data = compute_tracked_tip_positions_mm(cal, tracked_rows, imgs)
@@ -2001,7 +2080,7 @@ def main():
     csv_path = processed_dir / "tracked_tip_positions_mm.csv"
     metrics_json_path = processed_dir / "tracked_tip_error_metrics.json"
     error_plot_path = processed_dir / "tracked_tip_error_vs_sample.png"
-    hist_hexbin_path = processed_dir / "tracked_tip_error_histogram_hexbin.png"
+    hist_points_path = processed_dir / "tracked_tip_error_histogram_points.png"
 
     save_tracked_tip_csv(csv_path, records)
     save_metrics_json(metrics_json_path, metrics, cal, args)
@@ -2011,8 +2090,8 @@ def main():
         records,
         title_prefix="Checkerboard-referenced ",
     )
-    save_error_histogram_and_hexbin(
-        hist_hexbin_path,
+    save_error_histogram_and_points(
+        hist_points_path,
         metrics["errors_mm"],
         tip_data["mm_points"],
         metrics["reference_point_mm"],
@@ -2025,7 +2104,7 @@ def main():
     print(f"[INFO] Saved CSV: {csv_path}")
     print(f"[INFO] Saved metrics JSON: {metrics_json_path}")
     print(f"[INFO] Saved error plot: {error_plot_path}")
-    print(f"[INFO] Saved histogram + hexbin plot: {hist_hexbin_path}")
+    print(f"[INFO] Saved histogram + points plot: {hist_points_path}")
     print(f"[INFO] Updated analysis outputs with per-sample error titles: {processed_dir / 'analysis_outputs'}")
 
     if board_reference_debug_image is not None:

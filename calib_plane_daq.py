@@ -26,7 +26,8 @@ Key behavior changes vs the old cyclic C-sweep script:
     * smooth sinusoidal B motion with zero velocity at block boundaries
     * exact fixed-tip XYZ compensation at every sample
     * queued constant-feed tracked motion
-    * explicit M400 waits
+    * explicit M400 waits by default, or estimated-time settled captures
+      with --settled-capture-mode
     * fine re-approach to the first point of each block at a slower feed
     * conservative large-move handling between blocks
 
@@ -139,8 +140,15 @@ DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_INTER_COMMAND_DELAY_S = 0.005
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_CAPTURE_EVERY_MOVE_POINT = False
+DEFAULT_SETTLED_CAPTURE_MODE = False
+DEFAULT_SETTLED_CAPTURE_BUFFER_S = 1.0
+DEFAULT_MIN_ESTIMATED_MOVE_TIME_S = 0.008
 
 DEFAULT_FLIP_RZ_SIGN = True
+DEFAULT_POST_TIP_REFINER_MODEL = (
+    "Test_Calibration_2026-04-07_02_daq/"
+    "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
+)
 
 OFFPLANE_SIGN = -1.0
 
@@ -993,6 +1001,7 @@ class FixedTipPointTracker:
         self.cam_port = None
         self.command_log: List[dict] = []
         self.commanded_axes: dict = {}
+        self.estimated_motion_done_at: float = time.monotonic()
 
         print(f"Using run folder: {self.run_folder}")
         print(f"Using point-tracking folder: {self.point_tracking_folder}")
@@ -1131,10 +1140,83 @@ class FixedTipPointTracker:
         if extra_settle > 0:
             time.sleep(extra_settle)
 
+    def _seed_commanded_pose(self, cal: Calibration, pose: Tuple[float, float, float, float, float]):
+        x, y, z, b, c = [float(v) for v in pose]
+        self.commanded_axes = {
+            cal.x_axis: x,
+            cal.y_axis: y,
+            cal.z_axis: z,
+            cal.b_axis: b,
+            cal.c_axis: clamp_c_bounded(c),
+        }
+        self.estimated_motion_done_at = time.monotonic()
+
+    def _estimate_move_time_s(
+        self,
+        cal: Calibration,
+        previous_axes: dict,
+        axes_targets: dict,
+        feedrate: float,
+        b_max_feed: float,
+        min_move_time_s: float = DEFAULT_MIN_ESTIMATED_MOVE_TIME_S,
+    ) -> float:
+        feed_units_s = max(1e-9, float(feedrate) / 60.0)
+        b_units_s = max(1e-9, min(float(feedrate), float(b_max_feed)) / 60.0)
+
+        xyz_sq = 0.0
+        for axis in (cal.x_axis, cal.y_axis, cal.z_axis):
+            if axis not in axes_targets or axes_targets[axis] is None:
+                continue
+            if axis not in previous_axes:
+                continue
+            delta = float(axes_targets[axis]) - float(previous_axes[axis])
+            xyz_sq += delta * delta
+        xyz_time_s = math.sqrt(xyz_sq) / feed_units_s if xyz_sq > 0 else 0.0
+
+        b_time_s = 0.0
+        if cal.b_axis in axes_targets and axes_targets[cal.b_axis] is not None and cal.b_axis in previous_axes:
+            b_delta = abs(float(axes_targets[cal.b_axis]) - float(previous_axes[cal.b_axis]))
+            b_time_s = b_delta / b_units_s
+
+        c_time_s = 0.0
+        if cal.c_axis in axes_targets and axes_targets[cal.c_axis] is not None and cal.c_axis in previous_axes:
+            c_delta = abs(float(axes_targets[cal.c_axis]) - float(previous_axes[cal.c_axis]))
+            c_time_s = c_delta / feed_units_s
+
+        est_s = max(float(xyz_time_s), float(b_time_s), float(c_time_s))
+        if est_s <= 0.0:
+            return 0.0
+        return max(float(est_s), float(min_move_time_s))
+
+    def _record_estimated_motion(
+        self,
+        cal: Calibration,
+        command_record: dict,
+        b_max_feed: float,
+    ) -> float:
+        est_s = self._estimate_move_time_s(
+            cal=cal,
+            previous_axes=command_record.get("previous_axes", {}),
+            axes_targets=command_record.get("axes_targets", {}),
+            feedrate=float(command_record.get("feedrate", 0.0)),
+            b_max_feed=float(b_max_feed),
+        )
+        now = time.monotonic()
+        self.estimated_motion_done_at = max(now, self.estimated_motion_done_at) + est_s
+        return est_s
+
+    def _wait_for_estimated_motion_complete(self, extra_settle: float = 0.0, reason: str = "motion"):
+        wait_s = max(0.0, self.estimated_motion_done_at - time.monotonic()) + max(0.0, float(extra_settle))
+        if wait_s > 0:
+            print(f" Estimated wait for {reason}: {wait_s:.3f} s")
+            time.sleep(wait_s)
+        self.estimated_motion_done_at = max(self.estimated_motion_done_at, time.monotonic())
+
     def send_absolute_move(self, feedrate: float, **axes_targets):
         if self.rrf is None:
             raise RuntimeError("Robot is not connected.")
 
+        previous_axes = dict(self.commanded_axes)
         parts = ["G90", "G1"]
         for ax, val in axes_targets.items():
             if val is None:
@@ -1147,20 +1229,21 @@ class FixedTipPointTracker:
             if val is None:
                 continue
             self.commanded_axes[str(ax)] = float(val)
-        self.command_log.append(
-            {
-                "command_index": int(len(self.command_log) + 1),
-                "feedrate": float(feedrate),
-                "gcode": gcode,
-                "axes_targets": {
-                    str(ax): float(val)
-                    for ax, val in axes_targets.items()
-                    if val is not None
-                },
-                "resolved_axes": dict(self.commanded_axes),
-            }
-        )
+        command_record = {
+            "command_index": int(len(self.command_log) + 1),
+            "feedrate": float(feedrate),
+            "gcode": gcode,
+            "previous_axes": previous_axes,
+            "axes_targets": {
+                str(ax): float(val)
+                for ax, val in axes_targets.items()
+                if val is not None
+            },
+            "resolved_axes": dict(self.commanded_axes),
+        }
+        self.command_log.append(command_record)
         self.rrf.send_code(gcode)
+        return command_record
 
     def write_command_log_csv(self, cal: Calibration) -> str:
         csv_path = os.path.join(self.run_folder, "commanded_motor_positions.csv")
@@ -1210,10 +1293,12 @@ class FixedTipPointTracker:
         safe_approach_z: float,
         travel_feed: float,
         settle_s: float,
+        use_estimated_waits: bool = False,
+        b_max_feed: float = DEFAULT_B_MAX_FEED,
     ):
         x, y, z, b, c = [float(v) for v in pose]
 
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             travel_feed,
             **{
                 cal.z_axis: float(safe_approach_z),
@@ -1221,9 +1306,13 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, b_max_feed=b_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z approach")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             travel_feed,
             **{
                 cal.x_axis: x,
@@ -1232,9 +1321,13 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, b_max_feed=b_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe XY approach")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             travel_feed,
             **{
                 cal.z_axis: z,
@@ -1242,7 +1335,11 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, b_max_feed=b_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z landing")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
     def _fine_land_on_point(
         self,
@@ -1254,9 +1351,11 @@ class FixedTipPointTracker:
         c: float,
         fine_feed: float,
         settle_s: float,
+        use_estimated_waits: bool = False,
+        b_max_feed: float = DEFAULT_B_MAX_FEED,
     ):
         print(" Fine landing move for accuracy...")
-        self.send_absolute_move(
+        cmd = self.send_absolute_move(
             fine_feed,
             **{
                 cal.x_axis: x,
@@ -1266,7 +1365,11 @@ class FixedTipPointTracker:
                 cal.c_axis: clamp_c_bounded(c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if use_estimated_waits:
+            self._record_estimated_motion(cal=cal, command_record=cmd, b_max_feed=b_max_feed)
+            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="fine landing")
+        else:
+            self.wait_for_duet_motion_complete(extra_settle=settle_s)
 
     def execute_motion_and_capture(
         self,
@@ -1293,6 +1396,8 @@ class FixedTipPointTracker:
         capture_at_start: bool = True,
         initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
         c_flip_feed: float = DEFAULT_C_FLIP_FEED,
+        settled_capture_mode: bool = DEFAULT_SETTLED_CAPTURE_MODE,
+        settled_capture_buffer_s: float = DEFAULT_SETTLED_CAPTURE_BUFFER_S,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1303,6 +1408,7 @@ class FixedTipPointTracker:
         sample_counter = 0
         self.command_log = []
         self.commanded_axes = {}
+        self._seed_commanded_pose(cal=cal, pose=start_pose)
 
         blocks = split_trajectory_into_blocks(traj)
 
@@ -1311,6 +1417,11 @@ class FixedTipPointTracker:
         print("=" * 72)
         print(f"Tracked samples total: {len(traj)}")
         print(f"Orientation blocks: {len(blocks)}")
+        if settled_capture_mode:
+            print(
+                "Settled capture mode: using estimated move time plus "
+                f"{float(settled_capture_buffer_s):.3f} s buffer; M400 waits are skipped."
+            )
 
         print("\nSafe startup approach...")
         self._move_to_pose_safe(
@@ -1319,6 +1430,8 @@ class FixedTipPointTracker:
             safe_approach_z=float(safe_approach_z),
             travel_feed=float(travel_feed),
             settle_s=float(travel_move_settle_s),
+            use_estimated_waits=bool(settled_capture_mode),
+            b_max_feed=float(b_max_feed),
         )
 
         if int(dwell_before_ms) > 0:
@@ -1361,7 +1474,7 @@ class FixedTipPointTracker:
             else:
                 print("Large move onto first tracked point of block...")
 
-            self.send_absolute_move(
+            cmd = self.send_absolute_move(
                 transition_feed,
                 **{
                     cal.x_axis: x0,
@@ -1371,7 +1484,14 @@ class FixedTipPointTracker:
                     cal.c_axis: clamp_c_bounded(float(first_pt.c)),
                 }
             )
-            self.wait_for_duet_motion_complete(extra_settle=float(travel_move_settle_s))
+            if settled_capture_mode:
+                self._record_estimated_motion(cal=cal, command_record=cmd, b_max_feed=float(b_max_feed))
+                self._wait_for_estimated_motion_complete(
+                    extra_settle=float(travel_move_settle_s),
+                    reason=f"{block_name} transition",
+                )
+            else:
+                self.wait_for_duet_motion_complete(extra_settle=float(travel_move_settle_s))
             if c_flip_delay_s > 0:
                 print(f"Holding {c_flip_delay_s:.3f} s after C rotation...")
                 time.sleep(c_flip_delay_s)
@@ -1385,6 +1505,8 @@ class FixedTipPointTracker:
                 c=float(first_pt.c),
                 fine_feed=float(fine_approach_feed),
                 settle_s=max(float(tracked_move_settle_s), 0.05),
+                use_estimated_waits=bool(settled_capture_mode),
+                b_max_feed=float(b_max_feed),
             )
 
             if (
@@ -1399,6 +1521,11 @@ class FixedTipPointTracker:
                 time.sleep(float(initial_sweep_wait_s))
 
             if capture_at_start and first_pt.capture_image:
+                if settled_capture_mode:
+                    self._wait_for_estimated_motion_complete(
+                        extra_settle=float(settled_capture_buffer_s),
+                        reason=f"{block_name} start capture",
+                    )
                 sample_counter += 1
                 self.capture_and_save(
                     sample_idx=sample_counter,
@@ -1421,7 +1548,13 @@ class FixedTipPointTracker:
             for i, point in enumerate(block[1:], start=1):
                 prev_point = block[i - 1]
                 if point.motion_phase == "pull" and prev_point.motion_phase == "release":
-                    self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
+                    if settled_capture_mode:
+                        self._wait_for_estimated_motion_complete(
+                            extra_settle=float(tracked_move_settle_s),
+                            reason="release-to-pull boundary",
+                        )
+                    else:
+                        self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
                     if float(b_extra_settle_s) > 0:
                         time.sleep(float(b_extra_settle_s))
                     print(f"Holding {float(DEFAULT_PULL_SEQUENCE_BUFFER_S):.3f} s before next pull sequence...")
@@ -1434,7 +1567,7 @@ class FixedTipPointTracker:
                     bbox_warnings,
                 )
 
-                self.send_absolute_move(
+                cmd = self.send_absolute_move(
                     float(probe_feed),
                     **{
                         cal.x_axis: x,
@@ -1444,9 +1577,22 @@ class FixedTipPointTracker:
                         cal.c_axis: clamp_c_bounded(float(point.c)),
                     }
                 )
+                if settled_capture_mode:
+                    est_s = self._record_estimated_motion(
+                        cal=cal,
+                        command_record=cmd,
+                        b_max_feed=float(b_max_feed),
+                    )
+                    if point.capture_image:
+                        print(f" Estimated segment time before capture: {est_s:.3f} s")
                 if float(inter_command_delay_s) > 0:
                     time.sleep(float(inter_command_delay_s))
                 if point.capture_image:
+                    if settled_capture_mode:
+                        self._wait_for_estimated_motion_complete(
+                            extra_settle=float(settled_capture_buffer_s),
+                            reason=f"{block_name} sample {i} capture",
+                        )
                     sample_counter += 1
                     self.capture_and_save(
                         sample_idx=sample_counter,
@@ -1464,7 +1610,13 @@ class FixedTipPointTracker:
                     )
 
             if len(block) > 1:
-                self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
+                if settled_capture_mode:
+                    self._wait_for_estimated_motion_complete(
+                        extra_settle=float(tracked_move_settle_s),
+                        reason=f"{block_name} block completion",
+                    )
+                else:
+                    self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
                 if float(b_extra_settle_s) > 0:
                     time.sleep(float(b_extra_settle_s))
 
@@ -1479,6 +1631,8 @@ class FixedTipPointTracker:
             safe_approach_z=float(safe_approach_z),
             travel_feed=float(travel_feed),
             settle_s=float(travel_move_settle_s),
+            use_estimated_waits=bool(settled_capture_mode),
+            b_max_feed=float(b_max_feed),
         )
 
         print("\n" + "=" * 72)
@@ -1636,12 +1790,17 @@ def main(args):
             capture_at_start=bool(args.capture_at_start),
             initial_sweep_wait_s=float(args.initial_sweep_wait_s),
             c_flip_feed=float(args.c_flip_feed),
+            settled_capture_mode=bool(args.settled_capture_mode),
+            settled_capture_buffer_s=float(args.settled_capture_buffer_s),
         )
 
         print("\nFinal results:")
         print(results)
 
         if bool(args.enable_post):
+            post_tip_refiner_model = Path(args.post_tip_refiner_model).expanduser()
+            if not post_tip_refiner_model.is_absolute():
+                post_tip_refiner_model = script_dir / post_tip_refiner_model
             post_cmd = [
                 sys.executable,
                 str(script_dir / "calib_plane_process.py"),
@@ -1655,6 +1814,8 @@ def main(args):
                 "200",
                 "--tip_refine_mode",
                 "none",
+                "--tip_refiner_model",
+                str(post_tip_refiner_model.resolve()),
                 "--save_plots",
             ]
             print("\nRunning post-processing:")
@@ -1685,6 +1846,8 @@ if __name__ == "__main__":
                     help="Append timestamp to the run folder name.")
     ap.add_argument("--enable-post", action="store_true",
                     help="Run calib_plane_process.py on the generated project directory after acquisition.")
+    ap.add_argument("--post-tip-refiner-model", type=str, default=DEFAULT_POST_TIP_REFINER_MODEL,
+                    help="CNN tip refiner model passed to calib_plane_process.py.")
 
     # Connectivity
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet web address.")
@@ -1772,6 +1935,10 @@ if __name__ == "__main__":
                     help="Small pacing delay inserted after each streamed tracked move command.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
                     help="Capture at the first point of each block if that point is marked for acquisition.")
+    ap.add_argument("--settled-capture-mode", action="store_true", default=DEFAULT_SETTLED_CAPTURE_MODE,
+                    help="Avoid M400 waits; estimate queued move time and settle before each capture.")
+    ap.add_argument("--settled-capture-buffer-s", type=float, default=DEFAULT_SETTLED_CAPTURE_BUFFER_S,
+                    help="Extra idle time after estimated motion completion before each settled capture.")
 
     # Startup / end poses
     ap.add_argument("--safe-approach-z", type=float, default=DEFAULT_SAFE_APPROACH_Z)

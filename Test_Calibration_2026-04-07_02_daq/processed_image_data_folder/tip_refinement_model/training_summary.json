@@ -1,0 +1,8 @@
+{
+  "num_total": 466,
+  "num_train": 396,
+  "num_val": 70,
+  "best_val_mean_px_error": 0.8737224221229554,
+  "best_model_path": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-04-07_02_daq/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt",
+  "device": "cpu"
+}

@@ -1,0 +1,205 @@
+{
+  "analysis_crop": {
+    "crop_width_min": 1005,
+    "crop_width_max": 2897,
+    "crop_height_min": 532,
+    "crop_height_max": 1830
+  },
+  "ruler_ref_p1_px": null,
+  "ruler_ref_p2_px": null,
+  "ruler_ref_distance_mm": null,
+  "ruler_mm_per_px": null,
+  "ruler_px_per_mm": null,
+  "ruler_axis_unit": null,
+  "ruler_axis_perp_unit": null,
+  "ruler_calib_meta": null,
+  "board_reference_correction_meta": {
+    "checkerboard_mm_scale_correction": 0.5,
+    "checkerboard_planar_x_flipped": true
+  },
+  "cnn_crop_by_folder": {
+    "data_1": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    },
+    "data_2": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    },
+    "data_3": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    }
+  },
+  "board_reference": {
+    "camera_calib_path": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz",
+    "camera_calib_meta": {
+      "board_type": "checkerboard",
+      "rms": 0.19299808830440704,
+      "square_size_m": 0.01,
+      "square_size_mm": 10.0,
+      "inner_corners": [
+        11,
+        8
+      ]
+    },
+    "board_reference_image_path": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260406_104134.png",
+    "board_pose": {
+      "board_type": "checkerboard",
+      "rvec": [
+        [
+          0.009076619321332342
+        ],
+        [
+          0.011405495313015575
+        ],
+        [
+          -3.1345765899108424
+        ]
+      ],
+      "tvec": [
+        [
+          51.56738267795841
+        ],
+        [
+          48.627558055582845
+        ],
+        [
+          254.9674321114795
+        ]
+      ],
+      "R": [
+        [
+          -0.9999588557862167,
+          0.007003111764336207,
+          -0.0057656881928057424
+        ],
+        [
+          -0.006960968729502282,
+          -0.9999491466924343,
+          -0.00729718736360053
+        ],
+        [
+          -0.005816498007163342,
+          -0.007256752351349443,
+          0.9999567530129703
+        ]
+      ],
+      "normal_cam": [
+        -0.0057656881928057424,
+        -0.00729718736360053,
+        0.9999567530129703
+      ],
+      "origin_px": [
+        1247.9242911572078,
+        789.9390375433446
+      ],
+      "x_axis_px": [
+        1076.4039052397284,
+        788.9343565233405
+      ],
+      "y_axis_px": [
+        1249.3792232444891,
+        618.4641707585539
+      ],
+      "image_shape": [
+        1080,
+        1920,
+        3
+      ],
+      "square_size_mm": 10.0,
+      "use_undistort": true,
+      "board_homography_px_from_mm": [
+        [
+          -11.485532943882811,
+          0.02759796421020009,
+          1247.9585721849503
+        ],
+        [
+          -0.10373309891709592,
+          -11.464397917857319,
+          789.9228317761566
+        ],
+        [
+          -4.646401712071505e-05,
+          -5.461466842405377e-05,
+          1.0
+        ]
+      ],
+      "board_homography_mm_from_px": [
+        [
+          -0.08750353486967553,
+          -0.0007336219210201287,
+          109.7802911424016
+        ],
+        [
+          0.0005135487174260836,
+          -0.08755173490421289,
+          68.51822683830477
+        ],
+        [
+          -4.037718449385867e-06,
+          -4.8156959932426534e-06,
+          1.0088429335669358
+        ]
+      ],
+      "board_px_per_mm_local": 11.462087670088469,
+      "board_mm_per_px_local": 0.08724414162435748,
+      "board_planar_x_sign": -1.0,
+      "inner_corners": [
+        11,
+        8
+      ],
+      "corrections_applied": {
+        "checkerboard_mm_scale_correction": 0.5,
+        "checkerboard_planar_x_flipped": true
+      }
+    },
+    "true_vertical_img_unit": [
+      0.008484507062883432,
+      -0.9999640059221631
+    ],
+    "board_homography_px_from_mm": [
+      [
+        -11.485532943882811,
+        0.02759796421020009,
+        1247.9585721849503
+      ],
+      [
+        -0.10373309891709592,
+        -11.464397917857319,
+        789.9228317761566
+      ],
+      [
+        -4.646401712071505e-05,
+        -5.461466842405377e-05,
+        1.0
+      ]
+    ],
+    "board_homography_mm_from_px": [
+      [
+        -0.08750353486967553,
+        -0.0007336219210201287,
+        109.7802911424016
+      ],
+      [
+        0.0005135487174260836,
+        -0.08755173490421289,
+        68.51822683830477
+      ],
+      [
+        -4.037718449385867e-06,
+        -4.8156959932426534e-06,
+        1.0088429335669358
+      ]
+    ],
+    "board_px_per_mm_local": 11.462087670088469,
+    "board_mm_per_px_local": 0.08724414162435748
+  }
+}

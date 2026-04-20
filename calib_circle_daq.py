@@ -90,18 +90,22 @@ DEFAULT_USE_AVERAGE_CUBIC_FIT = False
 
 DEFAULT_POST_CAMERA_CALIBRATION_FILE = "captures/calibration_webcam_20260406_104136.npz"
 DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "captures/photo_20260406_104134.png"
+DEFAULT_POST_TIP_REFINER_MODEL = (
+    "Test_Calibration_2026-04-07_02_daq/"
+    "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
+)
 
-DEFAULT_SAFE_APPROACH_Z = -155.0
+DEFAULT_SAFE_APPROACH_Z = -135.0
 
 DEFAULT_START_X = 100.0
 DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -155.0
+DEFAULT_START_Z = -135.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
 DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -155.0
+DEFAULT_END_Z = -135.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
@@ -114,7 +118,7 @@ DEFAULT_BBOX_Z_MAX = 0.0
 
 CIRCLE_CENTER_X = 100.0
 CIRCLE_CENTER_Y = 52.0
-CIRCLE_CENTER_Z = -155.0
+CIRCLE_CENTER_Z = -130.0
 
 DEFAULT_SAMPLES_PER_QUARTER = 200
 DEFAULT_CAPTURE_EVERY_N_CIRCLE_MOVES = 7
@@ -1798,8 +1802,12 @@ def main(args):
         print(results)
 
         if args.enable_post:
+            script_dir = Path(__file__).resolve().parent
             post_camera_calibration = Path(args.post_camera_calibration_file).expanduser().resolve()
             post_reference_image = Path(args.post_checkerboard_reference_image).expanduser().resolve()
+            post_tip_refiner_model = Path(args.post_tip_refiner_model).expanduser()
+            if not post_tip_refiner_model.is_absolute():
+                post_tip_refiner_model = script_dir / post_tip_refiner_model
 
             if not post_camera_calibration.is_file():
                 raise FileNotFoundError(
@@ -1821,6 +1829,8 @@ def main(args):
                 str(post_reference_image),
                 "--capture_every_n_circle_moves",
                 str(int(args.capture_every_n_circle_moves)),
+                "--tip_refiner_model",
+                str(post_tip_refiner_model.resolve()),
             ]
             if bool(args.capture_at_start):
                 post_cmd.append("--capture_at_start")
@@ -1955,6 +1965,8 @@ if __name__ == "__main__":
                     help="Camera calibration .npz to pass to post-processing.")
     ap.add_argument("--post-checkerboard-reference-image", default=DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE,
                     help="Checkerboard reference image to pass to post-processing.")
+    ap.add_argument("--post-tip-refiner-model", default=DEFAULT_POST_TIP_REFINER_MODEL,
+                    help="CNN tip refiner model passed to calib_circle_process.py.")
     ap.add_argument("--post-save-plots", action="store_true",
                     help="Pass --save_plots to the post-processing script.")
 

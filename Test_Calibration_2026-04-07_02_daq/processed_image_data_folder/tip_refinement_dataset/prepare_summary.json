@@ -1,0 +1,52 @@
+{
+  "ctr_source": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/shadow_calibration.py",
+  "project_dir": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-04-07_02_daq",
+  "raw_folder": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-04-07_02_daq/raw_image_data_folder",
+  "output_dir": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-04-07_02_daq/processed_image_data_folder/tip_refinement_dataset",
+  "workspace_dir": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-04-07_02_daq/processed_image_data_folder/tip_refinement_dataset/workspace",
+  "anchor": "coarse",
+  "patch_size": 128,
+  "threshold": 200,
+  "crop": {
+    "crop_width_min": 1005,
+    "crop_width_max": 2897,
+    "crop_height_min": 532,
+    "crop_height_max": 1830
+  },
+  "crop_source": "analysis_reference.json",
+  "crop_gui_per_folder": true,
+  "crop_by_folder": {
+    "data_1": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    },
+    "data_2": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    },
+    "data_3": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    },
+    "data_4": {
+      "crop_width_min": 1005,
+      "crop_width_max": 2897,
+      "crop_height_min": 532,
+      "crop_height_max": 1830
+    }
+  },
+  "camera_calibration_file": null,
+  "board_reference_image": null,
+  "num_images": 468,
+  "recursive": true,
+  "num_success": 468,
+  "num_failures": 0,
+  "num_unique_patch_paths": 468,
+  "manifest_path": "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-04-07_02_daq/processed_image_data_folder/tip_refinement_dataset/manifest.csv"
+}

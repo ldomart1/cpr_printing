@@ -90,8 +90,8 @@ _TRACKED_SAMPLE_RE = re.compile(
 # Utilities: IO and discovery
 # -----------------------------
 def list_images(folder: Path) -> List[Path]:
-    imgs = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
-    imgs.sort(key=_image_sort_key)
+    imgs = [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    imgs.sort()
     return imgs
 
 
@@ -100,6 +100,8 @@ def ensure_project_from_raw(raw_dir: Path, project_dir: Path, link_mode: str = "
     Create a project_dir with raw_image_data_folder containing images from raw_dir.
     Returns raw_image_data_folder path.
     """
+    raw_dir = Path(raw_dir).expanduser().resolve()
+    project_dir = Path(project_dir).expanduser().resolve()
     project_dir.mkdir(parents=True, exist_ok=True)
     raw_out = project_dir / "raw_image_data_folder"
     raw_out.mkdir(parents=True, exist_ok=True)
@@ -109,9 +111,10 @@ def ensure_project_from_raw(raw_dir: Path, project_dir: Path, link_mode: str = "
         raise RuntimeError(f"No images found in raw_dir: {raw_dir}")
 
     for src in imgs:
-        dst = raw_out / src.name
+        dst = raw_out / src.relative_to(raw_dir)
         if dst.exists():
             continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
         if link_mode == "symlink":
             try:
                 os.symlink(src.resolve(), dst)
@@ -137,6 +140,48 @@ def _json_ready(value: Any):
     if isinstance(value, (list, tuple)):
         return [_json_ready(v) for v in value]
     return value
+
+
+def load_optional_tip_refiner(cal: CTR_Shadow_Calibration, args) -> None:
+    if not getattr(args, "tip_refiner_model", None):
+        return
+    model_path = Path(args.tip_refiner_model).expanduser().resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Tip refiner model not found: {model_path}")
+    cal.load_tip_refiner_model(
+        str(model_path),
+        anchor_name=args.tip_refiner_anchor,
+        use_as_selected=(not bool(args.tip_refiner_compare_only)),
+    )
+
+
+def select_tracked_rows_for_analysis(cal: CTR_Shadow_Calibration, args) -> Tuple[np.ndarray, str]:
+    source = str(getattr(args, "tracked_tip_source", "auto")).strip().lower()
+    if source == "auto":
+        if getattr(args, "tip_refiner_model", None) and not bool(getattr(args, "tip_refiner_compare_only", False)):
+            source = "selected"
+        else:
+            source = "coarse"
+
+    if source == "cnn":
+        arr = getattr(cal, "tip_locations_array_cnn", None)
+        if arr is None:
+            raise RuntimeError("tracked_tip_source=cnn requested, but tip_locations_array_cnn is unavailable.")
+        return np.asarray(arr, dtype=float), "cnn"
+
+    if source == "selected":
+        arr = getattr(cal, "tip_locations_array_selected", None)
+        if arr is None:
+            raise RuntimeError("tracked_tip_source=selected requested, but tip_locations_array_selected is unavailable.")
+        return np.asarray(arr, dtype=float), "selected"
+
+    if source == "coarse":
+        arr = getattr(cal, "tip_locations_array_coarse", None)
+        if arr is None:
+            raise RuntimeError("tracked_tip_source=coarse requested, but tip_locations_array_coarse is unavailable.")
+        return np.asarray(arr, dtype=float), "coarse"
+
+    raise ValueError(f"Unsupported tracked_tip_source: {source}")
 
 
 def _parse_inner_corners_arg(value):
@@ -2173,6 +2218,10 @@ def save_metrics_json(
         "board_reference": collect_board_reference_info(cal),
         "settings": {
             "threshold": int(args.threshold),
+            "tracked_tip_source": str(getattr(args, "tracked_tip_source", "auto")),
+            "tip_refiner_model": None if getattr(args, "tip_refiner_model", None) is None else str(Path(args.tip_refiner_model).expanduser().resolve()),
+            "tip_refiner_anchor": getattr(args, "tip_refiner_anchor", None),
+            "tip_refiner_compare_only": bool(getattr(args, "tip_refiner_compare_only", False)),
             "tip_refine_mode": str(args.tip_refine_mode),
             "tip_refine_dt_step_px": float(args.tip_refine_dt_step_px),
             "tip_refine_max_step_px": int(args.tip_refine_max_step_px),
@@ -2254,6 +2303,14 @@ def main():
     ap.add_argument("--tip_refine_parallel_cross_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_max_len_r", type=float, default=8.0)
+    ap.add_argument("--tip_refiner_model", type=str, default=None,
+                    help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt for CNN tip detection.")
+    ap.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"],
+                    help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
+    ap.add_argument("--tip_refiner_compare_only", action="store_true",
+                    help="Save CNN tips but keep non-CNN tips as the default tracked source.")
+    ap.add_argument("--tracked_tip_source", type=str, default="auto", choices=["auto", "coarse", "selected", "cnn"],
+                    help="Which tip rows to convert to mm. auto uses selected/CNN when --tip_refiner_model is active, otherwise coarse.")
 
     ap.add_argument("--circle_center_x_mm", type=float, default=CIRCLE_CENTER_X_DEFAULT)
     ap.add_argument("--circle_center_z_mm", type=float, default=CIRCLE_CENTER_Z_DEFAULT)
@@ -2312,6 +2369,7 @@ def main():
         add_date=False,
     )
     cal.calibration_data_folder = str(project_dir)
+    load_optional_tip_refiner(cal, args)
 
     patch_filename_parser()
 
@@ -2398,13 +2456,10 @@ def main():
     print("\n[INFO] Running analyze_data_batch (offline)...")
     cal.analyze_data_batch(threshold=int(args.threshold))
 
-    tracked_rows = np.asarray(cal.tip_locations_array_coarse, dtype=float)
-
+    tracked_rows, tracked_source = select_tracked_rows_for_analysis(cal, args)
     if tracked_rows.size == 0:
-        raise RuntimeError(
-            "Batch analysis completed, but tip_locations_array_coarse is empty. "
-            "Check filename parsing, image access, and tracking settings."
-        )
+        raise RuntimeError(f"No tracked tip data found for source={tracked_source} after analyze_data_batch.")
+    print(f"[INFO] Using tracked tip source for mm analysis: {tracked_source}")
 
     valid_mask = np.all(np.isfinite(tracked_rows[:, :2]), axis=1) if tracked_rows.ndim == 2 and tracked_rows.shape[1] >= 2 else np.zeros((0,), dtype=bool)
     num_valid = int(np.sum(valid_mask))

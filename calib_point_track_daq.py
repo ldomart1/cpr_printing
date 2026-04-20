@@ -159,6 +159,10 @@ DEFAULT_POST_CAMERA_CALIBRATION_FILE = "../captures/calibration_webcam_20260406_
 DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "../captures/photo_20260406_104134.png"
 DEFAULT_POST_THRESHOLD = 200
 DEFAULT_POST_TIP_REFINE_MODE = "none"
+DEFAULT_POST_TIP_REFINER_MODEL = (
+    "Test_Calibration_2026-04-07_02_daq/"
+    "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
+)
 
 OFFPLANE_SIGN = -1.0
 
@@ -1968,6 +1972,9 @@ def main(args):
         print(results)
 
         if bool(args.enable_post):
+            post_tip_refiner_model = Path(args.post_tip_refiner_model).expanduser()
+            if not post_tip_refiner_model.is_absolute():
+                post_tip_refiner_model = script_dir / post_tip_refiner_model
             post_cmd = [
                 sys.executable,
                 str(script_dir / "calib_point_process.py"),
@@ -1981,6 +1988,8 @@ def main(args):
                 str(int(args.post_threshold)),
                 "--tip_refine_mode",
                 str(args.post_tip_refine_mode),
+                "--tip_refiner_model",
+                str(post_tip_refiner_model.resolve()),
             ]
             if bool(args.post_save_plots):
                 post_cmd.append("--save_plots")
@@ -2122,6 +2131,8 @@ if __name__ == "__main__":
                     help="Threshold passed to calib_point_process.py.")
     ap.add_argument("--post-tip-refine-mode", type=str, default=DEFAULT_POST_TIP_REFINE_MODE,
                     help="Tip refinement mode passed to calib_point_process.py.")
+    ap.add_argument("--post-tip-refiner-model", type=str, default=DEFAULT_POST_TIP_REFINER_MODEL,
+                    help="CNN tip refiner model passed to calib_point_process.py.")
     ap.add_argument("--post-save-plots", dest="post_save_plots", action="store_true", default=True,
                     help="Pass --save_plots to calib_point_process.py.")
     ap.add_argument("--no-post-save-plots", dest="post_save_plots", action="store_false",

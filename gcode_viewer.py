@@ -24,25 +24,48 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider, Button, CheckButtons
+from matplotlib.widgets import Slider, CheckButtons
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
+
+PULL_PHASE = "pull"
+RELEASE_PHASE = "release"
+PHASE_SWITCH_RE = re.compile(r";\s*EQUATION_SWITCH\s+([A-Z0-9_]+)")
+WRITE_START_RE = re.compile(r";\s*VASCULATURE_WRITE_START\b", re.IGNORECASE)
+WRITE_END_RE = re.compile(r";\s*VASCULATURE_WRITE_END\b", re.IGNORECASE)
 
 
 # ---------------- Defaults ----------------
 DEFAULT_MIN_B = -5.0
 DEFAULT_MAX_B = -0.0
 DEFAULT_C0_DEG = 0.0
-DEFAULT_FIGSIZE = (12.5, 9.0)
+DEFAULT_FIGSIZE = (11.8, 8.4)
 DEFAULT_OFFPLANE_SIGN = -1.0
 
 DEFAULT_ROBOT_DIAMETER_MM = 3.0
 DEFAULT_ROBOT_LINKS = 6
+DEFAULT_PRESSURE_TOGGLE_U_MM = 2.0
 
 # UI tuning
 UI_DEBOUNCE_MS_INDEX = 18
 UI_DEBOUNCE_MS_ZOOM = 18
 MAX_BACKGROUND_POINTS = 25000  # background path decimation for faster initial draw on huge files
 # -----------------------------------------
+
+
+def remove_mpl_keymap_entries(keys):
+    """Prevent Matplotlib toolbar shortcuts from also handling app keys."""
+    for keymap_name in (
+        "keymap.back",
+        "keymap.forward",
+        "keymap.home",
+        "keymap.xscale",
+        "keymap.yscale",
+    ):
+        try:
+            existing = list(plt.rcParams.get(keymap_name, []))
+            plt.rcParams[keymap_name] = [k for k in existing if k not in keys]
+        except Exception:
+            pass
 
 
 # =========================
@@ -54,6 +77,8 @@ class Calibration:
     pz: np.ndarray
     pa: np.ndarray
     py_off: Optional[np.ndarray]
+    phase_models: Dict[str, Dict[str, dict]]
+    default_phase: str
     b_min: float
     b_max: float
     tip_angle_min: float
@@ -70,6 +95,122 @@ def _polyval4(coeffs: np.ndarray, u) -> np.ndarray:
     a, b, c, d = coeffs
     u = np.asarray(u, dtype=float)
     return ((a * u + b) * u + c) * u + d
+
+
+def _as_float_array(values) -> np.ndarray:
+    return np.asarray(values, dtype=float).ravel()
+
+
+def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    x = _as_float_array(x)
+    y = _as_float_array(y)
+    n = x.size
+    if n < 2:
+        raise ValueError("PCHIP requires at least two knots")
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    d = np.zeros(n, dtype=float)
+    if n == 2:
+        d[:] = delta[0]
+        return d
+
+    for k in range(1, n - 1):
+        if delta[k - 1] == 0.0 or delta[k] == 0.0 or np.sign(delta[k - 1]) != np.sign(delta[k]):
+            d[k] = 0.0
+        else:
+            w1 = 2.0 * h[k] + h[k - 1]
+            w2 = h[k] + 2.0 * h[k - 1]
+            d[k] = (w1 + w2) / (w1 / delta[k - 1] + w2 / delta[k])
+
+    d0 = ((2.0 * h[0] + h[1]) * delta[0] - h[0] * delta[1]) / (h[0] + h[1])
+    if np.sign(d0) != np.sign(delta[0]):
+        d0 = 0.0
+    elif np.sign(delta[0]) != np.sign(delta[1]) and abs(d0) > abs(3.0 * delta[0]):
+        d0 = 3.0 * delta[0]
+    d[0] = d0
+
+    dn = ((2.0 * h[-1] + h[-2]) * delta[-1] - h[-1] * delta[-2]) / (h[-1] + h[-2])
+    if np.sign(dn) != np.sign(delta[-1]):
+        dn = 0.0
+    elif np.sign(delta[-1]) != np.sign(delta[-2]) and abs(dn) > abs(3.0 * delta[-1]):
+        dn = 3.0 * delta[-1]
+    d[-1] = dn
+    return d
+
+
+def _eval_pchip(x_knots, y_knots, xq) -> np.ndarray:
+    x = _as_float_array(x_knots)
+    y = _as_float_array(y_knots)
+    xq_arr = np.asarray(xq, dtype=float)
+    flat = xq_arr.reshape(-1)
+    slopes = _pchip_slopes(x, y)
+
+    idx = np.searchsorted(x, flat, side="right") - 1
+    idx = np.clip(idx, 0, x.size - 2)
+
+    x0 = x[idx]
+    x1 = x[idx + 1]
+    y0 = y[idx]
+    y1 = y[idx + 1]
+    h = x1 - x0
+    t = (flat - x0) / h
+    t = np.clip(t, 0.0, 1.0)
+
+    h00 = 2.0 * t**3 - 3.0 * t**2 + 1.0
+    h10 = t**3 - 2.0 * t**2 + t
+    h01 = -2.0 * t**3 + 3.0 * t**2
+    h11 = t**3 - t**2
+
+    out = h00 * y0 + h10 * h * slopes[idx] + h01 * y1 + h11 * h * slopes[idx + 1]
+    return out.reshape(xq_arr.shape)
+
+
+def _eval_model(model: dict, xq) -> np.ndarray:
+    model_type = str(model.get("model_type", "")).strip().lower()
+    if model_type == "pchip":
+        return _eval_pchip(model["x_knots"], model["y_knots"], xq)
+    if model_type == "polynomial":
+        coeffs = _as_float_array(model["coefficients"])
+        return np.polyval(coeffs, np.asarray(xq, dtype=float))
+    raise ValueError(f"Unsupported model type '{model_type}'")
+
+
+def _eval_pchip_with_linear_extrap(model: dict, extrap_model: Optional[dict], xq) -> np.ndarray:
+    if extrap_model is None:
+        return _eval_model(model, xq)
+    x = _as_float_array(model.get("x_knots", []))
+    if x.size == 0:
+        return _eval_model(model, xq)
+
+    xq_arr = np.asarray(xq, dtype=float)
+    out = np.asarray(_eval_model(model, xq_arr), dtype=float).copy()
+    outside = (xq_arr < float(np.min(x))) | (xq_arr > float(np.max(x)))
+    if np.any(outside):
+        out = np.where(outside, _eval_model(extrap_model, xq_arr), out)
+    return out
+
+
+def _normalize_phase_name(name: Optional[str]) -> str:
+    raw = str(name or PULL_PHASE).strip().lower()
+    if raw.startswith(RELEASE_PHASE):
+        return raw
+    if raw.startswith(PULL_PHASE):
+        return raw
+    return PULL_PHASE
+
+
+def _phase_alias(name: str) -> str:
+    phase = _normalize_phase_name(name)
+    return RELEASE_PHASE if phase.startswith(RELEASE_PHASE) else PULL_PHASE
+
+
+def _phase_from_switch_token(token: str) -> Optional[str]:
+    tok = str(token or "").strip().upper()
+    if tok.endswith("_TO_PCHIP_RELEASE"):
+        return RELEASE_PHASE
+    if tok.endswith("_TO_PCHIP_PULL"):
+        return PULL_PHASE
+    return None
 
 
 def load_calibration_json(json_path: str) -> dict:
@@ -99,6 +240,20 @@ def load_calibration(json_path: str) -> Calibration:
     if pr.shape[0] != 4 or pz.shape[0] != 4 or pa.shape[0] != 4:
         raise ValueError("Expected 4 coeffs for r_coeffs, z_coeffs, and tip_angle_coeffs")
 
+    phase_models_raw = data.get("fit_models_by_phase", {})
+    phase_models: Dict[str, Dict[str, dict]] = {}
+    for phase_name, models in phase_models_raw.items():
+        norm_phase = _normalize_phase_name(phase_name)
+        if isinstance(models, dict):
+            phase_models[norm_phase] = models
+            phase_models.setdefault(_phase_alias(norm_phase), models)
+
+    default_phase = _normalize_phase_name(
+        data.get("default_phase_for_legacy_access")
+        or cubic.get("default_phase")
+        or PULL_PHASE
+    )
+
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
 
@@ -127,6 +282,7 @@ def load_calibration(json_path: str) -> Calibration:
 
     return Calibration(
         pr=pr, pz=pz, pa=pa, py_off=py_off,
+        phase_models=phase_models, default_phase=default_phase,
         b_min=b_min, b_max=b_max,
         tip_angle_min=tip_angle_min, tip_angle_max=tip_angle_max,
         pull_axis=pull_axis, rot_axis=rot_axis,
@@ -255,6 +411,8 @@ class MotionState:
     b_cmd: float
     c_cmd: float
     u_cmd: float
+    pressure_active: bool
+    equation_phase: str
     feed: Optional[float]
 
 
@@ -265,6 +423,21 @@ def strip_comment(line: str) -> str:
     no_semicolon = line.split(";", 1)[0]
     no_paren = re.sub(r"\([^)]*\)", "", no_semicolon)
     return no_paren.strip()
+
+
+def parse_gcode_metadata(gcode_path: str) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    p = Path(gcode_path)
+    if not p.exists():
+        return metadata
+    with p.open("r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            if not raw.lstrip().startswith(";"):
+                continue
+            match = re.match(r"\s*;\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$", raw)
+            if match:
+                metadata[match.group(1).strip().lower()] = match.group(2).strip()
+    return metadata
 
 
 def parse_gcode_motion_states(
@@ -293,66 +466,102 @@ def parse_gcode_motion_states(
         u_axis.upper(): 0.0,
     }
     current_feed: Optional[float] = None
+    current_phase = PULL_PHASE
+    pressure_active = False
+    write_marker_active = False
     states: List[MotionState] = []
 
     with p.open("r", encoding="utf-8", errors="replace") as f:
-        for line_no, raw in enumerate(f, start=1):
-            line = strip_comment(raw)
-            if not line:
-                continue
+        lines = f.readlines()
 
-            uline = line.upper()
-            if "G90" in uline:
-                abs_mode = True
-            if "G91" in uline:
-                abs_mode = False
+    has_write_markers = any(WRITE_START_RE.search(raw) or WRITE_END_RE.search(raw) for raw in lines)
+    metadata = parse_gcode_metadata(str(p))
+    current_phase = _normalize_phase_name(metadata.get("active_phase", current_phase))
 
-            if re.search(r"(?<!\d)G0(?!\d)", uline):
-                current_motion = "G0"
-            if re.search(r"(?<!\d)G1(?!\d)", uline):
-                current_motion = "G1"
+    for line_no, raw in enumerate(lines, start=1):
+        switch_match = PHASE_SWITCH_RE.search(raw)
+        if switch_match:
+            phase_from_marker = _phase_from_switch_token(switch_match.group(1))
+            if phase_from_marker is not None:
+                current_phase = phase_from_marker
 
-            words = {m.group(1).upper(): float(m.group(2)) for m in _AXVAL_RE.finditer(line)}
+        if has_write_markers:
+            if WRITE_START_RE.search(raw):
+                write_marker_active = True
+            if WRITE_END_RE.search(raw):
+                write_marker_active = False
 
-            if "F" in words:
-                current_feed = float(words["F"])
+        line = strip_comment(raw)
+        if not line:
+            continue
 
-            pose_axes = {x_axis.upper(), y_axis.upper(), z_axis.upper(), b_axis.upper(), c_axis.upper()}
-            is_motion_line = current_motion in ("G0", "G1")
-            if not is_motion_line:
-                continue
+        uline = line.upper()
+        if "G90" in uline:
+            abs_mode = True
+        if "G91" in uline:
+            abs_mode = False
 
-            u_axis_u = u_axis.upper()
-            if u_axis_u in words:
-                if abs_mode:
-                    pos[u_axis_u] = float(words[u_axis_u])
-                else:
-                    pos[u_axis_u] += float(words[u_axis_u])
+        if re.search(r"(?<!\d)G0(?!\d)", uline):
+            current_motion = "G0"
+        if re.search(r"(?<!\d)G1(?!\d)", uline):
+            current_motion = "G1"
 
-            has_pose_move = any(ax in words for ax in pose_axes)
-            if not has_pose_move:
-                continue
+        words = {m.group(1).upper(): float(m.group(2)) for m in _AXVAL_RE.finditer(line)}
 
-            for ax in pose_axes:
+        if "F" in words:
+            current_feed = float(words["F"])
+
+        pose_axes = {x_axis.upper(), y_axis.upper(), z_axis.upper(), b_axis.upper(), c_axis.upper()}
+        tracked_axes = pose_axes | {u_axis.upper()}
+        if re.search(r"(?<!\d)G92(?!\d)", uline):
+            for ax in tracked_axes:
                 if ax in words:
-                    if abs_mode:
-                        pos[ax] = float(words[ax])
-                    else:
-                        pos[ax] += float(words[ax])
+                    pos[ax] = float(words[ax])
+            continue
 
-            states.append(MotionState(
-                idx=len(states),
-                gcode_line_no=line_no,
-                gcode_raw=raw.rstrip("\n"),
-                motion_code=current_motion,
-                x_stage=pos[x_axis.upper()],
-                y_stage=pos[y_axis.upper()],
-                z_stage=pos[z_axis.upper()],
-                b_cmd=pos[b_axis.upper()],
-                c_cmd=pos[c_axis.upper()],
-                u_cmd=pos[u_axis.upper()],
-                feed=current_feed,
-            ))
+        is_motion_line = current_motion in ("G0", "G1")
+        if not is_motion_line:
+            continue
+
+        u_axis_u = u_axis.upper()
+        if u_axis_u in words:
+            prev_u = pos[u_axis_u]
+            if abs_mode:
+                pos[u_axis_u] = float(words[u_axis_u])
+            else:
+                pos[u_axis_u] += float(words[u_axis_u])
+            u_delta = pos[u_axis_u] - prev_u
+            if u_delta >= DEFAULT_PRESSURE_TOGGLE_U_MM:
+                pressure_active = True
+            elif u_delta <= -DEFAULT_PRESSURE_TOGGLE_U_MM:
+                pressure_active = False
+
+        has_pose_move = any(ax in words for ax in pose_axes)
+        if not has_pose_move:
+            continue
+
+        for ax in pose_axes:
+            if ax in words:
+                if abs_mode:
+                    pos[ax] = float(words[ax])
+                else:
+                    pos[ax] += float(words[ax])
+
+        states.append(MotionState(
+            idx=len(states),
+            gcode_line_no=line_no,
+            gcode_raw=raw.rstrip("\n"),
+            motion_code=current_motion,
+            x_stage=pos[x_axis.upper()],
+            y_stage=pos[y_axis.upper()],
+            z_stage=pos[z_axis.upper()],
+            b_cmd=pos[b_axis.upper()],
+            c_cmd=pos[c_axis.upper()],
+            u_cmd=pos[u_axis.upper()],
+            pressure_active=write_marker_active if has_write_markers else pressure_active,
+            equation_phase=current_phase,
+            feed=current_feed,
+        ))
 
     if not states:
         raise RuntimeError("No G0/G1 motion states with tracked axes were found in the G-code file.")
@@ -378,6 +587,49 @@ class TipTrajectory:
     y_off_of_b: np.ndarray
     tip_angle_deg: np.ndarray
     sgn: np.ndarray
+    equation_phase: np.ndarray
+
+
+def evaluate_calibration_phase_models(
+    cal: Calibration,
+    b_cmd: np.ndarray,
+    equation_phase: np.ndarray,
+    offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    r_of_b = np.empty_like(b_cmd, dtype=float)
+    z_of_b = np.empty_like(b_cmd, dtype=float)
+    tip_ang = np.empty_like(b_cmd, dtype=float)
+    y_off_of_b = np.empty_like(b_cmd, dtype=float)
+
+    for phase in sorted(set(str(p) for p in equation_phase)):
+        mask = (equation_phase == phase)
+        if not np.any(mask):
+            continue
+        models = cal.phase_models.get(phase) or cal.phase_models.get(_phase_alias(phase))
+        if not models:
+            raise ValueError(f"Calibration is missing phase models for '{phase}'")
+
+        r_model = models.get("r_pchip") or models.get("r")
+        z_model = models.get("z_pchip") or models.get("z")
+        tip_model = models.get("tip_angle_pchip") or models.get("tip_angle")
+        y_model = models.get("offplane_y_pchip") or models.get("offplane_y")
+        y_extrap_model = models.get("offplane_y_linear") or models.get("offplane_y")
+
+        if r_model is None or z_model is None or tip_model is None:
+            raise ValueError(f"Calibration phase '{phase}' is missing required PCHIP models")
+
+        r_of_b[mask] = _eval_model(r_model, b_cmd[mask])
+        z_of_b[mask] = _eval_model(z_model, b_cmd[mask])
+        tip_ang[mask] = _eval_model(tip_model, b_cmd[mask])
+
+        if y_model is None:
+            y_off_of_b[mask] = 0.0
+        elif str(y_model.get("model_type", "")).strip().lower() == "pchip":
+            y_off_of_b[mask] = offplane_sign * _eval_pchip_with_linear_extrap(y_model, y_extrap_model, b_cmd[mask])
+        else:
+            y_off_of_b[mask] = offplane_sign * _eval_model(y_model, b_cmd[mask])
+
+    return r_of_b, z_of_b, tip_ang, y_off_of_b
 
 
 def _angle_diff_deg(a: np.ndarray, b: float) -> np.ndarray:
@@ -395,21 +647,39 @@ def reconstruct_tip_trajectory(
     cal: Calibration,
     c0_deg: float = DEFAULT_C0_DEG,
     offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
+    write_mode: str = "calibrated",
 ) -> TipTrajectory:
     x_stage = np.array([s.x_stage for s in states], dtype=float)
     y_stage = np.array([s.y_stage for s in states], dtype=float)
     z_stage = np.array([s.z_stage for s in states], dtype=float)
     b_cmd = np.array([s.b_cmd for s in states], dtype=float)
     c_cmd = np.array([s.c_cmd for s in states], dtype=float)
+    equation_phase = np.array([_normalize_phase_name(s.equation_phase) for s in states], dtype=object)
 
-    r_of_b = _polyval4(cal.pr, b_cmd)
-    z_of_b = _polyval4(cal.pz, b_cmd)
-    tip_ang = _polyval4(cal.pa, b_cmd)
+    if str(write_mode).strip().lower() == "cartesian":
+        zeros = np.zeros_like(b_cmd, dtype=float)
+        sgn = infer_sgn_from_c(c_cmd, c0_deg=c0_deg, c180_deg=cal.c_180_deg)
+        return TipTrajectory(
+            x_tip=x_stage.copy(), y_tip=y_stage.copy(), z_tip=z_stage.copy(),
+            x_stage=x_stage, y_stage=y_stage, z_stage=z_stage,
+            b_cmd=b_cmd, c_cmd=c_cmd,
+            r_of_b=zeros.copy(), z_of_b=zeros.copy(), y_off_of_b=zeros.copy(),
+            tip_angle_deg=zeros.copy(), sgn=sgn, equation_phase=equation_phase,
+        )
 
-    if cal.py_off is None:
-        y_off_of_b = np.zeros_like(b_cmd, dtype=float)
+    if cal.phase_models:
+        r_of_b, z_of_b, tip_ang, y_off_of_b = evaluate_calibration_phase_models(
+            cal, b_cmd, equation_phase, offplane_sign=offplane_sign
+        )
     else:
-        y_off_of_b = offplane_sign * np.polyval(cal.py_off, b_cmd)
+        r_of_b = _polyval4(cal.pr, b_cmd)
+        z_of_b = _polyval4(cal.pz, b_cmd)
+        tip_ang = _polyval4(cal.pa, b_cmd)
+
+        if cal.py_off is None:
+            y_off_of_b = np.zeros_like(b_cmd, dtype=float)
+        else:
+            y_off_of_b = offplane_sign * np.polyval(cal.py_off, b_cmd)
 
     c_rad = np.deg2rad(c_cmd)
     x_tip = x_stage + r_of_b * np.cos(c_rad) - y_off_of_b * np.sin(c_rad)
@@ -423,7 +693,7 @@ def reconstruct_tip_trajectory(
         x_stage=x_stage, y_stage=y_stage, z_stage=z_stage,
         b_cmd=b_cmd, c_cmd=c_cmd,
         r_of_b=r_of_b, z_of_b=z_of_b, y_off_of_b=y_off_of_b,
-        tip_angle_deg=tip_ang,
+        tip_angle_deg=tip_ang, equation_phase=equation_phase,
         sgn=sgn,
     )
 
@@ -456,18 +726,31 @@ def compute_robot_polyline_world(
     r_tip: float,
     z_tip: float,
     y_off_tip: float,
+    equation_phase: str = PULL_PHASE,
     offplane_sign: float = DEFAULT_OFFPLANE_SIGN,
 ) -> np.ndarray:
     t = robot_cfg.t_knots
     b0 = float(cal.b_home)
     b = float(b_cmd)
+    phase_name = _normalize_phase_name(equation_phase)
 
-    r0 = float(_polyval4(cal.pr, b0))
-    z0 = float(_polyval4(cal.pz, b0))
-    if cal.py_off is None:
-        y0 = 0.0
+    if cal.phase_models:
+        r0_arr, z0_arr, _, y0_arr = evaluate_calibration_phase_models(
+            cal,
+            np.array([b0], dtype=float),
+            np.array([phase_name], dtype=object),
+            offplane_sign=offplane_sign,
+        )
+        r0 = float(r0_arr[0])
+        z0 = float(z0_arr[0])
+        y0 = float(y0_arr[0])
     else:
-        y0 = float(offplane_sign * np.polyval(cal.py_off, b0))
+        r0 = float(_polyval4(cal.pr, b0))
+        z0 = float(_polyval4(cal.pz, b0))
+        if cal.py_off is None:
+            y0 = 0.0
+        else:
+            y0 = float(offplane_sign * np.polyval(cal.py_off, b0))
 
     r_end = float(r_tip - r0)
     z_end = float(z_tip - z0)
@@ -475,12 +758,21 @@ def compute_robot_polyline_world(
 
     if robot_cfg.shape_mode == "poly_b":
         b_k = b0 + t * (b - b0)
-        r_k = _polyval4(cal.pr, b_k) - r0
-        z_k = _polyval4(cal.pz, b_k) - z0
-        if cal.py_off is None:
-            y_k = np.zeros_like(r_k)
+        if cal.phase_models:
+            phase_arr = np.full(b_k.shape, phase_name, dtype=object)
+            r_abs, z_abs, _, y_abs = evaluate_calibration_phase_models(
+                cal, b_k, phase_arr, offplane_sign=offplane_sign
+            )
+            r_k = r_abs - r0
+            z_k = z_abs - z0
+            y_k = y_abs - y0
         else:
-            y_k = offplane_sign * np.polyval(cal.py_off, b_k) - y0
+            r_k = _polyval4(cal.pr, b_k) - r0
+            z_k = _polyval4(cal.pz, b_k) - z0
+            if cal.py_off is None:
+                y_k = np.zeros_like(r_k)
+            else:
+                y_k = offplane_sign * np.polyval(cal.py_off, b_k) - y0
     else:
         p0 = np.array([0.0, 0.0], dtype=float)
         p1 = np.array([r_end, z_end], dtype=float)
@@ -508,7 +800,14 @@ def compute_robot_polyline_world(
                 y_k = t * y_end
             else:
                 b_k = b0 + t * (b - b0)
-                y_k = offplane_sign * np.polyval(cal.py_off, b_k) - y0
+                if cal.phase_models:
+                    phase_arr = np.full(b_k.shape, phase_name, dtype=object)
+                    _, _, _, y_abs = evaluate_calibration_phase_models(
+                        cal, b_k, phase_arr, offplane_sign=offplane_sign
+                    )
+                    y_k = y_abs - y0
+                else:
+                    y_k = offplane_sign * np.polyval(cal.py_off, b_k) - y0
 
     c_rad = np.deg2rad(float(c_cmd_deg))
     cosc = float(np.cos(c_rad))
@@ -583,6 +882,37 @@ def apply_equal_axes_with_zoom(ax, center: Tuple[float, float, float], base_radi
             pass
 
 
+def capture_view_state(ax) -> dict:
+    state = {
+        "xlim": ax.get_xlim3d(),
+        "ylim": ax.get_ylim3d(),
+        "zlim": ax.get_zlim3d(),
+        "elev": getattr(ax, "elev", None),
+        "azim": getattr(ax, "azim", None),
+    }
+    if hasattr(ax, "roll"):
+        state["roll"] = getattr(ax, "roll", None)
+    return state
+
+
+def restore_view_state(ax, state: dict):
+    ax.set_xlim(state["xlim"])
+    ax.set_ylim(state["ylim"])
+    ax.set_zlim(state["zlim"])
+    elev = state.get("elev")
+    azim = state.get("azim")
+    if elev is None or azim is None:
+        return
+    try:
+        roll = state.get("roll")
+        if roll is None:
+            ax.view_init(elev=elev, azim=azim)
+        else:
+            ax.view_init(elev=elev, azim=azim, roll=roll)
+    except Exception:
+        ax.view_init(elev=elev, azim=azim)
+
+
 def set_major_view(ax, view_name: str):
     name = view_name.upper()
     if name == "XY":
@@ -642,6 +972,55 @@ def _decimate_xyz(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, max_points: in
     return xs[idx], ys[idx], zs[idx]
 
 
+def _decimate_idx(n: int, max_points: int) -> np.ndarray:
+    if n <= max_points:
+        return np.arange(n, dtype=int)
+    idx = np.linspace(0, n - 1, max_points).astype(int)
+    idx[0] = 0
+    idx[-1] = n - 1
+    return idx
+
+
+def format_duration(seconds: float) -> str:
+    if not np.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    total_seconds = int(round(float(seconds)))
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def estimate_print_time_seconds(states: List[MotionState], traj: TipTrajectory) -> Tuple[np.ndarray, int]:
+    """Estimate elapsed time from modal G-code F values and reconstructed tip travel.
+
+    Feed rates are treated as mm/min. Segments without a positive feed are skipped
+    and counted so the UI can flag that the estimate is partial.
+    """
+    n = len(states)
+    elapsed = np.zeros(n, dtype=float)
+    skipped_segments = 0
+
+    if n <= 1:
+        return elapsed, skipped_segments
+
+    tip_xyz = np.column_stack([traj.x_tip, traj.y_tip, traj.z_tip])
+    dists = np.linalg.norm(np.diff(tip_xyz, axis=0), axis=1)
+
+    for i, dist in enumerate(dists, start=1):
+        feed = states[i].feed
+        dt = 0.0
+        if feed is None or not np.isfinite(feed) or feed <= 0.0:
+            if dist > 0.0:
+                skipped_segments += 1
+        else:
+            dt = float(dist) / float(feed) * 60.0
+        elapsed[i] = elapsed[i - 1] + dt
+
+    return elapsed, skipped_segments
+
+
 # =========================
 # Interactive UI
 # =========================
@@ -661,42 +1040,54 @@ def launch_interactive_plot(
         plt.rcParams["agg.path.chunksize"] = 20000
     except Exception:
         pass
+    remove_mpl_keymap_entries(("left", "right", "home", "h", "j", "k", "l"))
 
     n = len(states)
     idx0 = 0
+    elapsed_seconds, skipped_time_segments = estimate_print_time_seconds(states, traj)
+    total_estimated_seconds = float(elapsed_seconds[-1]) if elapsed_seconds.size else 0.0
 
     fig = plt.figure(figsize=DEFAULT_FIGSIZE)
     ax = fig.add_subplot(111, projection="3d")
 
-    # Title further up; controls further down
-    plt.subplots_adjust(left=0.05, right=0.98, bottom=0.24, top=0.975)
+    # Reserve less space for controls so the 3D axes stay larger.
+    plt.subplots_adjust(left=0.04, right=0.99, bottom=0.245, top=0.975)
     style_dark_3d_axes(fig, ax)
 
     xs, ys, zs = traj.x_tip, traj.y_tip, traj.z_tip
     segs = make_line_segments(xs, ys, zs)
+    phase_colors = {
+        PULL_PHASE: "#66d9ff",
+        RELEASE_PHASE: "tomato",
+    }
+    unprinted_line_width = 0.8
+    unprinted_line_alpha = 0.24
+    printed_line_color = "#66d9ff"
+    printed_line_width = 2.2
+    printed_line_alpha = 0.95
+    point_phase = np.asarray(traj.equation_phase, dtype=object)
 
-    u_cmd = np.array([s.u_cmd for s in states], dtype=float)
-    extrude_seg_mask = np.abs(np.diff(u_cmd)) > 1e-12  # length n-1
+    pressure_active = np.array([s.pressure_active for s in states], dtype=bool)
+    motion_codes = np.array([s.motion_code for s in states], dtype=object)
+    extrude_seg_mask = pressure_active[1:] & (motion_codes[1:] == "G1") if n > 1 else np.empty((0,), dtype=bool)
 
     # Precompute extruding segments for fast redraw (O(log N) selection)
     extrude_segs = segs[extrude_seg_mask] if len(segs) else np.empty((0, 2, 3), dtype=float)
     extrude_end_idx = (np.nonzero(extrude_seg_mask)[0] + 1).astype(int)  # segment ends at index i
 
-    # Full reference tip path (decimated for responsiveness on huge files)
-    bg_x, bg_y, bg_z = _decimate_xyz(xs, ys, zs, MAX_BACKGROUND_POINTS)
-    bg_segs = make_line_segments(bg_x, bg_y, bg_z)
+    # Full reference tip path, tinted by active equation set.
+    bg_idx = _decimate_idx(len(xs), MAX_BACKGROUND_POINTS)
+    bg_segs = make_line_segments(xs[bg_idx], ys[bg_idx], zs[bg_idx])
+    bg_seg_phase = point_phase[bg_idx[1:]] if bg_idx.size > 1 else np.empty((0,), dtype=object)
     if len(bg_segs) > 0:
-        lc = Line3DCollection(bg_segs, colors=["deepskyblue"], linewidths=1.4, alpha=0.45)
-        ax.add_collection3d(lc)
-
-    # Optional stage path
-    stage_path_line = None
-    if show_stage:
-        sx, sy, sz = _decimate_xyz(traj.x_stage, traj.y_stage, traj.z_stage, MAX_BACKGROUND_POINTS)
-        stage_path_line, = ax.plot(
-            sx, sy, sz,
-            linestyle="--", linewidth=0.7, alpha=0.35, color="0.8", label="Stage path"
+        bg_colors = [phase_colors.get(str(phase), "deepskyblue") for phase in bg_seg_phase]
+        lc = Line3DCollection(
+            bg_segs,
+            colors=bg_colors,
+            linewidths=unprinted_line_width,
+            alpha=unprinted_line_alpha,
         )
+        ax.add_collection3d(lc)
 
     # Start/end markers
     ax.scatter([xs[0]], [ys[0]], [zs[0]], marker="o", s=46, color="lime", label="Start")
@@ -710,7 +1101,12 @@ def launch_interactive_plot(
 
     # Current extruding portion
     p0 = np.array([[xs[idx0], ys[idx0], zs[idx0]], [xs[idx0], ys[idx0], zs[idx0]]], dtype=float)
-    current_print_lc = Line3DCollection([p0], colors=["yellow"], linewidths=2.2, alpha=0.95)
+    current_print_lc = Line3DCollection(
+        [p0],
+        colors=[printed_line_color],
+        linewidths=printed_line_width,
+        alpha=printed_line_alpha,
+    )
     ax.add_collection3d(current_print_lc)
 
     # Robot links (optional)
@@ -732,6 +1128,7 @@ def launch_interactive_plot(
             r_tip=traj.r_of_b[idx0],
             z_tip=traj.z_of_b[idx0],
             y_off_tip=traj.y_off_of_b[idx0],
+            equation_phase=str(traj.equation_phase[idx0]),
             offplane_sign=offplane_sign,
         )
         rsegs = np.stack([rp[:-1], rp[1:]], axis=1) if rp.shape[0] >= 2 else np.empty((0, 2, 3))
@@ -761,17 +1158,17 @@ def launch_interactive_plot(
     apply_view_limits()
     set_major_view(ax, "ISO")
 
-    # ----- Info panel (slightly lower) -----
-    text_ax = fig.add_axes([0.05, 0.005, 0.60, 0.12])
+    # ----- Info panel -----
+    text_ax = fig.add_axes([0.04, 0.025, 0.60, 0.165])
     text_ax.set_facecolor("black")
     text_ax.axis("off")
     info_text = text_ax.text(
         0.0, 1.0, "",
-        va="top", ha="left", family="monospace", fontsize=9, color="white"
+        va="top", ha="left", family="monospace", fontsize=8.3, color="white", clip_on=True
     )
 
-    # ----- Index slider (lower) -----
-    slider_ax = fig.add_axes([0.70, 0.040, 0.25, 0.03], facecolor="#111111")
+    # ----- Index slider -----
+    slider_ax = fig.add_axes([0.70, 0.080, 0.26, 0.026], facecolor="#111111")
     idx_slider = Slider(
         ax=slider_ax,
         label="Index",
@@ -786,8 +1183,8 @@ def launch_interactive_plot(
     except Exception:
         pass
 
-    # ----- Zoom slider (lower) -----
-    zoom_ax = fig.add_axes([0.70, 0.085, 0.25, 0.03], facecolor="#111111")
+    # ----- Zoom slider -----
+    zoom_ax = fig.add_axes([0.70, 0.125, 0.26, 0.026], facecolor="#111111")
     zoom_slider = Slider(
         ax=zoom_ax,
         label="Zoom",
@@ -802,42 +1199,10 @@ def launch_interactive_plot(
     except Exception:
         pass
 
-    # ----- Nav buttons (lower) -----
-    prev_ax = fig.add_axes([0.72, 0.118, 0.08, 0.04], facecolor="#111111")
-    next_ax = fig.add_axes([0.81, 0.118, 0.08, 0.04], facecolor="#111111")
-    zrst_ax = fig.add_axes([0.90, 0.118, 0.07, 0.04], facecolor="#111111")
-    btn_prev = Button(prev_ax, "Prev", color="#222222", hovercolor="#333333")
-    btn_next = Button(next_ax, "Next", color="#222222", hovercolor="#333333")
-    btn_zrst = Button(zrst_ax, "Zrst", color="#222222", hovercolor="#333333")
-
-    # ----- Major view plane buttons (lower) -----
-    xy_ax = fig.add_axes([0.72, 0.168, 0.055, 0.035], facecolor="#111111")
-    xz_ax = fig.add_axes([0.782, 0.168, 0.055, 0.035], facecolor="#111111")
-    yz_ax = fig.add_axes([0.844, 0.168, 0.055, 0.035], facecolor="#111111")
-    iso_ax = fig.add_axes([0.906, 0.168, 0.064, 0.035], facecolor="#111111")
-    btn_xy = Button(xy_ax, "XY", color="#222222", hovercolor="#333333")
-    btn_xz = Button(xz_ax, "XZ", color="#222222", hovercolor="#333333")
-    btn_yz = Button(yz_ax, "YZ", color="#222222", hovercolor="#333333")
-    btn_iso = Button(iso_ax, "ISO", color="#222222", hovercolor="#333333")
-
-    for b in [btn_prev, btn_next, btn_zrst, btn_xy, btn_xz, btn_yz, btn_iso]:
-        try:
-            b.label.set_color("white")
-        except Exception:
-            pass
-
-    # ----- Toggle checkboxes (bigger + above others to avoid dead clicks) -----
+    # ----- Toggle checkboxes -----
     toggles = []
     toggle_states = []
     toggle_actions = {}
-
-    if stage_path_line is not None:
-        toggles.append("Ref dashed")
-        toggle_states.append(True)
-
-        def _toggle_ref():
-            stage_path_line.set_visible(not stage_path_line.get_visible())
-        toggle_actions["Ref dashed"] = _toggle_ref
 
     if robot_cfg is not None and robot_lc is not None and robot_joints is not None:
         toggles.append("Robot links")
@@ -851,7 +1216,7 @@ def launch_interactive_plot(
 
     ref_check = None
     if toggles:
-        ref_ax = fig.add_axes([0.7, 0.200, 0.19, 0.060], facecolor="#2a2a2a")
+        ref_ax = fig.add_axes([0.70, 0.175, 0.26, 0.04], facecolor="#2a2a2a")
         ref_ax.set_zorder(10)  # ensure it receives clicks
         ref_check = CheckButtons(ref_ax, toggles, toggle_states)
         try:
@@ -907,12 +1272,12 @@ def launch_interactive_plot(
 
         fig.canvas.mpl_connect("button_press_event", on_ref_ax_click)
 
-    help_ax = fig.add_axes([0.70, 0.008, 0.28, 0.02], facecolor="black")
+    help_ax = fig.add_axes([0.70, 0.025, 0.28, 0.035], facecolor="black")
     help_ax.axis("off")
     help_ax.text(
-        0.0, 0.5,
-        "Keys: ←/→, j/k, 1=XY 2=XZ 3=YZ 0=ISO, +/- zoom",
-        va="center", ha="left", fontsize=8, color="white"
+        0.0, 1.0,
+        "Keys: left/right, j/k\n1=XY 2=XZ 3=YZ 0=ISO, +/- zoom",
+        va="top", ha="left", fontsize=8, color="white"
     )
 
     # ---------------------------
@@ -920,7 +1285,8 @@ def launch_interactive_plot(
     # ---------------------------
     def fmt_state(i: int) -> str:
         s = states[i]
-        f_val = s.feed if s.feed is not None else float("nan")
+        f_text = f"{s.feed:.3f}" if s.feed is not None and np.isfinite(s.feed) else "---"
+        time_note = "" if skipped_time_segments == 0 else f"  skipped_no_F={skipped_time_segments}"
         rob_line = ""
         if robot_cfg is not None:
             rob_line = (
@@ -928,7 +1294,11 @@ def launch_interactive_plot(
                 f"shape={robot_cfg.shape_mode}  anchor={robot_cfg.anchor_mode}  visible={robot_visible['value']}\n"
             )
         return (
-            f"idx={s.idx:6d}   gcode_line={s.gcode_line_no:6d}   motion={s.motion_code}   F={f_val:.3f}\n"
+            f"idx={s.idx:6d}   gcode_line={s.gcode_line_no:6d}   motion={s.motion_code}   F={f_text}\n"
+            f"est_time={format_duration(elapsed_seconds[i])} / {format_duration(total_estimated_seconds)}"
+            f"  ({elapsed_seconds[i]:.1f}s / {total_estimated_seconds:.1f}s){time_note}\n"
+            f"print_active={s.pressure_active}   equation_phase={traj.equation_phase[i]}   "
+            f"default_phase={cal.default_phase}\n"
             f"stage: X={traj.x_stage[i]: .4f}  Y={traj.y_stage[i]: .4f}  Z={traj.z_stage[i]: .4f}  "
             f"{cal.pull_axis}={traj.b_cmd[i]: .4f}  {cal.rot_axis}={traj.c_cmd[i]: .4f}\n"
             f"tip:   X={traj.x_tip[i]: .4f}  Y={traj.y_tip[i]: .4f}  Z={traj.z_tip[i]: .4f}    "
@@ -945,6 +1315,7 @@ def launch_interactive_plot(
         # how many extrude segments end at/before i?
         k = int(np.searchsorted(extrude_end_idx, i, side="right"))
         current_print_lc.set_segments(extrude_segs[:k])
+        current_print_lc.set_color(printed_line_color)
 
     def _update_robot(i: int):
         if robot_cfg is None or robot_lc is None or robot_joints is None:
@@ -961,6 +1332,7 @@ def launch_interactive_plot(
             r_tip=traj.r_of_b[i],
             z_tip=traj.z_of_b[i],
             y_off_tip=traj.y_off_of_b[i],
+            equation_phase=str(traj.equation_phase[i]),
             offplane_sign=offplane_sign,
         )
         rsegs = np.stack([rp[:-1], rp[1:]], axis=1) if rp.shape[0] >= 2 else np.empty((0, 2, 3))
@@ -969,11 +1341,13 @@ def launch_interactive_plot(
 
     def redraw(i: int):
         i = int(np.clip(i, 0, n - 1))
+        view_state = capture_view_state(ax)
         current_tip_marker.set_data_3d([traj.x_tip[i]], [traj.y_tip[i]], [traj.z_tip[i]])
         current_stage_marker.set_data_3d([traj.x_stage[i]], [traj.y_stage[i]], [traj.z_stage[i]])
         _update_print_segments(i)
         _update_robot(i)
         info_text.set_text(fmt_state(i))
+        restore_view_state(ax, view_state)
         fig.canvas.draw_idle()
 
     # Debounce helpers (so sliders feel fluid)
@@ -1016,32 +1390,8 @@ def launch_interactive_plot(
             pass
         zoom_timer.start()
 
-    def on_prev(event):
-        idx_slider.set_val(max(0, int(idx_slider.val) - 1))
-
-    def on_next(event):
-        idx_slider.set_val(min(n - 1, int(idx_slider.val) + 1))
-
-    def on_zoom_reset(event):
-        zoom_slider.set_val(1.0)
-
-    def make_view_cb(name: str):
-        def _cb(event):
-            set_major_view(ax, name)
-            apply_view_limits()
-            fig.canvas.draw_idle()
-        return _cb
-
-    btn_xy.on_clicked(make_view_cb("XY"))
-    btn_xz.on_clicked(make_view_cb("XZ"))
-    btn_yz.on_clicked(make_view_cb("YZ"))
-    btn_iso.on_clicked(make_view_cb("ISO"))
-
     idx_slider.on_changed(on_index_slider)
     zoom_slider.on_changed(on_zoom_slider)
-    btn_prev.on_clicked(on_prev)
-    btn_next.on_clicked(on_next)
-    btn_zrst.on_clicked(on_zoom_reset)
 
     def on_key(event):
         key = event.key.lower() if isinstance(event.key, str) else event.key
@@ -1099,6 +1449,8 @@ def main():
 
     cal_data = load_calibration_json(args.calibration)
     cal = load_calibration(args.calibration)
+    gcode_metadata = parse_gcode_metadata(args.gcode)
+    write_mode = str(gcode_metadata.get("write_mode", "calibrated")).strip().lower()
 
     # Robot config load (explicit or auto)
     robot_cfg = None
@@ -1135,6 +1487,7 @@ def main():
         cal=cal,
         c0_deg=args.c0_deg,
         offplane_sign=float(args.offplane_sign),
+        write_mode=write_mode,
     )
 
     if args.print_summary:
@@ -1142,6 +1495,7 @@ def main():
         print(f"Parsed {len(states)} motion states from {args.gcode}")
         print(f"Axis mapping: X={cal.x_axis}, Y={y_axis}, Z={cal.z_axis}, B={cal.pull_axis}, C={cal.rot_axis}")
         print(f"C0={args.c0_deg:.3f}, C180(cal)={cal.c_180_deg:.3f}")
+        print(f"write_mode={write_mode}")
         print(f"offplane_sign={float(args.offplane_sign):.3f}")
         print(f"B home={cal.b_home:.4f}")
         print(f"Unique C values (rounded): {c_unique.tolist()[:20]}{' ...' if len(c_unique) > 20 else ''}")

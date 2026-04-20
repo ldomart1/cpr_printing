@@ -453,6 +453,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tip_parallel_cross_step_px", type=float, default=0.5)
     parser.add_argument("--tip_parallel_ray_step_px", type=float, default=0.5)
     parser.add_argument("--tip_parallel_ray_max_len_r", type=float, default=16.0)
+    parser.add_argument("--tip_refiner_model", type=str, default=None, help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt")
+    parser.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"], help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
+    parser.add_argument("--tip_refiner_compare_only", action="store_true", help="Save tip_locations_cnn.* but keep classical selected tips for postprocessing.")
 
     parser.add_argument("--export_skeleton", action="store_true")
     parser.add_argument("--skeleton_diameter_mm", type=float, default=3.0)
@@ -499,6 +502,13 @@ def main() -> None:
     cal.tip_parallel_cross_step_px = float(args.tip_parallel_cross_step_px)
     cal.tip_parallel_ray_step_px = float(args.tip_parallel_ray_step_px)
     cal.tip_parallel_ray_max_len_r = float(args.tip_parallel_ray_max_len_r)
+
+    if args.tip_refiner_model:
+        cal.load_tip_refiner_model(
+            str(Path(args.tip_refiner_model).expanduser().resolve()),
+            anchor_name=args.tip_refiner_anchor,
+            use_as_selected=(not args.tip_refiner_compare_only),
+        )
 
     if args.camera_calibration_file:
         cal.load_camera_calibration(str(Path(args.camera_calibration_file).expanduser().resolve()))

@@ -14,7 +14,7 @@ print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_ca
 # Create calibration object
 cal = CTR_Shadow_Calibration(
     parent_directory= SCRIPT_DIR, 
-    project_name='Test_Calibration_2026-04-07_02_daq',
+    project_name='Test_Calibration_2026-04-20_00',
     allow_existing= True,
     add_date=False
 )
@@ -25,7 +25,7 @@ print("Calibration object created!")
 MANUAL_CROP_ADJUSTMENT = True
 THRESHOLD = 220
 PULL_B_START = 0.0
-PULL_B_STEPS = 22
+PULL_B_STEPS = 24
 PULL_B_STEP_SIZE = -0.2
 CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
 BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260406_104134.png")
@@ -33,8 +33,20 @@ BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260406_104134
 PROBE_MODE = "middle"  # "middle" | "five"
 FIT_MODEL = "pchip"  # "pchip" | "cubic"
 
+# Optional CNN tip refiner. Set TIP_REFINER_MODEL to None to use only the
+# classical selected/coarse tip pipeline.
+TIP_REFINER_MODEL = os.path.join(
+    SCRIPT_DIR,
+    "Test_Calibration_2026-04-07_02_daq",
+    "processed_image_data_folder",
+    "tip_refinement_model",
+    "best_tip_refiner.pt",
+)
+TIP_REFINER_ANCHOR = None  # None uses the checkpoint anchor; or "coarse", "selected", "refined"
+TIP_REFINER_COMPARE_ONLY = False  # True saves CNN tips but keeps classical tips for postprocessing.
+
 if PROBE_MODE == "middle":
-    probe_points = [(100.0, 52.0, -155.0)]
+    probe_points = [(100.0, 52.0, -130.0)]
 elif PROBE_MODE == "five":
     probe_points = [
         (30.0, 0.0, -70.0),
@@ -70,6 +82,16 @@ cal.tip_parallel_num_sections = 7
 cal.tip_parallel_cross_step_px = 0.5
 cal.tip_parallel_ray_step_px = 0.5
 cal.tip_parallel_ray_max_len_r = 10.0
+
+if TIP_REFINER_MODEL is not None:
+    if os.path.isfile(TIP_REFINER_MODEL):
+        cal.load_tip_refiner_model(
+            TIP_REFINER_MODEL,
+            anchor_name=TIP_REFINER_ANCHOR,
+            use_as_selected=(not TIP_REFINER_COMPARE_ONLY),
+        )
+    else:
+        raise FileNotFoundError(f"TIP_REFINER_MODEL not found: {TIP_REFINER_MODEL}")
 
 # Example usage:
 cal.connect_to_camera(cam_port=0, show_preview=False)

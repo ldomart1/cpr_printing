@@ -1,0 +1,13 @@
+{
+  "epochs": 80,
+  "batch_size": 8,
+  "learning_rate": 0.0005,
+  "val_fraction": 0.15,
+  "seed": 42,
+  "heatmap_sigma_px": 3.5,
+  "heatmap_loss_weight": 1.0,
+  "coord_loss_weight": 0.05,
+  "softargmax_temperature": 20.0,
+  "use_done_only": true,
+  "num_workers": 0
+}

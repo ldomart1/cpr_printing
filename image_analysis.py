@@ -1,5 +1,6 @@
 import math
 from pathlib import Path
+import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -14,8 +15,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"]
-ANGLES = list(range(0, 181, 5))
-EXPECTED_ITEMS = [1, 2, 3, 4, 5, 6]
+ANGLES = list(range(-180, 181, 5))
+EXPECTED_ITEMS = [1, 2]
 
 
 def find_images_by_item_number(folder: str):
@@ -233,7 +234,7 @@ class LineMeasurementApp:
             dist = perpendicular_distance_px(self.p1, self.p2, self.p3)
 
         status = (
-            f"Image {self.current_image_idx + 1}/6: {img_name} | "
+            f"Image {self.current_image_idx + 1}/{len(self.images)}: {img_name} | "
             f"Item #{self.current_sample_number()} | "
             f"Target angle: {ang}°"
         )
@@ -646,15 +647,19 @@ def main():
     root = tk.Tk()
     root.withdraw()
 
-    messagebox.showinfo(
-        "Select folder",
-        "Choose the folder containing image files named 1.jpg to 6.jpg "
-        "(or 1.png, 2.tif, etc. — one image per item number)."
-    )
+    folder = sys.argv[1] if len(sys.argv) > 1 else None
 
-    folder = filedialog.askdirectory(title="Select folder with images 1..6")
     if not folder:
-        return
+        messagebox.showinfo(
+            "Select folder",
+            "Choose the folder containing image files named 1.jpg and 2.jpg "
+            "(or 1.png, 2.tif, etc. - one image per item number).\n\n"
+            "You will be prompted through target angles -180 to 180 degrees in 5 degree increments."
+        )
+
+        folder = filedialog.askdirectory(title="Select folder with images 1..2")
+        if not folder:
+            return
 
     try:
         image_paths, sample_numbers = find_images_by_item_number(folder)

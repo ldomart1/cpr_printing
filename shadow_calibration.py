@@ -345,7 +345,7 @@ def _tip_pose_from_distal_pca(
     dist: np.ndarray,
     mask_u8: np.ndarray,
     distal_window=50,      # was 80
-    roi_margin=25,
+    roi_margin=18,
     tangent_len=40,
     radius_frac=0.30,      # was 0.55
     tip_keep_frac=0.65,    # was 0.85
@@ -1091,7 +1091,15 @@ def annotate_tip_geometry_on_axes(axs, dbg, title_suffix=""):
                 ax.scatter([tip_xy[0]], [tip_xy[1]], s=55, c="#ff3b30", edgecolors="#ffffff", label=lbl, zorder=6)
 
             try:
-                ax.legend(loc="upper right", fontsize=6.5)
+                handles, labels = ax.get_legend_handles_labels()
+                visible = [(h, lbl) for h, lbl in zip(handles, labels) if lbl and not lbl.startswith("_")]
+                if visible:
+                    ax.legend(
+                        [item[0] for item in visible],
+                        [item[1] for item in visible],
+                        loc="upper right",
+                        fontsize=6.5,
+                    )
             except Exception:
                 pass
     except Exception as e:
@@ -1205,6 +1213,15 @@ class CTR_Shadow_Calibration:
         self.tip_parallel_cross_step_px = 0.5
         self.tip_parallel_ray_step_px = 0.5
         self.tip_parallel_ray_max_len_r = 10.0
+        self.tip_refiner_model_path = None
+        self.tip_refiner_model = None
+        self.tip_refiner_device = None
+        self.tip_refiner_patch_size = None
+        self.tip_refiner_anchor_name = "selected"
+        self.tip_refiner_use_as_selected = True
+        self.tip_refiner_softargmax_temperature = None
+        self.tip_refiner_enabled = False
+        self._last_tip_locations_cnn = None
 
         print("Calibration object initialized successfully!")
 
@@ -2127,6 +2144,163 @@ class CTR_Shadow_Calibration:
             "board_reference_correction_meta": None if self.board_reference_correction_meta is None else dict(self.board_reference_correction_meta),
         }
 
+    @staticmethod
+    def _safe_output_stem(path_text):
+        stem = str(path_text).strip().replace("\\", "/")
+        root, ext = os.path.splitext(stem)
+        if ext.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"):
+            stem = root
+        out = []
+        for ch in stem:
+            if ch.isalnum() or ch in ("_", "-", "."):
+                out.append(ch)
+            else:
+                out.append("_")
+        return "".join(out).strip("._") or "image"
+
+    def load_tip_refiner_model(self, model_path, anchor_name=None, use_as_selected=True, device=None):
+        """Load the optional CNN tip refiner trained by cnn/train_tip_refiner.py."""
+        try:
+            import torch
+            import torch.nn as nn
+            import torch.nn.functional as F
+        except Exception as exc:
+            raise RuntimeError(
+                "PyTorch is required to use --tip_refiner_model. Install torch in this environment."
+            ) from exc
+
+        class ConvBlock(nn.Module):
+            def __init__(self, in_ch, out_ch):
+                super().__init__()
+                self.net = nn.Sequential(
+                    nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                    nn.BatchNorm2d(out_ch),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(out_ch, out_ch, 3, padding=1),
+                    nn.BatchNorm2d(out_ch),
+                    nn.ReLU(inplace=True),
+                )
+
+            def forward(self, x):
+                return self.net(x)
+
+        class TinyUNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.enc1 = ConvBlock(1, 32)
+                self.enc2 = ConvBlock(32, 64)
+                self.enc3 = ConvBlock(64, 128)
+                self.pool = nn.MaxPool2d(2)
+                self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+                self.dec2 = ConvBlock(128, 64)
+                self.up1 = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+                self.dec1 = ConvBlock(64, 32)
+                self.head = nn.Conv2d(32, 1, kernel_size=1)
+
+            def forward(self, x):
+                x1 = self.enc1(x)
+                x2 = self.enc2(self.pool(x1))
+                x3 = self.enc3(self.pool(x2))
+                y = self.up2(x3)
+                if y.shape[-2:] != x2.shape[-2:]:
+                    y = F.interpolate(y, size=x2.shape[-2:], mode="bilinear", align_corners=False)
+                y = self.dec2(torch.cat([y, x2], dim=1))
+                y = self.up1(y)
+                if y.shape[-2:] != x1.shape[-2:]:
+                    y = F.interpolate(y, size=x1.shape[-2:], mode="bilinear", align_corners=False)
+                y = self.dec1(torch.cat([y, x1], dim=1))
+                return self.head(y)
+
+        model_path = str(Path(model_path).expanduser().resolve())
+        dev = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        ckpt = torch.load(model_path, map_location=dev)
+        cfg = ckpt.get("config", {})
+        model = TinyUNet().to(dev)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+
+        ckpt_anchor = str(ckpt.get("anchor_name", "selected")).strip().lower()
+        chosen_anchor = str(anchor_name if anchor_name is not None else ckpt_anchor).strip().lower()
+        if chosen_anchor not in {"coarse", "selected", "refined"}:
+            raise ValueError("--tip_refiner_anchor must be one of: coarse, selected, refined")
+
+        self.tip_refiner_model_path = model_path
+        self.tip_refiner_model = model
+        self.tip_refiner_device = dev
+        self.tip_refiner_patch_size = int(ckpt.get("patch_size", 128))
+        self.tip_refiner_anchor_name = chosen_anchor
+        self.tip_refiner_use_as_selected = bool(use_as_selected)
+        self.tip_refiner_softargmax_temperature = (
+            float(cfg["softargmax_temperature"])
+            if isinstance(cfg, dict) and "softargmax_temperature" in cfg
+            else None
+        )
+        self.tip_refiner_enabled = True
+        print(
+            "Loaded CNN tip refiner: "
+            f"{model_path} | patch_size={self.tip_refiner_patch_size} "
+            f"anchor={self.tip_refiner_anchor_name} device={dev}"
+        )
+
+    @staticmethod
+    def _extract_tip_refiner_patch(gray_image, center_x, center_y, patch_size):
+        patch_size = int(patch_size)
+        half = patch_size // 2
+        x0 = int(round(float(center_x))) - half
+        y0 = int(round(float(center_y))) - half
+        x1 = x0 + patch_size
+        y1 = y0 + patch_size
+
+        h, w = gray_image.shape[:2]
+        src_x0 = max(0, x0)
+        src_y0 = max(0, y0)
+        src_x1 = min(w, x1)
+        src_y1 = min(h, y1)
+
+        dst_x0 = src_x0 - x0
+        dst_y0 = src_y0 - y0
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+
+        patch = np.full((patch_size, patch_size), 255, dtype=np.uint8)
+        patch[dst_y0:dst_y1, dst_x0:dst_x1] = gray_image[src_y0:src_y1, src_x0:src_x1]
+        return patch, x0, y0
+
+    def predict_tip_refiner_abs(self, gray_image, anchor_x_abs, anchor_y_abs):
+        if not self.tip_refiner_enabled or self.tip_refiner_model is None:
+            return None
+        import torch
+
+        patch, x0, y0 = self._extract_tip_refiner_patch(
+            gray_image=gray_image,
+            center_x=anchor_x_abs,
+            center_y=anchor_y_abs,
+            patch_size=self.tip_refiner_patch_size,
+        )
+        tensor = torch.from_numpy((patch.astype(np.float32) / 255.0)[None, None, :, :]).to(self.tip_refiner_device)
+        with torch.no_grad():
+            logits = self.tip_refiner_model(tensor)
+            _, _, h, w = logits.shape
+            if self.tip_refiner_softargmax_temperature is not None:
+                probs = torch.softmax(logits.view(1, -1) * float(self.tip_refiner_softargmax_temperature), dim=1)
+                ys = torch.arange(h, device=logits.device, dtype=logits.dtype).repeat_interleave(w)
+                xs = torch.arange(w, device=logits.device, dtype=logits.dtype).repeat(h)
+                x_patch = float(torch.sum(probs * xs[None, :], dim=1).detach().cpu().numpy()[0])
+                y_patch = float(torch.sum(probs * ys[None, :], dim=1).detach().cpu().numpy()[0])
+            else:
+                probs = torch.sigmoid(logits)
+                idx = torch.argmax(probs.view(1, -1), dim=1)
+                y_patch = float((idx // w).detach().cpu().numpy()[0])
+                x_patch = float((idx % w).detach().cpu().numpy()[0])
+        return {
+            "x_abs": float(x0 + x_patch),
+            "y_abs": float(y0 + y_patch),
+            "x_patch": x_patch,
+            "y_patch": y_patch,
+            "patch_x0": int(x0),
+            "patch_y0": int(y0),
+        }
+
     def project_pixel_delta_onto_true_vertical(self, dx_px, dy_px):
         """
         Return signed component in pixels along estimated true vertical image direction.
@@ -2944,7 +3118,7 @@ class CTR_Shadow_Calibration:
             fg = cv2.erode(fg, np.ones((3, 3), np.uint8), iterations=1)
 
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k, iterations=2)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k, iterations=1)
         #fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k, iterations=1)
 
         n, lab, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
@@ -2991,7 +3165,7 @@ class CTR_Shadow_Calibration:
             full_max = float(np.max(full_dist))
             trunk_max = float(np.max(trunk_dist))
             # Only trust the pruned trunk if it still reaches most of the distal extent.
-            if full_max <= 0 or trunk_max >= 0.88 * full_max:
+            if full_max <= 0 or trunk_max >= 0.97 * full_max:
                 skel = skel_trunk
                 dist = trunk_dist
             else:
@@ -3008,7 +3182,7 @@ class CTR_Shadow_Calibration:
                 dist=dist,
                 mask_u8=mask,
                 distal_window=70,
-                roi_margin=25,
+                roi_margin=18,
                 tangent_len=tip_angle_path_len,
                 radius_frac=0.18,
                 tip_keep_frac=0.40,
@@ -3027,12 +3201,12 @@ class CTR_Shadow_Calibration:
             skel_u8=skel,
             dist=dist,
             mask_u8=mask,
-            distal_window=60,
-            roi_margin=25,
+            distal_window=70,
+            roi_margin=18,
             tangent_len=tip_angle_path_len,
-            radius_frac=0.15,
-            tip_keep_frac=0.30,
-            weight_power=0.15,
+            radius_frac=0.10,
+            tip_keep_frac=0.20,
+            weight_power=0.05,
         )
         if return_debug:
             debug_data = {
@@ -3126,6 +3300,9 @@ class CTR_Shadow_Calibration:
 
         # Fixed path handling for Mac
         image = cv2.imread(os.path.join(raw_data_folder, image_file_name))
+        if image is None:
+            raise FileNotFoundError(f"Could not read image: {os.path.join(raw_data_folder, image_file_name)}")
+        full_grayscale_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         if crop_width_min is None:
             crop_width_min = self.analysis_crop["crop_width_min"]
@@ -3202,6 +3379,32 @@ class CTR_Shadow_Calibration:
             tip_dbg=tip_refine_dbg,
             mode=self.tip_refine_mode,
         )
+
+        cnn_tip_abs = None
+        cnn_tip_dbg = None
+        if self.tip_refiner_enabled:
+            anchor_lookup_abs = {
+                "coarse": (float(tip_x + crop_x_min_img), float(tip_y + crop_y_min_img)),
+                "refined": (float(xx_refined + crop_x_min_img), float(yy_refined + crop_y_min_img)),
+                "selected": (float(xx_selected + crop_x_min_img), float(yy_selected + crop_y_min_img)),
+            }
+            anchor_x_abs, anchor_y_abs = anchor_lookup_abs[self.tip_refiner_anchor_name]
+            try:
+                cnn_tip_dbg = self.predict_tip_refiner_abs(
+                    full_grayscale_image,
+                    anchor_x_abs=anchor_x_abs,
+                    anchor_y_abs=anchor_y_abs,
+                )
+                if cnn_tip_dbg is not None:
+                    cnn_tip_abs = (float(cnn_tip_dbg["y_abs"]), float(cnn_tip_dbg["x_abs"]))
+                    if self.tip_refiner_use_as_selected:
+                        yy_selected = float(cnn_tip_dbg["y_abs"] - crop_y_min_img)
+                        xx_selected = float(cnn_tip_dbg["x_abs"] - crop_x_min_img)
+                        tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                        tip_select_dbg["selected_tip_source"] = "cnn"
+                        tip_select_dbg["selected_tip_reason"] = "cnn_tip_refiner"
+            except Exception as exc:
+                cnn_tip_dbg = {"error": str(exc)}
 
         orientation = int(file_ctx['orientation'])
         ntnl_pos = float(file_ctx['ntnl_pos'])
@@ -3371,6 +3574,14 @@ class CTR_Shadow_Calibration:
                 axs[1, 1].plot(path_x[valid], path_y[valid], '-', color='yellow', linewidth=2)
 
         axs[1, 1].scatter([tip_column - crop_x_min], [tip_row - crop_y_min])
+        if cnn_tip_abs is not None:
+            axs[1, 1].scatter(
+                [cnn_tip_abs[1] - crop_x_min_img - crop_x_min],
+                [cnn_tip_abs[0] - crop_y_min_img - crop_y_min],
+                c="magenta",
+                marker="x",
+                s=80,
+            )
 
         # if p_1 is not None and x_points.size > 0:
         # axs[1, 1].scatter(np.unique(x_points), p_1(np.unique(x_points)))
@@ -3393,6 +3604,23 @@ class CTR_Shadow_Calibration:
             ]
         )
 
+        if cnn_tip_abs is not None:
+            self._last_tip_locations_cnn = np.array(
+                [
+                    cnn_tip_abs[0],
+                    cnn_tip_abs[1],
+                    float(orientation),
+                    float(ss_pos),
+                    float(ntnl_pos),
+                    float(tip_angle_deg),
+                    motion_phase_code,
+                    pass_idx,
+                ],
+                dtype=float,
+            )
+        else:
+            self._last_tip_locations_cnn = None
+
         dbg_local = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
         dbg_local["image_file_name"] = image_file_name
         dbg_local["tip_angle_deg"] = float(tip_angle_deg)
@@ -3400,6 +3628,10 @@ class CTR_Shadow_Calibration:
         dbg_local["coarse_tip_after_local_xy"] = [float(xx_refined), float(yy_refined)]
         dbg_local["legacy_tip_xy"] = [float(tip_col_legacy), float(tip_row_legacy)]
         dbg_local["crop_origin_xy"] = [int(crop_x_min_img), int(crop_y_min_img)]
+        if cnn_tip_dbg is not None:
+            dbg_local["cnn_tip_refiner"] = cnn_tip_dbg
+            dbg_local["cnn_tip_abs_yx"] = None if cnn_tip_abs is None else [float(cnn_tip_abs[0]), float(cnn_tip_abs[1])]
+            dbg_local["cnn_anchor_name"] = self.tip_refiner_anchor_name
         self.tip_refine_debug_records[image_file_name] = dbg_local
 
         _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
@@ -3500,11 +3732,13 @@ class CTR_Shadow_Calibration:
         print(f" crop_height_min={crop_height_min}, crop_height_max={crop_height_max}")
 
         try:
-            all_files = os.listdir(raw_data_folder)
             image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')
-            image_files = sorted(
-                f for f in all_files if f.lower().endswith(image_extensions)
-            )
+            image_files = []
+            for root, _, files in os.walk(raw_data_folder):
+                for file_name in files:
+                    if file_name.lower().endswith(image_extensions):
+                        image_files.append(os.path.relpath(os.path.join(root, file_name), raw_data_folder))
+            image_files = sorted(image_files)
 
             if len(image_files) == 0:
                 print(f"Error: No image files found in {raw_data_folder}")
@@ -3537,6 +3771,7 @@ class CTR_Shadow_Calibration:
         num_images = len(image_files)
         self.tip_locations_array_coarse = np.zeros((num_images, 8))
         self.tip_locations_array_selected = np.zeros((num_images, 8))
+        self.tip_locations_array_cnn = np.full((num_images, 8), np.nan)
 
         successful_analyses = 0
         failed_analyses = 0
@@ -3555,8 +3790,12 @@ class CTR_Shadow_Calibration:
 
                 self.tip_locations_array_coarse[i, :] = coarse_tip
                 self.tip_locations_array_selected[i, :] = selected_tip
+                if self.tip_refiner_enabled and self._last_tip_locations_cnn is not None:
+                    self.tip_locations_array_cnn[i, :] = self._last_tip_locations_cnn
+                    if self.tip_refiner_use_as_selected:
+                        self.tip_locations_array_selected[i, :] = self._last_tip_locations_cnn
 
-                output_filename = f"{os.path.splitext(image_file)[0]}_analysis.png"
+                output_filename = f"{self._safe_output_stem(image_file)}_analysis.png"
                 output_path = os.path.join(analysis_output_folder, output_filename)
                 self._apply_dark_theme_to_figure(fig)
                 fig.savefig(output_path, dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
@@ -3578,6 +3817,10 @@ class CTR_Shadow_Calibration:
             np.save(selected_file, self.tip_locations_array_selected)
             print(f"\n✓ Saved coarse tip locations to: {coarse_file}")
             print(f"✓ Saved selected tip locations to: {selected_file}")
+            if self.tip_refiner_enabled:
+                cnn_file = os.path.join(processed_folder, "tip_locations_cnn.npy")
+                np.save(cnn_file, self.tip_locations_array_cnn)
+                print(f"✓ Saved CNN tip locations to: {cnn_file}")
 
             try:
                 columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code', 'pass_idx']
@@ -3591,6 +3834,12 @@ class CTR_Shadow_Calibration:
                 df_selected.to_csv(selected_csv, index=False)
                 print(f"✓ Saved CSV file: {coarse_csv}")
                 print(f"✓ Saved CSV file: {selected_csv}")
+                if self.tip_refiner_enabled:
+                    df_cnn = pd.DataFrame(self.tip_locations_array_cnn, columns=columns)
+                    df_cnn['image_file'] = image_files
+                    cnn_csv = os.path.join(processed_folder, "tip_locations_cnn.csv")
+                    df_cnn.to_csv(cnn_csv, index=False)
+                    print(f"✓ Saved CSV file: {cnn_csv}")
             except Exception as e:
                 print(f"Warning: Could not save CSV files: {e}")
 

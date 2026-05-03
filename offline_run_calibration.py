@@ -436,6 +436,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width_in_pixels", type=float, default=3025.0)
     parser.add_argument("--width_in_mm", type=float, default=140.0)
     parser.add_argument("--fit_model", type=str, default="pchip", choices=["cubic", "pchip"])
+    parser.add_argument("--offplane_fit_model", type=str, default="pchip", choices=["linear", "cubic", "pchip"])
     parser.add_argument("--save_plots", action="store_true")
     parser.add_argument("--ruler_mm", type=float, default=150.0)
     parser.add_argument("--save_analysis_config", action="store_true")
@@ -454,6 +455,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tip_parallel_cross_step_px", type=float, default=0.5)
     parser.add_argument("--tip_parallel_ray_step_px", type=float, default=0.5)
     parser.add_argument("--tip_parallel_ray_max_len_r", type=float, default=16.0)
+    parser.add_argument("--tip_refine_mode", type=str, default="coarse", choices=["coarse", "parallel_centerline", "auto"])
+    parser.add_argument("--tip_detection_mode", type=str, default="classical", choices=["classical", "red_dot", "auto_red_dot"])
+    parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", help="Interpret C90 captures as having stage-Y compensation driven by planar pull/release PCHIP fits, and subtract that recorded Y offset during off-plane postprocessing.")
+    parser.add_argument("--red_tip_sat_min", type=int, default=80)
+    parser.add_argument("--red_tip_val_min", type=int, default=40)
+    parser.add_argument("--red_tip_min_area_px", type=int, default=8)
     parser.add_argument("--tip_refiner_model", type=str, default=None, help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt")
     parser.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"], help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
     parser.add_argument("--tip_refiner_compare_only", action="store_true", help="Save tip_locations_cnn.* but keep classical selected tips for postprocessing.")
@@ -496,6 +503,9 @@ def main() -> None:
     )
     cal.calibration_data_folder = str(project_dir)
 
+    cal.tip_refine_mode = str(args.tip_refine_mode)
+    cal.tip_detection_mode = str(args.tip_detection_mode)
+    cal.c90_y_compensation_from_planar_pchip = bool(args.c90_y_compensation_from_planar_pchip)
     cal.tip_parallel_section_near_r = float(args.tip_parallel_section_near_r)
     cal.tip_parallel_section_far_r = float(args.tip_parallel_section_far_r)
     cal.tip_parallel_scan_half_r = float(args.tip_parallel_scan_half_r)
@@ -503,6 +513,9 @@ def main() -> None:
     cal.tip_parallel_cross_step_px = float(args.tip_parallel_cross_step_px)
     cal.tip_parallel_ray_step_px = float(args.tip_parallel_ray_step_px)
     cal.tip_parallel_ray_max_len_r = float(args.tip_parallel_ray_max_len_r)
+    cal.red_tip_sat_min = int(args.red_tip_sat_min)
+    cal.red_tip_val_min = int(args.red_tip_val_min)
+    cal.red_tip_min_area_px = int(args.red_tip_min_area_px)
 
     if args.tip_refiner_model:
         cal.load_tip_refiner_model(
@@ -569,6 +582,7 @@ def main() -> None:
         robot_name=str(args.robot_name),
         save_plots=bool(args.save_plots),
         fit_model=str(args.fit_model),
+        offplane_fit_model=str(args.offplane_fit_model),
         export_skeleton=bool(args.export_skeleton),
         skeleton_diameter_mm=float(args.skeleton_diameter_mm),
         skeleton_links=int(args.skeleton_links),

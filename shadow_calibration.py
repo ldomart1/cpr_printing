@@ -958,6 +958,17 @@ def _point_to_polyline_distance_xy(point_xy, polyline_xy):
     return best_dist, best_proj
 
 
+def _normalize_tip_detection_mode(mode):
+    mode_norm = str(mode or "classical").strip().lower().replace("-", "_").replace(" ", "_")
+    if mode_norm in ("", "default", "standard", "classical", "skeleton", "cnn"):
+        return "classical"
+    if mode_norm in ("red", "red_dot", "red_marker", "red_centroid", "marker"):
+        return "red_dot"
+    if mode_norm in ("auto_red", "auto_red_dot", "red_dot_auto"):
+        return "auto_red_dot"
+    return "classical"
+
+
 def _select_tip_candidate(coarse_tip_yx, refined_tip_yx, tip_dbg, mode="auto"):
     dbg = dict(tip_dbg) if isinstance(tip_dbg, dict) else {}
 
@@ -1329,6 +1340,7 @@ class CTR_Shadow_Calibration:
         self.ruler_calib_meta = None
         self.tip_refine_debug_records = {}
         self.tip_refine_mode = "coarse"
+        self.tip_detection_mode = "classical"
         self.tip_parallel_section_near_r = 0.75
         self.tip_parallel_section_far_r = 5.0
         self.tip_parallel_scan_half_r = 2.5
@@ -1336,6 +1348,15 @@ class CTR_Shadow_Calibration:
         self.tip_parallel_cross_step_px = 0.5
         self.tip_parallel_ray_step_px = 0.5
         self.tip_parallel_ray_max_len_r = 10.0
+        self.red_tip_hue1_min = 0
+        self.red_tip_hue1_max = 12
+        self.red_tip_hue2_min = 170
+        self.red_tip_hue2_max = 179
+        self.red_tip_sat_min = 80
+        self.red_tip_val_min = 40
+        self.red_tip_min_area_px = 8
+        self.red_tip_morph_kernel = 3
+        self.c90_y_compensation_from_planar_pchip = False
         self.tip_refiner_model_path = None
         self.tip_refiner_model = None
         self.tip_refiner_device = None
@@ -2403,6 +2424,80 @@ class CTR_Shadow_Calibration:
         patch[dst_y0:dst_y1, dst_x0:dst_x1] = gray_image[src_y0:src_y1, src_x0:src_x1]
         return patch, x0, y0
 
+    def detect_red_tip_marker(self, bgr_image, crop_origin_xy=(0, 0)):
+        dbg = {
+            "found": False,
+            "detector": "red_dot_centroid",
+            "crop_origin_xy": [float(crop_origin_xy[0]), float(crop_origin_xy[1])],
+        }
+
+        if bgr_image is None or getattr(bgr_image, "size", 0) == 0:
+            dbg["reason"] = "empty_image"
+            return dbg
+
+        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+        lower1 = np.array(
+            [int(self.red_tip_hue1_min), int(self.red_tip_sat_min), int(self.red_tip_val_min)],
+            dtype=np.uint8,
+        )
+        upper1 = np.array([int(self.red_tip_hue1_max), 255, 255], dtype=np.uint8)
+        lower2 = np.array(
+            [int(self.red_tip_hue2_min), int(self.red_tip_sat_min), int(self.red_tip_val_min)],
+            dtype=np.uint8,
+        )
+        upper2 = np.array([int(self.red_tip_hue2_max), 255, 255], dtype=np.uint8)
+
+        mask = cv2.bitwise_or(
+            cv2.inRange(hsv, lower1, upper1),
+            cv2.inRange(hsv, lower2, upper2),
+        )
+        dbg["raw_red_pixel_count"] = int(np.count_nonzero(mask))
+
+        kernel_size = int(max(1, getattr(self, "red_tip_morph_kernel", 3)))
+        if kernel_size > 1:
+            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        dbg["filtered_red_pixel_count"] = int(np.count_nonzero(mask))
+
+        if dbg["filtered_red_pixel_count"] <= 0:
+            dbg["reason"] = "no_red_pixels_after_threshold"
+            return dbg
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num_labels <= 1:
+            dbg["reason"] = "no_connected_red_component"
+            return dbg
+
+        component_areas = stats[1:, cv2.CC_STAT_AREA].astype(int)
+        best_component = int(np.argmax(component_areas)) + 1
+        best_area = int(stats[best_component, cv2.CC_STAT_AREA])
+        dbg["largest_component_area_px"] = best_area
+
+        if best_area < int(max(1, getattr(self, "red_tip_min_area_px", 8))):
+            dbg["reason"] = "largest_component_below_min_area"
+            return dbg
+
+        centroid_x_local, centroid_y_local = centroids[best_component]
+        x0 = int(stats[best_component, cv2.CC_STAT_LEFT])
+        y0 = int(stats[best_component, cv2.CC_STAT_TOP])
+        bw = int(stats[best_component, cv2.CC_STAT_WIDTH])
+        bh = int(stats[best_component, cv2.CC_STAT_HEIGHT])
+        crop_x0, crop_y0 = float(crop_origin_xy[0]), float(crop_origin_xy[1])
+
+        dbg.update(
+            {
+                "found": True,
+                "reason": "largest_red_component_centroid",
+                "x_local": float(centroid_x_local),
+                "y_local": float(centroid_y_local),
+                "x_abs": float(crop_x0 + centroid_x_local),
+                "y_abs": float(crop_y0 + centroid_y_local),
+                "bbox_local_xyxy": [x0, y0, x0 + bw, y0 + bh],
+            }
+        )
+        return dbg
+
     def predict_tip_refiner_abs(self, gray_image, anchor_x_abs, anchor_y_abs):
         if not self.tip_refiner_enabled or self.tip_refiner_model is None:
             return None
@@ -2988,7 +3083,11 @@ class CTR_Shadow_Calibration:
                   capture_dwell_s=0.5,
                   combine_redundant_passes=True,
                   redundant_pass_combination="average",
-                  save_pass_index_in_filename=True):
+                  save_pass_index_in_filename=True,
+                  orientation_ids=None,
+                  append_raw_data=False,
+                  stage_y_offset_models_by_phase=None,
+                  stage_y_offset_orientation_ids=None):
         """
         Probes at 5 XYZ locations and for each location:
         - Capture pull images while moving B from b_start toward the pulled state.
@@ -3040,7 +3139,7 @@ class CTR_Shadow_Calibration:
 
         if not os.path.isdir("raw_image_data_folder"):
             os.mkdir("raw_image_data_folder")
-        else:
+        elif not bool(append_raw_data):
             print("You already have raw image data for this project. This will overwrite the current data.")
 
         os.chdir("raw_image_data_folder")
@@ -3126,6 +3225,32 @@ class CTR_Shadow_Calibration:
                     phases.append(("release", cycle_idx))
             return phases
 
+        def evaluate_stage_y_offset_mm(orientation_id: int, motion_phase: str, b_val: float):
+            if stage_y_offset_models_by_phase is None:
+                return 0.0
+            allowed_orientation_ids = (
+                {2}
+                if stage_y_offset_orientation_ids is None
+                else {int(v) for v in stage_y_offset_orientation_ids}
+            )
+            if int(orientation_id) not in allowed_orientation_ids:
+                return 0.0
+            phase_key = str(motion_phase).strip().lower()
+            model = stage_y_offset_models_by_phase.get(phase_key)
+            if model is None and phase_key == "release":
+                model = stage_y_offset_models_by_phase.get("pull")
+            if model is None:
+                return 0.0
+            try:
+                pred = self._evaluate_curve_model(model, np.asarray([float(b_val)], dtype=float))
+                pred_arr = np.asarray(pred, dtype=float).reshape(-1)
+                if pred_arr.size == 0 or not np.isfinite(pred_arr[0]):
+                    return 0.0
+                return float(pred_arr[0])
+            except Exception as exc:
+                print(f" Warning: failed to evaluate stage-Y offset model at B={b_val:.3f} ({exc}); using 0.")
+                return 0.0
+
         def run_motion_pass(orientation_id: int, x: float, y: float, z: float, probe_idx: int,
                             motion_phase: str, pass_idx: int, b_values, label_total: int):
             nonlocal pos, total_images
@@ -3139,9 +3264,20 @@ class CTR_Shadow_Calibration:
                     f" {motion_phase.capitalize()} step {step_idx:02d}/{len(b_values) - 1:02d}: "
                     f"{robot_rear_axis_name}={b_val:.2f}"
                 )
-                pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_val})
+                y_offset_mm = -evaluate_stage_y_offset_mm(orientation_id, motion_phase, b_val)
+                y_target = float(y) + float(y_offset_mm)
+                if not np.isclose(y_offset_mm, 0.0, atol=1e-12):
+                    print(f"  Applying stage-Y compensation: {y_offset_mm:+.3f} mm -> {robot_stage_y_axis_name}={y_target:.3f}")
+                pos = move_abs(
+                    0.3 * jogging_feedrate,
+                    pos,
+                    **{
+                        robot_rear_axis_name: b_val,
+                        robot_stage_y_axis_name: y_target,
+                    }
+                )
                 wait_for_duet_motion_complete(extra_settle=capture_dwell_s)
-                capture_and_save(orientation_id, x, y, z, b_val, probe_idx, step_idx, motion_phase, pass_idx=pass_idx)
+                capture_and_save(orientation_id, x, y_target, z, b_val, probe_idx, step_idx, motion_phase, pass_idx=pass_idx)
                 total_images += 1
 
         def run_pull_release_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float,
@@ -3173,6 +3309,12 @@ class CTR_Shadow_Calibration:
 
             if not enable_release_imaging:
                 pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            if stage_y_offset_models_by_phase is not None:
+                pos = move_abs(jogging_feedrate, pos, **{robot_stage_y_axis_name: y})
+
+        tip_detection_mode = _normalize_tip_detection_mode(getattr(self, "tip_detection_mode", "classical"))
+        use_red_dot_acquisition = tip_detection_mode in ("red_dot", "auto_red_dot")
+        orientation_ids = [0, 1, 2, 3] if orientation_ids is None else [int(v) for v in orientation_ids]
 
         pos = {
             robot_front_axis_name: 0.0,
@@ -3181,7 +3323,10 @@ class CTR_Shadow_Calibration:
             robot_rear_axis_name: 0.0,
         }
 
-        print("Starting probe sequence (4-orientation capture: 0/180/+90/-90)...")
+        if use_red_dot_acquisition:
+            print("Starting probe sequence (red-dot mode: 3-orientation capture 0/180/+90)...")
+        else:
+            print("Starting probe sequence (4-orientation capture: 0/180/+90/-90)...")
         print(f"Probe points (X,Y,Z): {probe_points}")
         print(f"Pull axis: {robot_rear_axis_name} | steps={b_steps} | step_size={b_step_size}mm | start={b_start}mm")
         print(f"Rotation axis: {robot_rotation_axis_name} | 180deg={robot_rotation_axis_180_deg} axis units")
@@ -3189,16 +3334,22 @@ class CTR_Shadow_Calibration:
         print(f"Redundant curl/uncurl cycles: {num_curl_uncurl_cycles}")
         print(f"Capture dwell after M400: {capture_dwell_s:.2f}s")
         print(f"Combine redundant passes: {combine_redundant_passes} ({redundant_pass_combination})")
+        print(f"Tip detection mode: {tip_detection_mode}")
+        print(f"Requested orientations: {orientation_ids}")
 
         print("\nMoving pull axis to start position...")
         pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-        offplane_step_fraction = 0.4
-        n_partial_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
-        print(
-            f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps "
-            f"({100.0 * offplane_step_fraction:.0f}%) due to tip detectability limits"
-        )
+        if not use_red_dot_acquisition:
+            offplane_step_fraction = 0.4
+            n_partial_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
+            print(
+                f"±90 acquisition truncated to first {n_partial_steps}/{b_steps} pull steps "
+                f"({100.0 * offplane_step_fraction:.0f}%) due to tip detectability limits"
+            )
+        else:
+            n_partial_steps = b_steps
+            print("Red-dot mode enabled: using one full +90 orientation pull/release and skipping -90.")
 
         total_images = 0
         for probe_idx, (x, y, z) in enumerate(probe_points, start=1):
@@ -3220,30 +3371,45 @@ class CTR_Shadow_Calibration:
             print(f" Setting {robot_rear_axis_name} to start ({b_start:.2f})...")
             pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
-            print(" Phase 1: orientation 0 (C = 0 deg)")
-            run_pull_release_sequence_for_orientation(0, x, y, z, probe_idx)
-
-            print(" Rotating to orientation 1 (C = 180 deg)...")
-            rotate_rel(robot_rotation_axis_name, robot_rotation_axis_180_deg)
-            print(" Phase 2: orientation 1 (C = 180 deg)")
-            run_pull_release_sequence_for_orientation(1, x, y, z, probe_idx)
-
-            print(" Rotating back to C = 0 deg...")
-            rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
-
             c_quarter = robot_rotation_axis_180_deg / 2.0
-            print(" Rotating to orientation 2 (C = +90 deg)...")
-            rotate_rel(robot_rotation_axis_name, +c_quarter)
-            print(" Phase 3: orientation 2 (C = +90 deg)")
-            run_pull_release_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+            if 0 in orientation_ids:
+                print(" Phase 1: orientation 0 (C = 0 deg)")
+                run_pull_release_sequence_for_orientation(0, x, y, z, probe_idx)
 
-            print(" Rotating to orientation 3 (C = -90 deg)...")
-            rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
-            print(" Phase 4: orientation 3 (C = -90 deg)")
-            run_pull_release_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+            if 1 in orientation_ids:
+                print(" Rotating to orientation 1 (C = 180 deg)...")
+                rotate_rel(robot_rotation_axis_name, robot_rotation_axis_180_deg)
+                print(" Phase 2: orientation 1 (C = 180 deg)")
+                run_pull_release_sequence_for_orientation(1, x, y, z, probe_idx)
+                print(" Rotating back to C = 0 deg...")
+                rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
 
-            print(" Rotating back to C = 0 deg...")
-            rotate_rel(robot_rotation_axis_name, +c_quarter)
+            if 2 in orientation_ids:
+                print(" Rotating to orientation 2 (C = +90 deg)...")
+                rotate_rel(robot_rotation_axis_name, +c_quarter)
+                print(" Phase 3: orientation 2 (C = +90 deg)")
+                run_pull_release_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+                if 3 not in orientation_ids:
+                    print(" Rotating back to C = 0 deg...")
+                    rotate_rel(robot_rotation_axis_name, -c_quarter)
+
+            if 3 in orientation_ids:
+                if 2 in orientation_ids:
+                    if use_red_dot_acquisition:
+                        print(" Rotating back to C = 0 deg...")
+                        rotate_rel(robot_rotation_axis_name, -c_quarter)
+                        print(" Rotating to orientation 3 (C = -90 deg)...")
+                        rotate_rel(robot_rotation_axis_name, -c_quarter)
+                    else:
+                        print(" Rotating to orientation 3 (C = -90 deg)...")
+                        rotate_rel(robot_rotation_axis_name, -robot_rotation_axis_180_deg)
+                else:
+                    print(" Rotating to orientation 3 (C = -90 deg)...")
+                    rotate_rel(robot_rotation_axis_name, -c_quarter)
+                print(" Phase 4: orientation 3 (C = -90 deg)")
+                run_pull_release_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+                print(" Rotating back to C = 0 deg...")
+                rotate_rel(robot_rotation_axis_name, +c_quarter)
 
         print("\n" + "=" * 70)
         print("ALL PROBES FINISHED!")
@@ -3430,6 +3596,7 @@ class CTR_Shadow_Calibration:
             "orientation": int(orientation),
             "ntnl_pos": ntnl_pos,
             "ss_pos": ss_pos,
+            "stage_y": None if "Y" not in values and "stageY" not in values else float(values.get("stageY", values.get("Y"))),
             "motion_phase": motion_phase,
             "motion_phase_code": 0 if motion_phase == "pull" else 1,
             "pass_idx": int(pass_idx),
@@ -3442,8 +3609,8 @@ class CTR_Shadow_Calibration:
 
         # Fixed path handling for Mac
         raw_data_folder = os.path.join(self.calibration_data_folder, "raw_image_data_folder")
-        tip_locations_array_coarse = np.zeros((len(os.listdir(raw_data_folder)), 8))
-        tip_locations_array_fine = np.zeros((len(os.listdir(raw_data_folder)), 8))
+        tip_locations_array_coarse = np.zeros((len(os.listdir(raw_data_folder)), 9))
+        tip_locations_array_fine = np.zeros((len(os.listdir(raw_data_folder)), 9))
         i = 0
 
         # Fixed path handling for Mac
@@ -3527,6 +3694,7 @@ class CTR_Shadow_Calibration:
             tip_dbg=tip_refine_dbg,
             mode=self.tip_refine_mode,
         )
+        tip_detection_mode = _normalize_tip_detection_mode(getattr(self, "tip_detection_mode", "classical"))
 
         cnn_tip_abs = None
         cnn_tip_dbg = None
@@ -3545,7 +3713,7 @@ class CTR_Shadow_Calibration:
                 )
                 if cnn_tip_dbg is not None:
                     cnn_tip_abs = (float(cnn_tip_dbg["y_abs"]), float(cnn_tip_dbg["x_abs"]))
-                    if self.tip_refiner_use_as_selected:
+                    if self.tip_refiner_use_as_selected and tip_detection_mode == "classical":
                         yy_selected = float(cnn_tip_dbg["y_abs"] - crop_y_min_img)
                         xx_selected = float(cnn_tip_dbg["x_abs"] - crop_x_min_img)
                         tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
@@ -3554,9 +3722,28 @@ class CTR_Shadow_Calibration:
             except Exception as exc:
                 cnn_tip_dbg = {"error": str(exc)}
 
+        red_tip_abs = None
+        red_tip_dbg = None
+        if tip_detection_mode in ("red_dot", "auto_red_dot"):
+            red_tip_dbg = self.detect_red_tip_marker(
+                cropped_image,
+                crop_origin_xy=(crop_x_min_img, crop_y_min_img),
+            )
+            if red_tip_dbg.get("found"):
+                red_tip_abs = (float(red_tip_dbg["y_abs"]), float(red_tip_dbg["x_abs"]))
+                yy_selected = float(red_tip_dbg["y_local"])
+                xx_selected = float(red_tip_dbg["x_local"])
+                tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                tip_select_dbg["selected_tip_source"] = "red_dot"
+                tip_select_dbg["selected_tip_reason"] = "red_dot_centroid"
+            else:
+                tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                tip_select_dbg["red_dot_fallback_reason"] = red_tip_dbg.get("reason", "red_dot_not_found")
+
         orientation = int(file_ctx['orientation'])
         ntnl_pos = float(file_ctx['ntnl_pos'])
         ss_pos = float(file_ctx['ss_pos'])
+        stage_y_cmd = float(file_ctx['stage_y']) if file_ctx.get('stage_y') is not None else float("nan")
         motion_phase_code = float(file_ctx['motion_phase_code'])
         pass_idx = float(file_ctx.get('pass_idx', 1))
 
@@ -3570,6 +3757,7 @@ class CTR_Shadow_Calibration:
                 float(tip_angle_deg),
                 motion_phase_code,
                 pass_idx,
+                stage_y_cmd,
             ]
         )
 
@@ -3730,6 +3918,14 @@ class CTR_Shadow_Calibration:
                 marker="x",
                 s=80,
             )
+        if red_tip_abs is not None:
+            axs[1, 1].scatter(
+                [red_tip_abs[1] - crop_x_min_img - crop_x_min],
+                [red_tip_abs[0] - crop_y_min_img - crop_y_min],
+                c="#00ff66",
+                marker="+",
+                s=90,
+            )
 
         # if p_1 is not None and x_points.size > 0:
         # axs[1, 1].scatter(np.unique(x_points), p_1(np.unique(x_points)))
@@ -3749,6 +3945,7 @@ class CTR_Shadow_Calibration:
                 float(tip_angle_deg),
                 motion_phase_code,
                 pass_idx,
+                stage_y_cmd,
             ]
         )
 
@@ -3763,6 +3960,7 @@ class CTR_Shadow_Calibration:
                     float(tip_angle_deg),
                     motion_phase_code,
                     pass_idx,
+                    stage_y_cmd,
                 ],
                 dtype=float,
             )
@@ -3796,6 +3994,10 @@ class CTR_Shadow_Calibration:
             dbg_local["cnn_tip_refiner"] = cnn_tip_dbg
             dbg_local["cnn_tip_abs_yx"] = None if cnn_tip_abs is None else [float(cnn_tip_abs[0]), float(cnn_tip_abs[1])]
             dbg_local["cnn_anchor_name"] = self.tip_refiner_anchor_name
+        if red_tip_dbg is not None:
+            dbg_local["red_dot_tip_detector"] = red_tip_dbg
+            dbg_local["red_dot_tip_xy"] = None if red_tip_abs is None else [float(red_tip_abs[1]), float(red_tip_abs[0])]
+        dbg_local["tip_detection_mode"] = tip_detection_mode
         self.tip_refine_debug_records[image_file_name] = dbg_local
 
         _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
@@ -3933,9 +4135,9 @@ class CTR_Shadow_Calibration:
             return
 
         num_images = len(image_files)
-        self.tip_locations_array_coarse = np.zeros((num_images, 8))
-        self.tip_locations_array_selected = np.zeros((num_images, 8))
-        self.tip_locations_array_cnn = np.full((num_images, 8), np.nan)
+        self.tip_locations_array_coarse = np.zeros((num_images, 9))
+        self.tip_locations_array_selected = np.zeros((num_images, 9))
+        self.tip_locations_array_cnn = np.full((num_images, 9), np.nan)
         n_skeleton_points = int(max(2, getattr(self, "skeleton_tracking_point_count", 20)))
         self.skeleton_points_array_selected_xy = np.full((num_images, n_skeleton_points, 2), np.nan, dtype=float)
 
@@ -3998,7 +4200,7 @@ class CTR_Shadow_Calibration:
                 print(f"✓ Saved CNN tip locations to: {cnn_file}")
 
             try:
-                columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code', 'pass_idx']
+                columns = ['tip_row', 'tip_column', 'orientation', 'ss_pos', 'ntnl_pos', 'tip_angle_deg', 'motion_phase_code', 'pass_idx', 'stage_y_cmd']
                 df_coarse = pd.DataFrame(self.tip_locations_array_coarse, columns=columns)
                 df_coarse['image_file'] = image_files
                 coarse_csv = os.path.join(processed_folder, "tip_locations_coarse.csv")
@@ -4343,15 +4545,16 @@ class CTR_Shadow_Calibration:
         if fit_family not in {"pchip", "linear", "cubic"}:
             raise ValueError("fit_family must be 'pchip', 'linear', or 'cubic'.")
         key_map = {
-            "pchip": {"r": "r", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y_pchip"},
-            "linear": {"r": "r", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y_linear"},
-            "cubic": {"r": "r_cubic", "z": "z_cubic", "tip_angle": "tip_angle_cubic", "offplane_y": "offplane_y_cubic"},
+            "pchip": {"r": "r_pchip", "y_offset": "y_offset_pchip", "z": "z_pchip", "tip_angle": "tip_angle_pchip", "offplane_y": "offplane_y_pchip"},
+            "linear": {"r": "r", "y_offset": "y_offset_pchip", "z": "z", "tip_angle": "tip_angle", "offplane_y": "offplane_y_linear"},
+            "cubic": {"r": "r_cubic", "y_offset": "y_offset_pchip", "z": "z_cubic", "tip_angle": "tip_angle_cubic", "offplane_y": "offplane_y_cubic"},
         }
         if dataset_key not in fit_models_by_phase:
             raise KeyError(f"Unknown fit model group '{dataset_key}'. Available: {list(fit_models_by_phase.keys())}")
         return {
             quantity: (
                 fit_models_by_phase[dataset_key].get(model_key)
+                or (fit_models_by_phase[dataset_key].get("r_pchip") if quantity == "y_offset" else None)
                 or (fit_models_by_phase[dataset_key].get("offplane_y") if quantity == "offplane_y" else None)
             )
             for quantity, model_key in key_map[fit_family].items()
@@ -5143,7 +5346,7 @@ def skeleton_points(b_pull_mm, phase=None):
 
         return param_path, py_path, stl_path, gcode_json_path
 
-    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=1.51, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="linear"):
+    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=1.51, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="pchip"):
         """Postprocess calibration data and export separate pull/release fits."""
         if not hasattr(self, 'tip_locations_array_selected'):
             print("Tip location data not found in memory, attempting to load from saved files...")
@@ -5176,6 +5379,8 @@ def skeleton_points(b_pull_mm, phase=None):
         try:
             print("\n" + "=" * 50)
             print("Starting calibration data postprocessing...")
+            if bool(getattr(self, "c90_y_compensation_from_planar_pchip", False)):
+                print("C90 stage-Y compensation was used during acquisition; off-plane processing uses the measured image displacement directly.")
 
             arr = np.asarray(self.tip_locations_array_selected, dtype=float)
             if arr.ndim != 2 or arr.shape[1] < 5:
@@ -5184,6 +5389,7 @@ def skeleton_points(b_pull_mm, phase=None):
             has_tip_angle = arr.shape[1] >= 6
             has_phase = arr.shape[1] >= 7
             has_pass_idx = arr.shape[1] >= 8
+            has_stage_y_cmd = arr.shape[1] >= 9
             if not has_phase:
                 arr = np.column_stack([arr, np.zeros((arr.shape[0],), dtype=float)])
                 print("Motion phase column not found; assuming all images are pull-phase.")
@@ -5196,6 +5402,7 @@ def skeleton_points(b_pull_mm, phase=None):
             ANGLE_COL = 5
             PHASE_COL = 6
             PASS_COL = 7
+            STAGEY_COL = 8 if has_stage_y_cmd else None
 
             has_calibrated_axes = (
                 self.board_homography_mm_from_px is not None
@@ -5214,6 +5421,7 @@ def skeleton_points(b_pull_mm, phase=None):
             # fitting, or all exported mm-valued fits end up 2x too small.
             board_measurement_scale = 1.0
             tip_mm = arr.copy()
+            tip_mm_offplane_proxy = arr.copy()
             origin_px = None
 
             if has_calibrated_axes:
@@ -5243,6 +5451,8 @@ def skeleton_points(b_pull_mm, phase=None):
 
             tip_mm[:, 0] = u_mm
             tip_mm[:, 1] = z_mm
+            tip_mm_offplane_proxy[:, 0] = arr[:, 1].astype(float) * pixel_to_mm_scale
+            tip_mm_offplane_proxy[:, 1] = z_mm
             pd.DataFrame(tip_mm).to_excel('tip_locations_selected_mm.xlsx', index=False, header=False)
             print(f"Physical conversion mode: {conversion_mode} | representative mm/px={pixel_to_mm_scale:.6f}")
 
@@ -5282,9 +5492,15 @@ def skeleton_points(b_pull_mm, phase=None):
                             skeleton_points_mm[:, :, 1] = -skeleton_px[:, :, 1] / float(width_in_pixels) * float(width_in_mm)
 
             valid_rows = tip_mm[np.all(np.isfinite(tip_mm[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL, PASS_COL]]), axis=1)].copy()
+            valid_rows_offplane_proxy = tip_mm_offplane_proxy[
+                np.all(np.isfinite(tip_mm_offplane_proxy[:, [0, 1, ORI_COL, B_PULL_COL, PHASE_COL, PASS_COL]]), axis=1)
+            ].copy()
             if valid_rows.size == 0:
                 raise ValueError("No valid calibration rows after filtering NaNs.")
-            print("Applying orientation processing (two-capture averaging) for rotation/runout compensation...")
+            if valid_rows_offplane_proxy.size == 0:
+                raise ValueError("No valid off-plane proxy rows after filtering NaNs.")
+            b_ref = 0.0
+            print("Applying orientation processing for rotation/runout compensation...")
 
             def circular_mean_deg(a):
                 a = np.asarray(a, dtype=float)
@@ -5383,12 +5599,51 @@ def skeleton_points(b_pull_mm, phase=None):
                     'avg_angle': None if avg_angle is None else avg_angle.astype(float),
                 }
 
+            def process_single_offplane_orientation(
+                arr_single,
+                *,
+                reference_mirror_line,
+                pair_name,
+                orientation_label,
+                primary_sign=1.0,
+            ):
+                arr_single = collapse_by_bpull(arr_single)
+                if arr_single.size == 0:
+                    return None
+
+                common_b = arr_single[:, B_PULL_COL].astype(float)
+                primary_raw = np.asarray(arr_single[:, 0], dtype=float)
+                secondary_raw = np.asarray(arr_single[:, 1], dtype=float)
+                mirror_line = float(reference_mirror_line)
+                y_raw = mirror_line + (float(primary_sign) * (primary_raw - mirror_line))
+
+                return {
+                    'pair_name': str(pair_name),
+                    'common_b': common_b,
+                    'mirror_line': mirror_line,
+                    'primary_sign': float(primary_sign),
+                    'orientation_label': str(orientation_label),
+                    'single_collapsed': arr_single,
+                    'avg_primary': y_raw.astype(float),
+                    'avg_secondary': secondary_raw.astype(float),
+                }
+
+            def nearest_b_index(b_vals, b_target):
+                b_arr = np.asarray(b_vals, dtype=float).ravel()
+                if b_arr.size == 0:
+                    return None
+                return int(np.argmin(np.abs(b_arr - float(b_target))))
+
             phase_name_map = {0: "pull", 1: "release"}
 
             def build_phase_dataset(phase_code, pass_idx=1):
                 phase_rows = valid_rows[
                     np.isclose(valid_rows[:, PHASE_COL], phase_code)
                     & np.isclose(valid_rows[:, PASS_COL], pass_idx)
+                ]
+                phase_rows_offplane = valid_rows_offplane_proxy[
+                    np.isclose(valid_rows_offplane_proxy[:, PHASE_COL], phase_code)
+                    & np.isclose(valid_rows_offplane_proxy[:, PASS_COL], pass_idx)
                 ]
                 if phase_rows.size == 0:
                     return None
@@ -5416,8 +5671,30 @@ def skeleton_points(b_pull_mm, phase=None):
                 avg_ang = planar_pair['avg_angle']
                 if avg_ang is None:
                     avg_ang = np.full((common_b.shape[0],), np.nan, dtype=float)
+                planar_pair_offplane_proxy = process_orientation_pair(
+                    phase_rows_offplane[np.isclose(phase_rows_offplane[:, ORI_COL], 0)],
+                    phase_rows_offplane[np.isclose(phase_rows_offplane[:, ORI_COL], 1)],
+                    primary_col=0,
+                    secondary_col=1,
+                    angle_col=None,
+                    primary_mirror_sign=-1.0,
+                    angle_mirror_sign=-1.0,
+                    pair_name='C0_C180_offplane_proxy',
+                )
                 zero_mask = np.isclose(common_b, 0.0, atol=1e-9)
                 zero_idx = int(np.where(zero_mask)[0][0]) if np.any(zero_mask) else int(np.argmin(np.abs(common_b)))
+                x_ref_mirror_line_offplane = None
+                if planar_pair_offplane_proxy is not None:
+                    proxy_common_b = np.asarray(planar_pair_offplane_proxy['common_b'], dtype=float)
+                    proxy_zero_idx = nearest_b_index(proxy_common_b, b_ref)
+                    if proxy_zero_idx is not None:
+                        proxy_o0 = np.asarray(planar_pair_offplane_proxy['a_aligned'], dtype=float)
+                        proxy_o1 = np.asarray(planar_pair_offplane_proxy['b_aligned'], dtype=float)
+                        x_ref_mirror_line_offplane = 0.5 * (
+                            float(proxy_o0[proxy_zero_idx, 0]) + float(proxy_o1[proxy_zero_idx, 0])
+                        )
+                if x_ref_mirror_line_offplane is None:
+                    x_ref_mirror_line_offplane = float(x_ref_mirror_line)
                 x0_ref = float(x_ref_mirror_line)
                 z0_ref = float(avg_z_raw[zero_idx])
                 x_avg = avg_x_raw - x0_ref
@@ -5474,9 +5751,11 @@ def skeleton_points(b_pull_mm, phase=None):
                         'avg_z': avg_z_raw.astype(float),
                     },
                 }
+                pos90_rows = phase_rows_offplane[np.isclose(phase_rows_offplane[:, ORI_COL], 2)]
+                neg90_rows = phase_rows_offplane[np.isclose(phase_rows_offplane[:, ORI_COL], 3)]
                 offplane_pair = process_orientation_pair(
-                    phase_rows[np.isclose(phase_rows[:, ORI_COL], 2)],
-                    phase_rows[np.isclose(phase_rows[:, ORI_COL], 3)],
+                    pos90_rows,
+                    neg90_rows,
                     primary_col=0,
                     secondary_col=1,
                     angle_col=None,
@@ -5484,40 +5763,80 @@ def skeleton_points(b_pull_mm, phase=None):
                     angle_mirror_sign=-1.0,
                     pair_name='C90_C-90',
                 )
+                if offplane_pair is None:
+                    if pos90_rows.size > 0:
+                        offplane_pair = process_single_offplane_orientation(
+                            pos90_rows,
+                            reference_mirror_line=x_ref_mirror_line_offplane,
+                            pair_name='C90_single',
+                            orientation_label='C90',
+                            primary_sign=1.0,
+                        )
+                    elif neg90_rows.size > 0:
+                        offplane_pair = process_single_offplane_orientation(
+                            neg90_rows,
+                            reference_mirror_line=x_ref_mirror_line_offplane,
+                            pair_name='C-90_single',
+                            orientation_label='C-90',
+                            primary_sign=-1.0,
+                        )
                 if offplane_pair is not None:
-                    o2 = offplane_pair['a_collapsed']
-                    o3 = offplane_pair['b_collapsed']
-                    o2p = offplane_pair['a_aligned']
-                    o3p = offplane_pair['b_aligned']
                     common_b_off = offplane_pair['common_b']
                     y_ref_offplane = float(offplane_pair['mirror_line'])
-                    o3_y_mirrored = offplane_pair['b_primary_mirrored']
                     y_off_raw = offplane_pair['avg_primary']
                     dataset['offplane_b'] = common_b_off.astype(float)
                     dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
                     dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
-                    dataset['orientation_processing_offplane'] = {
-                        'pair_name': offplane_pair['pair_name'],
-                        'common_b': common_b_off.astype(float),
-                        'mirror_line_mm': y_ref_offplane,
-                        'orientation_pos90_y_mm': o2p[:, 0].astype(float),
-                        'orientation_pos90_z_mm': o2p[:, 1].astype(float),
-                        'orientation_neg90_y_mirrored_mm': o3_y_mirrored.astype(float),
-                        'orientation_neg90_z_mm': o3p[:, 1].astype(float),
-                        'avg_y_mm': y_off_raw.astype(float),
-                    }
-                    dataset['raw_offplane_trajectories'] = {
-                        'C90': {
-                            'b': o2[:, B_PULL_COL].astype(float).tolist(),
-                            'y_proxy': o2[:, 0].astype(float).tolist(),
-                            'z': o2[:, 1].astype(float).tolist(),
-                        },
-                        'C-90': {
-                            'b': o3[:, B_PULL_COL].astype(float).tolist(),
-                            'y_proxy': o3[:, 0].astype(float).tolist(),
-                            'z': o3[:, 1].astype(float).tolist(),
-                        },
-                    }
+                    if 'single_collapsed' in offplane_pair:
+                        osingle = offplane_pair['single_collapsed']
+                        orientation_label = str(offplane_pair.get('orientation_label', 'C90'))
+                        dataset['orientation_processing_offplane'] = {
+                            'pair_name': offplane_pair['pair_name'],
+                            'common_b': common_b_off.astype(float),
+                            'mirror_line_mm': y_ref_offplane,
+                            'source_orientation': orientation_label,
+                            'source_y_mm': osingle[:, 0].astype(float),
+                            'source_z_mm': osingle[:, 1].astype(float),
+                            'avg_y_mm': y_off_raw.astype(float),
+                        }
+                        dataset['raw_offplane_trajectories'] = {
+                            orientation_label: {
+                                'b': osingle[:, B_PULL_COL].astype(float).tolist(),
+                                'y_proxy': osingle[:, 0].astype(float).tolist(),
+                                'y_disp': (y_off_raw - y_ref_offplane).astype(float).tolist(),
+                                'z': osingle[:, 1].astype(float).tolist(),
+                            },
+                        }
+                    else:
+                        o2 = offplane_pair['a_collapsed']
+                        o3 = offplane_pair['b_collapsed']
+                        o2p = offplane_pair['a_aligned']
+                        o3p = offplane_pair['b_aligned']
+                        o3_y_mirrored = offplane_pair['b_primary_mirrored']
+                        dataset['orientation_processing_offplane'] = {
+                            'pair_name': offplane_pair['pair_name'],
+                            'common_b': common_b_off.astype(float),
+                            'mirror_line_mm': y_ref_offplane,
+                            'orientation_pos90_y_mm': o2p[:, 0].astype(float),
+                            'orientation_pos90_z_mm': o2p[:, 1].astype(float),
+                            'orientation_neg90_y_mirrored_mm': o3_y_mirrored.astype(float),
+                            'orientation_neg90_z_mm': o3p[:, 1].astype(float),
+                            'avg_y_mm': y_off_raw.astype(float),
+                        }
+                        dataset['raw_offplane_trajectories'] = {
+                            'C90': {
+                                'b': o2[:, B_PULL_COL].astype(float).tolist(),
+                                'y_proxy': o2[:, 0].astype(float).tolist(),
+                                'y_disp': (o2[:, 0] - y_ref_offplane).astype(float).tolist(),
+                                'z': o2[:, 1].astype(float).tolist(),
+                            },
+                            'C-90': {
+                                'b': o3[:, B_PULL_COL].astype(float).tolist(),
+                                'y_proxy': o3[:, 0].astype(float).tolist(),
+                                'y_disp': (o3_y_mirrored - y_ref_offplane).astype(float).tolist(),
+                                'z': o3[:, 1].astype(float).tolist(),
+                            },
+                        }
                 else:
                     dataset['offplane_b'] = None
                     dataset['offplane_y'] = None
@@ -5749,12 +6068,15 @@ def skeleton_points(b_pull_mm, phase=None):
                 tip_ang = ds['tip_angle']
                 r_model = self._fit_curve_model(b, r_coords, fit_model, f"r_{phase_name}")
                 z_model = self._fit_curve_model(b, z_coords, fit_model, f"z_{phase_name}")
+                r_pchip_model = self._fit_curve_model(b, r_coords, 'pchip', f"r_{phase_name}_pchip")
                 r_cubic_model = self._fit_curve_model(b, r_coords, 'cubic', f"r_{phase_name}_avg_cubic")
                 z_cubic_model = self._fit_curve_model(b, z_coords, 'cubic', f"z_{phase_name}_avg_cubic")
                 if r_model is None or z_model is None:
                     raise ValueError(f"Insufficient points for {phase_name} planar fit.")
                 r_pred = self._evaluate_curve_model(r_model, b)
                 z_pred = self._evaluate_curve_model(z_model, b)
+                r_pchip_pred = None if r_pchip_model is None else self._evaluate_curve_model(r_pchip_model, b)
+                r_pchip_r2 = None if r_pchip_pred is None else r2_score_safe(r_coords, r_pchip_pred)
                 angle_model = None
                 angle_pred = None
                 angle_r2 = None
@@ -5773,8 +6095,11 @@ def skeleton_points(b_pull_mm, phase=None):
                 off_plot_b = None
                 off_plot_pred = None
                 off_linear_model = None
+                off_linear_r2 = None
                 off_cubic_model = None
+                off_cubic_r2 = None
                 off_pchip_model = None
+                off_pchip_r2 = None
                 if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
                     off_b = ds['offplane_b']
                     off_y = ds['offplane_y']
@@ -5783,6 +6108,21 @@ def skeleton_points(b_pull_mm, phase=None):
                         off_pchip_model = self._fit_curve_model(off_b, off_y, 'pchip', f"offplane_y_{phase_name}_pchip")
                     if off_b.size >= 4:
                         off_cubic_model = self._fit_curve_model(off_b, off_y, 'cubic', f"offplane_y_{phase_name}_cubic")
+                    if off_linear_model is not None:
+                        off_linear_r2 = r2_score_safe(
+                            off_y,
+                            self._evaluate_curve_model(off_linear_model, off_b),
+                        )
+                    if off_cubic_model is not None:
+                        off_cubic_r2 = r2_score_safe(
+                            off_y,
+                            self._evaluate_curve_model(off_cubic_model, off_b),
+                        )
+                    if off_pchip_model is not None:
+                        off_pchip_r2 = r2_score_safe(
+                            off_y,
+                            self._evaluate_curve_model(off_pchip_model, off_b),
+                        )
                     off_model = {
                         'linear': off_linear_model,
                         'cubic': off_cubic_model,
@@ -5799,7 +6139,7 @@ def skeleton_points(b_pull_mm, phase=None):
                     'dataset': ds,
                     'r_model': r_model,
                     'z_model': z_model,
-                    'r_pchip_model': self._fit_curve_model(b, r_coords, 'pchip', f"r_{phase_name}_pchip"),
+                    'r_pchip_model': r_pchip_model,
                     'z_pchip_model': self._fit_curve_model(b, z_coords, 'pchip', f"z_{phase_name}_pchip"),
                     'r_cubic_model': r_cubic_model,
                     'z_cubic_model': z_cubic_model,
@@ -5811,12 +6151,17 @@ def skeleton_points(b_pull_mm, phase=None):
                     'offplane_y_cubic_model': off_cubic_model,
                     'offplane_y_pchip_model': off_pchip_model,
                     'r_pred': r_pred,
+                    'r_pchip_pred': r_pchip_pred,
                     'z_pred': z_pred,
                     'tip_angle_pred': angle_pred,
                     'r_r2': r2_score_safe(r_coords, r_pred),
+                    'r_pchip_r2': r_pchip_r2,
                     'z_r2': r2_score_safe(z_coords, z_pred),
                     'tip_angle_r2': angle_r2,
                     'offplane_y_r2': off_r2,
+                    'offplane_y_linear_r2': off_linear_r2,
+                    'offplane_y_cubic_r2': off_cubic_r2,
+                    'offplane_y_pchip_r2': off_pchip_r2,
                     'offplane_plot_b': off_plot_b,
                     'offplane_plot_pred': off_plot_pred,
                 }
@@ -5839,19 +6184,6 @@ def skeleton_points(b_pull_mm, phase=None):
                 [fr['z_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='z_avg',
             )
-            shared_offplane_y_model = self._average_polynomial_models(
-                [fr['offplane_y_model'] for fr in selected_phase_fit_results.values()],
-                value_name='offplane_y_avg',
-            )
-            shared_offplane_y_linear_model = self._average_polynomial_models(
-                [fr['offplane_y_linear_model'] for fr in selected_phase_fit_results.values()],
-                value_name='offplane_y_avg_linear',
-            )
-            shared_offplane_y_cubic_model = self._average_polynomial_models(
-                [fr['offplane_y_cubic_model'] for fr in selected_phase_fit_results.values()],
-                value_name='offplane_y_avg_cubic',
-            )
-
             def shared_pair_average_xy(x_key, y_key, circular=False):
                 fr_pull = selected_phase_fit_results.get('pull')
                 fr_release = selected_phase_fit_results.get('release')
@@ -5898,6 +6230,7 @@ def skeleton_points(b_pull_mm, phase=None):
             shared_offplane_y_r2 = None
             shared_offplane_y_linear_r2 = None
             shared_offplane_y_cubic_r2 = None
+            shared_offplane_y_pchip_r2 = None
 
             if shared_r_cubic_model is not None:
                 r_b_avg, r_y_avg = shared_pair_average_xy('common_b', 'r_coords', circular=False)
@@ -5968,29 +6301,49 @@ def skeleton_points(b_pull_mm, phase=None):
                         )
 
             off_b_avg, off_y_avg = shared_pair_average_xy('offplane_b', 'offplane_y', circular=False)
-            if shared_offplane_y_model is not None:
-                if off_b_avg is not None:
-                    shared_offplane_y_r2 = r2_score_safe(
-                        off_y_avg,
-                        self._evaluate_curve_model(shared_offplane_y_model, off_b_avg),
+            if off_b_avg is None:
+                off_b_all = []
+                off_y_all = []
+                for fr in fit_results.values():
+                    ds = fr['dataset']
+                    if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
+                        off_b_all.append(np.asarray(ds['offplane_b'], dtype=float))
+                        off_y_all.append(np.asarray(ds['offplane_y'], dtype=float))
+                if off_b_all:
+                    off_b_avg = np.concatenate(off_b_all)
+                    off_y_avg = np.concatenate(off_y_all)
+            shared_offplane_y_linear_model = None
+            shared_offplane_y_cubic_model = None
+            shared_offplane_y_pchip_model = None
+            shared_offplane_y_model = None
+            if off_b_avg is not None and off_y_avg is not None:
+                if np.asarray(off_b_avg, dtype=float).size >= 2:
+                    shared_offplane_y_linear_model = self._fit_curve_model(
+                        off_b_avg, off_y_avg, 'linear', 'offplane_y_avg_linear'
                     )
-                else:
-                    off_b_all = []
-                    off_y_all = []
-                    for fr in fit_results.values():
-                        ds = fr['dataset']
-                        if ds.get('offplane_b') is not None and ds.get('offplane_y') is not None:
-                            off_b_all.append(np.asarray(ds['offplane_b'], dtype=float))
-                            off_y_all.append(np.asarray(ds['offplane_y'], dtype=float))
-                    if off_b_all:
-                        off_b_all = np.concatenate(off_b_all)
-                        off_y_all = np.concatenate(off_y_all)
-                        shared_offplane_y_r2 = r2_score_safe(
-                            off_y_all,
-                            self._evaluate_curve_model(shared_offplane_y_model, off_b_all),
-                        )
-                        off_b_avg = off_b_all
-                        off_y_avg = off_y_all
+                    shared_offplane_y_pchip_model = self._fit_curve_model(
+                        off_b_avg, off_y_avg, 'pchip', 'offplane_y_avg_pchip'
+                    )
+                if np.asarray(off_b_avg, dtype=float).size >= 4:
+                    shared_offplane_y_cubic_model = self._fit_curve_model(
+                        off_b_avg, off_y_avg, 'cubic', 'offplane_y_avg_cubic'
+                    )
+                shared_offplane_y_model = {
+                    'linear': shared_offplane_y_linear_model,
+                    'cubic': shared_offplane_y_cubic_model,
+                    'pchip': shared_offplane_y_pchip_model,
+                }.get(offplane_fit_model)
+                if shared_offplane_y_model is None:
+                    shared_offplane_y_model = (
+                        shared_offplane_y_pchip_model
+                        or shared_offplane_y_cubic_model
+                        or shared_offplane_y_linear_model
+                    )
+            if shared_offplane_y_model is not None and off_b_avg is not None:
+                shared_offplane_y_r2 = r2_score_safe(
+                    off_y_avg,
+                    self._evaluate_curve_model(shared_offplane_y_model, off_b_avg),
+                )
             if shared_offplane_y_linear_model is not None and off_b_avg is not None:
                 shared_offplane_y_linear_r2 = r2_score_safe(
                     off_y_avg,
@@ -6000,6 +6353,11 @@ def skeleton_points(b_pull_mm, phase=None):
                 shared_offplane_y_cubic_r2 = r2_score_safe(
                     off_y_avg,
                     self._evaluate_curve_model(shared_offplane_y_cubic_model, off_b_avg),
+                )
+            if shared_offplane_y_pchip_model is not None and off_b_avg is not None:
+                shared_offplane_y_pchip_r2 = r2_score_safe(
+                    off_y_avg,
+                    self._evaluate_curve_model(shared_offplane_y_pchip_model, off_b_avg),
                 )
 
             shared_offplane_plot_model = (
@@ -6048,7 +6406,10 @@ def skeleton_points(b_pull_mm, phase=None):
                 shared_z_cubic_coefficients = np.asarray(shared_z_cubic_model['coefficients'], dtype=float)
             if shared_tip_angle_model is not None:
                 tip_angle_coefficients = np.asarray(shared_tip_angle_model['coefficients'], dtype=float)
-            if shared_offplane_y_model is not None:
+            if (
+                shared_offplane_y_model is not None
+                and str(shared_offplane_y_model.get('model_type', '')).lower() == 'polynomial'
+            ):
                 y_off_coefficients = np.asarray(shared_offplane_y_model['coefficients'], dtype=float)
             y_off_linear_coefficients = None
             y_off_cubic_coefficients = None
@@ -6061,9 +6422,11 @@ def skeleton_points(b_pull_mm, phase=None):
             for phase_name, fr in fit_results.items():
                 phase_metrics_rows.extend([
                     {'Phase': phase_name, 'Channel': 'r', 'R2': fr['r_r2'], 'Equation': fr['r_model'].get('equation')},
+                    {'Phase': phase_name, 'Channel': 'y_offset_pchip', 'R2': fr['r_pchip_r2'], 'Equation': None if fr['r_pchip_model'] is None else fr['r_pchip_model'].get('equation')},
                     {'Phase': phase_name, 'Channel': 'z', 'R2': fr['z_r2'], 'Equation': fr['z_model'].get('equation')},
                     {'Phase': phase_name, 'Channel': 'tip_angle', 'R2': fr['tip_angle_r2'], 'Equation': None if fr['tip_angle_model'] is None else fr['tip_angle_model'].get('equation')},
                     {'Phase': phase_name, 'Channel': 'offplane_y', 'R2': fr['offplane_y_r2'], 'Equation': None if fr['offplane_y_model'] is None else fr['offplane_y_model'].get('equation')},
+                    {'Phase': phase_name, 'Channel': 'offplane_y_pchip', 'R2': fr['offplane_y_pchip_r2'], 'Equation': None if fr['offplane_y_pchip_model'] is None else fr['offplane_y_pchip_model'].get('equation')},
                 ])
             phase_metrics_rows.extend([
                 {'Phase': 'averaged', 'Channel': 'r_cubic', 'R2': shared_r_cubic_r2, 'Equation': None if shared_r_cubic_model is None else shared_r_cubic_model.get('equation')},
@@ -6072,6 +6435,7 @@ def skeleton_points(b_pull_mm, phase=None):
                 {'Phase': 'averaged', 'Channel': 'offplane_y', 'R2': shared_offplane_y_r2, 'Equation': None if shared_offplane_y_model is None else shared_offplane_y_model.get('equation')},
                 {'Phase': 'averaged', 'Channel': 'offplane_y_linear', 'R2': shared_offplane_y_linear_r2, 'Equation': None if shared_offplane_y_linear_model is None else shared_offplane_y_linear_model.get('equation')},
                 {'Phase': 'averaged', 'Channel': 'offplane_y_cubic', 'R2': shared_offplane_y_cubic_r2, 'Equation': None if shared_offplane_y_cubic_model is None else shared_offplane_y_cubic_model.get('equation')},
+                {'Phase': 'averaged', 'Channel': 'offplane_y_pchip', 'R2': shared_offplane_y_pchip_r2, 'Equation': None if shared_offplane_y_pchip_model is None else shared_offplane_y_pchip_model.get('equation')},
             ])
             pd.DataFrame(phase_metrics_rows).to_excel(f"{robot_name}_phase_fit_summary.xlsx", index=False)
 
@@ -6222,7 +6586,7 @@ def skeleton_points(b_pull_mm, phase=None):
                     raw_offplane = ds.get('raw_offplane_trajectories') or {}
                     if 'C90' in raw_offplane:
                         ax_raw_yz.plot(
-                            raw_offplane['C90']['y_proxy'],
+                            raw_offplane['C90'].get('y_disp', raw_offplane['C90']['y_proxy']),
                             raw_offplane['C90']['z'],
                             marker='o',
                             linestyle='-',
@@ -6232,7 +6596,7 @@ def skeleton_points(b_pull_mm, phase=None):
                         )
                     if 'C-90' in raw_offplane:
                         ax_raw_yz.plot(
-                            raw_offplane['C-90']['y_proxy'],
+                            raw_offplane['C-90'].get('y_disp', raw_offplane['C-90']['y_proxy']),
                             raw_offplane['C-90']['z'],
                             marker='o',
                             linestyle='-',
@@ -6277,6 +6641,19 @@ def skeleton_points(b_pull_mm, phase=None):
                             markersize=5,
                             label=f"{phase_name} measured",
                         )
+                        off_pchip_plot_model = fr.get('offplane_y_pchip_model')
+                        if off_pchip_plot_model is not None:
+                            off_phase_plot_b = model_plot_b(off_pchip_plot_model, off_b.tolist())
+                            if off_phase_plot_b is not None:
+                                ax_off.plot(
+                                    off_phase_plot_b,
+                                    self._evaluate_curve_model(off_pchip_plot_model, off_phase_plot_b),
+                                    color=color,
+                                    linewidth=2.0,
+                                    linestyle='--',
+                                    alpha=0.95,
+                                    label=f"{phase_name} PCHIP fit",
+                                )
 
                 if shared_tip_angle_model is not None and all_tip_b:
                     tip_plot_b = model_plot_b(shared_tip_angle_model, all_tip_b)
@@ -6340,7 +6717,7 @@ def skeleton_points(b_pull_mm, phase=None):
                     if fr['dataset'].get('y_ref_offplane_mirror_line_mm') is not None
                 ]
                 if mirror_y_vals:
-                    ax_raw_yz.axvline(float(np.mean(mirror_y_vals)), color='white', linestyle='--', linewidth=1.5, alpha=0.8, label='Mirror line')
+                    ax_raw_yz.axvline(0.0, color='white', linestyle='--', linewidth=1.5, alpha=0.8, label='Mirror line')
 
                 max_r_r2 = max(fr['r_r2'] for fr in fit_results.values()) if fit_results else float('nan')
                 max_z_r2 = max(fr['z_r2'] for fr in fit_results.values()) if fit_results else float('nan')
@@ -6387,7 +6764,7 @@ def skeleton_points(b_pull_mm, phase=None):
                 ax_off.set_ylabel("Off-plane Y' (mm, ref.)")
                 ax_raw_xz.set_xlabel('X (mm)')
                 ax_raw_xz.set_ylabel('Z (mm)')
-                ax_raw_yz.set_xlabel('Y proxy (mm)')
+                ax_raw_yz.set_xlabel('Horizontal tip displacement from mirror line (mm)')
                 ax_raw_yz.set_ylabel('Z (mm)')
                 fig.tight_layout()
                 self._apply_dark_theme_to_figure(fig)
@@ -6689,6 +7066,7 @@ def skeleton_points(b_pull_mm, phase=None):
                     'r': fr['r_model'],
                     'z': fr['z_model'],
                     'r_pchip': fr['r_pchip_model'],
+                    'y_offset_pchip': fr['r_pchip_model'],
                     'z_pchip': fr['z_pchip_model'],
                     'r_cubic': fr['r_cubic_model'],
                     'z_cubic': fr['z_cubic_model'],
@@ -6702,6 +7080,7 @@ def skeleton_points(b_pull_mm, phase=None):
                     'offplane_y_pchip': fr['offplane_y_pchip_model'],
                     'offplane_y_avg_linear': shared_offplane_y_linear_model,
                     'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
+                    'offplane_y_avg_pchip': shared_offplane_y_pchip_model,
                     'r_avg_cubic': shared_r_cubic_model,
                     'z_avg_cubic': shared_z_cubic_model,
                 }
@@ -6732,18 +7111,26 @@ def skeleton_points(b_pull_mm, phase=None):
                     'offplane_y': shared_offplane_y_model,
                     'offplane_y_avg_linear': shared_offplane_y_linear_model,
                     'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
+                    'offplane_y_avg_pchip': shared_offplane_y_pchip_model,
                 },
                 'phase_fit_metrics': {
                     phase: {
                         'r_r2': fr['r_r2'],
+                        'y_offset_pchip_r2': fr['r_pchip_r2'],
                         'z_r2': fr['z_r2'],
                         'r_avg_cubic_r2': shared_r_cubic_r2,
                         'z_avg_cubic_r2': shared_z_cubic_r2,
                         'tip_angle_r2': fr['tip_angle_r2'],
                         'tip_angle_avg_cubic_r2': shared_tip_angle_r2,
-                        'offplane_y_r2': shared_offplane_y_r2,
-                        'offplane_y_linear_r2': shared_offplane_y_linear_r2,
-                        'offplane_y_cubic_r2': shared_offplane_y_cubic_r2,
+                        'offplane_y_r2': fr['offplane_y_r2'],
+                        'offplane_y_linear_r2': fr['offplane_y_linear_r2'],
+                        'offplane_y_cubic_r2': fr['offplane_y_cubic_r2'],
+                        'offplane_y_pchip_r2': fr['offplane_y_pchip_r2'],
+                        'y_offset_pchip_equation': None if fr['r_pchip_model'] is None else fr['r_pchip_model'].get('equation'),
+                        'offplane_y_equation': None if fr['offplane_y_model'] is None else fr['offplane_y_model'].get('equation'),
+                        'offplane_y_linear_equation': None if fr['offplane_y_linear_model'] is None else fr['offplane_y_linear_model'].get('equation'),
+                        'offplane_y_cubic_equation': None if fr['offplane_y_cubic_model'] is None else fr['offplane_y_cubic_model'].get('equation'),
+                        'offplane_y_pchip_equation': None if fr['offplane_y_pchip_model'] is None else fr['offplane_y_pchip_model'].get('equation'),
                     }
                     for phase, fr in fit_results.items()
                 },
@@ -6794,6 +7181,7 @@ def get_fit_model(phase, fit_family='pchip'):
     if fit_family == 'pchip':
         return {{
             'r': m.get('r_pchip') or m.get('r'),
+            'y_offset': m.get('y_offset_pchip') or m.get('r_pchip') or m.get('r'),
             'z': m.get('z_pchip') or m.get('z'),
             'tip_angle': m.get('tip_angle_pchip') or m.get('tip_angle'),
             'offplane_y': m.get('offplane_y_pchip') or m.get('offplane_y'),
@@ -6801,6 +7189,7 @@ def get_fit_model(phase, fit_family='pchip'):
     if fit_family == 'linear':
         return {{
             'r': m.get('r'),
+            'y_offset': m.get('y_offset_pchip') or m.get('r'),
             'z': m.get('z'),
             'tip_angle': m.get('tip_angle'),
             'offplane_y': m.get('offplane_y_linear') or m.get('offplane_y'),
@@ -6808,6 +7197,7 @@ def get_fit_model(phase, fit_family='pchip'):
     if fit_family == 'cubic':
         return {{
             'r': m.get('r_cubic') or m.get('r_avg_cubic'),
+            'y_offset': m.get('y_offset_pchip') or m.get('r_pchip') or m.get('r_cubic') or m.get('r_avg_cubic'),
             'z': m.get('z_cubic') or m.get('z_avg_cubic'),
             'tip_angle': m.get('tip_angle_cubic') or m.get('tip_angle_avg_cubic'),
             'offplane_y': m.get('offplane_y_cubic') or m.get('offplane_y_avg_cubic') or m.get('offplane_y'),
@@ -6842,6 +7232,13 @@ def predict_offplane_y_from_b(b_motor_pos, phase=None):
         return None
     return _evaluate_curve_model(m['offplane_y'], np.atleast_1d(b_motor_pos))
 
+def predict_y_offset_from_b(b_motor_pos, phase=None):
+    m = _get_phase_models(phase)
+    model = m.get('y_offset_pchip') or m.get('r_pchip') or m.get('r')
+    if model is None:
+        return None
+    return _evaluate_curve_model(model, np.atleast_1d(b_motor_pos))
+
 def predict_cartesian_from_b(b_motor_pos, phase=None):
     return predict_tip_position_from_b(b_motor_pos, phase=phase)
 """.format(
@@ -6871,18 +7268,26 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                     'offplane_y': shared_offplane_y_model,
                     'offplane_y_avg_linear': shared_offplane_y_linear_model,
                     'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
+                    'offplane_y_avg_pchip': shared_offplane_y_pchip_model,
                 },
                 'phase_fit_metrics': {
                     phase: {
                         'r_r_squared': fr['r_r2'],
+                        'y_offset_pchip_r_squared': fr['r_pchip_r2'],
                         'z_r_squared': fr['z_r2'],
                         'r_avg_cubic_r_squared': shared_r_cubic_r2,
                         'z_avg_cubic_r_squared': shared_z_cubic_r2,
                         'tip_angle_r_squared': fr['tip_angle_r2'],
                         'tip_angle_avg_cubic_r_squared': shared_tip_angle_r2,
-                        'offplane_y_r_squared': shared_offplane_y_r2,
-                        'offplane_y_linear_r_squared': shared_offplane_y_linear_r2,
-                        'offplane_y_cubic_r_squared': shared_offplane_y_cubic_r2,
+                        'offplane_y_r_squared': fr['offplane_y_r2'],
+                        'offplane_y_linear_r_squared': fr['offplane_y_linear_r2'],
+                        'offplane_y_cubic_r_squared': fr['offplane_y_cubic_r2'],
+                        'offplane_y_pchip_r_squared': fr['offplane_y_pchip_r2'],
+                        'y_offset_pchip_equation': None if fr['r_pchip_model'] is None else fr['r_pchip_model'].get('equation'),
+                        'offplane_y_equation': None if fr['offplane_y_model'] is None else fr['offplane_y_model'].get('equation'),
+                        'offplane_y_linear_equation': None if fr['offplane_y_linear_model'] is None else fr['offplane_y_linear_model'].get('equation'),
+                        'offplane_y_cubic_equation': None if fr['offplane_y_cubic_model'] is None else fr['offplane_y_cubic_model'].get('equation'),
+                        'offplane_y_pchip_equation': None if fr['offplane_y_pchip_model'] is None else fr['offplane_y_pchip_model'].get('equation'),
                     }
                     for phase, fr in fit_results.items()
                 },
@@ -6902,6 +7307,7 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                     'offplane_y_equation': None if shared_offplane_y_model is None else shared_offplane_y_model.get('equation'),
                     'offplane_y_linear_equation': None if shared_offplane_y_linear_model is None else shared_offplane_y_linear_model.get('equation'),
                     'offplane_y_cubic_equation': None if shared_offplane_y_cubic_model is None else shared_offplane_y_cubic_model.get('equation'),
+                    'offplane_y_pchip_equation': None if shared_offplane_y_pchip_model is None else shared_offplane_y_pchip_model.get('equation'),
                 },
                 'motor_setup': {
                     'b_motor_axis': 'B',

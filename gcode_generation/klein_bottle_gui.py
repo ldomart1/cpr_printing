@@ -119,6 +119,7 @@ DEFAULT_SHELL_PHASE_DEG = 0.0
 
 # Radius controls
 DEFAULT_LARGE_BASE_RADIUS = 30.0
+DEFAULT_LARGE_BASE_HEIGHT = 0.0
 DEFAULT_BASE_TUBE_RADIUS = 14.0
 DEFAULT_BASE_TUBE_HEIGHT = 14.0
 DEFAULT_NECK_RADIUS = 5.0
@@ -239,6 +240,7 @@ class Params:
     shell_phase_deg: float = DEFAULT_SHELL_PHASE_DEG
 
     large_base_radius: float = DEFAULT_LARGE_BASE_RADIUS
+    large_base_height: float = DEFAULT_LARGE_BASE_HEIGHT
     base_tube_radius: float = DEFAULT_BASE_TUBE_RADIUS
     base_tube_height: float = DEFAULT_BASE_TUBE_HEIGHT
     neck_radius: float = DEFAULT_NECK_RADIUS
@@ -288,6 +290,9 @@ class ParamPoint:
     phi: float
     mode: str
     comment: str = ""
+    track_sign: float = 1.0
+    track_mode: str = "centerline_tangent"
+    track_u: float = 0.0
 
 
 @dataclass
@@ -334,6 +339,7 @@ PARAM_GROUPS: List[Tuple[str, List[Dict[str, Any]]]] = [
         "Radius / Base / Neck",
         [
             {"key": "large_base_radius", "label": "Large Base Radius", "from_": 1.0, "to": 60.0, "resolution": 0.25, "step": 0.25},
+            {"key": "large_base_height", "label": "Large Base Height", "from_": 0.0, "to": 80.0, "resolution": 0.25, "step": 0.25},
             {"key": "base_tube_radius", "label": "Base Tube Radius", "from_": 1.0, "to": 40.0, "resolution": 0.25, "step": 0.25},
             {"key": "base_tube_height", "label": "Base Tube Height", "from_": 0.0, "to": 80.0, "resolution": 0.25, "step": 0.25},
             {"key": "neck_radius", "label": "Neck Radius", "from_": 1.0, "to": 25.0, "resolution": 0.25, "step": 0.25},
@@ -745,6 +751,10 @@ def vertical_height_at_t(t: float, p: Params) -> float:
     return base_h + loop_h * math.sin(math.pi * clamp01(u))
 
 
+def large_base_top_height(p: Params) -> float:
+    return max(0.0, float(p.large_base_height))
+
+
 def radius_profile(t: float, p: Params) -> float:
     """
     Swept-tube radius with:
@@ -760,8 +770,13 @@ def radius_profile(t: float, p: Params) -> float:
     t = clamp01(t)
     r_body = body_radius_profile(t, p)
 
-    if float(p.base_fillet_span) > 1e-9:
-        s = clamp01(t / float(p.base_fillet_span))
+    h = vertical_height_at_t(t, p)
+    collar_top_h = large_base_top_height(p)
+    fillet_h = max(0.0, float(p.base_fillet_span)) * max(1e-9, float(p.base_tube_height) + float(p.spine_height))
+    if h <= collar_top_h + 1e-9:
+        collar_w = 1.0
+    elif fillet_h > 1e-9:
+        s = clamp01((h - collar_top_h) / fillet_h)
         collar_w = 1.0 - smootherstep(s)
     else:
         collar_w = 0.0
@@ -938,12 +953,31 @@ def make_base_ring_polyline(p: Params) -> ParamPolyline:
     return ParamPolyline(name="base_ring", points=pts)
 
 
-def make_shell_polyline(cache: SurfaceCache, p: Params, t0: float, t1: float, steps: int, name: str) -> ParamPolyline:
+def make_shell_polyline(
+    cache: SurfaceCache,
+    p: Params,
+    t0: float,
+    t1: float,
+    steps: int,
+    name: str,
+    *,
+    phase_offset: float = 0.0,
+    track_sign: float = 1.0,
+) -> ParamPolyline:
     t0 = clamp01(t0)
     t1 = clamp01(t1)
     n = int(max(2, steps))
     ts = np.linspace(t0, t1, n)
-    pts = [ParamPoint(t=float(t), phi=shell_phi_for_t(cache, float(t), p), mode="surface", comment=f"{name} t={t:.4f}") for t in ts]
+    pts = [
+        ParamPoint(
+            t=float(t),
+            phi=shell_phi_for_t(cache, float(t), p) + float(phase_offset),
+            mode="surface",
+            comment=f"{name} t={t:.4f}",
+            track_sign=float(track_sign),
+        )
+        for t in ts
+    ]
     return ParamPolyline(name=name, points=pts)
 
 
@@ -955,6 +989,25 @@ def make_param_edge(t0: float, phi0: float, t1: float, phi1: float, samples: int
         t = (1.0 - a) * float(t0) + a * float(t1)
         phi = (1.0 - a) * float(phi0) + a * float(phi1)
         pts.append(ParamPoint(t=t, phi=phi, mode="surface", comment=f"{name} a={a:.3f}"))
+    return ParamPolyline(name=name, points=pts)
+
+
+def make_base_transition_polyline(phi0: float, phi1: float, samples: int, name: str) -> ParamPolyline:
+    n = int(max(3, samples))
+    pts: List[ParamPoint] = []
+    for i in range(n):
+        a = 0.0 if n == 1 else (i / (n - 1))
+        phi = (1.0 - a) * float(phi0) + a * float(phi1)
+        pts.append(
+            ParamPoint(
+                t=0.0,
+                phi=phi,
+                mode="surface",
+                comment=f"{name} a={a:.3f}",
+                track_mode="bottom_turn",
+                track_u=float(a),
+            )
+        )
     return ParamPolyline(name=name, points=pts)
 
 
@@ -1013,22 +1066,75 @@ def build_lattice_polylines(p: Params) -> List[ParamPolyline]:
 def build_param_polylines(cache: SurfaceCache, p: Params) -> List[ParamPolyline]:
     lat0 = clamp01(min(float(p.lattice_start), float(p.lattice_end)))
     lat1 = clamp01(max(float(p.lattice_start), float(p.lattice_end)))
+    base_top_t = base_tube_fraction(p)
+    base_phase_shift = math.pi
 
     steps_total = int(max(100, p.path_steps))
+    shell_down_steps = max(2, int(round(steps_total * max(0.0, base_top_t))))
     shell_1_steps = max(2, int(round(steps_total * max(0.0, lat0))))
     shell_2_steps = max(2, int(round(steps_total * max(0.0, 1.0 - lat1))))
+    base_turn_steps = max(12, int(round(0.5 * max(16, p.base_ring_segments))))
 
-    polylines: List[ParamPolyline] = [make_base_ring_polyline(p)]
+    polylines: List[ParamPolyline] = []
+
+    if base_top_t > 1e-6:
+        polylines.append(
+            make_shell_polyline(
+                cache,
+                p,
+                base_top_t,
+                0.0,
+                shell_down_steps,
+                "shell_base_descent",
+                track_sign=-1.0,
+            )
+        )
+
+    phi0 = shell_phi_for_t(cache, 0.0, p)
+    polylines.append(make_base_transition_polyline(phi0, phi0 + base_phase_shift, base_turn_steps, "shell_base_turn"))
 
     if lat0 > 1e-6:
-        polylines.append(make_shell_polyline(cache, p, 0.0, lat0, shell_1_steps, "shell_pre_lattice"))
+        polylines.append(
+            make_shell_polyline(
+                cache,
+                p,
+                0.0,
+                lat0,
+                shell_1_steps,
+                "shell_pre_lattice",
+                phase_offset=base_phase_shift,
+                track_sign=1.0,
+            )
+        )
     else:
-        polylines.append(make_shell_polyline(cache, p, 0.0, min(0.05, 1.0), max(2, shell_1_steps), "shell_pre_lattice"))
+        polylines.append(
+            make_shell_polyline(
+                cache,
+                p,
+                0.0,
+                min(0.05, 1.0),
+                max(2, shell_1_steps),
+                "shell_pre_lattice",
+                phase_offset=base_phase_shift,
+                track_sign=1.0,
+            )
+        )
 
     polylines.extend(build_lattice_polylines(p))
 
     if lat1 < 1.0 - 1e-6:
-        polylines.append(make_shell_polyline(cache, p, lat1, 1.0, shell_2_steps, "shell_post_lattice"))
+        polylines.append(
+            make_shell_polyline(
+                cache,
+                p,
+                lat1,
+                1.0,
+                shell_2_steps,
+                "shell_post_lattice",
+                phase_offset=base_phase_shift,
+                track_sign=1.0,
+            )
+        )
 
     return polylines
 
@@ -1046,11 +1152,16 @@ def param_point_to_xyz(cache: SurfaceCache, p: Params, pt: ParamPoint) -> np.nda
 
 
 def param_point_to_direction(cache: SurfaceCache, p: Params, pt: ParamPoint) -> np.ndarray:
-    sign = 1.0 if int(p.tool_normal_sign) >= 0 else -1.0
+    tool_sign = 1.0 if int(p.tool_normal_sign) >= 0 else -1.0
     if pt.mode in {"base_ring", "surface"}:
-        # Use one centroid-following tracking rule everywhere instead of
-        # switching between separate base and surface orientation modes.
-        return _normalize(sign * tangent_dir(cache, pt.t))
+        centerline_t = tangent_dir(cache, pt.t)
+        if pt.track_mode == "bottom_turn":
+            n, b = normal_frame(cache, pt.t)
+            ring_tangent = _normalize(-math.sin(pt.phi) * n + math.cos(pt.phi) * b)
+            a = clamp01(pt.track_u)
+            d = -math.cos(math.pi * a) * centerline_t + math.sin(math.pi * a) * ring_tangent
+            return _normalize(tool_sign * d)
+        return _normalize(tool_sign * float(pt.track_sign) * centerline_t)
     raise ValueError(f"Unknown point mode: {pt.mode}")
 
 
@@ -1260,6 +1371,7 @@ def sanitize_params(p: Params) -> Params:
     q.neck_width = max(1e-6, float(q.neck_width))
     q.base_fillet_span = max(0.0, float(q.base_fillet_span))
     q.base_outer_edge_fillet = max(0.0, float(q.base_outer_edge_fillet))
+    q.large_base_height = max(0.0, float(q.large_base_height))
     q.base_tube_radius = max(0.1, float(q.base_tube_radius))
     q.base_tube_height = max(0.0, float(q.base_tube_height))
     q.large_base_radius = max(0.1, float(q.large_base_radius))
@@ -1319,7 +1431,7 @@ def export_gcode(params: Params, out_path: str) -> Dict[str, Any]:
         f.write(f"; start tip-space base = [{p.start_x:.3f}, {p.start_y:.3f}, {p.start_z:.3f}]\n")
         f.write(f"; spine: height={p.spine_height:.3f}, base_tube_height={p.base_tube_height:.3f}, r0={p.spine_r0:.3f}, r1={p.spine_r1:.3f}, s={p.spine_s:.3f}, z_wobble={p.spine_z_wobble:.3f}\n")
         f.write(f"; twist_deg={p.twist_deg:.3f}, continuous_layer_height={p.continuous_layer_height:.3f}, shell_phase_deg={p.shell_phase_deg:.3f}\n")
-        f.write(f"; radii: large_base={p.large_base_radius:.3f}, base_tube={p.base_tube_radius:.3f}, neck={p.neck_radius:.3f}\n")
+        f.write(f"; radii: large_base={p.large_base_radius:.3f}, large_base_height={p.large_base_height:.3f}, base_tube={p.base_tube_radius:.3f}, neck={p.neck_radius:.3f}\n")
         f.write(f"; neck: center={p.neck_center:.3f}, width={p.neck_width:.3f}, power={p.neck_power:.3f}\n")
         f.write(f"; base fillets: base_fillet_span={p.base_fillet_span:.3f}, outer_edge_fillet={p.base_outer_edge_fillet:.3f}, outer_edge_span=base_tube_radius({p.base_tube_radius:.3f})\n")
         f.write(f"; lattice window: start={p.lattice_start:.3f}, end={p.lattice_end:.3f}, u={p.lattice_u_count}, v={p.lattice_v_count}\n")
@@ -1880,7 +1992,7 @@ class KleinBottleApp:
         txt = (
             f"Approx print length: {total_len:.1f} mm\n"
             f"Approx extrusion: {total_len * self.params.extrusion_per_mm:.2f} mm\n"
-            f"Continuous layer height: {self.params.continuous_layer_height:.2f} mm | Base tube height: {self.params.base_tube_height:.2f} mm\n"
+            f"Continuous layer height: {self.params.continuous_layer_height:.2f} mm | Base tube height: {self.params.base_tube_height:.2f} mm | Large base height: {self.params.large_base_height:.2f} mm\n"
             f"Radius samples -> start: {base_r:.2f} mm, neck: {neck_r:.2f} mm, end: {end_r:.2f} mm\n"
             f"Lattice window: {lat0:.3f} to {lat1:.3f} | Polylines: {len(polylines)}\n"
             f"{cal_text}"

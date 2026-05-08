@@ -9,15 +9,14 @@ Offline CTR shadow calibration runner that:
   3) Uses a checkerboard reference image + camera calibration to define mm axes
   4) Runs analyze_data_batch + existing tracking pipeline
   5) Converts tracked tip pixels to checkerboard-referenced mm coordinates
-  6) Builds a dense desired hourglass curve and projects/corrects desired samples onto it
-  7) Computes per-sample distance from measured tip to the closest point on that curve (in mm)
+  6) Computes a reference tracked point = mean of all valid tracked points
+  7) Computes per-sample error distance to that mean (in mm)
   8) Saves:
        - CSV of tracked points and errors
        - JSON metrics summary
        - error-vs-sample plot
        - desired-vs-actual hourglass plot
        - histogram of error distance vs number of samples
-       - desired projection/debug alignment troubleshooting plots
        - optional overlay on checkerboard image
        - optional desired lookup from planned_hourglass_command_sequence.csv when available
 
@@ -638,204 +637,6 @@ def resolve_desired_tip_lookup(project_dir: Path, args) -> Dict[int, Dict[str, f
         capture_every_n_shape_moves=int(args.capture_every_n_shape_moves),
     )
 
-
-
-def _dedupe_consecutive_points(points_xy: np.ndarray, eps: float = 1e-9) -> np.ndarray:
-    """
-    Remove only consecutive duplicates, preserving trajectory order and intersections.
-    """
-    pts = np.asarray(points_xy, dtype=np.float64).reshape(-1, 2)
-    if pts.shape[0] <= 1:
-        return pts.copy()
-    kept = [pts[0]]
-    for p in pts[1:]:
-        if float(np.linalg.norm(p - kept[-1])) > float(eps):
-            kept.append(p)
-    return np.asarray(kept, dtype=np.float64)
-
-
-def _candidate_planned_command_csvs(project_dir: Path, args) -> List[Path]:
-    candidates: List[Path] = []
-    if getattr(args, "desired_curve_csv", None):
-        candidates.append(Path(args.desired_curve_csv).expanduser())
-    if getattr(args, "planned_command_csv", None):
-        candidates.append(Path(args.planned_command_csv).expanduser())
-    candidates.append(Path(project_dir) / "planned_hourglass_command_sequence.csv")
-    candidates.append(Path(project_dir) / "planned_command_sequence.csv")
-    # Preserve order while removing duplicates.
-    unique: List[Path] = []
-    seen = set()
-    for p in candidates:
-        key = str(Path(p).expanduser())
-        if key in seen:
-            continue
-        unique.append(Path(p).expanduser())
-        seen.add(key)
-    return unique
-
-
-def _load_planned_command_rows(planned_csv_path: Path) -> List[Dict[str, Any]]:
-    planned_csv_path = Path(planned_csv_path).expanduser().resolve()
-    rows: List[Dict[str, Any]] = []
-    with open(planned_csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
-
-
-def _row_has_tip_xz(row: Dict[str, Any]) -> bool:
-    try:
-        float(row["tip_x"])
-        float(row["tip_z"])
-        return True
-    except Exception:
-        return False
-
-
-def _phase_is_hourglass_shape_phase(phase: Optional[str]) -> bool:
-    phase_name = str(phase).strip()
-    if phase_name == "final_recenter":
-        return True
-    if phase_name in HOURGLASS_RECORDED_PHASES:
-        return True
-    if phase_name.endswith("_start") and phase_name[:-6] in HOURGLASS_RECORDED_PHASES:
-        return True
-    return False
-
-
-def build_desired_curve_from_planned_csv(planned_csv_path: Path) -> np.ndarray:
-    """
-    Build the dense desired hourglass curve from every planned shape row in the command CSV.
-
-    This is intentionally separate from the downsampled lookup used to match camera captures.
-    The plotting/error curve should be the real path, not straight chords through sparse samples.
-    """
-    rows = _load_planned_command_rows(planned_csv_path)
-    pts: List[List[float]] = []
-
-    for row in rows:
-        if not _row_has_tip_xz(row):
-            continue
-        phase = str(row.get("phase", "")).strip()
-        # Prefer real hourglass rows when phase labels are present.
-        if phase and not _phase_is_hourglass_shape_phase(phase):
-            continue
-        pts.append([float(row["tip_x"]), float(row["tip_z"])])
-
-    if not pts:
-        raise RuntimeError(f"No usable tip_x/tip_z hourglass rows found in planned command CSV: {planned_csv_path}")
-
-    return _dedupe_consecutive_points(np.asarray(pts, dtype=np.float64))
-
-
-def build_ideal_hourglass_curve_from_args(args) -> np.ndarray:
-    rows = build_hourglass_tip_rows(
-        center_x=float(args.hourglass_center_x_mm),
-        center_z=float(args.hourglass_center_z_mm),
-        arc_vertical_gap_mm=float(args.arc_vertical_gap_mm),
-        circle_diameter_mm=float(args.circle_diameter_mm),
-        middle_gap_mm=float(args.middle_gap_mm),
-        arc_overtravel_deg=float(args.arc_overtravel_deg),
-        samples_per_arc=max(int(args.samples_per_arc), 360),
-        samples_per_diagonal=max(int(args.samples_per_diagonal), 240),
-        final_recenter=True,
-    )
-    pts = np.asarray([[float(r["tip_x"]), float(r["tip_z"])] for r in rows], dtype=np.float64)
-    return _dedupe_consecutive_points(pts)
-
-
-def build_desired_curve_from_lookup(desired_tip_lookup: Dict[int, Dict[str, float]]) -> np.ndarray:
-    pts: List[List[float]] = []
-    for k in sorted(desired_tip_lookup.keys()):
-        row = desired_tip_lookup[k]
-        pts.append([float(row["desired_tip_x_mm"]), float(row["desired_tip_z_mm"])])
-    if not pts:
-        raise RuntimeError("Desired lookup is empty; cannot build desired curve from lookup.")
-    return _dedupe_consecutive_points(np.asarray(pts, dtype=np.float64))
-
-
-def resolve_desired_tip_curve(
-    project_dir: Path,
-    args,
-    desired_tip_lookup: Dict[int, Dict[str, float]],
-) -> Tuple[np.ndarray, str]:
-    """
-    Resolve the dense curve used for:
-      - projecting/correcting sparse desired sample points
-      - computing point-to-curve error
-      - plotting the true hourglass path
-
-    auto:
-      1) planned CSV if present
-      2) ideal analytic hourglass fallback
-    """
-    source = str(getattr(args, "desired_curve_source", "auto")).strip().lower()
-
-    if source in ("auto", "planned"):
-        for candidate in _candidate_planned_command_csvs(project_dir, args):
-            try:
-                if candidate.exists():
-                    curve = build_desired_curve_from_planned_csv(candidate)
-                    print(f"[INFO] Using planned command CSV for dense desired curve: {candidate}")
-                    return curve, f"planned_csv:{candidate}"
-            except Exception as e:
-                print(f"[WARN] Failed to build dense desired curve from {candidate}: {e}")
-        if source == "planned":
-            raise RuntimeError("desired_curve_source=planned was requested, but no usable planned CSV was found.")
-
-    if source == "lookup":
-        curve = build_desired_curve_from_lookup(desired_tip_lookup)
-        print("[WARN] Using downsampled lookup as desired curve; this can draw chords through sparse samples.")
-        return curve, "lookup"
-
-    if source in ("auto", "ideal"):
-        curve = build_ideal_hourglass_curve_from_args(args)
-        print("[INFO] Using analytic ideal hourglass as dense desired curve.")
-        return curve, "ideal_hourglass"
-
-    raise ValueError(f"Unsupported desired_curve_source: {source}")
-
-
-def _project_single_point_to_curve(point_xz: np.ndarray, curve_xz: np.ndarray) -> Tuple[np.ndarray, int, float]:
-    point_xz = np.asarray(point_xz, dtype=np.float64).reshape(1, 2)
-    curve_xz = np.asarray(curve_xz, dtype=np.float64).reshape(-1, 2)
-    closest, seg_idx = _closest_points_on_polyline(point_xz, curve_xz)
-    dist = float(np.linalg.norm(point_xz[0] - closest[0]))
-    return closest[0], int(seg_idx[0]) if seg_idx.size else 0, dist
-
-
-def compute_desired_projection_stats(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    vals = []
-    for rec in records:
-        d = rec.get("desired_projection_distance_mm")
-        if d is None:
-            continue
-        try:
-            if np.isfinite(float(d)):
-                vals.append(float(d))
-        except Exception:
-            continue
-    arr = np.asarray(vals, dtype=float)
-    if arr.size == 0:
-        return {
-            "num_projected_desired_points": 0,
-            "mean_projection_distance_mm": None,
-            "median_projection_distance_mm": None,
-            "max_projection_distance_mm": None,
-            "num_over_0p25_mm": 0,
-            "num_over_0p50_mm": 0,
-            "num_over_1p00_mm": 0,
-        }
-    return {
-        "num_projected_desired_points": int(arr.size),
-        "mean_projection_distance_mm": float(np.mean(arr)),
-        "median_projection_distance_mm": float(np.median(arr)),
-        "max_projection_distance_mm": float(np.max(arr)),
-        "num_over_0p25_mm": int(np.sum(arr > 0.25)),
-        "num_over_0p50_mm": int(np.sum(arr > 0.50)),
-        "num_over_1p00_mm": int(np.sum(arr > 1.00)),
-    }
 
 def patch_filename_parser():
     """
@@ -2069,18 +1870,9 @@ def compute_tracked_tip_positions_mm(
     tracked_rows: np.ndarray,
     image_files: List[Path],
     desired_tip_lookup: Optional[Dict[int, Dict[str, float]]] = None,
-    desired_curve_mm_points: Optional[np.ndarray] = None,
-    project_desired_to_curve: bool = True,
-    desired_missing_policy: str = "skip",
 ) -> Dict[str, Any]:
     """
     Convert tracked tip pixel coordinates to checkerboard-referenced mm.
-
-    The previous version used desired samples directly and, when lookup failed, silently fell
-    back to stage X/Z. That made some "desired" points leave the true hourglass path.
-
-    This version keeps raw desired values for debugging, then optionally projects the desired
-    sample to the dense desired hourglass curve before it is used for plotting or error metrics.
     """
     if getattr(cal, "board_pose", None) is None:
         raise RuntimeError("Checkerboard board_pose is not available.")
@@ -2088,15 +1880,6 @@ def compute_tracked_tip_positions_mm(
         raise RuntimeError("tracked_rows is empty.")
 
     origin = np.asarray(cal.board_pose["origin_px"], dtype=np.float64).reshape(2)
-    desired_missing_policy = str(desired_missing_policy).strip().lower()
-    if desired_missing_policy not in ("skip", "stage"):
-        raise ValueError("desired_missing_policy must be 'skip' or 'stage'.")
-
-    curve_xz = None
-    if desired_curve_mm_points is not None:
-        curve_xz = np.asarray(desired_curve_mm_points, dtype=np.float64).reshape(-1, 2)
-        if curve_xz.shape[0] < 2:
-            curve_xz = None
 
     records = []
     mm_points = []
@@ -2109,35 +1892,18 @@ def compute_tracked_tip_positions_mm(
         file_name = image_files[i].name if i < len(image_files) else f"sample_{i:04d}"
         tracked_sample_idx, tracked_phase = parse_tracked_sample_metadata(file_name)
         csv_sample_index = int(tracked_sample_idx) if tracked_sample_idx is not None else int(i)
-
-        named_values = extract_named_values_from_filename(file_name)
-
-        base_rec = {
-            "sample_index": csv_sample_index,
-            "image_name": file_name,
-            "tip_y_px": None,
-            "tip_x_px": None,
-            "u_mm": None,
-            "z_mm": None,
-            "b_pull_mm": _extract_b_value_from_row(row),
-            "phase": tracked_phase,
-            "stage_x_mm": float(named_values["X"]) if "X" in named_values else None,
-            "stage_y_mm": float(named_values["Y"]) if "Y" in named_values else None,
-            "stage_z_mm": float(named_values["Z"]) if "Z" in named_values else None,
-            "desired_source": None,
-            "raw_desired_x_mm": None,
-            "raw_desired_y_mm": None,
-            "raw_desired_z_mm": None,
-            "desired_x_mm": None,
-            "desired_y_mm": None,
-            "desired_z_mm": None,
-            "desired_projection_distance_mm": None,
-            "desired_projection_segment_index": None,
-            "valid": False,
-        }
-
         if row.size < 2 or not np.all(np.isfinite(row[:2])):
-            records.append(base_rec)
+            records.append({
+                "sample_index": csv_sample_index,
+                "image_name": file_name,
+                "tip_y_px": None,
+                "tip_x_px": None,
+                "u_mm": None,
+                "z_mm": None,
+                "b_pull_mm": None,
+                "phase": tracked_phase,
+                "valid": False,
+            })
             continue
 
         y_px = float(row[0])
@@ -2156,54 +1922,25 @@ def compute_tracked_tip_positions_mm(
             u_mm, z_mm = float("nan"), float("nan")
             valid = False
 
-        rec = dict(base_rec)
-        rec.update({
+        rec = {
+            "sample_index": csv_sample_index,
+            "image_name": file_name,
             "tip_y_px": y_px,
             "tip_x_px": x_px,
             "u_mm": u_mm if valid else None,
             "z_mm": z_mm if valid else None,
+            "b_pull_mm": _extract_b_value_from_row(row),
+            "phase": tracked_phase,
             "valid": bool(valid),
-        })
-
-        desired_tip = (
-            desired_tip_lookup.get(tracked_sample_idx)
-            if (desired_tip_lookup and tracked_sample_idx is not None)
-            else None
-        )
-
-        raw_desired_x = None
-        raw_desired_z = None
-        desired_source = None
-
-        if desired_tip is not None:
-            raw_desired_x = float(desired_tip["desired_tip_x_mm"])
-            raw_desired_z = float(desired_tip["desired_tip_z_mm"])
-            desired_source = "lookup"
-        elif desired_missing_policy == "stage" and rec["stage_x_mm"] is not None and rec["stage_z_mm"] is not None:
-            raw_desired_x = float(rec["stage_x_mm"])
-            raw_desired_z = float(rec["stage_z_mm"])
-            desired_source = "stage_fallback"
-
-        rec["desired_source"] = desired_source
-        rec["raw_desired_x_mm"] = raw_desired_x
-        rec["raw_desired_y_mm"] = rec["stage_y_mm"]
-        rec["raw_desired_z_mm"] = raw_desired_z
+        }
+        named_values = extract_named_values_from_filename(file_name)
+        rec["stage_x_mm"] = float(named_values["X"]) if "X" in named_values else None
+        rec["stage_y_mm"] = float(named_values["Y"]) if "Y" in named_values else None
+        rec["stage_z_mm"] = float(named_values["Z"]) if "Z" in named_values else None
+        desired_tip = desired_tip_lookup.get(tracked_sample_idx) if (desired_tip_lookup and tracked_sample_idx is not None) else None
+        rec["desired_x_mm"] = float(desired_tip["desired_tip_x_mm"]) if desired_tip is not None else rec["stage_x_mm"]
         rec["desired_y_mm"] = rec["stage_y_mm"]
-
-        if raw_desired_x is not None and raw_desired_z is not None:
-            raw_xy = np.asarray([float(raw_desired_x), float(raw_desired_z)], dtype=np.float64)
-            if bool(project_desired_to_curve) and curve_xz is not None:
-                projected_xy, seg_idx, proj_dist = _project_single_point_to_curve(raw_xy, curve_xz)
-                rec["desired_x_mm"] = float(projected_xy[0])
-                rec["desired_z_mm"] = float(projected_xy[1])
-                rec["desired_projection_distance_mm"] = float(proj_dist)
-                rec["desired_projection_segment_index"] = int(seg_idx)
-            else:
-                rec["desired_x_mm"] = float(raw_xy[0])
-                rec["desired_z_mm"] = float(raw_xy[1])
-                rec["desired_projection_distance_mm"] = 0.0
-                rec["desired_projection_segment_index"] = None
-
+        rec["desired_z_mm"] = float(desired_tip["desired_tip_z_mm"]) if desired_tip is not None else rec["stage_z_mm"]
         records.append(rec)
 
         if valid:
@@ -2274,25 +2011,11 @@ def _closest_points_on_polyline(points_xy: np.ndarray, polyline_xy: np.ndarray) 
     return nearest_points, nearest_seg_indices
 
 
-def compute_error_metrics(
-    measured_mm_points: np.ndarray,
-    desired_mm_points: np.ndarray,
-    desired_curve_mm_points: Optional[np.ndarray] = None,
-    error_alignment: str = "mean",
-) -> Dict[str, Any]:
+def compute_error_metrics(measured_mm_points: np.ndarray, desired_mm_points: np.ndarray) -> Dict[str, Any]:
     """
-    Compute tip error against the true desired curve.
-
-    Alignment:
-      - mean: translate measured points so their centroid matches the desired centroid.
-              If a dense desired curve is available, its centroid is used as the target;
-              otherwise the centroid of the matched desired samples is used.
-      - none: do not translate measured points; this reflects absolute calibrated coordinates.
-
-    Error:
-      - primary error is distance from each aligned measured point to the closest point on the
-        dense desired curve.
-      - samplewise error to the matched corrected desired sample is also saved for debugging.
+    Align measured points to desired points by matching their mean centers.
+    Error for each sample = Euclidean distance to the closest point on the desired curve.
+    RMSE = sqrt(mean(error^2))
     """
     measured_mm_points = np.asarray(measured_mm_points, dtype=float).reshape(-1, 2)
     desired_mm_points = np.asarray(desired_mm_points, dtype=float).reshape(-1, 2)
@@ -2300,45 +2023,17 @@ def compute_error_metrics(
         raise RuntimeError("No valid measured mm points available for error analysis.")
     if desired_mm_points.shape[0] == 0:
         raise RuntimeError("No desired mm points available for aligned error analysis.")
-    if measured_mm_points.shape[0] != desired_mm_points.shape[0]:
-        raise RuntimeError(
-            f"Measured and desired point counts differ: {measured_mm_points.shape[0]} vs {desired_mm_points.shape[0]}"
-        )
 
-    if desired_curve_mm_points is None:
-        curve_points = desired_mm_points
-    else:
-        curve_points = np.asarray(desired_curve_mm_points, dtype=float).reshape(-1, 2)
-        if curve_points.shape[0] < 2:
-            curve_points = desired_mm_points
-
-    error_alignment = str(error_alignment).strip().lower()
     measured_mean = np.mean(measured_mm_points, axis=0)
     desired_mean = np.mean(desired_mm_points, axis=0)
-    curve_mean = np.mean(curve_points, axis=0)
-
-    if error_alignment == "mean":
-        alignment_target = curve_mean if curve_points.shape[0] >= 2 else desired_mean
-        alignment_offset = alignment_target - measured_mean
-    elif error_alignment in ("none", "raw", "absolute"):
-        alignment_offset = np.zeros((2,), dtype=float)
-        alignment_target = measured_mean.copy()
-        error_alignment = "none"
-    else:
-        raise ValueError("error_alignment must be 'mean' or 'none'.")
-
+    alignment_offset = desired_mean - measured_mean
     aligned_measured_points = measured_mm_points + alignment_offset[None, :]
-    aligned_measured_mean = np.mean(aligned_measured_points, axis=0)
-
     closest_desired_points, closest_segment_indices = _closest_points_on_polyline(
         aligned_measured_points,
-        curve_points,
+        desired_mm_points,
     )
     deltas = aligned_measured_points - closest_desired_points
     dist_mm = np.linalg.norm(deltas, axis=1)
-
-    samplewise_deltas = aligned_measured_points - desired_mm_points
-    samplewise_dist_mm = np.linalg.norm(samplewise_deltas, axis=1)
 
     rmse_mm = float(np.sqrt(np.mean(dist_mm ** 2)))
     mean_err_mm = float(np.mean(dist_mm))
@@ -2347,56 +2042,35 @@ def compute_error_metrics(
     min_err_mm = float(np.min(dist_mm))
     median_err_mm = float(np.median(dist_mm))
 
-    samplewise_rmse_mm = float(np.sqrt(np.mean(samplewise_dist_mm ** 2)))
-    samplewise_mean_err_mm = float(np.mean(samplewise_dist_mm))
-
     return {
         "reference_point_mm": {
-            "u_mean_mm": float(alignment_target[0]),
-            "z_mean_mm": float(alignment_target[1]),
+            "u_mean_mm": float(desired_mean[0]),
+            "z_mean_mm": float(desired_mean[1]),
         },
         "measured_mean_mm": {
             "u_mean_mm": float(measured_mean[0]),
             "z_mean_mm": float(measured_mean[1]),
         },
-        "aligned_measured_mean_mm": {
-            "u_mean_mm": float(aligned_measured_mean[0]),
-            "z_mean_mm": float(aligned_measured_mean[1]),
-        },
         "desired_mean_mm": {
             "u_mean_mm": float(desired_mean[0]),
             "z_mean_mm": float(desired_mean[1]),
-        },
-        "desired_curve_mean_mm": {
-            "u_mean_mm": float(curve_mean[0]),
-            "z_mean_mm": float(curve_mean[1]),
-        },
-        "alignment_target_mm": {
-            "u_mean_mm": float(alignment_target[0]),
-            "z_mean_mm": float(alignment_target[1]),
         },
         "alignment_offset_mm": {
             "du_mm": float(alignment_offset[0]),
             "dz_mm": float(alignment_offset[1]),
         },
-        "error_alignment": error_alignment,
         "errors_mm": dist_mm,
         "deltas_mm": deltas,
         "aligned_measured_mm_points": aligned_measured_points,
         "desired_mm_points": desired_mm_points,
-        "desired_curve_mm_points": curve_points,
         "closest_desired_mm_points": closest_desired_points,
         "closest_desired_segment_indices": closest_segment_indices,
-        "samplewise_errors_mm": samplewise_dist_mm,
-        "samplewise_deltas_mm": samplewise_deltas,
         "rmse_mm": rmse_mm,
         "mean_error_mm": mean_err_mm,
         "std_error_mm": std_err_mm,
         "median_error_mm": median_err_mm,
         "min_error_mm": min_err_mm,
         "max_error_mm": max_err_mm,
-        "samplewise_rmse_mm": samplewise_rmse_mm,
-        "samplewise_mean_error_mm": samplewise_mean_err_mm,
         "num_samples": int(measured_mm_points.shape[0]),
     }
 
@@ -2408,9 +2082,6 @@ def attach_errors_to_records(
     errors_mm: np.ndarray,
     aligned_measured_mm_points: np.ndarray,
     closest_desired_mm_points: np.ndarray,
-    closest_desired_segment_indices: Optional[np.ndarray] = None,
-    samplewise_deltas_mm: Optional[np.ndarray] = None,
-    samplewise_errors_mm: Optional[np.ndarray] = None,
 ):
     idx_to_local = {global_idx: k for k, global_idx in enumerate(valid_indices)}
 
@@ -2420,13 +2091,9 @@ def attach_errors_to_records(
             rec["aligned_z_mm"] = None
             rec["closest_desired_u_mm"] = None
             rec["closest_desired_z_mm"] = None
-            rec["closest_desired_segment_index"] = None
             rec["du_aligned_to_desired_mm"] = None
             rec["dz_aligned_to_desired_mm"] = None
             rec["error_distance_mm"] = None
-            rec["samplewise_du_mm"] = None
-            rec["samplewise_dz_mm"] = None
-            rec["samplewise_error_distance_mm"] = None
             continue
 
         k = idx_to_local[i]
@@ -2434,26 +2101,14 @@ def attach_errors_to_records(
         rec["aligned_z_mm"] = float(aligned_measured_mm_points[k, 1])
         rec["closest_desired_u_mm"] = float(closest_desired_mm_points[k, 0])
         rec["closest_desired_z_mm"] = float(closest_desired_mm_points[k, 1])
-        if closest_desired_segment_indices is not None:
-            rec["closest_desired_segment_index"] = int(np.asarray(closest_desired_segment_indices)[k])
-        else:
-            rec["closest_desired_segment_index"] = None
         rec["du_aligned_to_desired_mm"] = float(deltas_mm[k, 0])
         rec["dz_aligned_to_desired_mm"] = float(deltas_mm[k, 1])
         rec["error_distance_mm"] = float(errors_mm[k])
 
-        if samplewise_deltas_mm is not None and samplewise_errors_mm is not None:
-            rec["samplewise_du_mm"] = float(np.asarray(samplewise_deltas_mm)[k, 0])
-            rec["samplewise_dz_mm"] = float(np.asarray(samplewise_deltas_mm)[k, 1])
-            rec["samplewise_error_distance_mm"] = float(np.asarray(samplewise_errors_mm)[k])
-        else:
-            rec["samplewise_du_mm"] = None
-            rec["samplewise_dz_mm"] = None
-            rec["samplewise_error_distance_mm"] = None
-
     return records
 
 
+\
 def _phase_to_segment_label(phase: Optional[str]) -> Optional[str]:
     phase_str = str(phase).strip() if phase is not None else ""
     for seg in HOURGLASS_RECORDED_PHASES_ORDER:
@@ -2525,26 +2180,16 @@ def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
         "stage_x_mm",
         "stage_y_mm",
         "stage_z_mm",
-        "desired_source",
-        "raw_desired_x_mm",
-        "raw_desired_y_mm",
-        "raw_desired_z_mm",
         "desired_x_mm",
         "desired_y_mm",
         "desired_z_mm",
-        "desired_projection_distance_mm",
-        "desired_projection_segment_index",
         "aligned_u_mm",
         "aligned_z_mm",
         "closest_desired_u_mm",
         "closest_desired_z_mm",
-        "closest_desired_segment_index",
         "du_aligned_to_desired_mm",
         "dz_aligned_to_desired_mm",
         "error_distance_mm",
-        "samplewise_du_mm",
-        "samplewise_dz_mm",
-        "samplewise_error_distance_mm",
         "valid",
     ]
     with open(csv_path, "w", newline="") as f:
@@ -2629,7 +2274,6 @@ def save_desired_vs_actual_plot(
     records: List[Dict[str, Any]],
     reference_point_mm: Dict[str, float],
     alignment_offset_mm: Dict[str, float],
-    desired_curve_mm_points: Optional[np.ndarray] = None,
     title_prefix: str = "",
 ):
     valid_recs = [
@@ -2649,42 +2293,27 @@ def save_desired_vs_actual_plot(
 
     actual_u = np.asarray([float(r["aligned_u_mm"]) for r in valid_recs], dtype=float)
     actual_z = np.asarray([float(r["aligned_z_mm"]) for r in valid_recs], dtype=float)
-    desired_u = np.asarray([float(r["desired_x_mm"]) for r in desired_recs], dtype=float)
-    desired_z = np.asarray([float(r["desired_z_mm"]) for r in desired_recs], dtype=float)
-
-    curve = None
-    if desired_curve_mm_points is not None:
-        curve = np.asarray(desired_curve_mm_points, dtype=float).reshape(-1, 2)
-        if curve.shape[0] < 2:
-            curve = None
+    desired_tip_x = np.asarray([float(r["desired_x_mm"]) for r in desired_recs], dtype=float)
+    desired_tip_z = np.asarray([float(r["desired_z_mm"]) for r in desired_recs], dtype=float)
 
     ref_u = float(reference_point_mm["u_mean_mm"])
     ref_z = float(reference_point_mm["z_mean_mm"])
 
+    desired_u = desired_tip_x
+    desired_z = desired_tip_z
+
     fig, ax = plt.subplots(figsize=(8.5, 7.0), facecolor="none")
     ax.set_facecolor("none")
 
-    if curve is not None:
-        ax.plot(
-            curve[:, 0],
-            curve[:, 1],
-            color="#8cf7ff",
-            linewidth=2.4,
-            alpha=0.95,
-            label="Desired hourglass curve",
-            zorder=3,
-        )
-    else:
-        ax.plot(
-            desired_u,
-            desired_z,
-            color="#8cf7ff",
-            linewidth=2.2,
-            alpha=0.95,
-            label="Desired points connected",
-            zorder=3,
-        )
-
+    ax.plot(
+        desired_u,
+        desired_z,
+        color="#8cf7ff",
+        linewidth=2.2,
+        alpha=0.95,
+        label="Desired hourglass",
+        zorder=3,
+    )
     ax.scatter(
         desired_u,
         desired_z,
@@ -2693,32 +2322,9 @@ def save_desired_vs_actual_plot(
         edgecolors="#8cf7ff",
         linewidths=0.6,
         alpha=0.95,
-        label="Desired sample points corrected to curve",
+        label="Desired sampled points",
         zorder=4,
     )
-
-    raw_recs = [
-        r for r in desired_recs
-        if r.get("raw_desired_x_mm") is not None
-        and r.get("raw_desired_z_mm") is not None
-        and r.get("desired_projection_distance_mm") is not None
-        and float(r.get("desired_projection_distance_mm") or 0.0) > 1e-6
-    ]
-    if raw_recs:
-        raw_x = np.asarray([float(r["raw_desired_x_mm"]) for r in raw_recs], dtype=float)
-        raw_z = np.asarray([float(r["raw_desired_z_mm"]) for r in raw_recs], dtype=float)
-        ax.scatter(
-            raw_x,
-            raw_z,
-            s=34,
-            marker="x",
-            color="#ffcc00",
-            linewidths=1.5,
-            alpha=0.95,
-            label="Raw desired before curve projection",
-            zorder=6,
-        )
-
     ax.scatter(
         actual_u,
         actual_z,
@@ -2727,7 +2333,7 @@ def save_desired_vs_actual_plot(
         edgecolors="#fff1f5",
         linewidths=0.5,
         alpha=0.9,
-        label="Measured tracked points",
+        label="Measured tracked points (mean-aligned)",
         zorder=5,
     )
     ax.scatter(
@@ -2737,20 +2343,11 @@ def save_desired_vs_actual_plot(
         color="#f4d35e",
         edgecolors="none",
         label="Trajectory start",
-        zorder=7,
+        zorder=6,
     )
 
-    arrays_for_bounds = [actual_u, desired_u, np.asarray([ref_u])]
-    arrays_z_for_bounds = [actual_z, desired_z, np.asarray([ref_z])]
-    if curve is not None:
-        arrays_for_bounds.append(curve[:, 0])
-        arrays_z_for_bounds.append(curve[:, 1])
-    if raw_recs:
-        arrays_for_bounds.append(np.asarray([float(r["raw_desired_x_mm"]) for r in raw_recs]))
-        arrays_z_for_bounds.append(np.asarray([float(r["raw_desired_z_mm"]) for r in raw_recs]))
-
-    all_u = np.concatenate(arrays_for_bounds)
-    all_z = np.concatenate(arrays_z_for_bounds)
+    all_u = np.concatenate([actual_u, desired_u, np.asarray([ref_u])])
+    all_z = np.concatenate([actual_z, desired_z, np.asarray([ref_z])])
     center_u = 0.5 * float(np.min(all_u) + np.max(all_u))
     center_z = 0.5 * float(np.min(all_z) + np.max(all_z))
     span_u = max(float(np.max(np.abs(all_u - center_u))), 1.0)
@@ -2764,7 +2361,7 @@ def save_desired_vs_actual_plot(
     ax.set_xlabel("u / desired X (mm)", color="#e8f3ff")
     ax.set_ylabel("z / desired tip Z (mm)", color="#e8f3ff")
     ax.set_title(
-        f"{title_prefix}Desired hourglass curve vs tracked points".strip(),
+        f"{title_prefix}Desired hourglass trajectory vs mean-aligned tracked points".strip(),
         color="#f8fbff",
     )
     ax.grid(True, color="#8eb8d8", alpha=0.12, linewidth=0.8)
@@ -2776,16 +2373,13 @@ def save_desired_vs_actual_plot(
     for txt in legend.get_texts():
         txt.set_color("#f8fbff")
 
-    target_centroid = reference_point_mm
     ax.text(
         0.02,
         0.98,
         (
-            "Centroid alignment "
+            "Applied mean alignment "
             f"(du={float(alignment_offset_mm['du_mm']):.3f} mm, "
-            f"dz={float(alignment_offset_mm['dz_mm']):.3f} mm)\n"
-            f"Shared centroid: (u={float(target_centroid['u_mean_mm']):.3f} mm, "
-            f"z={float(target_centroid['z_mean_mm']):.3f} mm)"
+            f"dz={float(alignment_offset_mm['dz_mm']):.3f} mm)"
         ),
         transform=ax.transAxes,
         va="top",
@@ -2800,172 +2394,6 @@ def save_desired_vs_actual_plot(
     plt.close()
 
 
-def save_desired_projection_debug_plot(
-    plot_path: Path,
-    records: List[Dict[str, Any]],
-    title_prefix: str = "",
-):
-    recs = [
-        r for r in records
-        if r.get("desired_projection_distance_mm") is not None
-        and r.get("raw_desired_x_mm") is not None
-        and r.get("raw_desired_z_mm") is not None
-    ]
-    if not recs:
-        raise RuntimeError("No desired projection diagnostics available.")
-    recs = sorted(recs, key=lambda r: int(r["sample_index"]))
-
-    sample_idx = np.asarray([int(r["sample_index"]) for r in recs], dtype=int)
-    d = np.asarray([float(r["desired_projection_distance_mm"]) for r in recs], dtype=float)
-
-    fig, ax = plt.subplots(figsize=(10, 5), facecolor="none")
-    ax.set_facecolor("none")
-    ax.plot(sample_idx, d, marker="o", linewidth=1.6, markersize=4.2, color="white")
-    ax.axhline(0.25, color="#f4d35e", linewidth=1.0, linestyle="--", alpha=0.7, label="0.25 mm")
-    ax.axhline(0.50, color="#ff9f1c", linewidth=1.0, linestyle="--", alpha=0.7, label="0.50 mm")
-    ax.axhline(1.00, color="#ff5d73", linewidth=1.0, linestyle="--", alpha=0.7, label="1.00 mm")
-    ax.set_xlabel("Sample index", color="white")
-    ax.set_ylabel("Raw desired point projection distance to desired curve (mm)", color="white")
-    ax.set_title(f"{title_prefix}Desired-point curve projection diagnostic".strip(), color="white")
-    ax.grid(True, alpha=0.20, color="white")
-    ax.tick_params(colors="white")
-    for spine in ax.spines.values():
-        spine.set_color("white")
-    leg = ax.legend(frameon=True, facecolor="#102131", edgecolor="#6b92b3")
-    for txt in leg.get_texts():
-        txt.set_color("white")
-    plt.tight_layout()
-    plt.savefig(plot_path, dpi=220, transparent=True)
-    plt.close()
-
-
-def save_error_debug_alignment_plot(
-    plot_path: Path,
-    records: List[Dict[str, Any]],
-    metrics: Dict[str, Any],
-    desired_curve_mm_points: Optional[np.ndarray] = None,
-    worst_n: int = 12,
-    title_prefix: str = "",
-):
-    recs = [
-        r for r in records
-        if r.get("valid", False)
-        and r.get("u_mm") is not None
-        and r.get("z_mm") is not None
-        and r.get("aligned_u_mm") is not None
-        and r.get("aligned_z_mm") is not None
-        and r.get("closest_desired_u_mm") is not None
-        and r.get("closest_desired_z_mm") is not None
-        and r.get("error_distance_mm") is not None
-    ]
-    if not recs:
-        raise RuntimeError("No records available for error debug alignment plot.")
-    recs = sorted(recs, key=lambda r: int(r["sample_index"]))
-
-    aligned = np.asarray([[float(r["aligned_u_mm"]), float(r["aligned_z_mm"])] for r in recs], dtype=float)
-    closest = np.asarray([[float(r["closest_desired_u_mm"]), float(r["closest_desired_z_mm"])] for r in recs], dtype=float)
-    desired = np.asarray([[float(r["desired_x_mm"]), float(r["desired_z_mm"])] for r in recs], dtype=float)
-    errors = np.asarray([float(r["error_distance_mm"]) for r in recs], dtype=float)
-    sample_idx = np.asarray([int(r["sample_index"]) for r in recs], dtype=int)
-
-    curve = None
-    if desired_curve_mm_points is not None:
-        curve = np.asarray(desired_curve_mm_points, dtype=float).reshape(-1, 2)
-        if curve.shape[0] < 2:
-            curve = None
-
-    fig, ax = plt.subplots(figsize=(9.5, 8.0), facecolor="none")
-    ax.set_facecolor("none")
-
-    if curve is not None:
-        ax.plot(curve[:, 0], curve[:, 1], color="#8cf7ff", linewidth=2.2, alpha=0.95, label="desired curve", zorder=2)
-
-    ax.scatter(aligned[:, 0], aligned[:, 1], s=28, color="#ff8fab", alpha=0.85, label="aligned measured", zorder=4)
-    ax.scatter(desired[:, 0], desired[:, 1], s=20, color="#f8fafc", edgecolors="#8cf7ff", linewidths=0.6, label="corrected desired samples", zorder=5)
-    ax.scatter(closest[:, 0], closest[:, 1], s=20, color="#f4d35e", alpha=0.95, label="closest point on curve", zorder=6)
-
-    centroid = metrics.get("alignment_target_mm", metrics.get("reference_point_mm", {}))
-    if centroid and ("u_mean_mm" in centroid) and ("z_mean_mm" in centroid):
-        ax.scatter(
-            [float(centroid["u_mean_mm"])],
-            [float(centroid["z_mean_mm"])],
-            s=80,
-            marker="+",
-            color="#ffffff",
-            linewidths=1.6,
-            label="shared centroid",
-            zorder=8,
-        )
-
-    # Draw error vectors for the largest errors to keep the plot readable.
-    n = int(max(0, min(worst_n, len(recs))))
-    if n > 0:
-        worst = np.argsort(errors)[-n:]
-        for j in worst:
-            ax.plot(
-                [aligned[j, 0], closest[j, 0]],
-                [aligned[j, 1], closest[j, 1]],
-                color="#ff5d73",
-                linewidth=1.1,
-                alpha=0.85,
-                zorder=7,
-            )
-            ax.annotate(
-                str(int(sample_idx[j])),
-                (aligned[j, 0], aligned[j, 1]),
-                xytext=(4, 4),
-                textcoords="offset points",
-                color="#f8fbff",
-                fontsize=8,
-                bbox=dict(boxstyle="round,pad=0.15", fc="#102131", ec="none", alpha=0.65),
-            )
-
-    arrays = [aligned, closest, desired]
-    if curve is not None:
-        arrays.append(curve)
-    all_pts = np.vstack(arrays)
-    center = 0.5 * (np.nanmin(all_pts, axis=0) + np.nanmax(all_pts, axis=0))
-    span = max(float(np.nanmax(np.abs(all_pts[:, 0] - center[0]))), float(np.nanmax(np.abs(all_pts[:, 1] - center[1]))), 1.0)
-    span *= 1.08
-    ax.set_xlim(center[0] - span, center[0] + span)
-    ax.set_ylim(center[1] - span, center[1] + span)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("u / desired X (mm)", color="#e8f3ff")
-    ax.set_ylabel("z / desired tip Z (mm)", color="#e8f3ff")
-    ax.set_title(
-        f"{title_prefix}Debug: aligned measured vs corrected desired with curve-distance vectors".strip(),
-        color="#f8fbff",
-    )
-    ax.grid(True, color="#8eb8d8", alpha=0.12, linewidth=0.8)
-    ax.tick_params(colors="#dceaf7")
-    for spine in ax.spines.values():
-        spine.set_color("#6b92b3")
-
-    text = (
-        f"RMSE to curve: {float(metrics['rmse_mm']):.4f} mm\n"
-        f"samplewise RMSE: {float(metrics.get('samplewise_rmse_mm', float('nan'))):.4f} mm\n"
-        f"alignment: {metrics.get('error_alignment', 'mean')} "
-        f"(du={float(metrics['alignment_offset_mm']['du_mm']):.3f}, dz={float(metrics['alignment_offset_mm']['dz_mm']):.3f})"
-    )
-    ax.text(
-        0.02, 0.98, text,
-        transform=ax.transAxes,
-        va="top",
-        ha="left",
-        color="#f8fbff",
-        fontsize=9.5,
-        bbox={"facecolor": "#102131", "edgecolor": "#6b92b3", "alpha": 0.78, "pad": 6},
-    )
-
-    legend = ax.legend(frameon=True, facecolor="#102131", edgecolor="#6b92b3", loc="best")
-    for txt in legend.get_texts():
-        txt.set_color("#f8fbff")
-
-    plt.tight_layout()
-    plt.savefig(plot_path, dpi=230, transparent=True)
-    plt.close()
-
-
 def save_metrics_json(
     json_path: Path,
     metrics: Dict[str, Any],
@@ -2977,10 +2405,6 @@ def save_metrics_json(
         "measured_mean_mm": metrics["measured_mean_mm"],
         "desired_mean_mm": metrics["desired_mean_mm"],
         "alignment_offset_mm": metrics["alignment_offset_mm"],
-        "error_alignment": metrics.get("error_alignment", "mean"),
-        "desired_curve_source": metrics.get("desired_curve_source"),
-        "desired_curve_num_points": int(np.asarray(metrics.get("desired_curve_mm_points", np.empty((0, 2)))).reshape(-1, 2).shape[0]),
-        "desired_projection_stats": metrics.get("desired_projection_stats", {}),
         "segment_error_stats": metrics.get("segment_error_stats", {}),
         "rmse_mm": metrics["rmse_mm"],
         "mean_error_mm": metrics["mean_error_mm"],
@@ -2988,8 +2412,6 @@ def save_metrics_json(
         "median_error_mm": metrics["median_error_mm"],
         "min_error_mm": metrics["min_error_mm"],
         "max_error_mm": metrics["max_error_mm"],
-        "samplewise_rmse_mm": metrics.get("samplewise_rmse_mm"),
-        "samplewise_mean_error_mm": metrics.get("samplewise_mean_error_mm"),
         "num_samples": metrics["num_samples"],
         "analysis_crop": getattr(cal, "analysis_crop", None),
         "board_reference": collect_board_reference_info(cal),
@@ -2999,7 +2421,6 @@ def save_metrics_json(
             "tip_refiner_model": None if getattr(args, "tip_refiner_model", None) is None else str(Path(args.tip_refiner_model).expanduser().resolve()),
             "tip_refiner_anchor": getattr(args, "tip_refiner_anchor", None),
             "tip_refiner_compare_only": bool(getattr(args, "tip_refiner_compare_only", False)),
-            "tip_detection_mode": str(args.tip_detection_mode),
             "tip_refine_mode": str(args.tip_refine_mode),
             "tip_refine_dt_step_px": float(args.tip_refine_dt_step_px),
             "tip_refine_max_step_px": int(args.tip_refine_max_step_px),
@@ -3026,12 +2447,6 @@ def save_metrics_json(
             "samples_per_arc": int(args.samples_per_arc),
             "samples_per_diagonal": int(args.samples_per_diagonal),
             "planned_command_csv": (None if args.planned_command_csv is None else str(args.planned_command_csv)),
-            "desired_curve_csv": (None if getattr(args, "desired_curve_csv", None) is None else str(args.desired_curve_csv)),
-            "desired_curve_source": str(getattr(args, "desired_curve_source", "auto")),
-            "project_desired_to_curve": not bool(getattr(args, "disable_desired_projection", False)),
-            "desired_missing_policy": str(getattr(args, "desired_missing_policy", "skip")),
-            "error_alignment": str(getattr(args, "error_alignment", "mean")),
-            "debug_worst_n": int(getattr(args, "debug_worst_n", 12)),
             "capture_at_start": bool(args.capture_at_start),
             "capture_every_n_shape_moves": int(args.capture_every_n_shape_moves),
             "hist_bins": int(args.hist_bins),
@@ -3093,26 +2508,17 @@ def main():
     ap.add_argument("--tip_refine_parallel_cross_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_step_px", type=float, default=0.5)
     ap.add_argument("--tip_refine_parallel_ray_max_len_r", type=float, default=8.0)
-    ap.add_argument("--tip_refiner_model", "--post-tip-refiner-model", dest="tip_refiner_model", type=str, default=None,
-                    help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt for CNN tip detection. The --post-tip-refiner-model alias is kept for compatibility.")
-    ap.add_argument("--tip_refiner_anchor", "--post-tip-refiner-anchor", dest="tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"],
+    ap.add_argument("--tip_refiner_model", type=str, default=None,
+                    help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt for CNN tip detection.")
+    ap.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"],
                     help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
-    ap.add_argument("--tip_refiner_compare_only", "--post-tip-refiner-compare-only", dest="tip_refiner_compare_only", action="store_true",
+    ap.add_argument("--tip_refiner_compare_only", action="store_true",
                     help="Save CNN tips but keep non-CNN tips as the default tracked source.")
     ap.add_argument("--tip_detection_mode", type=str, default="classical",
                     choices=["classical", "red_dot", "auto_red_dot"],
                     help="Tip detection mode from CTR shadow calibration. red_dot uses the red marker centroid as the selected tip.")
-    ap.add_argument(
-        "--tracked_tip_source",
-        "--tracked-tip-source",
-        "--post-tracked-tip-source",
-        "--post_tracked_tip_source",
-        dest="tracked_tip_source",
-        type=str,
-        default="auto",
-        choices=["auto", "coarse", "selected", "cnn"],
-        help="Which tip rows to convert to mm. auto uses selected rows when red-dot or CNN-selected tips are active, otherwise coarse. Compatibility aliases: --tracked-tip-source, --post-tracked-tip-source, --post_tracked_tip_source.",
-    )
+    ap.add_argument("--tracked_tip_source", type=str, default="auto", choices=["auto", "coarse", "selected", "cnn"],
+                    help="Which tip rows to convert to mm. auto uses selected rows when red-dot or CNN-selected tips are active, otherwise coarse.")
 
     ap.add_argument("--hourglass_center_x_mm", type=float, default=HOURGLASS_CENTER_X_DEFAULT)
     ap.add_argument("--hourglass_center_z_mm", type=float, default=HOURGLASS_CENTER_Z_DEFAULT)
@@ -3126,18 +2532,6 @@ def main():
     help="Fallback ideal-hourglass diagonal sampling used only when the planned command CSV is unavailable.")
     ap.add_argument("--planned_command_csv", type=str, default=None,
     help="Optional path to the planned hourglass command CSV. Defaults to <project_dir>/planned_hourglass_command_sequence.csv when present.")
-    ap.add_argument("--desired_curve_csv", type=str, default=None,
-    help="Optional CSV used only to build the dense desired curve. Defaults to the planned command CSV when present.")
-    ap.add_argument("--desired_curve_source", type=str, default="auto", choices=["auto", "planned", "ideal", "lookup"],
-    help="Source for the dense desired curve used for projection, plotting, and point-to-curve error.")
-    ap.add_argument("--disable_desired_projection", action="store_true",
-    help="Do not project/correct desired samples to the dense desired curve before error analysis.")
-    ap.add_argument("--desired_missing_policy", type=str, default="skip", choices=["skip", "stage"],
-    help="What to do when a camera sample has no desired lookup. 'skip' avoids injecting off-curve stage values; 'stage' preserves the old fallback.")
-    ap.add_argument("--error_alignment", type=str, default="mean", choices=["mean", "none"],
-    help="Use mean alignment like the previous script, or none for absolute calibrated-coordinate error.")
-    ap.add_argument("--debug_worst_n", type=int, default=12,
-    help="Number of largest-error samples to label/draw in the debug alignment plot.")
     ap.add_argument("--capture_at_start", action="store_true",
     help="Match acquisition runs that also captured the initial top_arc_pull_start point.")
     ap.add_argument("--capture_every_n_shape_moves", "--capture_every_n_circle_moves", dest="capture_every_n_shape_moves", type=int, default=1,
@@ -3194,15 +2588,6 @@ def main():
     patch_filename_parser()
 
     desired_tip_lookup = resolve_desired_tip_lookup(project_dir, args)
-    desired_curve_mm_points, desired_curve_source = resolve_desired_tip_curve(
-        project_dir,
-        args,
-        desired_tip_lookup=desired_tip_lookup,
-    )
-    print(
-        f"[INFO] Dense desired curve source: {desired_curve_source} "
-        f"({desired_curve_mm_points.shape[0]} points)"
-    )
 
     if args.tip_refine_mode != "none":
         patch_analyze_data_for_tip_refinement(
@@ -3308,9 +2693,6 @@ def main():
         tracked_rows,
         imgs,
         desired_tip_lookup=desired_tip_lookup,
-        desired_curve_mm_points=desired_curve_mm_points,
-        project_desired_to_curve=(not bool(args.disable_desired_projection)),
-        desired_missing_policy=str(args.desired_missing_policy),
     )
 
     if tip_data["mm_points"].shape[0] == 0:
@@ -3323,15 +2705,11 @@ def main():
             "Tracked rows exist, but no desired tip points were available for mean-aligned error analysis."
         )
 
-    print("[INFO] Computing point-to-dense-curve error metrics...")
+    print("[INFO] Computing mean-aligned nearest-curve error metrics...")
     metrics = compute_error_metrics(
         tip_data["matched_measured_mm_points"],
         tip_data["desired_mm_points"],
-        desired_curve_mm_points=desired_curve_mm_points,
-        error_alignment=str(args.error_alignment),
     )
-    metrics["desired_curve_source"] = desired_curve_source
-    metrics["desired_projection_stats"] = compute_desired_projection_stats(tip_data["records"])
 
     records = attach_errors_to_records(
         records=tip_data["records"],
@@ -3340,9 +2718,6 @@ def main():
         errors_mm=metrics["errors_mm"],
         aligned_measured_mm_points=metrics["aligned_measured_mm_points"],
         closest_desired_mm_points=metrics["closest_desired_mm_points"],
-        closest_desired_segment_indices=metrics["closest_desired_segment_indices"],
-        samplewise_deltas_mm=metrics["samplewise_deltas_mm"],
-        samplewise_errors_mm=metrics["samplewise_errors_mm"],
     )
     metrics["segment_error_stats"] = compute_segment_error_stats(records)
 
@@ -3351,8 +2726,6 @@ def main():
     error_plot_path = processed_dir / "tracked_tip_error_vs_sample.png"
     hist_path = processed_dir / "tracked_tip_error_histogram.png"
     desired_vs_actual_plot_path = processed_dir / "tracked_tip_desired_vs_actual.png"
-    desired_projection_debug_plot_path = processed_dir / "tracked_tip_desired_projection_debug.png"
-    error_debug_alignment_plot_path = processed_dir / "tracked_tip_error_debug_alignment.png"
 
     save_tracked_tip_csv(csv_path, records)
     save_metrics_json(metrics_json_path, metrics, cal, args)
@@ -3373,20 +2746,6 @@ def main():
         records,
         reference_point_mm=metrics["reference_point_mm"],
         alignment_offset_mm=metrics["alignment_offset_mm"],
-        desired_curve_mm_points=desired_curve_mm_points,
-        title_prefix="Checkerboard-referenced ",
-    )
-    save_desired_projection_debug_plot(
-        desired_projection_debug_plot_path,
-        records,
-        title_prefix="Checkerboard-referenced ",
-    )
-    save_error_debug_alignment_plot(
-        error_debug_alignment_plot_path,
-        records,
-        metrics=metrics,
-        desired_curve_mm_points=desired_curve_mm_points,
-        worst_n=int(args.debug_worst_n),
         title_prefix="Checkerboard-referenced ",
     )
 
@@ -3395,8 +2754,6 @@ def main():
     print(f"[INFO] Saved error plot: {error_plot_path}")
     print(f"[INFO] Saved histogram: {hist_path}")
     print(f"[INFO] Saved desired-vs-actual hourglass plot: {desired_vs_actual_plot_path}")
-    print(f"[INFO] Saved desired projection debug plot: {desired_projection_debug_plot_path}")
-    print(f"[INFO] Saved error alignment debug plot: {error_debug_alignment_plot_path}")
 
     if board_reference_debug_image is not None:
         try:
@@ -3415,28 +2772,16 @@ def main():
     print("\n========== RESULTS ==========")
     print(f"Valid samples: {metrics['num_samples']}")
     print(
-        "Shared centroid reference (desired centroid / aligned tracked centroid): "
+        "Shared mean reference (desired mean / aligned tracked mean): "
         f"u = {metrics['reference_point_mm']['u_mean_mm']:.6f} mm, "
         f"z = {metrics['reference_point_mm']['z_mean_mm']:.6f} mm"
     )
     print(
-        "Applied centroid-alignment offset to measured points: "
+        "Applied alignment offset to measured points: "
         f"du = {metrics['alignment_offset_mm']['du_mm']:.6f} mm, "
         f"dz = {metrics['alignment_offset_mm']['dz_mm']:.6f} mm"
     )
-    print(
-        "Error definition: distance from each measured point "
-        f"({metrics.get('error_alignment', 'mean')} alignment) to the closest point on the dense desired curve."
-    )
-    pstats = metrics.get("desired_projection_stats", {})
-    if int(pstats.get("num_projected_desired_points", 0)) > 0:
-        print(
-            "Desired sample projection to curve: "
-            f"mean={float(pstats['mean_projection_distance_mm']):.6f} mm, "
-            f"median={float(pstats['median_projection_distance_mm']):.6f} mm, "
-            f"max={float(pstats['max_projection_distance_mm']):.6f} mm, "
-            f">0.5mm={int(pstats['num_over_0p50_mm'])}"
-        )
+    print("Error definition: distance from each aligned measured point to the closest point on the desired curve.")
     print(f"RMSE:         {metrics['rmse_mm']:.6f} mm")
     print(f"Mean error:   {metrics['mean_error_mm']:.6f} mm")
     print(f"Std error:    {metrics['std_error_mm']:.6f} mm")

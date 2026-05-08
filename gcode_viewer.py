@@ -26,6 +26,9 @@ RELEASE_PHASE = "release"
 PHASE_SWITCH_RE = re.compile(r";\s*EQUATION_SWITCH\s+([A-Z0-9_]+)")
 WRITE_START_RE = re.compile(r";\s*VASCULATURE_WRITE_START\b", re.IGNORECASE)
 WRITE_END_RE = re.compile(r";\s*VASCULATURE_WRITE_END\b", re.IGNORECASE)
+WAVE_WRITE_START_RE = re.compile(r";\s*WAVE_WRITE_START\b", re.IGNORECASE)
+WAVE_WRITE_END_RE = re.compile(r";\s*WAVE_WRITE_END\b", re.IGNORECASE)
+PRESSURE_SOLENOID_RE = re.compile(r"(?<!\d)M42(?!\d).*?\bP\s*0\b.*?\bS\s*([01])(?:\.0+)?\b", re.IGNORECASE)
 
 
 # ---------------- Defaults ----------------
@@ -34,6 +37,7 @@ DEFAULT_MAX_B = -0.0
 DEFAULT_C0_DEG = 0.0
 DEFAULT_FIGSIZE = (11.8, 8.4)
 DEFAULT_OFFPLANE_SIGN = -1.0
+DEFAULT_Y_OFFPLANE_FIT_MODEL = "avg_cubic"
 
 DEFAULT_ROBOT_DIAMETER_MM = 3.0
 DEFAULT_ROBOT_LINKS = 6
@@ -87,6 +91,7 @@ class Calibration:
     z_axis: str
     c_180_deg: float
     b_home: float
+    requested_offplane_fit_model: Optional[str]
 
 
 def _polyval4(coeffs: np.ndarray, u) -> np.ndarray:
@@ -211,6 +216,28 @@ def _phase_from_switch_token(token: str) -> Optional[str]:
     return None
 
 
+def _normalize_model_spec(model_spec):
+    if not isinstance(model_spec, dict):
+        return None
+    out = dict(model_spec)
+    if out.get("model_type") is not None:
+        out["model_type"] = str(out["model_type"]).strip().lower()
+    return out
+
+
+def _select_named_model(models: Dict[str, dict], base_name: str, selected_fit_model: Optional[str]) -> Optional[dict]:
+    selected = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
+    candidates: List[str] = []
+    if selected:
+        candidates.append(f"{base_name}_{selected}")
+    candidates.append(base_name)
+    for key in candidates:
+        spec = _normalize_model_spec(models.get(key))
+        if spec is not None:
+            return spec
+    return None
+
+
 def load_calibration_json(json_path: str) -> dict:
     p = Path(json_path)
     if not p.exists():
@@ -219,7 +246,7 @@ def load_calibration_json(json_path: str) -> dict:
         return json.load(f)
 
 
-def load_calibration(json_path: str) -> Calibration:
+def load_calibration(json_path: str, requested_offplane_fit_model: Optional[str] = DEFAULT_Y_OFFPLANE_FIT_MODEL) -> Calibration:
     data = load_calibration_json(json_path)
     cubic = data["cubic_coefficients"]
 
@@ -250,6 +277,13 @@ def load_calibration(json_path: str) -> Calibration:
         data.get("default_phase_for_legacy_access")
         or cubic.get("default_phase")
         or PULL_PHASE
+    )
+    selected_fit_model = data.get("selected_fit_model")
+    selected_fit_model = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
+    selected_offplane_fit_model = data.get("selected_offplane_fit_model")
+    selected_offplane_fit_model = None if selected_offplane_fit_model is None else str(selected_offplane_fit_model).strip().lower()
+    requested_offplane_fit_model = (
+        None if requested_offplane_fit_model is None else str(requested_offplane_fit_model).strip().lower()
     )
 
     motor_setup = data.get("motor_setup", {})
@@ -287,6 +321,7 @@ def load_calibration(json_path: str) -> Calibration:
         x_axis=x_axis, z_axis=z_axis,
         c_180_deg=c_180,
         b_home=b_home,
+        requested_offplane_fit_model=requested_offplane_fit_model or selected_offplane_fit_model or selected_fit_model,
     )
 
 
@@ -576,7 +611,14 @@ def parse_gcode_motion_states(
     with p.open("r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
 
-    has_write_markers = any(WRITE_START_RE.search(raw) or WRITE_END_RE.search(raw) for raw in lines)
+    has_write_markers = any(
+        WRITE_START_RE.search(raw)
+        or WRITE_END_RE.search(raw)
+        or WAVE_WRITE_START_RE.search(raw)
+        or WAVE_WRITE_END_RE.search(raw)
+        for raw in lines
+    )
+    has_pressure_solenoid = any(PRESSURE_SOLENOID_RE.search(raw) for raw in lines)
     metadata = parse_gcode_metadata(str(p))
     current_phase = _normalize_phase_name(metadata.get("active_phase", current_phase))
 
@@ -587,10 +629,14 @@ def parse_gcode_motion_states(
             if phase_from_marker is not None:
                 current_phase = phase_from_marker
 
+        solenoid_match = PRESSURE_SOLENOID_RE.search(raw)
+        if solenoid_match:
+            pressure_active = solenoid_match.group(1) == "1"
+
         if has_write_markers:
-            if WRITE_START_RE.search(raw):
+            if WRITE_START_RE.search(raw) or WAVE_WRITE_START_RE.search(raw):
                 write_marker_active = True
-            if WRITE_END_RE.search(raw):
+            if WRITE_END_RE.search(raw) or WAVE_WRITE_END_RE.search(raw):
                 write_marker_active = False
 
         line = strip_comment(raw)
@@ -660,7 +706,11 @@ def parse_gcode_motion_states(
             b_cmd=pos[b_axis.upper()],
             c_cmd=pos[c_axis.upper()],
             u_cmd=pos[u_axis.upper()],
-            pressure_active=write_marker_active if has_write_markers else pressure_active,
+            pressure_active=(
+                pressure_active
+                if has_pressure_solenoid
+                else (write_marker_active if has_write_markers else pressure_active)
+            ),
             equation_phase=current_phase,
             feed=current_feed,
         ))
@@ -711,11 +761,14 @@ def evaluate_calibration_phase_models(
         if not models:
             raise ValueError(f"Calibration is missing phase models for '{phase}'")
 
-        r_model = models.get("r_pchip") or models.get("r")
-        z_model = models.get("z_pchip") or models.get("z")
-        tip_model = models.get("tip_angle_pchip") or models.get("tip_angle")
-        y_model = models.get("offplane_y_pchip") or models.get("offplane_y")
-        y_extrap_model = models.get("offplane_y_linear") or models.get("offplane_y")
+        r_model = _select_named_model(models, "r", "pchip")
+        z_model = _select_named_model(models, "z", "pchip")
+        tip_model = _select_named_model(models, "tip_angle", "pchip")
+        y_selector = cal.requested_offplane_fit_model or "pchip"
+        y_model = _select_named_model(models, "offplane_y", y_selector)
+        y_extrap_model = _normalize_model_spec(models.get("offplane_y_linear"))
+        if y_extrap_model is None:
+            y_extrap_model = _normalize_model_spec(models.get("offplane_y"))
 
         if r_model is None or z_model is None or tip_model is None:
             raise ValueError(f"Calibration phase '{phase}' is missing required PCHIP models")

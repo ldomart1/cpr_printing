@@ -277,6 +277,8 @@ def _normalize_model_spec(model_spec: Any) -> Optional[Dict[str, Any]]:
 def _select_named_model(models: Dict[str, Any], base_name: str, selected_fit_model: Optional[str]) -> Optional[Dict[str, Any]]:
     selected = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
     candidates: List[str] = []
+    if base_name == "offplane_y":
+        candidates.append("offplane_y_avg_cubic")
     if selected:
         candidates.append(f"{base_name}_{selected}")
     candidates.append(base_name)
@@ -1739,7 +1741,6 @@ class GCodeWriter:
         self.skeleton_collision_clearance = max(0.0, float(skeleton_collision_clearance))
         self.skeleton_collision_sample_step_mm = max(0.25, float(skeleton_collision_sample_step_mm))
 
-        self.u_material_abs = 0.0
         self.pressure_charged = False
         self.cur_stage_xyz: Optional[np.ndarray] = None
         self.cur_tip_xyz: Optional[np.ndarray] = None
@@ -1766,9 +1767,6 @@ class GCodeWriter:
         if abs(x - float(p_stage[0])) > 1e-12 or abs(y - float(p_stage[1])) > 1e-12 or abs(z - float(p_stage[2])) > 1e-12:
             self.warnings.append(f"WARNING: {context} stage point clamped to bbox.")
         return np.array([x, y, z], dtype=float)
-
-    def u_cmd_actual(self) -> float:
-        return self.u_material_abs + (self.pressure_offset_mm if self.pressure_charged else 0.0)
 
     def bc_for_tangent(self, tangent: np.ndarray, prev_c: Optional[float] = None, prev_b: Optional[float] = None) -> Tuple[float, float]:
         if self.orientation_mode == "fixed" or self.write_mode != "calibrated":
@@ -2156,21 +2154,21 @@ class GCodeWriter:
             self.printed_paths.append(PrintedVasculaturePath(points_xyz_mm=pts.copy(), radius_mm=max(0.0, float(radius_mm))))
 
     def pressure_preload_before_print(self) -> None:
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and not self.pressure_charged:
+        if self.emit_extrusion and not self.pressure_charged:
             self.pressure_charged = True
-            self.f.write("; pressure preload before print pass\n")
-            self.f.write(f"G1 {self.cal.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_advance_feed:.0f}\n")
+            self.f.write("; enable pressure solenoid before print pass\n")
+            self.f.write("M42 P0 S1\n")
             if self.preflow_dwell_ms > 0:
                 self.f.write(f"G4 P{self.preflow_dwell_ms}\n")
 
     def pressure_release_after_print(self) -> None:
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and self.pressure_charged:
+        if self.emit_extrusion and self.pressure_charged:
             if self.node_dwell_ms > 0:
                 self.f.write("; end-of-pass dwell for node formation / liquid flow\n")
                 self.f.write(f"G4 P{self.node_dwell_ms}\n")
             self.pressure_charged = False
-            self.f.write("; pressure release after print pass\n")
-            self.f.write(f"G1 {self.cal.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_retract_feed:.0f}\n")
+            self.f.write("; disable pressure solenoid after print pass\n")
+            self.f.write("M42 P0 S0\n")
 
     def approach_start_from_side(
         self,
@@ -2335,13 +2333,7 @@ class GCodeWriter:
                 tangent = normalize((1.0 - t) * seg_t0 + t * seg_t1)
                 p_stage, b, c = self.tip_to_stage(p_tip, tangent=tangent, prev_c=self.cur_c)
 
-                u_val = None
-                if self.emit_extrusion:
-                    tip_seg_len = float(np.linalg.norm(p_tip - last_tip))
-                    self.u_material_abs += self.extrusion_per_mm * float(extrusion_multiplier) * tip_seg_len
-                    u_val = self.u_cmd_actual()
-
-                self.write_move(p_stage, b, c, self.print_feed, comment=None, u_value=u_val)
+                self.write_move(p_stage, b, c, self.print_feed, comment=None, u_value=None)
                 self.cur_tip_xyz = p_tip.copy()
                 self.last_tip_tangent = tangent.copy()
                 last_tip = p_tip.copy()
@@ -2795,6 +2787,7 @@ def write_vessel_gcode(
         f.write(f"; path_count = {path_summary['path_count']} (main={path_summary['main_path_count']}, secondary={path_summary['secondary_path_count']})\n")
         f.write(f"; radius_like range = [{vessel_summary['min_radius']:.6f}, {vessel_summary['max_radius']:.6f}]\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
+        f.write("; extrusion actuation: pressure solenoid valve via M42 P0 S1 / M42 P0 S0\n")
         f.write(f"; write_mode = {write_mode}\n")
         f.write(f"; orientation_mode = {orientation_mode}\n")
         f.write("; physical B convention = 0=>-Z, 90=>horizontal, 180=>+Z\n")
@@ -2837,10 +2830,7 @@ def write_vessel_gcode(
         f.write(f"; side approach: far={side_approach_far:.3f}, near={side_approach_near:.3f}, retreat={side_retreat:.3f}, lift_z={side_lift_z:.3f}\n")
         f.write("G90\n")
         if emit_extrusion:
-            f.write("M82\n")
-            f.write(f"G92 {cal.u_axis}0\n")
-            if abs(float(prime_mm)) > 0.0:
-                f.write(f"G1 {cal.u_axis}{float(prime_mm):.3f} F{max(60.0, float(pressure_advance_feed)):.0f} ; prime material\n")
+            f.write("M42 P0 S0\n")
 
         g = GCodeWriter(
             fh=f,
@@ -2921,7 +2911,7 @@ def write_vessel_gcode(
 
         g.write_move(np.array([mex, mey, mez], dtype=float), meb, mec, travel_feed, comment="shutdown: move to anchored machine end pose")
         if emit_extrusion:
-            f.write(f"G92 {cal.u_axis}0\n")
+            f.write("M42 P0 S0\n")
 
         if g.warnings:
             f.write("; ==================== warnings ====================\n")

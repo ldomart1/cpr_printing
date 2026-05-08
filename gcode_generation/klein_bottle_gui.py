@@ -9,9 +9,8 @@ What this script does
 1) Lets you tweak the swept-surface geometry live with a GUI.
 2) Exports Duet/RRF-friendly G-code using a calibration JSON.
 3) Supports shell -> lattice -> shell switching along the curve.
-4) Keeps extrusion perpendicular to the written layer:
-   - base ring on the XY plane -> tool axis vertical
-   - curved shell/lattice on the surface -> tool axis follows surface normal
+4) Uses calibration-aware tip tracking with one continuous centroid-following
+   orientation rule across the print path.
 5) Supports a large base diameter, a thinner tube diameter, a smooth fillet between them,
    and an additional outer-edge roundover control on the large base.
 
@@ -21,8 +20,8 @@ Notes
   analytic Klein bottle. That gives you robust local control and predictable toolpaths.
 - The lattice region is a low-poly surface-following mesh made from rings, meridians,
   and alternating diagonals. It behaves like an octahedral / diamond-style skin lattice.
-- Orientation uses the local surface normal for shell/lattice toolpaths so deposition stays
-  perpendicular to the written layer. The base ring is treated specially as an XY-plane loop.
+- Orientation follows the local spine/centroid direction continuously across the exported
+  print path rather than switching between separate base and surface tracking modes.
 
 Dependencies
 ------------
@@ -42,9 +41,8 @@ import argparse
 import json
 import math
 import os
-import sys
 import traceback
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -116,19 +114,31 @@ DEFAULT_SPINE_R1 = 15.0
 DEFAULT_SPINE_S = 18.0
 DEFAULT_SPINE_Z_WOBBLE = 0.0
 DEFAULT_TWIST_DEG = 180.0
-DEFAULT_SHELL_TURNS = 90.0
+DEFAULT_CONTINUOUS_LAYER_HEIGHT = 0.9
 DEFAULT_SHELL_PHASE_DEG = 0.0
 
 # Radius controls
 DEFAULT_LARGE_BASE_RADIUS = 30.0
 DEFAULT_BASE_TUBE_RADIUS = 14.0
+DEFAULT_BASE_TUBE_HEIGHT = 14.0
 DEFAULT_NECK_RADIUS = 5.0
 DEFAULT_NECK_CENTER = 0.52
 DEFAULT_NECK_WIDTH = 0.24
 DEFAULT_NECK_POWER = 3.0
 DEFAULT_BASE_FILLET_SPAN = 0.12
 DEFAULT_BASE_OUTER_EDGE_FILLET = 3.0
-DEFAULT_BASE_OUTER_EDGE_SPAN = 0.04
+
+# Dark UI colors
+UI_BG = "#17191f"
+UI_PANEL_BG = "#20242c"
+UI_PANEL_ALT_BG = "#262b34"
+UI_FG = "#e6edf3"
+UI_MUTED_FG = "#a8b3c2"
+UI_ACCENT = "#5aa9ff"
+UI_BORDER = "#3b4350"
+UI_ENTRY_BG = "#11151b"
+UI_PLOT_BG = "#11151b"
+UI_GRID = "#4b5563"
 
 # Lattice window + density
 DEFAULT_LATTICE_START = 0.42
@@ -173,6 +183,9 @@ class Calibration:
     u_axis: str
 
     c_180_deg: float
+    selected_fit_model: Optional[str] = None
+    selected_offplane_fit_model: Optional[str] = None
+    active_phase: str = "pull"
 
 
 @dataclass
@@ -222,18 +235,18 @@ class Params:
     spine_s: float = DEFAULT_SPINE_S
     spine_z_wobble: float = DEFAULT_SPINE_Z_WOBBLE
     twist_deg: float = DEFAULT_TWIST_DEG
-    shell_turns: float = DEFAULT_SHELL_TURNS
+    continuous_layer_height: float = DEFAULT_CONTINUOUS_LAYER_HEIGHT
     shell_phase_deg: float = DEFAULT_SHELL_PHASE_DEG
 
     large_base_radius: float = DEFAULT_LARGE_BASE_RADIUS
     base_tube_radius: float = DEFAULT_BASE_TUBE_RADIUS
+    base_tube_height: float = DEFAULT_BASE_TUBE_HEIGHT
     neck_radius: float = DEFAULT_NECK_RADIUS
     neck_center: float = DEFAULT_NECK_CENTER
     neck_width: float = DEFAULT_NECK_WIDTH
     neck_power: float = DEFAULT_NECK_POWER
     base_fillet_span: float = DEFAULT_BASE_FILLET_SPAN
     base_outer_edge_fillet: float = DEFAULT_BASE_OUTER_EDGE_FILLET
-    base_outer_edge_span: float = DEFAULT_BASE_OUTER_EDGE_SPAN
 
     lattice_start: float = DEFAULT_LATTICE_START
     lattice_end: float = DEFAULT_LATTICE_END
@@ -261,6 +274,7 @@ class Params:
 class SurfaceCache:
     ts: np.ndarray
     spine: np.ndarray
+    spine_s_mm: np.ndarray
     T: np.ndarray
     N: np.ndarray
     B: np.ndarray
@@ -312,7 +326,7 @@ PARAM_GROUPS: List[Tuple[str, List[Dict[str, Any]]]] = [
             {"key": "spine_s", "label": "Crossing Term", "from_": -80.0, "to": 80.0, "resolution": 0.5, "step": 0.5},
             {"key": "spine_z_wobble", "label": "Z Wobble", "from_": -40.0, "to": 40.0, "resolution": 0.25, "step": 0.25},
             {"key": "twist_deg", "label": "Twist Deg", "from_": -720.0, "to": 720.0, "resolution": 1.0, "step": 1.0},
-            {"key": "shell_turns", "label": "Shell Turns", "from_": 1.0, "to": 200.0, "resolution": 1.0, "step": 1.0},
+            {"key": "continuous_layer_height", "label": "Continuous Layer H", "from_": 0.1, "to": 10.0, "resolution": 0.05, "step": 0.05},
             {"key": "shell_phase_deg", "label": "Shell Phase", "from_": -180.0, "to": 180.0, "resolution": 1.0, "step": 1.0},
         ],
     ),
@@ -321,13 +335,13 @@ PARAM_GROUPS: List[Tuple[str, List[Dict[str, Any]]]] = [
         [
             {"key": "large_base_radius", "label": "Large Base Radius", "from_": 1.0, "to": 60.0, "resolution": 0.25, "step": 0.25},
             {"key": "base_tube_radius", "label": "Base Tube Radius", "from_": 1.0, "to": 40.0, "resolution": 0.25, "step": 0.25},
+            {"key": "base_tube_height", "label": "Base Tube Height", "from_": 0.0, "to": 80.0, "resolution": 0.25, "step": 0.25},
             {"key": "neck_radius", "label": "Neck Radius", "from_": 1.0, "to": 25.0, "resolution": 0.25, "step": 0.25},
             {"key": "neck_center", "label": "Neck Center", "from_": 0.0, "to": 1.0, "resolution": 0.005, "step": 0.005},
             {"key": "neck_width", "label": "Neck Width", "from_": 0.01, "to": 1.0, "resolution": 0.005, "step": 0.005},
             {"key": "neck_power", "label": "Neck Power", "from_": 0.5, "to": 8.0, "resolution": 0.05, "step": 0.05},
             {"key": "base_fillet_span", "label": "Base Fillet Span", "from_": 0.0, "to": 0.5, "resolution": 0.002, "step": 0.002},
             {"key": "base_outer_edge_fillet", "label": "Base Outer Edge Fillet", "from_": 0.0, "to": 20.0, "resolution": 0.1, "step": 0.1},
-            {"key": "base_outer_edge_span", "label": "Base Outer Edge Span", "from_": 0.0, "to": 0.2, "resolution": 0.001, "step": 0.001},
         ],
     ),
     (
@@ -356,8 +370,6 @@ PARAM_GROUPS: List[Tuple[str, List[Dict[str, Any]]]] = [
             {"key": "travel_feed", "label": "Travel Feed", "from_": 50.0, "to": 5000.0, "resolution": 10.0, "step": 10.0},
             {"key": "print_feed", "label": "Print Feed", "from_": 10.0, "to": 2000.0, "resolution": 5.0, "step": 5.0},
             {"key": "extrusion_per_mm", "label": "Extrusion / mm", "from_": 0.0, "to": 0.2, "resolution": 0.0005, "step": 0.0005},
-            {"key": "prime_mm", "label": "Prime mm", "from_": 0.0, "to": 20.0, "resolution": 0.1, "step": 0.1},
-            {"key": "pressure_offset_mm", "label": "Pressure Offset", "from_": 0.0, "to": 20.0, "resolution": 0.1, "step": 0.1},
             {"key": "safe_approach_z", "label": "Safe Approach Z", "from_": -50.0, "to": 50.0, "resolution": 0.5, "step": 0.5},
         ],
     ),
@@ -428,6 +440,20 @@ def poly_eval(coeffs: Any, u: Any, default_if_none: Optional[float] = None) -> n
     return np.polyval(arr, u)
 
 
+def _coeffs_from_models(models: Dict[str, Any], *names: str) -> Optional[np.ndarray]:
+    for name in names:
+        spec = models.get(name)
+        if not isinstance(spec, dict):
+            continue
+        coeffs = spec.get("coefficients", spec.get("coeffs"))
+        if coeffs is None:
+            continue
+        arr = np.asarray(coeffs, dtype=float).reshape(-1)
+        if arr.size > 0:
+            return arr
+    return None
+
+
 # ============================================================================
 # Calibration / kinematics
 # ============================================================================
@@ -440,13 +466,37 @@ def load_calibration(json_path: str) -> Calibration:
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    cubic = data["cubic_coefficients"]
-    pr = np.array(cubic["r_coeffs"], dtype=float)
-    pz = np.array(cubic["z_coeffs"], dtype=float)
-    py_off_raw = cubic.get("offplane_y_coeffs", None)
-    py_off = None if py_off_raw is None else np.array(py_off_raw, dtype=float)
-    pa_raw = cubic.get("tip_angle_coeffs", None)
-    pa = None if pa_raw is None else np.array(pa_raw, dtype=float)
+    cubic = data.get("cubic_coefficients", {}) or {}
+    fit_models = data.get("fit_models", {}) or {}
+    selected_fit_model = data.get("selected_fit_model")
+    selected_fit_model = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
+    selected_offplane_fit_model = data.get("selected_offplane_fit_model")
+    selected_offplane_fit_model = None if selected_offplane_fit_model is None else str(selected_offplane_fit_model).strip().lower()
+    active_phase = str(data.get("default_phase_for_legacy_access") or "pull").strip().lower()
+
+    phase_models = data.get("fit_models_by_phase", {}) or {}
+    active_models = phase_models.get(active_phase) if isinstance(phase_models, dict) else None
+    if not isinstance(active_models, dict):
+        active_models = fit_models
+
+    pr = (np.asarray(cubic["r_coeffs"], dtype=float) if cubic.get("r_coeffs") is not None
+          else (_coeffs_from_models(active_models, "r_cubic", "r_avg_cubic") or np.zeros(1)))
+    pz = (np.asarray(cubic["z_coeffs"], dtype=float) if cubic.get("z_coeffs") is not None
+          else (_coeffs_from_models(active_models, "z_cubic", "z_avg_cubic") or np.zeros(1)))
+
+    py_off = _coeffs_from_models(
+        active_models,
+        "offplane_y_avg_cubic",
+        "offplane_y_cubic",
+        "offplane_y",
+        "offplane_y_linear",
+        "offplane_y_avg_linear",
+    )
+    if py_off is None and cubic.get("offplane_y_coeffs") is not None:
+        py_off = np.asarray(cubic["offplane_y_coeffs"], dtype=float)
+
+    pa = (np.asarray(cubic["tip_angle_coeffs"], dtype=float) if cubic.get("tip_angle_coeffs") is not None
+          else _coeffs_from_models(active_models, "tip_angle_cubic", "tip_angle_avg_cubic"))
 
     motor_setup = data.get("motor_setup", {})
     duet_map = data.get("duet_axis_mapping", {})
@@ -478,6 +528,9 @@ def load_calibration(json_path: str) -> Calibration:
         c_axis=c_axis,
         u_axis=u_axis,
         c_180_deg=c_180,
+        selected_fit_model=selected_fit_model,
+        selected_offplane_fit_model=selected_offplane_fit_model,
+        active_phase=active_phase,
     )
 
 
@@ -552,6 +605,7 @@ class TipAngleInverter:
 def kleinish_spine(
     t: float,
     base_xyz: np.ndarray,
+    base_tube_height: float,
     height: float,
     r0: float,
     r1: float,
@@ -559,9 +613,39 @@ def kleinish_spine(
     z_wobble: float,
 ) -> np.ndarray:
     """
-    Smooth up-and-down centerline with endpoint vertical tangent.
+    Smooth up-and-down centerline with endpoint vertical tangent and an optional
+    vertical base tube before the main loop departs laterally.
     """
     t = float(t)
+    base_tube_height = max(0.0, float(base_tube_height))
+    height = max(0.0, float(height))
+    total_vertical = base_tube_height + height
+    if total_vertical <= 1e-9:
+        return np.asarray(base_xyz, dtype=float).copy()
+
+    base_frac = base_tube_height / total_vertical
+    if base_frac >= 1.0 - 1e-9:
+        return np.array(
+            [
+                float(base_xyz[0]),
+                float(base_xyz[1]),
+                float(base_xyz[2]) + base_tube_height * clamp01(t),
+            ],
+            dtype=float,
+        )
+
+    if t <= base_frac:
+        s_lin = 0.0 if base_frac <= 1e-9 else (t / base_frac)
+        return np.array(
+            [
+                float(base_xyz[0]),
+                float(base_xyz[1]),
+                float(base_xyz[2]) + base_tube_height * s_lin,
+            ],
+            dtype=float,
+        )
+
+    t = (t - base_frac) / max(1e-9, 1.0 - base_frac)
     u = 2.0 * math.pi * t
     s = math.sin(math.pi * t)
     s2 = s * s
@@ -571,7 +655,7 @@ def kleinish_spine(
 
     x = float(base_xyz[0]) + s2 * loop_x
     y = float(base_xyz[1]) + s2 * loop_y
-    z = float(base_xyz[2]) + height * math.sin(math.pi * t) + z_wobble * s2 * math.sin(2.0 * u)
+    z = float(base_xyz[2]) + base_tube_height + height * math.sin(math.pi * t) + z_wobble * s2 * math.sin(2.0 * u)
     return np.array([x, y, z], dtype=float)
 
 
@@ -637,6 +721,30 @@ def body_radius_profile(t: float, p: Params) -> float:
     return float(p.base_tube_radius) * (1.0 - w) + float(p.neck_radius) * w
 
 
+def base_tube_fraction(p: Params) -> float:
+    base_h = max(0.0, float(p.base_tube_height))
+    loop_h = max(0.0, float(p.spine_height))
+    total = base_h + loop_h
+    if total <= 1e-9:
+        return 0.0
+    return clamp01(base_h / total)
+
+
+def vertical_height_at_t(t: float, p: Params) -> float:
+    t = clamp01(t)
+    base_h = max(0.0, float(p.base_tube_height))
+    loop_h = max(0.0, float(p.spine_height))
+    frac = base_tube_fraction(p)
+    if frac > 1.0 - 1e-9:
+        return base_h * t
+    if frac > 1e-9 and t <= frac:
+        return base_h * (t / frac)
+    if loop_h <= 1e-9:
+        return base_h
+    u = 0.0 if frac >= 1.0 else (t - frac) / max(1e-9, 1.0 - frac)
+    return base_h + loop_h * math.sin(math.pi * clamp01(u))
+
+
 def radius_profile(t: float, p: Params) -> float:
     """
     Swept-tube radius with:
@@ -646,7 +754,8 @@ def radius_profile(t: float, p: Params) -> float:
     - an optional extra outer-edge roundover on the large base
 
     The outer-edge roundover is implemented by slightly reducing the very first radius and
-    smoothly letting it grow to the full large_base_radius over base_outer_edge_span.
+    smoothly letting it grow to the full large_base_radius over a vertical span equal to
+    base_tube_radius, so the span and base tube radius stay coincident.
     """
     t = clamp01(t)
     r_body = body_radius_profile(t, p)
@@ -659,8 +768,9 @@ def radius_profile(t: float, p: Params) -> float:
 
     r = r_body * (1.0 - collar_w) + float(p.large_base_radius) * collar_w
 
-    if float(p.base_outer_edge_fillet) > 1e-9 and float(p.base_outer_edge_span) > 1e-9:
-        s2 = clamp01(t / float(p.base_outer_edge_span))
+    edge_span_h = max(0.0, float(p.base_tube_radius))
+    if float(p.base_outer_edge_fillet) > 1e-9 and edge_span_h > 1e-9:
+        s2 = clamp01(vertical_height_at_t(t, p) / edge_span_h)
         edge_w = 1.0 - smootherstep(s2)
         r -= float(p.base_outer_edge_fillet) * edge_w
 
@@ -676,6 +786,7 @@ def build_surface_cache(p: Params, samples: int) -> SurfaceCache:
             kleinish_spine(
                 t=float(t),
                 base_xyz=base_xyz,
+                base_tube_height=float(p.base_tube_height),
                 height=float(p.spine_height),
                 r0=float(p.spine_r0),
                 r1=float(p.spine_r1),
@@ -686,9 +797,12 @@ def build_surface_cache(p: Params, samples: int) -> SurfaceCache:
         ],
         axis=0,
     )
+    spine_s_mm = np.zeros(n, dtype=float)
+    if n > 1:
+        spine_s_mm[1:] = np.cumsum(np.linalg.norm(np.diff(spine, axis=0), axis=1))
     T, N, B = build_rmf_frames(spine)
     Nt, Bt = apply_twist_about_tangent(T, N, B, float(p.twist_deg))
-    return SurfaceCache(ts=ts, spine=spine, T=T, N=N, B=B, Nt=Nt, Bt=Bt)
+    return SurfaceCache(ts=ts, spine=spine, spine_s_mm=spine_s_mm, T=T, N=N, B=B, Nt=Nt, Bt=Bt)
 
 
 def _interp_frame(cache: SurfaceCache, arr: np.ndarray, t: float) -> np.ndarray:
@@ -736,8 +850,25 @@ def normal_frame(cache: SurfaceCache, t: float) -> Tuple[np.ndarray, np.ndarray]
     return n, b
 
 
-def shell_phi_for_t(t: float, p: Params) -> float:
-    return math.radians(float(p.shell_phase_deg)) + 2.0 * math.pi * float(p.shell_turns) * float(t)
+def spine_arclength_mm(cache: SurfaceCache, t: float) -> float:
+    t = clamp01(t)
+    idx = np.searchsorted(cache.ts, t)
+    if idx <= 0:
+        return float(cache.spine_s_mm[0])
+    if idx >= len(cache.ts):
+        return float(cache.spine_s_mm[-1])
+    t0 = float(cache.ts[idx - 1])
+    t1 = float(cache.ts[idx])
+    if t1 <= t0 + 1e-15:
+        return float(cache.spine_s_mm[idx])
+    a = (t - t0) / (t1 - t0)
+    return float((1.0 - a) * cache.spine_s_mm[idx - 1] + a * cache.spine_s_mm[idx])
+
+
+def shell_phi_for_t(cache: SurfaceCache, t: float, p: Params) -> float:
+    pitch = max(0.05, float(p.continuous_layer_height))
+    turns = spine_arclength_mm(cache, t) / pitch
+    return math.radians(float(p.shell_phase_deg)) + 2.0 * math.pi * turns
 
 
 def point_on_surface(cache: SurfaceCache, p: Params, t: float, phi: float) -> np.ndarray:
@@ -807,12 +938,12 @@ def make_base_ring_polyline(p: Params) -> ParamPolyline:
     return ParamPolyline(name="base_ring", points=pts)
 
 
-def make_shell_polyline(p: Params, t0: float, t1: float, steps: int, name: str) -> ParamPolyline:
+def make_shell_polyline(cache: SurfaceCache, p: Params, t0: float, t1: float, steps: int, name: str) -> ParamPolyline:
     t0 = clamp01(t0)
     t1 = clamp01(t1)
     n = int(max(2, steps))
     ts = np.linspace(t0, t1, n)
-    pts = [ParamPoint(t=float(t), phi=shell_phi_for_t(float(t), p), mode="surface", comment=f"{name} t={t:.4f}") for t in ts]
+    pts = [ParamPoint(t=float(t), phi=shell_phi_for_t(cache, float(t), p), mode="surface", comment=f"{name} t={t:.4f}") for t in ts]
     return ParamPolyline(name=name, points=pts)
 
 
@@ -879,7 +1010,7 @@ def build_lattice_polylines(p: Params) -> List[ParamPolyline]:
     return polylines
 
 
-def build_param_polylines(p: Params) -> List[ParamPolyline]:
+def build_param_polylines(cache: SurfaceCache, p: Params) -> List[ParamPolyline]:
     lat0 = clamp01(min(float(p.lattice_start), float(p.lattice_end)))
     lat1 = clamp01(max(float(p.lattice_start), float(p.lattice_end)))
 
@@ -890,14 +1021,14 @@ def build_param_polylines(p: Params) -> List[ParamPolyline]:
     polylines: List[ParamPolyline] = [make_base_ring_polyline(p)]
 
     if lat0 > 1e-6:
-        polylines.append(make_shell_polyline(p, 0.0, lat0, shell_1_steps, "shell_pre_lattice"))
+        polylines.append(make_shell_polyline(cache, p, 0.0, lat0, shell_1_steps, "shell_pre_lattice"))
     else:
-        polylines.append(make_shell_polyline(p, 0.0, min(0.05, 1.0), max(2, shell_1_steps), "shell_pre_lattice"))
+        polylines.append(make_shell_polyline(cache, p, 0.0, min(0.05, 1.0), max(2, shell_1_steps), "shell_pre_lattice"))
 
     polylines.extend(build_lattice_polylines(p))
 
     if lat1 < 1.0 - 1e-6:
-        polylines.append(make_shell_polyline(p, lat1, 1.0, shell_2_steps, "shell_post_lattice"))
+        polylines.append(make_shell_polyline(cache, p, lat1, 1.0, shell_2_steps, "shell_post_lattice"))
 
     return polylines
 
@@ -916,11 +1047,10 @@ def param_point_to_xyz(cache: SurfaceCache, p: Params, pt: ParamPoint) -> np.nda
 
 def param_point_to_direction(cache: SurfaceCache, p: Params, pt: ParamPoint) -> np.ndarray:
     sign = 1.0 if int(p.tool_normal_sign) >= 0 else -1.0
-    if pt.mode == "base_ring":
-        # The base ring is an XY-plane loop at the endpoint, so the written layer normal is vertical.
-        return _normalize(sign * tangent_dir(cache, 0.0))
-    if pt.mode == "surface":
-        return _normalize(sign * surface_normal(cache, p, pt.t, pt.phi))
+    if pt.mode in {"base_ring", "surface"}:
+        # Use one centroid-following tracking rule everywhere instead of
+        # switching between separate base and surface orientation modes.
+        return _normalize(sign * tangent_dir(cache, pt.t))
     raise ValueError(f"Unknown point mode: {pt.mode}")
 
 
@@ -1044,21 +1174,21 @@ class CalibratedGCodeWriter:
         self.cur_tip_xyz = np.asarray(tip_xyz, dtype=float).copy()
 
     def pressure_preload(self):
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and not self.pressure_charged:
+        if self.emit_extrusion and not self.pressure_charged:
             self.pressure_charged = True
             self.f.write("; pressure preload\n")
-            self.f.write(f"G1 {self.cal.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_advance_feed:.0f}\n")
+            self.f.write("M42 P0 S1\n")
             if self.preflow_dwell_ms > 0:
                 self.f.write(f"G4 P{self.preflow_dwell_ms}\n")
 
     def pressure_release(self):
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and self.pressure_charged:
+        if self.emit_extrusion and self.pressure_charged:
             if self.end_dwell_ms > 0:
                 self.f.write("; end dwell\n")
                 self.f.write(f"G4 P{self.end_dwell_ms}\n")
             self.pressure_charged = False
             self.f.write("; pressure release\n")
-            self.f.write(f"G1 {self.cal.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_retract_feed:.0f}\n")
+            self.f.write("M42 P0 S0\n")
 
     def print_waypoint(self, wp: Waypoint, feed: float, do_extrude: bool, prev_tip_xyz: Optional[np.ndarray]):
         tip_xyz = np.asarray(wp.tip_xyz, dtype=float)
@@ -1080,7 +1210,6 @@ class CalibratedGCodeWriter:
         if self.emit_extrusion and do_extrude:
             seg_len = 0.0 if prev_tip_xyz is None else float(np.linalg.norm(tip_xyz - prev_tip_xyz))
             self.u_material_abs += self.extrusion_per_mm * seg_len
-            axes.append((self.cal.u_axis, self.u_cmd_actual()))
 
         if wp.comment and self.debug_every > 0 and (self.step_counter % self.debug_every == 0):
             tip_ang = float(eval_tip_angle_deg(self.cal, wp.b_cmd))
@@ -1130,12 +1259,27 @@ def sanitize_params(p: Params) -> Params:
     q.neck_center = clamp01(q.neck_center)
     q.neck_width = max(1e-6, float(q.neck_width))
     q.base_fillet_span = max(0.0, float(q.base_fillet_span))
-    q.base_outer_edge_span = max(0.0, float(q.base_outer_edge_span))
     q.base_outer_edge_fillet = max(0.0, float(q.base_outer_edge_fillet))
     q.base_tube_radius = max(0.1, float(q.base_tube_radius))
+    q.base_tube_height = max(0.0, float(q.base_tube_height))
     q.large_base_radius = max(0.1, float(q.large_base_radius))
     q.neck_radius = max(0.1, float(q.neck_radius))
+    q.continuous_layer_height = max(0.05, float(q.continuous_layer_height))
     return q
+
+
+def params_from_mapping(data: Dict[str, Any], base: Optional[Params] = None) -> Params:
+    merged = asdict(base or Params())
+    allowed = {f.name for f in fields(Params)}
+    for key, value in data.items():
+        if key in allowed:
+            merged[key] = value
+
+    if "continuous_layer_height" not in data and "shell_turns" in data:
+        shell_turns = max(1e-6, float(data["shell_turns"]))
+        merged["continuous_layer_height"] = max(0.05, float(merged["spine_height"]) / shell_turns)
+
+    return sanitize_params(Params(**merged))
 
 
 def params_bbox(p: Params) -> Dict[str, float]:
@@ -1153,11 +1297,10 @@ def export_gcode(params: Params, out_path: str) -> Dict[str, Any]:
     p = sanitize_params(params)
     if not p.calibration_path:
         raise ValueError("Calibration JSON path is required for G-code export.")
-
     cal = load_calibration(p.calibration_path)
     inverter = TipAngleInverter(cal)
     cache = build_surface_cache(p, samples=int(max(300, p.path_steps // 4)))
-    polylines = build_param_polylines(p)
+    polylines = build_param_polylines(cache, p)
     bbox = params_bbox(p)
     emit_extrusion = float(p.extrusion_per_mm) != 0.0
     warn_log: List[str] = []
@@ -1168,26 +1311,24 @@ def export_gcode(params: Params, out_path: str) -> Dict[str, Any]:
         total_len = total_print_length(cache, p, polylines)
         f.write("; generated by klein_bottle_gui_slicer.py\n")
         f.write("; calibrated tip-position planning: stage = tip - offset_tip(B_cmd,C)\n")
-        f.write("; shell -> lattice -> shell with surface-normal orientation\n")
+        f.write("; continuous centroid-following tracking across the print path\n")
+        f.write("; extrusion actuation: pressure solenoid valve via M42 P0 S1 / M42 P0 S0\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
         f.write(f"; calibration B range (command units): [{cal.b_min:.6f}, {cal.b_max:.6f}]\n")
+        f.write(f"; selected_offplane_fit_model={cal.selected_offplane_fit_model or cal.selected_fit_model or 'avg_cubic'} active_phase={cal.active_phase}\n")
         f.write(f"; start tip-space base = [{p.start_x:.3f}, {p.start_y:.3f}, {p.start_z:.3f}]\n")
-        f.write(f"; spine: height={p.spine_height:.3f}, r0={p.spine_r0:.3f}, r1={p.spine_r1:.3f}, s={p.spine_s:.3f}, z_wobble={p.spine_z_wobble:.3f}\n")
-        f.write(f"; twist_deg={p.twist_deg:.3f}, shell_turns={p.shell_turns:.3f}, shell_phase_deg={p.shell_phase_deg:.3f}\n")
+        f.write(f"; spine: height={p.spine_height:.3f}, base_tube_height={p.base_tube_height:.3f}, r0={p.spine_r0:.3f}, r1={p.spine_r1:.3f}, s={p.spine_s:.3f}, z_wobble={p.spine_z_wobble:.3f}\n")
+        f.write(f"; twist_deg={p.twist_deg:.3f}, continuous_layer_height={p.continuous_layer_height:.3f}, shell_phase_deg={p.shell_phase_deg:.3f}\n")
         f.write(f"; radii: large_base={p.large_base_radius:.3f}, base_tube={p.base_tube_radius:.3f}, neck={p.neck_radius:.3f}\n")
         f.write(f"; neck: center={p.neck_center:.3f}, width={p.neck_width:.3f}, power={p.neck_power:.3f}\n")
-        f.write(f"; base fillets: base_fillet_span={p.base_fillet_span:.3f}, outer_edge_fillet={p.base_outer_edge_fillet:.3f}, outer_edge_span={p.base_outer_edge_span:.3f}\n")
+        f.write(f"; base fillets: base_fillet_span={p.base_fillet_span:.3f}, outer_edge_fillet={p.base_outer_edge_fillet:.3f}, outer_edge_span=base_tube_radius({p.base_tube_radius:.3f})\n")
         f.write(f"; lattice window: start={p.lattice_start:.3f}, end={p.lattice_end:.3f}, u={p.lattice_u_count}, v={p.lattice_v_count}\n")
         f.write(f"; lengths: approx_total_print_length={total_len:.3f} mm, approx_total_extrusion={total_len * p.extrusion_per_mm:.3f}\n")
         f.write(f"; feeds: travel={p.travel_feed:.1f}, print={p.print_feed:.1f}\n")
         f.write(f"; tool_normal_sign={p.tool_normal_sign}\n")
         f.write("G90\n")
-
         if emit_extrusion:
-            f.write("M82\n")
-            f.write(f"G92 {cal.u_axis}0\n")
-            if abs(float(p.prime_mm)) > 0.0:
-                f.write(f"G1 {cal.u_axis}{float(p.prime_mm):.3f} F{max(60.0, float(p.pressure_advance_feed)):.0f} ; prime\n")
+            f.write("M42 P0 S0\n")
 
         g = CalibratedGCodeWriter(
             fh=f,
@@ -1205,10 +1346,7 @@ def export_gcode(params: Params, out_path: str) -> Dict[str, Any]:
             warn_log=warn_log,
             debug_every=int(p.debug_every),
         )
-        if emit_extrusion:
-            g.u_material_abs = float(p.prime_mm)
 
-        # Safe startup in machine-stage coordinates.
         g.move_stage_xyzbc(
             np.array([float(p.machine_start_x), float(p.machine_start_y), float(p.safe_approach_z)], dtype=float),
             b_cmd=float(p.machine_start_b),
@@ -1224,7 +1362,7 @@ def export_gcode(params: Params, out_path: str) -> Dict[str, Any]:
             comment="startup: dive to machine-start Z",
         )
 
-        c_seed = 0.0
+        c_seed = float(p.machine_start_c)
         total_waypoints = 0
         for poly in polylines:
             waypoints = polyline_to_waypoints(cache, p, poly, inverter, c_seed)
@@ -1234,7 +1372,6 @@ def export_gcode(params: Params, out_path: str) -> Dict[str, Any]:
             total_waypoints += len(waypoints)
             g.print_polyline(poly.name, waypoints)
 
-        # Safe end move.
         if g.cur_stage_xyz is not None:
             g.move_stage_xyzbc(
                 np.array([float(g.cur_stage_xyz[0]), float(g.cur_stage_xyz[1]), float(p.safe_approach_z)], dtype=float),
@@ -1315,6 +1452,11 @@ class ParameterControl(ttk.Frame):
             showvalue=False,
             command=self._scale_changed,
             length=240,
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            troughcolor=UI_PANEL_ALT_BG,
+            highlightthickness=0,
+            activebackground=UI_ACCENT,
         )
         self.scale.grid(row=0, column=2, sticky="ew", padx=2)
         self.scale.bind("<Button-1>", lambda e: self.set_active(self))
@@ -1378,7 +1520,7 @@ class ParameterControl(ttk.Frame):
 class ScrollableFrame(ttk.Frame):
     def __init__(self, master, *args, **kwargs):
         super().__init__(master, *args, **kwargs)
-        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg=UI_PANEL_BG)
         vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         self.inner = ttk.Frame(canvas)
         self.inner.bind(
@@ -1403,6 +1545,7 @@ class KleinBottleApp:
     def __init__(self, root: tk.Tk, initial_params: Optional[Params] = None):
         self.root = root
         self.root.title("Klein Bottle Shell/Lattice G-code Tool")
+        self._configure_theme()
         self.params = sanitize_params(initial_params or Params())
         self.controls: Dict[str, ParameterControl] = {}
         self.active_control: Optional[ParameterControl] = None
@@ -1424,6 +1567,26 @@ class KleinBottleApp:
         self.schedule_redraw()
 
     # ---------- UI ----------
+
+    def _configure_theme(self):
+        self.root.configure(bg=UI_BG)
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(".", background=UI_BG, foreground=UI_FG)
+        style.configure("TFrame", background=UI_BG)
+        style.configure("TLabelframe", background=UI_PANEL_BG, foreground=UI_FG, bordercolor=UI_BORDER)
+        style.configure("TLabelframe.Label", background=UI_PANEL_BG, foreground=UI_FG)
+        style.configure("TLabel", background=UI_BG, foreground=UI_FG)
+        style.configure("TButton", background=UI_PANEL_ALT_BG, foreground=UI_FG, bordercolor=UI_BORDER, focusthickness=1, focuscolor=UI_ACCENT)
+        style.map("TButton", background=[("active", UI_ACCENT)], foreground=[("active", UI_BG)])
+        style.configure("TCheckbutton", background=UI_PANEL_BG, foreground=UI_FG)
+        style.map("TCheckbutton", background=[("active", UI_PANEL_BG)], foreground=[("active", UI_FG)])
+        style.configure("TEntry", fieldbackground=UI_ENTRY_BG, foreground=UI_FG, bordercolor=UI_BORDER, insertcolor=UI_FG)
+        style.configure("Vertical.TScrollbar", background=UI_PANEL_ALT_BG, troughcolor=UI_PANEL_BG, bordercolor=UI_BORDER, arrowcolor=UI_FG)
 
     def _build_ui(self):
         self.root.columnconfigure(1, weight=1)
@@ -1489,6 +1652,7 @@ class KleinBottleApp:
         self.fig = Figure(figsize=(8.0, 7.0), dpi=100)
         self.ax = self.fig.add_subplot(111, projection="3d")
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas.get_tk_widget().configure(bg=UI_BG, highlightthickness=0)
         self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
 
         status = ttk.Label(self.root, textvariable=self.status_var, anchor="w", relief="sunken")
@@ -1563,9 +1727,7 @@ class KleinBottleApp:
             return
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        merged = asdict(self.params)
-        merged.update(data)
-        self.params = sanitize_params(Params(**merged))
+        self.params = params_from_mapping(data, base=self.params)
         self._sync_controls_from_params()
         self.status_var.set(f"Loaded preset: {path}")
         self.schedule_redraw()
@@ -1611,7 +1773,7 @@ class KleinBottleApp:
             self.params = sanitize_params(self.params)
 
             cache = build_surface_cache(self.params, self.params.preview_spine_samples)
-            polylines = build_param_polylines(self.params)
+            polylines = build_param_polylines(cache, self.params)
             self._draw_scene(cache, polylines)
             self._update_info(cache, polylines)
             self.status_var.set("Preview updated")
@@ -1624,12 +1786,18 @@ class KleinBottleApp:
     def _draw_scene(self, cache: SurfaceCache, polylines: Sequence[ParamPolyline]):
         ax = self.ax
         ax.clear()
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-        ax.set_title("Klein bottle shell / lattice preview")
+        self.fig.patch.set_facecolor(UI_BG)
+        ax.set_facecolor(UI_PLOT_BG)
+        ax.set_xlabel("X", color=UI_FG)
+        ax.set_ylabel("Y", color=UI_FG)
+        ax.set_zlabel("Z", color=UI_FG)
+        ax.set_title("Klein bottle shell / lattice preview", color=UI_FG)
+        ax.tick_params(colors=UI_MUTED_FG)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.line.set_color(UI_MUTED_FG)
+            axis.set_pane_color((*matplotlib.colors.to_rgb(UI_PLOT_BG), 1.0))
+            axis._axinfo["grid"]["color"] = UI_GRID
 
-        # Wireframe
         if int(self.params.show_wireframe):
             uu = int(max(8, self.params.preview_wireframe_u))
             vv = int(max(6, self.params.preview_wireframe_v))
@@ -1642,28 +1810,26 @@ class KleinBottleApp:
                 for j, phi in enumerate(phis):
                     xyz = point_on_surface(cache, self.params, float(t), float(phi))
                     X[i, j], Y[i, j], Z[i, j] = xyz
-            ax.plot_wireframe(X, Y, Z, linewidth=0.45, alpha=0.25)
+            ax.plot_wireframe(X, Y, Z, linewidth=0.45, alpha=0.25, color="#8fb8ff")
 
-        # Spine
-        ax.plot(cache.spine[:, 0], cache.spine[:, 1], cache.spine[:, 2], linewidth=1.0, alpha=0.7)
+        ax.plot(cache.spine[:, 0], cache.spine[:, 1], cache.spine[:, 2], linewidth=1.0, alpha=0.7, color="#f59e0b")
 
-        # Polylines
         for poly in polylines:
-            xyz = np.array(polyline_to_xyz(cache, self.params, poly))
+            xyz = np.asarray(polyline_to_xyz(cache, self.params, poly), dtype=float)
             if xyz.shape[0] < 2:
                 continue
             lw = 1.8 if poly.name.startswith("shell") else (2.2 if poly.name == "base_ring" else 0.9)
-            ax.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2], linewidth=lw)
+            color = "#4ade80" if poly.name.startswith("shell") else ("#f97316" if poly.name == "base_ring" else "#93c5fd")
+            ax.plot(xyz[:, 0], xyz[:, 1], xyz[:, 2], linewidth=lw, color=color)
 
-        # Normals
         if int(self.params.show_normals):
             stride = int(max(1, self.params.normal_stride))
             shells = [poly for poly in polylines if poly.name.startswith("shell") or poly.name == "base_ring"]
             for poly in shells:
-                for idx, pt in enumerate(poly.points[::stride]):
+                for pt in poly.points[::stride]:
                     pos = param_point_to_xyz(cache, self.params, pt)
                     nrm = param_point_to_direction(cache, self.params, pt)
-                    ax.quiver(pos[0], pos[1], pos[2], nrm[0], nrm[1], nrm[2], length=8.0, normalize=True)
+                    ax.quiver(pos[0], pos[1], pos[2], nrm[0], nrm[1], nrm[2], length=8.0, normalize=True, color="#f43f5e")
 
         self._set_equal_axes_from_polys(cache, polylines)
         self.canvas.draw_idle()
@@ -1701,19 +1867,20 @@ class KleinBottleApp:
                 inv = TipAngleInverter(cal)
                 sample_pts = []
                 for t in [0.0, max(0.0, lat0 * 0.5), min(1.0, 0.5 * (lat0 + lat1)), min(1.0, 0.5 * (lat1 + 1.0)), 1.0]:
-                    phi = shell_phi_for_t(t, self.params)
-                    d = param_point_to_direction(cache, self.params, ParamPoint(t=t, phi=phi, mode="surface"))
+                    d = _normalize(float(self.params.tool_normal_sign) * tangent_dir(cache, t))
                     tilt, _ = direction_to_tilt_azimuth_deg(d, 0.0)
                     b_cmd, clamped = inv.angle_to_b(tilt)
                     tag = "*" if clamped else ""
-                    sample_pts.append(f"t={t:.2f}: tilt={tilt:.1f}° -> B={b_cmd:.3f}{tag}")
-                cal_text = "Calibration: loaded | " + " | ".join(sample_pts)
+                    sample_pts.append(f"t={t:.2f}: track={tilt:.1f}° -> B={b_cmd:.3f}{tag}")
+                fit_name = cal.selected_offplane_fit_model or cal.selected_fit_model or "legacy"
+                cal_text = f"Calibration: loaded | offplane fit={fit_name} | " + " | ".join(sample_pts)
             except Exception as exc:
                 cal_text = f"Calibration preview unavailable: {exc}"
 
         txt = (
             f"Approx print length: {total_len:.1f} mm\n"
             f"Approx extrusion: {total_len * self.params.extrusion_per_mm:.2f} mm\n"
+            f"Continuous layer height: {self.params.continuous_layer_height:.2f} mm | Base tube height: {self.params.base_tube_height:.2f} mm\n"
             f"Radius samples -> start: {base_r:.2f} mm, neck: {neck_r:.2f} mm, end: {end_r:.2f} mm\n"
             f"Lattice window: {lat0:.3f} to {lat1:.3f} | Polylines: {len(polylines)}\n"
             f"{cal_text}"
@@ -1767,9 +1934,7 @@ def load_startup_params(args: argparse.Namespace) -> Params:
     if args.preset:
         with open(args.preset, "r", encoding="utf-8") as f:
             data = json.load(f)
-        merged = asdict(p)
-        merged.update(data)
-        p = Params(**merged)
+        p = params_from_mapping(data, base=p)
     if args.calibration:
         p.calibration_path = args.calibration
     return sanitize_params(p)

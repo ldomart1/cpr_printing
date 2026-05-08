@@ -13,12 +13,12 @@ from shadow_calibration import CTR_Shadow_Calibration
 import shadow_calibration
 
 
-DEFAULT_PROJECT_NAME = "Test_Calibration_2026-05_02_03_sanity"
+DEFAULT_PROJECT_NAME = "Test_Calibration_2026-05-07_sample_CNN"
 DEFAULT_MANUAL_CROP_ADJUSTMENT = True
 DEFAULT_THRESHOLD = 220
 DEFAULT_PULL_B_START = 0.0
-DEFAULT_PULL_B_STEPS = 10
-DEFAULT_PULL_B_STEP_SIZE = -0.5
+DEFAULT_PULL_B_STEPS = 40 #40
+DEFAULT_PULL_B_STEP_SIZE = -0.125
 DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
 DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260430_103919.png")
 DEFAULT_BOARD_XZ_AXIS_SIGN = 1
@@ -56,9 +56,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tip_refine_mode", type=str, default=DEFAULT_TIP_REFINE_MODE, choices=["coarse", "parallel_centerline", "auto"])
     parser.add_argument("--tip_detection_mode", type=str, default=DEFAULT_TIP_DETECTION_MODE, choices=["classical", "red_dot", "auto_red_dot"])
     parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", help="Acquire C0/C180 first, fit planar pull/release PCHIP radial models, then apply that radial value as a stage-Y offset during the C90 pull/release pass.")
+    parser.add_argument("--full_c90_partial_cneg90_reference", action="store_true", help="Acquire full compensated C+90 pull/release, but only the first 40%% of compensated C-90 pull/release for reference mirroring. Off-plane equations are then fit from the full C+90 trajectory using the partial paired segment only to establish the reference mirror line.")
     parser.add_argument("--red_tip_sat_min", type=int, default=80)
     parser.add_argument("--red_tip_val_min", type=int, default=40)
     parser.add_argument("--red_tip_min_area_px", type=int, default=8)
+    parser.add_argument("--red_tip_morph_kernel", type=int, default=2)
+    parser.add_argument("--red_tip_hue1_min", type=int, default=0)
+    parser.add_argument("--red_tip_hue1_max", type=int, default=10)
+    parser.add_argument("--red_tip_hue2_min", type=int, default=130)
+    parser.add_argument("--red_tip_hue2_max", type=int, default=179)
+    parser.add_argument("--red_tip_search_radius_px", type=float, default=140.0)
+    parser.add_argument("--red_tip_local_min_area_px", type=int, default=2)
+    parser.add_argument("--red_tip_distance_weight", type=float, default=3.0)
     parser.add_argument("--tip_refiner_model", type=str, default=DEFAULT_TIP_REFINER_MODEL)
     parser.add_argument("--tip_refiner_anchor", type=str, default=DEFAULT_TIP_REFINER_ANCHOR)
     parser.add_argument("--tip_refiner_compare_only", action="store_true", default=DEFAULT_TIP_REFINER_COMPARE_ONLY)
@@ -72,7 +81,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def probe_points_for_mode(probe_mode: str):
     if probe_mode == "middle":
-        return [(100.0, 50.0, -185.0)]
+        return [(100.0, 52.0, -180.0)]
     if probe_mode == "five":
         return [
             (30.0, 0.0, -70.0),
@@ -115,6 +124,7 @@ def main(args: argparse.Namespace) -> None:
     cal.tip_refine_mode = str(args.tip_refine_mode)
     cal.tip_detection_mode = str(args.tip_detection_mode)
     cal.c90_y_compensation_from_planar_pchip = bool(args.c90_y_compensation_from_planar_pchip)
+    cal.full_c90_partial_cneg90_reference = bool(args.full_c90_partial_cneg90_reference)
     cal.tip_parallel_section_near_r = 0.75
     cal.tip_parallel_section_far_r = 5.0
     cal.tip_parallel_scan_half_r = 2.5
@@ -125,6 +135,14 @@ def main(args: argparse.Namespace) -> None:
     cal.red_tip_sat_min = int(args.red_tip_sat_min)
     cal.red_tip_val_min = int(args.red_tip_val_min)
     cal.red_tip_min_area_px = int(args.red_tip_min_area_px)
+    cal.red_tip_morph_kernel = int(args.red_tip_morph_kernel)
+    cal.red_tip_hue1_min = int(args.red_tip_hue1_min)
+    cal.red_tip_hue1_max = int(args.red_tip_hue1_max)
+    cal.red_tip_hue2_min = int(args.red_tip_hue2_min)
+    cal.red_tip_hue2_max = int(args.red_tip_hue2_max)
+    cal.red_tip_search_radius_px = float(args.red_tip_search_radius_px)
+    cal.red_tip_local_min_area_px = int(args.red_tip_local_min_area_px)
+    cal.red_tip_distance_weight = float(args.red_tip_distance_weight)
 
     if args.tip_refiner_model:
         tip_refiner_model = os.path.expanduser(str(args.tip_refiner_model))
@@ -142,6 +160,7 @@ def main(args: argparse.Namespace) -> None:
     cal.connect_to_robot()
     calibrate_kwargs = dict(
         jogging_feedrate=200,
+        initial_positioning_feedrate=3000,
         probe_points=probe_points,
         b_start=float(args.pull_b_start),
         b_steps=int(args.pull_b_steps),
@@ -169,8 +188,12 @@ def main(args: argparse.Namespace) -> None:
         stage_y_offset_models_by_phase = {
             "pull": pull_models.get("r"),
         }
-        release_models = cal.get_fit_model("release", fit_family="pchip")
-        stage_y_offset_models_by_phase["release"] = release_models.get("r")
+        try:
+            release_models = cal.get_fit_model("release", fit_family="pchip")
+            stage_y_offset_models_by_phase["release"] = release_models.get("r")
+        except KeyError:
+            print("[WARN] Planar seed export has no release dataset; reusing pull PCHIP model for release compensation.")
+            stage_y_offset_models_by_phase["release"] = stage_y_offset_models_by_phase.get("pull")
 
         if stage_y_offset_models_by_phase.get("pull") is None:
             raise RuntimeError("Could not build planar pull PCHIP model for C90 Y compensation.")
@@ -179,10 +202,10 @@ def main(args: argparse.Namespace) -> None:
 
         print("[INFO] Planar PCHIP seed models built; acquiring compensated C90 pass.")
         cal.calibrate(
-            orientation_ids=[2],
+            orientation_ids=[2, 3],
             append_raw_data=True,
             stage_y_offset_models_by_phase=stage_y_offset_models_by_phase,
-            stage_y_offset_orientation_ids=[2],
+            stage_y_offset_orientation_ids=[2, 3],
             **calibrate_kwargs,
         )
     else:

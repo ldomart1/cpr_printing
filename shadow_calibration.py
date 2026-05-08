@@ -1299,12 +1299,12 @@ class CTR_Shadow_Calibration:
         self.rrf = None
 
         # On 3840x2160 frames this maps to the GUI box:
-        # x:[1005,2897] y:[330,1628]
+        # x:[1394,2856] y:[458,1393]
         self.default_analysis_crop = {
-            "crop_width_min": 1005,
-            "crop_width_max": 2897,
-            "crop_height_min": 532,
-            "crop_height_max": 1830,
+            "crop_width_min": 1394,
+            "crop_width_max": 2856,
+            "crop_height_min": 767,
+            "crop_height_max": 1702,
         }
         self.analysis_crop = dict(self.default_analysis_crop)
 
@@ -1349,13 +1349,17 @@ class CTR_Shadow_Calibration:
         self.tip_parallel_ray_step_px = 0.5
         self.tip_parallel_ray_max_len_r = 10.0
         self.red_tip_hue1_min = 0
-        self.red_tip_hue1_max = 12
-        self.red_tip_hue2_min = 170
+        self.red_tip_hue1_max = 10
+        self.red_tip_hue2_min = 130
         self.red_tip_hue2_max = 179
         self.red_tip_sat_min = 80
         self.red_tip_val_min = 40
         self.red_tip_min_area_px = 8
-        self.red_tip_morph_kernel = 3
+        self.red_tip_morph_kernel = 2
+        self.red_tip_search_radius_px = 140
+        self.red_tip_local_min_area_px = 2
+        self.red_tip_distance_weight = 3.0
+        self.red_tip_bottom_band_px = 3
         self.c90_y_compensation_from_planar_pchip = False
         self.tip_refiner_model_path = None
         self.tip_refiner_model = None
@@ -2424,7 +2428,7 @@ class CTR_Shadow_Calibration:
         patch[dst_y0:dst_y1, dst_x0:dst_x1] = gray_image[src_y0:src_y1, src_x0:src_x1]
         return patch, x0, y0
 
-    def detect_red_tip_marker(self, bgr_image, crop_origin_xy=(0, 0)):
+    def detect_red_tip_marker(self, bgr_image, crop_origin_xy=(0, 0), anchor_yx_local=None):
         dbg = {
             "found": False,
             "detector": "red_dot_centroid",
@@ -2453,11 +2457,12 @@ class CTR_Shadow_Calibration:
         )
         dbg["raw_red_pixel_count"] = int(np.count_nonzero(mask))
 
-        kernel_size = int(max(1, getattr(self, "red_tip_morph_kernel", 3)))
+        kernel_size = int(max(1, getattr(self, "red_tip_morph_kernel", 2)))
         if kernel_size > 1:
             kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            if kernel_size > 2:
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         dbg["filtered_red_pixel_count"] = int(np.count_nonzero(mask))
 
         if dbg["filtered_red_pixel_count"] <= 0:
@@ -2469,14 +2474,82 @@ class CTR_Shadow_Calibration:
             dbg["reason"] = "no_connected_red_component"
             return dbg
 
-        component_areas = stats[1:, cv2.CC_STAT_AREA].astype(int)
-        best_component = int(np.argmax(component_areas)) + 1
+        anchor_xy = None
+        if anchor_yx_local is not None:
+            anchor_arr = np.asarray(anchor_yx_local, dtype=float).reshape(-1)
+            if anchor_arr.size >= 2 and np.all(np.isfinite(anchor_arr[:2])):
+                anchor_xy = np.array([float(anchor_arr[1]), float(anchor_arr[0])], dtype=float)
+                dbg["anchor_xy_local"] = anchor_xy.astype(float).tolist()
+
+        search_radius_px = float(max(1.0, getattr(self, "red_tip_search_radius_px", 140.0)))
+        global_min_area_px = int(max(1, getattr(self, "red_tip_min_area_px", 8)))
+        local_min_area_px = int(max(1, getattr(self, "red_tip_local_min_area_px", 2)))
+
+        best_component = None
+        best_score = None
+        component_debug = []
+        for comp_idx in range(1, num_labels):
+            area_px = int(stats[comp_idx, cv2.CC_STAT_AREA])
+            centroid_x_local, centroid_y_local = centroids[comp_idx]
+            dist_px = None
+            min_area_px = global_min_area_px
+            if anchor_xy is not None:
+                dist_px = float(
+                    np.hypot(
+                        float(centroid_x_local) - anchor_xy[0],
+                        float(centroid_y_local) - anchor_xy[1],
+                    )
+                )
+                if dist_px > search_radius_px:
+                    continue
+                min_area_px = local_min_area_px
+            if area_px < min_area_px:
+                continue
+
+            component_mask = (labels == comp_idx).astype(np.uint8)
+            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            perimeter_px = 0.0
+            if contours:
+                perimeter_px = float(max(cv2.arcLength(cnt, True) for cnt in contours))
+            bbox_w = int(stats[comp_idx, cv2.CC_STAT_WIDTH])
+            bbox_h = int(stats[comp_idx, cv2.CC_STAT_HEIGHT])
+            bbox_area = float(max(1, bbox_w * bbox_h))
+            fill_ratio = float(area_px) / bbox_area
+            circularity = 0.0
+            if perimeter_px > 1e-6:
+                circularity = float(4.0 * np.pi * float(area_px) / (perimeter_px * perimeter_px))
+            circularity = float(np.clip(circularity, 0.0, 1.0))
+            compactness = float(0.7 * circularity + 0.3 * fill_ratio)
+            score = (
+                compactness,
+                -float("inf") if dist_px is None else -dist_px,
+                float(area_px),
+            )
+            component_debug.append(
+                {
+                    "component": int(comp_idx),
+                    "area_px": area_px,
+                    "min_area_px": int(min_area_px),
+                    "centroid_local_xy": [float(centroid_x_local), float(centroid_y_local)],
+                    "distance_from_anchor_px": None if dist_px is None else float(dist_px),
+                    "perimeter_px": float(perimeter_px),
+                    "fill_ratio": float(fill_ratio),
+                    "circularity": float(circularity),
+                    "compactness": float(compactness),
+                    "score": [float(compactness), None if dist_px is None else float(-dist_px), float(area_px)],
+                }
+            )
+            if best_score is None or score > best_score:
+                best_score = score
+                best_component = int(comp_idx)
+
+        dbg["component_candidates"] = component_debug
+        if best_component is None:
+            dbg["reason"] = "no_valid_pink_component_within_anchor_radius" if anchor_xy is not None else "no_valid_pink_component"
+            return dbg
+
         best_area = int(stats[best_component, cv2.CC_STAT_AREA])
         dbg["largest_component_area_px"] = best_area
-
-        if best_area < int(max(1, getattr(self, "red_tip_min_area_px", 8))):
-            dbg["reason"] = "largest_component_below_min_area"
-            return dbg
 
         centroid_x_local, centroid_y_local = centroids[best_component]
         x0 = int(stats[best_component, cv2.CC_STAT_LEFT])
@@ -2484,15 +2557,24 @@ class CTR_Shadow_Calibration:
         bw = int(stats[best_component, cv2.CC_STAT_WIDTH])
         bh = int(stats[best_component, cv2.CC_STAT_HEIGHT])
         crop_x0, crop_y0 = float(crop_origin_xy[0]), float(crop_origin_xy[1])
+        component_mask = (labels == best_component)
+        ys_local, xs_local = np.where(component_mask)
+        if ys_local.size == 0:
+            dbg["reason"] = "selected_component_empty"
+            return dbg
+        x_tip_local = float(centroid_x_local)
+        y_tip_local = float(centroid_y_local)
 
         dbg.update(
             {
                 "found": True,
-                "reason": "largest_red_component_centroid",
-                "x_local": float(centroid_x_local),
-                "y_local": float(centroid_y_local),
-                "x_abs": float(crop_x0 + centroid_x_local),
-                "y_abs": float(crop_y0 + centroid_y_local),
+                "reason": "most_compact_pink_component_centroid",
+                "x_local": float(x_tip_local),
+                "y_local": float(y_tip_local),
+                "x_abs": float(crop_x0 + x_tip_local),
+                "y_abs": float(crop_y0 + y_tip_local),
+                "centroid_x_local": float(centroid_x_local),
+                "centroid_y_local": float(centroid_y_local),
                 "bbox_local_xyxy": [x0, y0, x0 + bw, y0 + bh],
             }
         )
@@ -3063,6 +3145,7 @@ class CTR_Shadow_Calibration:
     def calibrate(self,
                   manual_focus_val=60,
                   jogging_feedrate=200,
+                  initial_positioning_feedrate=3000,
                   # Axis names
                   robot_front_axis_name="X",
                   robot_stage_y_axis_name="Y",
@@ -3136,6 +3219,7 @@ class CTR_Shadow_Calibration:
         settling_time_small = 0.2
         rotation_settling_time = 2.0
         small_move_threshold = 2.0
+        compensated_stage_y_feedrate = max(float(initial_positioning_feedrate), 3.0 * float(jogging_feedrate))
 
         if not os.path.isdir("raw_image_data_folder"):
             os.mkdir("raw_image_data_folder")
@@ -3176,22 +3260,40 @@ class CTR_Shadow_Calibration:
             if extra_settle > 0:
                 time.sleep(extra_settle)
 
-        def wait_for_move(cur: dict, tgt: dict, feedrate: float):
+        def move_distance_mm(cur: dict, tgt: dict) -> float:
             diffs = []
             for ax in tgt:
                 if ax in cur and tgt[ax] is not None and cur[ax] is not None and tgt[ax] != cur[ax]:
                     diffs.append(tgt[ax] - cur[ax])
             if not diffs:
+                return 0.0
+            return float(math.sqrt(sum(d * d for d in diffs)))
+
+        def move_time_seconds(distance_mm: float, feedrate_mm_min: float) -> float:
+            fr = abs(float(feedrate_mm_min))
+            if fr <= 1e-12:
+                return 0.0
+            return 60.0 * float(distance_mm) / fr
+
+        def dynamic_compensation_settle(distance_mm: float, feedrate_mm_min: float, min_s: float, max_s: float, gain: float = 0.12, bias_s: float = 0.03) -> float:
+            move_time_s = move_time_seconds(distance_mm, feedrate_mm_min)
+            settle_s = bias_s + gain * move_time_s
+            return float(np.clip(settle_s, min_s, max_s))
+
+        def wait_for_move(cur: dict, tgt: dict, feedrate: float, extra_settle_override: float = None):
+            distance = move_distance_mm(cur, tgt)
+            if distance <= 1e-12:
                 time.sleep(settling_time_small)
                 return
-            distance = math.sqrt(sum(d * d for d in diffs))
             is_small = distance <= small_move_threshold
             move_type = "small" if is_small else "large"
             settle = settling_time_small if is_small else settling_time_large
+            if extra_settle_override is not None:
+                settle = max(0.0, float(extra_settle_override))
             print(f" {move_type} move: {distance:.2f}mm at {feedrate}mm/min - waiting for Duet (M400) + {settle:.1f}s settle")
             wait_for_duet_motion_complete(extra_settle=settle)
 
-        def move_abs(fr: float, cur: dict, **axes_targets):
+        def move_abs(fr: float, cur: dict, extra_settle_override: float = None, **axes_targets):
             cmd = ["G90", "G1"]
             tgt = dict(cur)
             for ax, val in axes_targets.items():
@@ -3203,7 +3305,7 @@ class CTR_Shadow_Calibration:
             g = " ".join(cmd)
             print(f" Command: {g}")
             self.rrf.send_code(g)
-            wait_for_move(cur, tgt, fr)
+            wait_for_move(cur, tgt, fr, extra_settle_override=extra_settle_override)
             return tgt
 
         def rotate_rel(axis_name: str, c_units: float, fr=None):
@@ -3251,8 +3353,17 @@ class CTR_Shadow_Calibration:
                 print(f" Warning: failed to evaluate stage-Y offset model at B={b_val:.3f} ({exc}); using 0.")
                 return 0.0
 
+        def stage_y_compensation_sign(orientation_id: int) -> float:
+            orientation_id = int(orientation_id)
+            if orientation_id == 2:
+                return -1.0
+            if orientation_id == 3:
+                return +1.0
+            return 0.0
+
         def run_motion_pass(orientation_id: int, x: float, y: float, z: float, probe_idx: int,
-                            motion_phase: str, pass_idx: int, b_values, label_total: int):
+                            motion_phase: str, pass_idx: int, b_values, label_total: int,
+                            extra_stage_y_offset_mm: float = 0.0):
             nonlocal pos, total_images
             motion_phase = str(motion_phase).strip().lower()
             if motion_phase == "pull":
@@ -3264,19 +3375,52 @@ class CTR_Shadow_Calibration:
                     f" {motion_phase.capitalize()} step {step_idx:02d}/{len(b_values) - 1:02d}: "
                     f"{robot_rear_axis_name}={b_val:.2f}"
                 )
-                y_offset_mm = -evaluate_stage_y_offset_mm(orientation_id, motion_phase, b_val)
-                y_target = float(y) + float(y_offset_mm)
-                if not np.isclose(y_offset_mm, 0.0, atol=1e-12):
-                    print(f"  Applying stage-Y compensation: {y_offset_mm:+.3f} mm -> {robot_stage_y_axis_name}={y_target:.3f}")
-                pos = move_abs(
-                    0.3 * jogging_feedrate,
-                    pos,
-                    **{
-                        robot_rear_axis_name: b_val,
-                        robot_stage_y_axis_name: y_target,
-                    }
+                y_offset_mm = (
+                    stage_y_compensation_sign(orientation_id)
+                    * evaluate_stage_y_offset_mm(orientation_id, motion_phase, b_val)
                 )
-                wait_for_duet_motion_complete(extra_settle=capture_dwell_s)
+                y_target = float(y) + float(y_offset_mm) + float(extra_stage_y_offset_mm)
+                if not np.isclose(y_offset_mm, 0.0, atol=1e-12) or not np.isclose(extra_stage_y_offset_mm, 0.0, atol=1e-12):
+                    print(
+                        f"  Applying stage-Y compensation: {y_offset_mm:+.3f} mm"
+                        f" with extra offset {extra_stage_y_offset_mm:+.3f} mm"
+                        f" -> {robot_stage_y_axis_name}={y_target:.3f}"
+                    )
+                use_fast_compensation_path = (
+                    stage_y_offset_models_by_phase is not None and int(orientation_id) in {2, 3}
+                )
+                if use_fast_compensation_path:
+                    if not np.isclose(float(pos.get(robot_stage_y_axis_name, 0.0)), y_target, atol=1e-12):
+                        y_target_map = {robot_stage_y_axis_name: y_target}
+                        y_distance_mm = move_distance_mm(pos, {**pos, **y_target_map})
+                        y_move_time_s = move_time_seconds(y_distance_mm, compensated_stage_y_feedrate)
+                        y_settle_s = 1.0 + y_move_time_s
+                        pos = move_abs(
+                            compensated_stage_y_feedrate,
+                            pos,
+                            extra_settle_override=y_settle_s,
+                            **y_target_map,
+                        )
+                    b_target_map = {robot_rear_axis_name: b_val}
+                    b_distance_mm = move_distance_mm(pos, {**pos, **b_target_map})
+                    b_move_time_s = move_time_seconds(b_distance_mm, 0.3 * jogging_feedrate)
+                    b_settle_s = 1.0 + b_move_time_s
+                    pos = move_abs(
+                        0.3 * jogging_feedrate,
+                        pos,
+                        extra_settle_override=b_settle_s,
+                        **b_target_map,
+                    )
+                else:
+                    pos = move_abs(
+                        0.3 * jogging_feedrate,
+                        pos,
+                        **{
+                            robot_rear_axis_name: b_val,
+                            robot_stage_y_axis_name: y_target,
+                        }
+                    )
+                    wait_for_duet_motion_complete(extra_settle=capture_dwell_s)
                 capture_and_save(orientation_id, x, y_target, z, b_val, probe_idx, step_idx, motion_phase, pass_idx=pass_idx)
                 total_images += 1
 
@@ -3285,6 +3429,11 @@ class CTR_Shadow_Calibration:
             nonlocal pos
             steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
             steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
+            extra_stage_y_offset_mm = (
+                -10.0
+                if stage_y_offset_models_by_phase is not None and int(orientation_id) in {2, 3} and steps_to_run < b_steps
+                else 0.0
+            )
             pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
             pull_b_values = [b_start + step_idx * b_step_size for step_idx in range(0, steps_to_run + 1)]
             release_b_values = list(reversed(pull_b_values))
@@ -3299,12 +3448,14 @@ class CTR_Shadow_Calibration:
                         orientation_id, x, y, z, probe_idx,
                         motion_phase="pull", pass_idx=pass_idx,
                         b_values=pull_b_values, label_total=total_pull_passes,
+                        extra_stage_y_offset_mm=extra_stage_y_offset_mm,
                     )
                 elif len(release_b_values) > 0:
                     run_motion_pass(
                         orientation_id, x, y, z, probe_idx,
                         motion_phase="release", pass_idx=pass_idx,
                         b_values=release_b_values, label_total=total_release_passes,
+                        extra_stage_y_offset_mm=extra_stage_y_offset_mm,
                     )
 
             if not enable_release_imaging:
@@ -3336,10 +3487,13 @@ class CTR_Shadow_Calibration:
         print(f"Combine redundant passes: {combine_redundant_passes} ({redundant_pass_combination})")
         print(f"Tip detection mode: {tip_detection_mode}")
         print(f"Requested orientations: {orientation_ids}")
+        print(f"Initial XYZ positioning feedrate: {float(initial_positioning_feedrate):.1f} mm/min")
+        print(f"Compensated stage-Y travel feedrate: {float(compensated_stage_y_feedrate):.1f} mm/min")
 
         print("\nMoving pull axis to start position...")
         pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
 
+        partial_cneg90_reference_mode = bool(getattr(self, "full_c90_partial_cneg90_reference", False))
         if not use_red_dot_acquisition:
             offplane_step_fraction = 0.4
             n_partial_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
@@ -3348,8 +3502,18 @@ class CTR_Shadow_Calibration:
                 f"({100.0 * offplane_step_fraction:.0f}%) due to tip detectability limits"
             )
         else:
-            n_partial_steps = b_steps
-            print("Red-dot mode enabled: using one full +90 orientation pull/release and skipping -90.")
+            pos90_max_pull_steps = b_steps
+            neg90_max_pull_steps = b_steps
+            if partial_cneg90_reference_mode and stage_y_offset_models_by_phase is not None:
+                offplane_step_fraction = 0.4
+                neg90_max_pull_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
+                print(
+                    "Red-dot compensated partial-reference mode enabled: "
+                    f"using full +90 pull/release and only first {neg90_max_pull_steps}/{b_steps} "
+                    f"pull steps ({100.0 * offplane_step_fraction:.0f}%) for -90."
+                )
+            else:
+                print("Red-dot mode enabled: using full +90/-90 acquisition.")
 
         total_images = 0
         for probe_idx, (x, y, z) in enumerate(probe_points, start=1):
@@ -3359,7 +3523,7 @@ class CTR_Shadow_Calibration:
 
             print(" Moving to probe XYZ...")
             pos = move_abs(
-                jogging_feedrate,
+                initial_positioning_feedrate,
                 pos,
                 **{
                     robot_front_axis_name: x,
@@ -3388,7 +3552,8 @@ class CTR_Shadow_Calibration:
                 print(" Rotating to orientation 2 (C = +90 deg)...")
                 rotate_rel(robot_rotation_axis_name, +c_quarter)
                 print(" Phase 3: orientation 2 (C = +90 deg)")
-                run_pull_release_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+                max_pull_steps = pos90_max_pull_steps if use_red_dot_acquisition else n_partial_steps
+                run_pull_release_sequence_for_orientation(2, x, y, z, probe_idx, max_pull_steps=max_pull_steps)
                 if 3 not in orientation_ids:
                     print(" Rotating back to C = 0 deg...")
                     rotate_rel(robot_rotation_axis_name, -c_quarter)
@@ -3407,7 +3572,8 @@ class CTR_Shadow_Calibration:
                     print(" Rotating to orientation 3 (C = -90 deg)...")
                     rotate_rel(robot_rotation_axis_name, -c_quarter)
                 print(" Phase 4: orientation 3 (C = -90 deg)")
-                run_pull_release_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=n_partial_steps)
+                max_pull_steps = neg90_max_pull_steps if use_red_dot_acquisition else n_partial_steps
+                run_pull_release_sequence_for_orientation(3, x, y, z, probe_idx, max_pull_steps=max_pull_steps)
                 print(" Rotating back to C = 0 deg...")
                 rotate_rel(robot_rotation_axis_name, +c_quarter)
 
@@ -3717,8 +3883,11 @@ class CTR_Shadow_Calibration:
                         yy_selected = float(cnn_tip_dbg["y_abs"] - crop_y_min_img)
                         xx_selected = float(cnn_tip_dbg["x_abs"] - crop_x_min_img)
                         tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                        tip_select_dbg["tip_xy"] = [float(xx_selected), float(yy_selected)]
+                        tip_select_dbg["selected_tip_xy"] = [float(xx_selected), float(yy_selected)]
                         tip_select_dbg["selected_tip_source"] = "cnn"
                         tip_select_dbg["selected_tip_reason"] = "cnn_tip_refiner"
+                        tip_select_dbg["mode"] = "cnn"
             except Exception as exc:
                 cnn_tip_dbg = {"error": str(exc)}
 
@@ -3728,14 +3897,18 @@ class CTR_Shadow_Calibration:
             red_tip_dbg = self.detect_red_tip_marker(
                 cropped_image,
                 crop_origin_xy=(crop_x_min_img, crop_y_min_img),
+                anchor_yx_local=(yy_selected, xx_selected),
             )
             if red_tip_dbg.get("found"):
                 red_tip_abs = (float(red_tip_dbg["y_abs"]), float(red_tip_dbg["x_abs"]))
                 yy_selected = float(red_tip_dbg["y_local"])
                 xx_selected = float(red_tip_dbg["x_local"])
                 tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                tip_select_dbg["tip_xy"] = [float(xx_selected), float(yy_selected)]
+                tip_select_dbg["selected_tip_xy"] = [float(xx_selected), float(yy_selected)]
                 tip_select_dbg["selected_tip_source"] = "red_dot"
                 tip_select_dbg["selected_tip_reason"] = "red_dot_centroid"
+                tip_select_dbg["mode"] = "red_dot"
             else:
                 tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
                 tip_select_dbg["red_dot_fallback_reason"] = red_tip_dbg.get("reason", "red_dot_not_found")
@@ -4160,7 +4333,10 @@ class CTR_Shadow_Calibration:
                 self.tip_locations_array_selected[i, :] = selected_tip
                 if self.tip_refiner_enabled and self._last_tip_locations_cnn is not None:
                     self.tip_locations_array_cnn[i, :] = self._last_tip_locations_cnn
-                    if self.tip_refiner_use_as_selected:
+                    tip_detection_mode = _normalize_tip_detection_mode(
+                        getattr(self, "tip_detection_mode", "classical")
+                    )
+                    if self.tip_refiner_use_as_selected and tip_detection_mode == "classical":
                         self.tip_locations_array_selected[i, :] = self._last_tip_locations_cnn
                 if self._last_skeleton_points_selected_xy is not None:
                     pts_xy = np.asarray(self._last_skeleton_points_selected_xy, dtype=float).reshape(-1, 2)
@@ -5560,7 +5736,16 @@ def skeleton_points(b_pull_mm, phase=None):
                 arr_ap = arr_a[idx_a].copy()
                 arr_bp = arr_b[idx_b].copy()
 
-                mirror_line = float(np.mean(np.vstack([arr_a[:, primary_col], arr_b[:, primary_col]])))
+                mirror_line = float(
+                    np.mean(
+                        np.concatenate(
+                            [
+                                np.asarray(arr_ap[:, primary_col], dtype=float).ravel(),
+                                np.asarray(arr_bp[:, primary_col], dtype=float).ravel(),
+                            ]
+                        )
+                    )
+                )
                 arr_b_primary_mirrored = mirror_line + (
                     primary_mirror_sign * (arr_bp[:, primary_col] - mirror_line)
                 )
@@ -5633,6 +5818,16 @@ def skeleton_points(b_pull_mm, phase=None):
                 if b_arr.size == 0:
                     return None
                 return int(np.argmin(np.abs(b_arr - float(b_target))))
+
+            def rows_matching_b_values(arr_phase, b_values):
+                arr_phase = np.asarray(arr_phase, dtype=float)
+                b_values = np.asarray(b_values, dtype=float).ravel()
+                if arr_phase.size == 0 or b_values.size == 0:
+                    return np.zeros((0, arr_phase.shape[1] if arr_phase.ndim == 2 else 0), dtype=float)
+                keep = np.zeros((arr_phase.shape[0],), dtype=bool)
+                for b_val in b_values:
+                    keep |= np.isclose(arr_phase[:, B_PULL_COL], float(b_val), atol=1e-12)
+                return arr_phase[keep]
 
             phase_name_map = {0: "pull", 1: "release"}
 
@@ -5753,61 +5948,87 @@ def skeleton_points(b_pull_mm, phase=None):
                 }
                 pos90_rows = phase_rows_offplane[np.isclose(phase_rows_offplane[:, ORI_COL], 2)]
                 neg90_rows = phase_rows_offplane[np.isclose(phase_rows_offplane[:, ORI_COL], 3)]
-                offplane_pair = process_orientation_pair(
-                    pos90_rows,
-                    neg90_rows,
-                    primary_col=0,
-                    secondary_col=1,
-                    angle_col=None,
-                    primary_mirror_sign=-1.0,
-                    angle_mirror_sign=-1.0,
-                    pair_name='C90_C-90',
-                )
-                if offplane_pair is None:
-                    if pos90_rows.size > 0:
-                        offplane_pair = process_single_offplane_orientation(
-                            pos90_rows,
-                            reference_mirror_line=x_ref_mirror_line_offplane,
-                            pair_name='C90_single',
-                            orientation_label='C90',
-                            primary_sign=1.0,
+                partial_cneg90_reference_mode = bool(getattr(self, "full_c90_partial_cneg90_reference", False))
+                offplane_pair = None
+                if partial_cneg90_reference_mode and pos90_rows.size > 0 and neg90_rows.size > 0:
+                    pos90_collapsed_full = collapse_by_bpull(pos90_rows)
+                    neg90_collapsed_ref = collapse_by_bpull(neg90_rows)
+                    common_b_ref = np.intersect1d(
+                        np.asarray(pos90_collapsed_full[:, B_PULL_COL], dtype=float),
+                        np.asarray(neg90_collapsed_ref[:, B_PULL_COL], dtype=float),
+                    )
+                    if common_b_ref.size > 0:
+                        pos90_rows_ref = rows_matching_b_values(pos90_rows, common_b_ref)
+                        neg90_rows_ref = rows_matching_b_values(neg90_rows, common_b_ref)
+                        offplane_pair = process_orientation_pair(
+                            pos90_rows_ref,
+                            neg90_rows_ref,
+                            primary_col=0,
+                            secondary_col=1,
+                            angle_col=None,
+                            primary_mirror_sign=-1.0,
+                            angle_mirror_sign=-1.0,
+                            pair_name='C90_C-90_reference',
                         )
-                    elif neg90_rows.size > 0:
-                        offplane_pair = process_single_offplane_orientation(
-                            neg90_rows,
-                            reference_mirror_line=x_ref_mirror_line_offplane,
-                            pair_name='C-90_single',
-                            orientation_label='C-90',
-                            primary_sign=-1.0,
-                        )
+                        if offplane_pair is not None:
+                            y_ref_offplane = float(offplane_pair['mirror_line'])
+                            common_b_off = np.asarray(pos90_collapsed_full[:, B_PULL_COL], dtype=float)
+                            y_off_raw = np.asarray(pos90_collapsed_full[:, 0], dtype=float)
+                            z_off_raw = np.asarray(pos90_collapsed_full[:, 1], dtype=float)
+                            dataset['offplane_b'] = common_b_off.astype(float)
+                            dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
+                            dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
+                            o2_ref = np.asarray(offplane_pair['a_aligned'], dtype=float)
+                            o3_ref = np.asarray(offplane_pair['b_aligned'], dtype=float)
+                            o3_y_mirrored_ref = np.asarray(offplane_pair['b_primary_mirrored'], dtype=float)
+                            dataset['orientation_processing_offplane'] = {
+                                'pair_name': offplane_pair['pair_name'],
+                                'common_b': common_b_off.astype(float),
+                                'reference_common_b': np.asarray(offplane_pair['common_b'], dtype=float),
+                                'mirror_line_mm': y_ref_offplane,
+                                'fit_source_orientation': 'C90',
+                                'orientation_pos90_y_mm': o2_ref[:, 0].astype(float),
+                                'orientation_pos90_z_mm': o2_ref[:, 1].astype(float),
+                                'orientation_neg90_y_mirrored_mm': o3_y_mirrored_ref.astype(float),
+                                'orientation_neg90_z_mm': o3_ref[:, 1].astype(float),
+                                'avg_y_mm': y_off_raw.astype(float),
+                                'full_source_b': common_b_off.astype(float),
+                                'full_source_y_mm': y_off_raw.astype(float),
+                                'full_source_z_mm': z_off_raw.astype(float),
+                            }
+                            dataset['raw_offplane_trajectories'] = {
+                                'C90': {
+                                    'b': common_b_off.astype(float).tolist(),
+                                    'y_proxy': y_off_raw.astype(float).tolist(),
+                                    'y_disp': (y_off_raw - y_ref_offplane).astype(float).tolist(),
+                                    'z': z_off_raw.astype(float).tolist(),
+                                },
+                                'C-90': {
+                                    'b': np.asarray(offplane_pair['b_collapsed'][:, B_PULL_COL], dtype=float).tolist(),
+                                    'y_proxy': np.asarray(offplane_pair['b_collapsed'][:, 0], dtype=float).tolist(),
+                                    'y_disp': (o3_y_mirrored_ref - y_ref_offplane).astype(float).tolist(),
+                                    'z': np.asarray(offplane_pair['b_collapsed'][:, 1], dtype=float).tolist(),
+                                },
+                            }
+                if offplane_pair is None and dataset.get('offplane_b') is None:
+                    offplane_pair = process_orientation_pair(
+                        pos90_rows,
+                        neg90_rows,
+                        primary_col=0,
+                        secondary_col=1,
+                        angle_col=None,
+                        primary_mirror_sign=-1.0,
+                        angle_mirror_sign=-1.0,
+                        pair_name='C90_C-90',
+                    )
                 if offplane_pair is not None:
-                    common_b_off = offplane_pair['common_b']
-                    y_ref_offplane = float(offplane_pair['mirror_line'])
-                    y_off_raw = offplane_pair['avg_primary']
-                    dataset['offplane_b'] = common_b_off.astype(float)
-                    dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
-                    dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
-                    if 'single_collapsed' in offplane_pair:
-                        osingle = offplane_pair['single_collapsed']
-                        orientation_label = str(offplane_pair.get('orientation_label', 'C90'))
-                        dataset['orientation_processing_offplane'] = {
-                            'pair_name': offplane_pair['pair_name'],
-                            'common_b': common_b_off.astype(float),
-                            'mirror_line_mm': y_ref_offplane,
-                            'source_orientation': orientation_label,
-                            'source_y_mm': osingle[:, 0].astype(float),
-                            'source_z_mm': osingle[:, 1].astype(float),
-                            'avg_y_mm': y_off_raw.astype(float),
-                        }
-                        dataset['raw_offplane_trajectories'] = {
-                            orientation_label: {
-                                'b': osingle[:, B_PULL_COL].astype(float).tolist(),
-                                'y_proxy': osingle[:, 0].astype(float).tolist(),
-                                'y_disp': (y_off_raw - y_ref_offplane).astype(float).tolist(),
-                                'z': osingle[:, 1].astype(float).tolist(),
-                            },
-                        }
-                    else:
+                    if dataset.get('offplane_b') is None:
+                        common_b_off = offplane_pair['common_b']
+                        y_ref_offplane = float(offplane_pair['mirror_line'])
+                        y_off_raw = offplane_pair['avg_primary']
+                        dataset['offplane_b'] = common_b_off.astype(float)
+                        dataset['offplane_y'] = (y_off_raw - y_ref_offplane).astype(float)
+                        dataset['y_ref_offplane_mirror_line_mm'] = y_ref_offplane
                         o2 = offplane_pair['a_collapsed']
                         o3 = offplane_pair['b_collapsed']
                         o2p = offplane_pair['a_aligned']
@@ -6361,15 +6582,15 @@ def skeleton_points(b_pull_mm, phase=None):
                 )
 
             shared_offplane_plot_model = (
-                shared_offplane_y_model
-                or shared_offplane_y_cubic_model
+                shared_offplane_y_cubic_model
+                or shared_offplane_y_model
                 or shared_offplane_y_linear_model
             )
             shared_offplane_plot_r2 = (
-                shared_offplane_y_r2
-                if shared_offplane_y_model is not None
-                else shared_offplane_y_cubic_r2
+                shared_offplane_y_cubic_r2
                 if shared_offplane_y_cubic_model is not None
+                else shared_offplane_y_r2
+                if shared_offplane_y_model is not None
                 else shared_offplane_y_linear_r2
             )
 

@@ -80,11 +80,11 @@ DEFAULT_ADD_DATE = True
 
 DEFAULT_POINT_X = 90.0
 DEFAULT_POINT_Y = 52.0
-DEFAULT_POINT_Z = -130.0
+DEFAULT_POINT_Z = -140.0
 
 DEFAULT_TRAVEL_FEED = 8000.0
-DEFAULT_FINE_APPROACH_FEED = 100.0
-DEFAULT_PROBE_FEED = 100.0
+DEFAULT_FINE_APPROACH_FEED = 180.0
+DEFAULT_PROBE_FEED = 180.0
 DEFAULT_B_MAX_FEED = 500.0
 DEFAULT_B_ACCEL_TIME_S = 0.05
 DEFAULT_B_DECEL_TIME_S = 0.05
@@ -102,17 +102,17 @@ DEFAULT_B_PHASE_OFFSET_DEG = -90.0   # starts at tip_min and ends at tip_min
 
 DEFAULT_START_X = 100.0
 DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -130.0
+DEFAULT_START_Z = -140.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
 DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -130.0
+DEFAULT_END_Z = -140.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
-DEFAULT_SAFE_APPROACH_Z = -155.0
+DEFAULT_SAFE_APPROACH_Z = -140.0
 
 DEFAULT_DWELL_BEFORE_MS = 0.5
 DEFAULT_DWELL_AFTER_MS = 0
@@ -141,14 +141,16 @@ DEFAULT_INTER_COMMAND_DELAY_S = 0.005
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_CAPTURE_EVERY_MOVE_POINT = False
 DEFAULT_SETTLED_CAPTURE_MODE = True
-DEFAULT_SETTLED_CAPTURE_BUFFER_S = 4
-DEFAULT_MIN_ESTIMATED_MOVE_TIME_S = 0.008
+DEFAULT_SETTLED_CAPTURE_BUFFER_S = 0.5
+DEFAULT_MIN_ESTIMATED_MOVE_TIME_S = 0.020
 
 DEFAULT_FLIP_RZ_SIGN = True
+DEFAULT_POST_TIP_DETECTION_MODE = "classical"
 DEFAULT_POST_TIP_REFINER_MODEL = (
     "CNN_Calib/"
     "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
 )
+DEFAULT_Y_OFFSET_FIT = "avg_pchip"
 
 OFFPLANE_SIGN = -1.0
 
@@ -287,7 +289,86 @@ def _extract_phase_models(data: dict) -> Tuple[dict, str]:
     return phase_models, default_phase
 
 
-def load_calibration(json_path: str) -> Calibration:
+def _select_y_offset_model(
+    fit_models: dict,
+    default_phase_models: dict,
+    cubic: dict,
+    y_offset_fit: str,
+) -> Optional[dict]:
+    mode = str(y_offset_fit).strip().lower()
+
+    if mode == "avg_pchip":
+        return (
+            fit_models.get("offplane_y_avg_pchip")
+            or fit_models.get("offplane_y")
+            or default_phase_models.get("offplane_y_avg_pchip")
+            or default_phase_models.get("offplane_y")
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "avg_cubic":
+        return (
+            fit_models.get("offplane_y_avg_cubic")
+            or fit_models.get("offplane_y_cubic")
+            or default_phase_models.get("offplane_y_cubic")
+            or legacy_poly_model(
+                cubic.get("offplane_y_cubic_coeffs"),
+                cubic.get("offplane_y_cubic_equation"),
+                "y_offplane_mm",
+            )
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "pchip":
+        return (
+            fit_models.get("offplane_y_pchip")
+            or fit_models.get("offplane_y")
+            or default_phase_models.get("offplane_y_pchip")
+            or default_phase_models.get("offplane_y")
+            or fit_models.get("offplane_y_avg_pchip")
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "cubic":
+        return (
+            fit_models.get("offplane_y_cubic")
+            or default_phase_models.get("offplane_y_cubic")
+            or fit_models.get("offplane_y_avg_cubic")
+            or legacy_poly_model(
+                cubic.get("offplane_y_cubic_coeffs"),
+                cubic.get("offplane_y_cubic_equation"),
+                "y_offplane_mm",
+            )
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "legacy":
+        return legacy_poly_model(
+            cubic.get("offplane_y_coeffs"),
+            cubic.get("offplane_y_equation"),
+            "y_offplane_mm",
+        )
+
+    raise ValueError(f"Unsupported y-offset fit selection: {y_offset_fit}")
+
+
+def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -> Calibration:
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Calibration JSON not found: {json_path}")
@@ -311,10 +392,11 @@ def load_calibration(json_path: str) -> Calibration:
         cubic.get("z_equation"),
         "z",
     )
-    y_off_model = fit_models.get("offplane_y") or default_phase_models.get("offplane_y") or legacy_poly_model(
-        cubic.get("offplane_y_coeffs"),
-        cubic.get("offplane_y_equation"),
-        "y_offplane_mm",
+    y_off_model = _select_y_offset_model(
+        fit_models=fit_models,
+        default_phase_models=default_phase_models,
+        cubic=cubic,
+        y_offset_fit=y_offset_fit,
     )
     tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
         cubic.get("tip_angle_coeffs"),
@@ -1660,7 +1742,7 @@ class FixedTipPointTracker:
 
 def main(args):
     script_dir = Path(__file__).resolve().parent
-    cal = load_calibration(args.calibration)
+    cal = load_calibration(args.calibration, y_offset_fit=args.y_offset_fit)
 
     p_tip_fixed = np.array(
         [float(args.point_x), float(args.point_y), float(args.point_z)],
@@ -1812,6 +1894,8 @@ def main(args):
                 str(script_dir / "captures/photo_20260428_162904.png"),
                 "--threshold",
                 "200",
+                "--tip_detection_mode",
+                str(args.post_tip_detection_mode),
                 "--tip_refine_mode",
                 "none",
                 "--tip_refiner_model",
@@ -1846,6 +1930,9 @@ if __name__ == "__main__":
                     help="Append timestamp to the run folder name.")
     ap.add_argument("--enable-post", action="store_true",
                     help="Run calib_plane_process.py on the generated project directory after acquisition.")
+    ap.add_argument("--post-tip-detection-mode", type=str, default=DEFAULT_POST_TIP_DETECTION_MODE,
+                    choices=["classical", "red_dot", "auto_red_dot"],
+                    help="Tip detection mode passed to calib_plane_process.py during --enable-post.")
     ap.add_argument("--post-tip-refiner-model", type=str, default=DEFAULT_POST_TIP_REFINER_MODEL,
                     help="CNN tip refiner model passed to calib_plane_process.py.")
 
@@ -1868,6 +1955,9 @@ if __name__ == "__main__":
 
     # Calibration input
     ap.add_argument("--calibration", required=True, help="Path to calibration JSON.")
+    ap.add_argument("--y-offset-fit", type=str, default=DEFAULT_Y_OFFSET_FIT,
+                    choices=["avg_pchip", "avg_cubic", "pchip", "cubic", "legacy"],
+                    help="Which calibration y-offset fit to use for DAQ motion.")
 
     # Fixed tip point
     ap.add_argument("--point-x", type=float, default=DEFAULT_POINT_X, help="Fixed tip X (Cartesian/world).")

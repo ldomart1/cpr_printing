@@ -178,7 +178,10 @@ def load_optional_tip_refiner(cal: CTR_Shadow_Calibration, args) -> None:
 def select_tracked_rows_for_analysis(cal: CTR_Shadow_Calibration, args) -> Tuple[np.ndarray, str]:
     source = str(getattr(args, "tracked_tip_source", "auto")).strip().lower()
     if source == "auto":
-        if getattr(args, "tip_refiner_model", None) and not bool(getattr(args, "tip_refiner_compare_only", False)):
+        tip_detection_mode = str(getattr(args, "tip_detection_mode", "classical")).strip().lower()
+        if tip_detection_mode in ("red", "red_dot", "red_marker", "red_centroid", "marker", "auto_red", "auto_red_dot", "red_dot_auto"):
+            source = "selected"
+        elif getattr(args, "tip_refiner_model", None) and not bool(getattr(args, "tip_refiner_compare_only", False)):
             source = "selected"
         else:
             source = "coarse"
@@ -2387,6 +2390,7 @@ def save_metrics_json(
             "tip_refiner_model": None if getattr(args, "tip_refiner_model", None) is None else str(Path(args.tip_refiner_model).expanduser().resolve()),
             "tip_refiner_anchor": getattr(args, "tip_refiner_anchor", None),
             "tip_refiner_compare_only": bool(getattr(args, "tip_refiner_compare_only", False)),
+            "tip_detection_mode": str(args.tip_detection_mode),
             "tip_refine_mode": str(args.tip_refine_mode),
             "tip_refine_dt_step_px": float(args.tip_refine_dt_step_px),
             "tip_refine_max_step_px": int(args.tip_refine_max_step_px),
@@ -2467,8 +2471,11 @@ def main():
                     help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
     ap.add_argument("--tip_refiner_compare_only", action="store_true",
                     help="Save CNN tips but keep non-CNN tips as the default tracked source.")
+    ap.add_argument("--tip_detection_mode", type=str, default="classical",
+                    choices=["classical", "red_dot", "auto_red_dot"],
+                    help="Tip detection mode from CTR shadow calibration. red_dot uses the red marker centroid as the selected tip.")
     ap.add_argument("--tracked_tip_source", type=str, default="auto", choices=["auto", "coarse", "selected", "cnn"],
-                    help="Which tip rows to convert to mm. auto uses selected/CNN when --tip_refiner_model is active, otherwise coarse.")
+                    help="Which tip rows to convert to mm. auto uses selected rows when red-dot or CNN-selected tips are active, otherwise coarse.")
 
     ap.add_argument("--hist_bins", type=int, default=24,
                     help="Number of histogram bins.")
@@ -2508,6 +2515,7 @@ def main():
         add_date=False,
     )
     cal.calibration_data_folder = str(project_dir)
+    cal.tip_detection_mode = str(args.tip_detection_mode)
     load_optional_tip_refiner(cal, args)
     cal.tip_parallel_section_near_r = float(args.tip_refine_parallel_section_near_r)
     cal.tip_parallel_section_far_r = float(args.tip_refine_parallel_section_far_r)

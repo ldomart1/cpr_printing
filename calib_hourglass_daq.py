@@ -60,10 +60,10 @@ DEFAULT_CAMERA_WIDTH = 3840
 DEFAULT_CAMERA_HEIGHT = 2160
 DEFAULT_CAMERA_FLUSH_FRAMES = 1
 
-DEFAULT_TRAVEL_FEED = 2000.0
-DEFAULT_PRINT_FEED = 2000.0
-DEFAULT_FINE_APPROACH_FEED = 150.0
-DEFAULT_PRINT_FEED_B = 200.0
+DEFAULT_TRAVEL_FEED = 4000.0
+DEFAULT_PRINT_FEED = 4000.0
+DEFAULT_FINE_APPROACH_FEED = 300.0
+DEFAULT_PRINT_FEED_B = 400.0
 DEFAULT_PRINT_FEED_C = 20000.0
 DEFAULT_TRANSITION_FEED = 1200.0
 DEFAULT_C_FLIP_DELAY_S = 4.0
@@ -90,17 +90,17 @@ DEFAULT_POST_TIP_REFINER_MODEL = (
     "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
 )
 
-DEFAULT_SAFE_APPROACH_Z = -135.0
+DEFAULT_SAFE_APPROACH_Z = -140.0
 
 DEFAULT_START_X = 100.0
 DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -135.0
+DEFAULT_START_Z = -140.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
 DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -135.0
+DEFAULT_END_Z = -140.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
@@ -111,15 +111,22 @@ DEFAULT_BBOX_Y_MAX = 200.0
 DEFAULT_BBOX_Z_MIN = -200.0
 DEFAULT_BBOX_Z_MAX = 0.0
 
-CIRCLE_CENTER_X = 100.0
-CIRCLE_CENTER_Y = 52.0
-CIRCLE_CENTER_Z = -130.0
-
 DEFAULT_SAMPLES_PER_QUARTER = 200
 DEFAULT_CAPTURE_EVERY_N_CIRCLE_MOVES = 7
 DEFAULT_C0_DEG = 0.0
 DEFAULT_FLIP_RZ_SIGN = True
 DEFAULT_QUARTER_GAP_MM = 15.0
+DEFAULT_Y_OFFSET_FIT = "avg_pchip"
+DEFAULT_POST_TIP_DETECTION_MODE = "classical"
+DEFAULT_HOURGLASS_CENTER_X = 100.0
+DEFAULT_HOURGLASS_CENTER_Y = 52.0
+DEFAULT_HOURGLASS_CENTER_Z = -140.0
+DEFAULT_ARC_VERTICAL_GAP_MM = 20.0
+DEFAULT_CIRCLE_DIAMETER_MM = 20.0
+DEFAULT_MIDDLE_GAP_MM = 10.0
+DEFAULT_ARC_OVERTRAVEL_DEG = 20.0
+DEFAULT_SAMPLES_PER_ARC = 180
+DEFAULT_SAMPLES_PER_DIAGONAL = 120
 
 OFFPLANE_SIGN = -1.0
 C_HARD_MIN_DEG = -360.0
@@ -135,6 +142,18 @@ TRANSITION_PHASES = {
     "pull_to_release_1",
     "midpoint_c_flip",
     "pull_to_release_2",
+    "final_recenter",
+}
+
+HOURGLASS_RECORDED_PHASES = {
+    "top_arc_pull",
+    "right_diag_upper_release",
+    "right_diag_lower_pull",
+    "bottom_arc_release",
+    "left_diag_lower_pull",
+    "left_diag_upper_release",
+}
+HOURGLASS_TRANSITION_PHASES = {
     "final_recenter",
 }
 
@@ -296,7 +315,86 @@ def _extract_phase_models(data: dict) -> Tuple[dict, str]:
     return phase_models, default_phase
 
 
-def load_calibration(json_path: str) -> Calibration:
+def _select_y_offset_model(
+    fit_models: dict,
+    default_phase_models: dict,
+    cubic: dict,
+    y_offset_fit: str,
+) -> Optional[dict]:
+    mode = str(y_offset_fit).strip().lower()
+
+    if mode == "avg_pchip":
+        return (
+            fit_models.get("offplane_y_avg_pchip")
+            or fit_models.get("offplane_y")
+            or default_phase_models.get("offplane_y_avg_pchip")
+            or default_phase_models.get("offplane_y")
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "avg_cubic":
+        return (
+            fit_models.get("offplane_y_avg_cubic")
+            or fit_models.get("offplane_y_cubic")
+            or default_phase_models.get("offplane_y_cubic")
+            or legacy_poly_model(
+                cubic.get("offplane_y_cubic_coeffs"),
+                cubic.get("offplane_y_cubic_equation"),
+                "y_offplane_mm",
+            )
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "pchip":
+        return (
+            fit_models.get("offplane_y_pchip")
+            or fit_models.get("offplane_y")
+            or default_phase_models.get("offplane_y_pchip")
+            or default_phase_models.get("offplane_y")
+            or fit_models.get("offplane_y_avg_pchip")
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "cubic":
+        return (
+            fit_models.get("offplane_y_cubic")
+            or default_phase_models.get("offplane_y_cubic")
+            or fit_models.get("offplane_y_avg_cubic")
+            or legacy_poly_model(
+                cubic.get("offplane_y_cubic_coeffs"),
+                cubic.get("offplane_y_cubic_equation"),
+                "y_offplane_mm",
+            )
+            or legacy_poly_model(
+                cubic.get("offplane_y_coeffs"),
+                cubic.get("offplane_y_equation"),
+                "y_offplane_mm",
+            )
+        )
+
+    if mode == "legacy":
+        return legacy_poly_model(
+            cubic.get("offplane_y_coeffs"),
+            cubic.get("offplane_y_equation"),
+            "y_offplane_mm",
+        )
+
+    raise ValueError(f"Unsupported y-offset fit selection: {y_offset_fit}")
+
+
+def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -> Calibration:
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Calibration JSON not found: {json_path}")
@@ -315,8 +413,11 @@ def load_calibration(json_path: str) -> Calibration:
     z_model = fit_models.get("z") or default_phase_models.get("z") or legacy_poly_model(
         cubic.get("z_coeffs"), cubic.get("z_equation"), "z"
     )
-    y_off_model = fit_models.get("offplane_y") or default_phase_models.get("offplane_y") or legacy_poly_model(
-        cubic.get("offplane_y_coeffs"), cubic.get("offplane_y_equation"), "y_offplane_mm"
+    y_off_model = _select_y_offset_model(
+        fit_models=fit_models,
+        default_phase_models=default_phase_models,
+        cubic=cubic,
+        y_offset_fit=y_offset_fit,
     )
     tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
         cubic.get("tip_angle_coeffs"), cubic.get("tip_angle_equation"), "tip_angle_deg"
@@ -574,35 +675,13 @@ def common_b_window_for_pull_release(
 # Hourglass planner
 # =========================
 
-HOURGLASS_CENTER_X = CIRCLE_CENTER_X
-HOURGLASS_CENTER_Y = CIRCLE_CENTER_Y
-HOURGLASS_CENTER_Z = CIRCLE_CENTER_Z
-DEFAULT_ARC_VERTICAL_GAP_MM = 18.0
-DEFAULT_CIRCLE_DIAMETER_MM = 18.0
-DEFAULT_MIDDLE_GAP_MM = 6.0
-DEFAULT_ARC_OVERTRAVEL_DEG = 20.0
-DEFAULT_SAMPLES_PER_ARC = 180
-DEFAULT_SAMPLES_PER_DIAGONAL = 120
-
-RECORDED_PHASES = {
-    "top_arc_pull",
-    "right_diag_upper_release",
-    "right_diag_lower_pull",
-    "bottom_arc_release",
-    "left_diag_lower_pull",
-    "left_diag_upper_release",
-}
-TRANSITION_PHASES = {
-    "final_recenter",
-}
-
 
 def is_recorded_phase(phase: str) -> bool:
     phase_name = str(phase)
-    if phase_name in RECORDED_PHASES:
+    if phase_name in HOURGLASS_RECORDED_PHASES:
         return True
     if phase_name.endswith("_start"):
-        return phase_name[:-6] in RECORDED_PHASES
+        return phase_name[:-6] in HOURGLASS_RECORDED_PHASES
     return False
 
 
@@ -1724,7 +1803,7 @@ class CircleTrackerRunner:
                     print(f"Holding {float(DEFAULT_C_FLIP_DELAY_S):.3f} s after C rotation...")
                     time.sleep(float(DEFAULT_C_FLIP_DELAY_S))
 
-                if cp.phase in RECORDED_PHASES:
+                if cp.phase in HOURGLASS_RECORDED_PHASES:
                     circle_move_counter += 1
                     if (circle_move_counter % capture_every_n_circle_moves) == 0:
                         sample_counter += 1
@@ -1777,7 +1856,7 @@ class CircleTrackerRunner:
 # =========================
 
 def main(args):
-    cal = load_calibration(args.calibration)
+    cal = load_calibration(args.calibration, y_offset_fit=args.y_offset_fit)
     if bool(args.use_average_cubic_fit):
         cal = calibration_with_average_cubic_override(cal)
 
@@ -2005,6 +2084,7 @@ def main(args):
             post_tip_refiner_model = post_tip_refiner_model.resolve()
             if post_tip_refiner_model.is_file():
                 post_cmd.extend(["--tip_refiner_model", str(post_tip_refiner_model)])
+                post_cmd.extend(["--tip_detection_mode", str(args.post_tip_detection_mode)])
                 post_cmd.extend(["--tracked_tip_source", str(args.post_tracked_tip_source)])
             else:
                 fallback_source = "auto" if str(args.post_tracked_tip_source).strip().lower() == "cnn" else str(args.post_tracked_tip_source)
@@ -2013,6 +2093,7 @@ def main(args):
                     f"tracked tip source '{args.post_tracked_tip_source}'. Falling back to '{fallback_source}': "
                     f"{post_tip_refiner_model}"
                 )
+                post_cmd.extend(["--tip_detection_mode", str(args.post_tip_detection_mode)])
                 post_cmd.extend(["--tracked_tip_source", fallback_source])
 
             if bool(args.capture_at_start):
@@ -2072,6 +2153,9 @@ if __name__ == "__main__":
 
     # Calibration input
     ap.add_argument("--calibration", required=True, help="Path to calibration JSON.")
+    ap.add_argument("--y-offset-fit", type=str, default=DEFAULT_Y_OFFSET_FIT,
+                    choices=["avg_pchip", "avg_cubic", "pchip", "cubic", "legacy"],
+                    help="Which calibration y-offset fit to use for DAQ motion.")
 
     # Kinematic sign override
     ap.add_argument("--flip-rz-sign", action="store_true", default=DEFAULT_FLIP_RZ_SIGN,
@@ -2080,11 +2164,11 @@ if __name__ == "__main__":
                     help="Override pull/release r/z PCHIP models with one shared average cubic fit built from the phase cubic coefficients.")
 
     # Hourglass placement (tip-space)
-    ap.add_argument("--center-x", type=float, default=HOURGLASS_CENTER_X,
+    ap.add_argument("--center-x", type=float, default=DEFAULT_HOURGLASS_CENTER_X,
                     help="Hourglass center X in tip space.")
-    ap.add_argument("--center-y", type=float, default=HOURGLASS_CENTER_Y,
+    ap.add_argument("--center-y", type=float, default=DEFAULT_HOURGLASS_CENTER_Y,
                     help="Constant hourglass center Y in tip space. Stage Y is solved to hold this exactly.")
-    ap.add_argument("--center-z", type=float, default=HOURGLASS_CENTER_Z,
+    ap.add_argument("--center-z", type=float, default=DEFAULT_HOURGLASS_CENTER_Z,
                     help="Hourglass center Z in tip space.")
 
     # Hourglass geometry
@@ -2155,6 +2239,9 @@ if __name__ == "__main__":
                     help="Checkerboard reference image to pass to post-processing.")
     ap.add_argument("--post-tip-refiner-model", default=DEFAULT_POST_TIP_REFINER_MODEL,
                     help="Optional CNN tip refiner model passed to the hourglass post-processing script when present.")
+    ap.add_argument("--post-tip-detection-mode", default=DEFAULT_POST_TIP_DETECTION_MODE,
+                    choices=["classical", "red_dot", "auto_red_dot"],
+                    help="Tip detection mode passed to calib_hourglass_process.py during --enable-post.")
     ap.add_argument("--post-tracked-tip-source", default=DEFAULT_POST_TRACKED_TIP_SOURCE,
                     choices=["auto", "coarse", "selected", "cnn"],
                     help="Tracked tip source to use during automatic hourglass post-processing. Defaults to cnn when the tip refiner model is available.")

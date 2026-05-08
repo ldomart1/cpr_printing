@@ -25,6 +25,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+os.environ.setdefault("MPLBACKEND", "Agg")
+
 from shadow_calibration import CTR_Shadow_Calibration
 
 
@@ -440,6 +442,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_plots", action="store_true")
     parser.add_argument("--ruler_mm", type=float, default=150.0)
     parser.add_argument("--save_analysis_config", action="store_true")
+    parser.add_argument(
+        "--use_default_analysis_crop",
+        action="store_true",
+        help="Skip the crop GUI and use CTR_Shadow_Calibration.default_analysis_crop.",
+    )
+    parser.add_argument(
+        "--skip_ruler_setup",
+        action="store_true",
+        help="Do not collect a ruler reference. Use board calibration or width-based scaling during postprocessing.",
+    )
 
     parser.add_argument("--camera_calibration_file", type=str, default=None, help="Path to camera calibration .npz")
     parser.add_argument("--board_reference_image", type=str, default=None, help="Path to checkerboard/board reference image")
@@ -458,9 +470,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tip_refine_mode", type=str, default="coarse", choices=["coarse", "parallel_centerline", "auto"])
     parser.add_argument("--tip_detection_mode", type=str, default="classical", choices=["classical", "red_dot", "auto_red_dot"])
     parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", help="Interpret C90 captures as having stage-Y compensation driven by planar pull/release PCHIP fits, and subtract that recorded Y offset during off-plane postprocessing.")
+    parser.add_argument("--full_c90_partial_cneg90_reference", action="store_true", help="Interpret the project as using full compensated C+90 pull/release with only the first 40%% of compensated C-90 pull/release for off-plane reference mirroring. The exported off-plane equations are then fit from the full C+90 trajectory.")
     parser.add_argument("--red_tip_sat_min", type=int, default=80)
     parser.add_argument("--red_tip_val_min", type=int, default=40)
     parser.add_argument("--red_tip_min_area_px", type=int, default=8)
+    parser.add_argument("--red_tip_morph_kernel", type=int, default=2)
+    parser.add_argument("--red_tip_hue1_min", type=int, default=0)
+    parser.add_argument("--red_tip_hue1_max", type=int, default=10)
+    parser.add_argument("--red_tip_hue2_min", type=int, default=130)
+    parser.add_argument("--red_tip_hue2_max", type=int, default=179)
+    parser.add_argument("--red_tip_search_radius_px", type=float, default=140.0)
+    parser.add_argument("--red_tip_local_min_area_px", type=int, default=2)
+    parser.add_argument("--red_tip_distance_weight", type=float, default=3.0)
     parser.add_argument("--tip_refiner_model", type=str, default=None, help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt")
     parser.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"], help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
     parser.add_argument("--tip_refiner_compare_only", action="store_true", help="Save tip_locations_cnn.* but keep classical selected tips for postprocessing.")
@@ -506,6 +527,7 @@ def main() -> None:
     cal.tip_refine_mode = str(args.tip_refine_mode)
     cal.tip_detection_mode = str(args.tip_detection_mode)
     cal.c90_y_compensation_from_planar_pchip = bool(args.c90_y_compensation_from_planar_pchip)
+    cal.full_c90_partial_cneg90_reference = bool(args.full_c90_partial_cneg90_reference)
     cal.tip_parallel_section_near_r = float(args.tip_parallel_section_near_r)
     cal.tip_parallel_section_far_r = float(args.tip_parallel_section_far_r)
     cal.tip_parallel_scan_half_r = float(args.tip_parallel_scan_half_r)
@@ -516,6 +538,14 @@ def main() -> None:
     cal.red_tip_sat_min = int(args.red_tip_sat_min)
     cal.red_tip_val_min = int(args.red_tip_val_min)
     cal.red_tip_min_area_px = int(args.red_tip_min_area_px)
+    cal.red_tip_morph_kernel = int(args.red_tip_morph_kernel)
+    cal.red_tip_hue1_min = int(args.red_tip_hue1_min)
+    cal.red_tip_hue1_max = int(args.red_tip_hue1_max)
+    cal.red_tip_hue2_min = int(args.red_tip_hue2_min)
+    cal.red_tip_hue2_max = int(args.red_tip_hue2_max)
+    cal.red_tip_search_radius_px = float(args.red_tip_search_radius_px)
+    cal.red_tip_local_min_area_px = int(args.red_tip_local_min_area_px)
+    cal.red_tip_distance_weight = float(args.red_tip_distance_weight)
 
     if args.tip_refiner_model:
         cal.load_tip_refiner_model(
@@ -544,14 +574,25 @@ def main() -> None:
     elif args.board_reference_image:
         print("Board reference image was provided without camera calibration; skipping board-reference setup.")
 
-    print(f"\nUsing first image for setup: {first_image_path.name}")
-    analysis_crop, ruler_p1, ruler_p2 = interactive_crop_and_ruler_from_image(
-        first_image,
-        default_crop=dict(cal.default_analysis_crop),
-        ruler_known_mm=float(args.ruler_mm),
-    )
-    cal.analysis_crop = dict(analysis_crop)
-    set_ruler_reference(cal, ruler_p1, ruler_p2, known_distance_mm=float(args.ruler_mm))
+    if args.use_default_analysis_crop:
+        cal.analysis_crop = dict(cal.default_analysis_crop)
+        ruler_p1 = None
+        ruler_p2 = None
+        print(f"\nUsing default analysis crop: {cal.analysis_crop}")
+    else:
+        print(f"\nUsing first image for setup: {first_image_path.name}")
+        analysis_crop, ruler_p1, ruler_p2 = interactive_crop_and_ruler_from_image(
+            first_image,
+            default_crop=dict(cal.default_analysis_crop),
+            ruler_known_mm=float(args.ruler_mm),
+        )
+        cal.analysis_crop = dict(analysis_crop)
+
+    if args.skip_ruler_setup:
+        set_ruler_reference(cal, None, None, known_distance_mm=float(args.ruler_mm))
+        print("Skipping ruler setup; postprocessing will use board calibration or width scaling.")
+    else:
+        set_ruler_reference(cal, ruler_p1, ruler_p2, known_distance_mm=float(args.ruler_mm))
 
     if args.save_analysis_config:
         config = cal.get_analysis_reference_info()

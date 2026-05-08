@@ -110,6 +110,7 @@ DEFAULT_PRESSURE_ADVANCE_FEED = 120.0
 DEFAULT_PRESSURE_RETRACT_FEED = 240.0
 DEFAULT_PREFLOW_DWELL_MS = 300
 DEFAULT_NODE_DWELL_MS = 500
+DEFAULT_LINE_EXIT_OVERTRAVEL_MM = 5.0
 DEFAULT_EXTRUSION_MULTIPLIER_VERTICAL = 1.0
 DEFAULT_EXTRUSION_MULTIPLIER_BRANCH = 1.0
 
@@ -1038,7 +1039,7 @@ def build_plane_pattern(
             return pts, ()
         ext_xyz = p0 - float(ext_mm) * tangent
         ext = p3(ext_xyz[0], ext_xyz[1], ext_xyz[2])
-        return (ext,) + pts, (1,)
+        return (ext,) + pts, (0,)
 
     angled_specs = [
         (30.0, 20.0, "fig1", 1),
@@ -1295,7 +1296,6 @@ class GCodeWriter:
         self.bc_solve_samples = int(bc_solve_samples)
         self.c_max_step_deg = float(c_max_step_deg)
 
-        self.u_material_abs = 0.0
         self.pressure_charged = False
         self.cur_stage_xyz: Optional[np.ndarray] = None
         self.cur_tip_xyz: Optional[np.ndarray] = None
@@ -1342,9 +1342,6 @@ class GCodeWriter:
         if abs(x - float(p_stage[0])) > 1e-12 or abs(y - float(p_stage[1])) > 1e-12 or abs(z - float(p_stage[2])) > 1e-12:
             self.warnings.append(f"WARNING: {context} stage point clamped to bbox.")
         return np.array([x, y, z], dtype=float)
-
-    def u_cmd_actual(self) -> float:
-        return self.u_material_abs + (self.pressure_offset_mm if self.pressure_charged else 0.0)
 
     def bc_for_tangent(
         self,
@@ -1513,18 +1510,39 @@ class GCodeWriter:
         )
 
     def pressure_preload_before_print(self) -> None:
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and not self.pressure_charged:
+        if self.emit_extrusion and not self.pressure_charged:
             self.pressure_charged = True
             self.f.write("; pressure preload before print pass\n")
-            self.f.write(f"G1 {self.cal.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_advance_feed:.0f}\n")
+            self.f.write("M42 P0 S1\n")
             if self.preflow_dwell_ms > 0:
                 self.f.write(f"G4 P{self.preflow_dwell_ms}\n")
 
     def pressure_release_after_print(self, end_is_node: bool = False) -> None:
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and self.pressure_charged:
+        if self.emit_extrusion and self.pressure_charged:
             self.pressure_charged = False
             self.f.write("; pressure release after print pass\n")
-            self.f.write(f"G1 {self.cal.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_retract_feed:.0f}\n")
+            self.f.write("M42 P0 S0\n")
+            if self.node_dwell_ms > 0:
+                self.f.write("; line-end dwell after pressure shutoff\n")
+                self.f.write(f"G4 P{self.node_dwell_ms}\n")
+
+    def line_exit_after_print(self) -> None:
+        if self.cur_stage_xyz is None:
+            return
+        overtravel_mm = float(DEFAULT_LINE_EXIT_OVERTRAVEL_MM)
+        if overtravel_mm <= 0.0:
+            return
+        exit_stage = np.asarray(self.cur_stage_xyz, dtype=float).copy()
+        exit_stage[1] -= overtravel_mm
+        self.write_move(
+            exit_stage,
+            self.cur_b,
+            self.cur_c,
+            self.travel_feed,
+            comment=f"line exit machine-space -Y move ({overtravel_mm:.1f} mm, no extrusion)",
+        )
+        if self.cur_tip_xyz is not None:
+            self.cur_tip_xyz = np.asarray(self.cur_tip_xyz, dtype=float).copy() + np.array([0.0, -overtravel_mm, 0.0], dtype=float)
 
     def approach_start_from_side(
         self,
@@ -1667,7 +1685,10 @@ class GCodeWriter:
         last_tip = np.asarray(points[0], dtype=float).copy()
         self.cur_tip_xyz = last_tip.copy()
         self.last_tip_tangent = np.asarray(tangents[0], dtype=float).copy()
-        junction_dwell_set = {int(i) for i in junction_dwell_indices if 0 < int(i) < len(points)}
+        junction_dwell_set = {int(i) for i in junction_dwell_indices if 0 <= int(i) < len(points)}
+        if 0 in junction_dwell_set and self.node_dwell_ms > 0:
+            self.f.write("; junction dwell at branch start\n")
+            self.f.write(f"G4 P{self.node_dwell_ms}\n")
 
         for i in range(1, len(points)):
             p0 = np.asarray(points[i - 1], dtype=float)
@@ -1686,13 +1707,7 @@ class GCodeWriter:
                     row_num=row_num,
                 )
 
-                u_val = None
-                if self.emit_extrusion:
-                    tip_seg_len = float(np.linalg.norm(p_tip - last_tip))
-                    self.u_material_abs += self.extrusion_per_mm * float(extrusion_multiplier) * tip_seg_len
-                    u_val = self.u_cmd_actual()
-
-                self.write_move(p_stage, b, c, active_print_feed, comment=None, u_value=u_val)
+                self.write_move(p_stage, b, c, active_print_feed, comment=None, u_value=None)
                 self.cur_tip_xyz = p_tip.copy()
                 self.cur_motion_phase = motion_phase
                 self.last_tip_tangent = tangent.copy()
@@ -1704,6 +1719,7 @@ class GCodeWriter:
 
         self.emit_node_write_end(label)
         self.pressure_release_after_print(end_is_node=end_is_node)
+        self.line_exit_after_print()
         self.total_paths_written += 1
 
 
@@ -1940,7 +1956,7 @@ def write_node_gcode(
         f.write(f"; orientation_mode = {orientation_mode}\n")
         f.write(f"; pull_phase_only = {bool(pull_phase_only)}\n")
         f.write("; calibrated motion uses C=180 deg for all emitted rows during approach and printing\n; calibrated stage-tip kinematics include the off-plane calibration term when write_mode=calibrated\n")
-        f.write("; row 1 paths are fixed-B / physical tip-angle 0; row 2 paths solve tangent B from the calibration pull/tip-angle model\n; node junction dwell uses the original trunk-attachment dwell points only; end-of-pass dwell is disabled\n")
+        f.write("; row 1 paths are fixed-B / physical tip-angle 0; row 2 paths solve tangent B from the calibration pull/tip-angle model\n; node junction dwell uses the original trunk-attachment dwell points only, except overextended branches dwell at branch start; end-of-pass closes pressure immediately, holds position for node_dwell_ms, then moves 5 mm in machine-space -Y with no extrusion before moving away\n")
         f.write("; startup always uses the configured machine-start coordinates; shutdown always uses the configured machine-end coordinates\n")
         f.write(f"; selected_fit_model = {cal.selected_fit_model or 'legacy-polynomial'}\n")
         f.write(f"; selected_offplane_fit_model = {cal.selected_offplane_fit_model or cal.selected_fit_model or 'legacy-polynomial'}\n")
@@ -1957,10 +1973,7 @@ def write_node_gcode(
         f.write(f"; side approach: far={side_approach_far:.3f}, near={side_approach_near:.3f}, retreat={side_retreat:.3f}, lift_z={side_lift_z:.3f}\n")
         f.write("G90\n")
         if emit_extrusion:
-            f.write("M82\n")
-            f.write(f"G92 {cal.u_axis}0\n")
-            if abs(float(prime_mm)) > 0.0:
-                f.write(f"G1 {cal.u_axis}{float(prime_mm):.3f} F{max(60.0, float(pressure_advance_feed)):.0f} ; prime material\n")
+            f.write("; extrusion is controlled by pressure solenoid valve M42 P0 S1/S0\n")
 
         g = GCodeWriter(
             fh=f,

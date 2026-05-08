@@ -63,6 +63,7 @@ DEFAULT_C_DEG = 180.0
 DEFAULT_B_ANGLE_BIAS_DEG = 0.0
 DEFAULT_BC_SOLVE_SAMPLES = 5001
 DEFAULT_Y_OFFPLANE_SIGN = -1.0
+DEFAULT_Y_OFFPLANE_FIT_MODEL = "avg_cubic"
 
 # Motion
 DEFAULT_TRAVEL_FEED = 1000.0
@@ -135,6 +136,8 @@ class Calibration:
     tip_angle_model: Optional[Dict[str, Any]] = None
     selected_fit_model: Optional[str] = None
     selected_offplane_fit_model: Optional[str] = None
+    requested_offplane_fit_model: Optional[str] = None
+    resolved_offplane_fit_model: Optional[str] = None
     active_phase: str = "pull"
     offplane_y_sign: float = 1.0
 
@@ -429,7 +432,7 @@ def eval_pchip_with_linear_extrap(model_spec: Dict[str, Any], extrap_model_spec:
     return out
 
 
-def load_calibration(json_path: str) -> Calibration:
+def load_calibration(json_path: str, requested_offplane_fit_model: Optional[str] = DEFAULT_Y_OFFPLANE_FIT_MODEL) -> Calibration:
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Calibration JSON not found: {json_path}")
@@ -499,8 +502,18 @@ def load_calibration(json_path: str) -> Calibration:
 
     r_model = _select_named_model(active_phase_models, "r", selected_fit_model)
     z_model = _select_named_model(active_phase_models, "z", selected_fit_model)
-    y_off_selector = selected_offplane_fit_model or selected_fit_model
+    requested_offplane_fit_model = (
+        None if requested_offplane_fit_model is None else str(requested_offplane_fit_model).strip().lower()
+    )
+    y_off_selector = requested_offplane_fit_model or selected_offplane_fit_model or selected_fit_model
     y_off_model = _select_named_model(active_phase_models, "offplane_y", y_off_selector)
+    resolved_offplane_fit_model = None
+    if y_off_model is not None:
+        resolved_offplane_fit_model = y_off_selector
+    elif selected_offplane_fit_model:
+        resolved_offplane_fit_model = selected_offplane_fit_model
+    elif selected_fit_model:
+        resolved_offplane_fit_model = selected_fit_model
     y_off_extrap_model = _normalize_model_spec(active_phase_models.get("offplane_y_linear"))
     if y_off_extrap_model is None:
         y_off_extrap_model = _normalize_model_spec(active_phase_models.get("offplane_y"))
@@ -525,6 +538,8 @@ def load_calibration(json_path: str) -> Calibration:
         tip_angle_model=tip_angle_model,
         selected_fit_model=selected_fit_model,
         selected_offplane_fit_model=selected_offplane_fit_model,
+        requested_offplane_fit_model=requested_offplane_fit_model,
+        resolved_offplane_fit_model=resolved_offplane_fit_model,
         active_phase=active_phase,
         b_min=b_min,
         b_max=b_max,
@@ -868,18 +883,18 @@ class GCodeWriter:
         self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
 
     def pressure_preload_before_print(self) -> None:
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and not self.pressure_charged:
+        if self.emit_extrusion and not self.pressure_charged:
             self.pressure_charged = True
-            self.f.write("; pressure preload before print pass\n")
-            self.f.write(f"G1 {self.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_advance_feed:.0f}\n")
+            self.f.write("; open pressure solenoid before print pass\n")
+            self.f.write("M42 P0 S1\n")
             if self.preflow_dwell_ms > 0:
                 self.f.write(f"G4 P{self.preflow_dwell_ms}\n")
 
     def pressure_release_after_print(self) -> None:
-        if self.emit_extrusion and self.pressure_offset_mm > 0.0 and self.pressure_charged:
+        if self.emit_extrusion and self.pressure_charged:
             self.pressure_charged = False
-            self.f.write("; pressure release after print pass\n")
-            self.f.write(f"G1 {self.u_axis}{self.u_cmd_actual():.3f} F{self.pressure_retract_feed:.0f}\n")
+            self.f.write("; close pressure solenoid after print pass\n")
+            self.f.write("M42 P0 S0\n")
 
     def approach_start(
         self,
@@ -1010,13 +1025,7 @@ class GCodeWriter:
                         feed = min(feed, self.node_connection_feed)
                         break
 
-                u_value = None
-                if self.emit_extrusion:
-                    tip_seg_len = float(np.linalg.norm(p_tip - last_tip))
-                    self.u_material_abs += self.extrusion_per_mm * tip_seg_len
-                    u_value = self.u_cmd_actual()
-
-                self.write_move(p_stage, b, c, feed, comment=None, u_value=u_value)
+                self.write_move(p_stage, b, c, feed, comment=None, u_value=None)
                 self.cur_tip_xyz = p_tip.copy()
                 self.last_tip_tangent = tangent.copy()
                 last_tip = p_tip.copy()
@@ -1100,7 +1109,7 @@ def write_pi_sign_gcode(
 
     cal: Optional[Calibration]
     if write_mode == "calibrated":
-        cal = load_calibration(str(calibration))
+        cal = load_calibration(str(calibration), requested_offplane_fit_model=DEFAULT_Y_OFFPLANE_FIT_MODEL)
         cal.offplane_y_sign = float(y_offplane_sign)
     else:
         cal = None
@@ -1173,6 +1182,14 @@ def write_pi_sign_gcode(
         fh.write("G90\n")
         fh.write("; B-angle convention: 0=up, 90=horizontal, 180=down\n")
         fh.write(f"; C held constant at {float(c_deg):.3f} deg by default\n")
+        if cal is not None:
+            fh.write(
+                "; y_offplane_model "
+                f"requested={cal.requested_offplane_fit_model or 'calibration_default'} "
+                f"resolved={cal.resolved_offplane_fit_model or 'unspecified'} "
+                f"calibration_default={cal.selected_offplane_fit_model or cal.selected_fit_model or 'unspecified'} "
+                f"active_phase={cal.active_phase}\n"
+            )
 
         for branch in branches:
             pts = np.asarray(branch["points"], dtype=float)

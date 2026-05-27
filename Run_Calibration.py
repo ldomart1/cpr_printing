@@ -13,14 +13,14 @@ from shadow_calibration import CTR_Shadow_Calibration
 import shadow_calibration
 
 
-DEFAULT_PROJECT_NAME = "Test_Calibration_2026-05-07_sample_CNN"
+DEFAULT_PROJECT_NAME = "Test_Calibration_2026-05-26_00"
 DEFAULT_MANUAL_CROP_ADJUSTMENT = True
 DEFAULT_THRESHOLD = 220
 DEFAULT_PULL_B_START = 0.0
-DEFAULT_PULL_B_STEPS = 40 #40
-DEFAULT_PULL_B_STEP_SIZE = -0.125
+DEFAULT_PULL_B_STEPS = 28
+DEFAULT_PULL_B_STEP_SIZE = -0.20
 DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
-DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260430_103919.png")
+DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260526_200532.png")
 DEFAULT_BOARD_XZ_AXIS_SIGN = 1
 DEFAULT_PROBE_MODE = "middle"
 DEFAULT_FIT_MODEL = "pchip"
@@ -57,17 +57,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tip_detection_mode", type=str, default=DEFAULT_TIP_DETECTION_MODE, choices=["classical", "red_dot", "auto_red_dot"])
     parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", help="Acquire C0/C180 first, fit planar pull/release PCHIP radial models, then apply that radial value as a stage-Y offset during the C90 pull/release pass.")
     parser.add_argument("--full_c90_partial_cneg90_reference", action="store_true", help="Acquire full compensated C+90 pull/release, but only the first 40%% of compensated C-90 pull/release for reference mirroring. Off-plane equations are then fit from the full C+90 trajectory using the partial paired segment only to establish the reference mirror line.")
-    parser.add_argument("--red_tip_sat_min", type=int, default=80)
-    parser.add_argument("--red_tip_val_min", type=int, default=40)
-    parser.add_argument("--red_tip_min_area_px", type=int, default=8)
+    parser.add_argument("--red_tip_sat_min", type=int, default=25)
+    parser.add_argument("--red_tip_val_min", type=int, default=20)
+    parser.add_argument("--red_tip_min_area_px", type=int, default=50)
     parser.add_argument("--red_tip_morph_kernel", type=int, default=2)
     parser.add_argument("--red_tip_hue1_min", type=int, default=0)
     parser.add_argument("--red_tip_hue1_max", type=int, default=10)
     parser.add_argument("--red_tip_hue2_min", type=int, default=130)
     parser.add_argument("--red_tip_hue2_max", type=int, default=179)
     parser.add_argument("--red_tip_search_radius_px", type=float, default=140.0)
-    parser.add_argument("--red_tip_local_min_area_px", type=int, default=2)
+    parser.add_argument("--red_tip_local_min_area_px", type=int, default=50)
     parser.add_argument("--red_tip_distance_weight", type=float, default=3.0)
+    parser.add_argument("--red_tip_min_circularity", type=float, default=0.0)
+    parser.add_argument(
+        "--red_tip_component_selection",
+        type=str,
+        default="nearest_largest",
+        choices=["largest", "nearest", "nearest_largest"],
+    )
+    parser.add_argument("--red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess", action="store_true", default=True)
+    parser.add_argument("--no_red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess", action="store_false")
+    parser.add_argument("--red_tip_rgb_excess_min", type=int, default=35)
+    parser.add_argument("--red_tip_debug_save_mask", action="store_true")
     parser.add_argument("--tip_refiner_model", type=str, default=DEFAULT_TIP_REFINER_MODEL)
     parser.add_argument("--tip_refiner_anchor", type=str, default=DEFAULT_TIP_REFINER_ANCHOR)
     parser.add_argument("--tip_refiner_compare_only", action="store_true", default=DEFAULT_TIP_REFINER_COMPARE_ONLY)
@@ -81,7 +92,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def probe_points_for_mode(probe_mode: str):
     if probe_mode == "middle":
-        return [(100.0, 52.0, -180.0)]
+        return [(100.0, 55.0, -70.0)]
     if probe_mode == "five":
         return [
             (30.0, 0.0, -70.0),
@@ -104,6 +115,7 @@ def main(args: argparse.Namespace) -> None:
         add_date=False,
     )
     print("Calibration object created!")
+    cal.clear_raw_image_data_folder()
 
     probe_points = probe_points_for_mode(str(args.probe_mode))
 
@@ -143,6 +155,11 @@ def main(args: argparse.Namespace) -> None:
     cal.red_tip_search_radius_px = float(args.red_tip_search_radius_px)
     cal.red_tip_local_min_area_px = int(args.red_tip_local_min_area_px)
     cal.red_tip_distance_weight = float(args.red_tip_distance_weight)
+    cal.red_tip_min_circularity = float(args.red_tip_min_circularity)
+    cal.red_tip_component_selection = str(args.red_tip_component_selection)
+    cal.red_tip_use_rgb_excess = bool(args.red_tip_use_rgb_excess)
+    cal.red_tip_rgb_excess_min = int(args.red_tip_rgb_excess_min)
+    cal.red_tip_debug_save_mask = bool(args.red_tip_debug_save_mask)
 
     if args.tip_refiner_model:
         tip_refiner_model = os.path.expanduser(str(args.tip_refiner_model))

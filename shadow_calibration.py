@@ -33,6 +33,10 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import curve_fit
 
 
+SKELETON_VERTICAL_EXTENSION_MM = 100.0
+SKELETON_VERTICAL_EXTENSION_POINTS = 5
+
+
 def _disable_opencv_opencl_if_needed():
     """
     Avoid macOS ARM OpenCV crashes in checkerboard SB detection via OpenCL/Metal.
@@ -1352,13 +1356,18 @@ class CTR_Shadow_Calibration:
         self.red_tip_hue1_max = 10
         self.red_tip_hue2_min = 130
         self.red_tip_hue2_max = 179
-        self.red_tip_sat_min = 80
-        self.red_tip_val_min = 40
-        self.red_tip_min_area_px = 8
+        self.red_tip_sat_min = 25
+        self.red_tip_val_min = 20
+        self.red_tip_min_area_px = 50
         self.red_tip_morph_kernel = 2
         self.red_tip_search_radius_px = 140
-        self.red_tip_local_min_area_px = 2
+        self.red_tip_local_min_area_px = 50
         self.red_tip_distance_weight = 3.0
+        self.red_tip_min_circularity = 0.0
+        self.red_tip_component_selection = "nearest_largest"
+        self.red_tip_use_rgb_excess = True
+        self.red_tip_rgb_excess_min = 35
+        self.red_tip_debug_save_mask = False
         self.red_tip_bottom_band_px = 3
         self.c90_y_compensation_from_planar_pchip = False
         self.tip_refiner_model_path = None
@@ -1374,6 +1383,35 @@ class CTR_Shadow_Calibration:
         self._last_skeleton_points_selected_xy = None
 
         print("Calibration object initialized successfully!")
+
+    def clear_raw_image_data_folder(self):
+        """
+        Remove existing raw capture files from the active project folder before
+        starting a fresh acquisition.
+        """
+        raw_folder = os.path.join(self.calibration_data_folder, "raw_image_data_folder")
+        if not os.path.isdir(raw_folder):
+            return 0
+
+        removed_count = 0
+        for root, dirnames, filenames in os.walk(raw_folder, topdown=False):
+            for file_name in filenames:
+                file_path = os.path.join(root, file_name)
+                try:
+                    os.remove(file_path)
+                    removed_count += 1
+                except OSError as exc:
+                    print(f"Warning: Could not remove raw capture file {file_path}: {exc}")
+            for dirname in dirnames:
+                dir_path = os.path.join(root, dirname)
+                try:
+                    os.rmdir(dir_path)
+                except OSError:
+                    pass
+
+        if removed_count > 0:
+            print(f"Removed {removed_count} existing raw capture file(s) from: {raw_folder}")
+        return removed_count
 
     # Usage example:
     # sc.load_camera_calibration("/path/to/webcam_calibration.npz")
@@ -2429,153 +2467,240 @@ class CTR_Shadow_Calibration:
         return patch, x0, y0
 
     def detect_red_tip_marker(self, bgr_image, crop_origin_xy=(0, 0), anchor_yx_local=None):
+        """
+        Detect the red spherical tip marker and return the centroid of the selected
+        masked red component.
+
+        In red_dot mode, this function is intentionally mask-centric:
+        the returned tip is the centroid of the red mask component, not the
+        skeleton endpoint and not the parallel-centerline endpoint.
+        """
         dbg = {
             "found": False,
-            "detector": "red_dot_centroid",
+            "mode": "red_dot_mask_centroid",
             "crop_origin_xy": [float(crop_origin_xy[0]), float(crop_origin_xy[1])],
         }
 
-        if bgr_image is None or getattr(bgr_image, "size", 0) == 0:
+        if bgr_image is None or bgr_image.size == 0:
             dbg["reason"] = "empty_image"
             return dbg
 
-        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-        lower1 = np.array(
-            [int(self.red_tip_hue1_min), int(self.red_tip_sat_min), int(self.red_tip_val_min)],
-            dtype=np.uint8,
-        )
-        upper1 = np.array([int(self.red_tip_hue1_max), 255, 255], dtype=np.uint8)
-        lower2 = np.array(
-            [int(self.red_tip_hue2_min), int(self.red_tip_sat_min), int(self.red_tip_val_min)],
-            dtype=np.uint8,
-        )
-        upper2 = np.array([int(self.red_tip_hue2_max), 255, 255], dtype=np.uint8)
+        h_img, w_img = bgr_image.shape[:2]
 
-        mask = cv2.bitwise_or(
+        # 1. HSV red / pink mask
+        hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+
+        h1_min = int(np.clip(getattr(self, "red_tip_hue1_min", 0), 0, 179))
+        h1_max = int(np.clip(getattr(self, "red_tip_hue1_max", 10), 0, 179))
+        h2_min = int(np.clip(getattr(self, "red_tip_hue2_min", 150), 0, 179))
+        h2_max = int(np.clip(getattr(self, "red_tip_hue2_max", 179), 0, 179))
+        s_min = int(np.clip(getattr(self, "red_tip_sat_min", 80), 0, 255))
+        v_min = int(np.clip(getattr(self, "red_tip_val_min", 80), 0, 255))
+
+        lower1 = np.array([h1_min, s_min, v_min], dtype=np.uint8)
+        upper1 = np.array([h1_max, 255, 255], dtype=np.uint8)
+        lower2 = np.array([h2_min, s_min, v_min], dtype=np.uint8)
+        upper2 = np.array([h2_max, 255, 255], dtype=np.uint8)
+
+        hsv_mask = cv2.bitwise_or(
             cv2.inRange(hsv, lower1, upper1),
             cv2.inRange(hsv, lower2, upper2),
         )
+
+        # 2. Optional RGB "excess red" gate
+        use_rgb_excess = bool(getattr(self, "red_tip_use_rgb_excess", True))
+        rgb_excess_min = int(max(0, getattr(self, "red_tip_rgb_excess_min", 35)))
+
+        if use_rgb_excess:
+            b, g, r = cv2.split(bgr_image)
+            r_i = r.astype(np.int16)
+            g_i = g.astype(np.int16)
+            b_i = b.astype(np.int16)
+
+            excess_red = (
+                (r_i - g_i >= rgb_excess_min)
+                & (r_i - b_i >= rgb_excess_min)
+            ).astype(np.uint8) * 255
+            mask = cv2.bitwise_and(hsv_mask, excess_red)
+        else:
+            mask = hsv_mask
+
+        dbg["image_shape_hw"] = [int(h_img), int(w_img)]
         dbg["raw_red_pixel_count"] = int(np.count_nonzero(mask))
 
+        # 3. Morphological cleanup
         kernel_size = int(max(1, getattr(self, "red_tip_morph_kernel", 2)))
         if kernel_size > 1:
             kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            if kernel_size > 2:
+            if kernel_size >= 3:
                 mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        dbg["filtered_red_pixel_count"] = int(np.count_nonzero(mask))
 
+        dbg["filtered_red_pixel_count"] = int(np.count_nonzero(mask))
         if dbg["filtered_red_pixel_count"] <= 0:
             dbg["reason"] = "no_red_pixels_after_threshold"
             return dbg
 
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        if num_labels <= 1:
-            dbg["reason"] = "no_connected_red_component"
-            return dbg
-
+        # 4. Anchor and local search radius
         anchor_xy = None
         if anchor_yx_local is not None:
             anchor_arr = np.asarray(anchor_yx_local, dtype=float).reshape(-1)
             if anchor_arr.size >= 2 and np.all(np.isfinite(anchor_arr[:2])):
-                anchor_xy = np.array([float(anchor_arr[1]), float(anchor_arr[0])], dtype=float)
-                dbg["anchor_xy_local"] = anchor_xy.astype(float).tolist()
+                anchor_xy = np.array([float(anchor_arr[1]), float(anchor_arr[0])], dtype=np.float64)
+                dbg["anchor_xy_local"] = anchor_xy.tolist()
 
-        search_radius_px = float(max(1.0, getattr(self, "red_tip_search_radius_px", 140.0)))
-        global_min_area_px = int(max(1, getattr(self, "red_tip_min_area_px", 8)))
-        local_min_area_px = int(max(1, getattr(self, "red_tip_local_min_area_px", 2)))
+        search_radius_px = float(max(1.0, getattr(self, "red_tip_search_radius_px", 80.0)))
+        if anchor_xy is not None:
+            yy, xx = np.indices(mask.shape)
+            dist_map = np.sqrt(
+                (xx.astype(float) - anchor_xy[0]) ** 2
+                + (yy.astype(float) - anchor_xy[1]) ** 2
+            )
+            local_gate = (dist_map <= search_radius_px).astype(np.uint8) * 255
+            mask = cv2.bitwise_and(mask, local_gate)
+            dbg["local_red_pixel_count"] = int(np.count_nonzero(mask))
+            if dbg["local_red_pixel_count"] <= 0:
+                dbg["reason"] = "no_red_pixels_inside_anchor_radius"
+                return dbg
 
-        best_component = None
-        best_score = None
+        if bool(getattr(self, "red_tip_debug_save_mask", False)):
+            dbg["mask_local_u8"] = mask.copy()
+
+        # 5. Connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            (mask > 0).astype(np.uint8),
+            connectivity=8,
+        )
+        if num_labels <= 1:
+            dbg["reason"] = "no_connected_red_component"
+            return dbg
+
+        global_min_area_px = int(max(1, getattr(self, "red_tip_min_area_px", 20)))
+        local_min_area_px = int(max(1, getattr(self, "red_tip_local_min_area_px", 20)))
+        min_area_px = local_min_area_px if anchor_xy is not None else global_min_area_px
+        min_circularity = float(np.clip(getattr(self, "red_tip_min_circularity", 0.0), 0.0, 1.0))
+        selection_mode = str(getattr(self, "red_tip_component_selection", "nearest_largest")).strip().lower()
+
+        candidates = []
         component_debug = []
+
         for comp_idx in range(1, num_labels):
             area_px = int(stats[comp_idx, cv2.CC_STAT_AREA])
-            centroid_x_local, centroid_y_local = centroids[comp_idx]
-            dist_px = None
-            min_area_px = global_min_area_px
-            if anchor_xy is not None:
-                dist_px = float(
-                    np.hypot(
-                        float(centroid_x_local) - anchor_xy[0],
-                        float(centroid_y_local) - anchor_xy[1],
-                    )
-                )
-                if dist_px > search_radius_px:
-                    continue
-                min_area_px = local_min_area_px
             if area_px < min_area_px:
+                component_debug.append(
+                    {
+                        "component": int(comp_idx),
+                        "area_px": area_px,
+                        "rejected": "area_below_min",
+                        "min_area_px": int(min_area_px),
+                    }
+                )
                 continue
 
-            component_mask = (labels == comp_idx).astype(np.uint8)
-            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cx, cy = centroids[comp_idx]
+            dist_px = None
+            if anchor_xy is not None:
+                dist_px = float(np.hypot(float(cx) - anchor_xy[0], float(cy) - anchor_xy[1]))
+
+            component_mask_u8 = (labels == comp_idx).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                component_mask_u8,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
+            )
+
             perimeter_px = 0.0
             if contours:
                 perimeter_px = float(max(cv2.arcLength(cnt, True) for cnt in contours))
-            bbox_w = int(stats[comp_idx, cv2.CC_STAT_WIDTH])
-            bbox_h = int(stats[comp_idx, cv2.CC_STAT_HEIGHT])
-            bbox_area = float(max(1, bbox_w * bbox_h))
-            fill_ratio = float(area_px) / bbox_area
+
             circularity = 0.0
             if perimeter_px > 1e-6:
-                circularity = float(4.0 * np.pi * float(area_px) / (perimeter_px * perimeter_px))
+                circularity = float(4.0 * np.pi * area_px / (perimeter_px * perimeter_px))
             circularity = float(np.clip(circularity, 0.0, 1.0))
-            compactness = float(0.7 * circularity + 0.3 * fill_ratio)
-            score = (
-                compactness,
-                -float("inf") if dist_px is None else -dist_px,
-                float(area_px),
-            )
-            component_debug.append(
-                {
-                    "component": int(comp_idx),
-                    "area_px": area_px,
-                    "min_area_px": int(min_area_px),
-                    "centroid_local_xy": [float(centroid_x_local), float(centroid_y_local)],
-                    "distance_from_anchor_px": None if dist_px is None else float(dist_px),
-                    "perimeter_px": float(perimeter_px),
-                    "fill_ratio": float(fill_ratio),
-                    "circularity": float(circularity),
-                    "compactness": float(compactness),
-                    "score": [float(compactness), None if dist_px is None else float(-dist_px), float(area_px)],
-                }
-            )
-            if best_score is None or score > best_score:
-                best_score = score
-                best_component = int(comp_idx)
+
+            if circularity < min_circularity:
+                component_debug.append(
+                    {
+                        "component": int(comp_idx),
+                        "area_px": area_px,
+                        "centroid_local_xy": [float(cx), float(cy)],
+                        "distance_from_anchor_px": None if dist_px is None else float(dist_px),
+                        "circularity": float(circularity),
+                        "rejected": "circularity_below_min",
+                        "min_circularity": float(min_circularity),
+                    }
+                )
+                continue
+
+            if selection_mode == "largest":
+                score = (float(area_px), -float("inf") if dist_px is None else -dist_px)
+            elif selection_mode == "nearest":
+                score = (-float("inf") if dist_px is None else -dist_px, float(area_px))
+            else:
+                if dist_px is None:
+                    score = (float(area_px), float(circularity))
+                else:
+                    score = (-dist_px, float(area_px), float(circularity))
+
+            candidate = {
+                "component": int(comp_idx),
+                "area_px": int(area_px),
+                "centroid_local_xy": [float(cx), float(cy)],
+                "distance_from_anchor_px": None if dist_px is None else float(dist_px),
+                "circularity": float(circularity),
+                "score": [float(v) for v in score],
+            }
+            component_debug.append(candidate)
+            candidates.append((score, comp_idx, candidate))
 
         dbg["component_candidates"] = component_debug
-        if best_component is None:
-            dbg["reason"] = "no_valid_pink_component_within_anchor_radius" if anchor_xy is not None else "no_valid_pink_component"
+        if not candidates:
+            dbg["reason"] = (
+                "no_valid_red_component_inside_anchor_radius"
+                if anchor_xy is not None
+                else "no_valid_red_component"
+            )
             return dbg
 
-        best_area = int(stats[best_component, cv2.CC_STAT_AREA])
-        dbg["largest_component_area_px"] = best_area
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, best_component, best_candidate_dbg = candidates[0]
+        selected_mask = (labels == best_component).astype(np.uint8)
 
-        centroid_x_local, centroid_y_local = centroids[best_component]
+        # 6. True mask centroid
+        moments = cv2.moments(selected_mask, binaryImage=True)
+        if abs(moments["m00"]) < 1e-9:
+            dbg["reason"] = "selected_component_zero_moment"
+            return dbg
+
+        x_tip_local = float(moments["m10"] / moments["m00"])
+        y_tip_local = float(moments["m01"] / moments["m00"])
+
         x0 = int(stats[best_component, cv2.CC_STAT_LEFT])
         y0 = int(stats[best_component, cv2.CC_STAT_TOP])
         bw = int(stats[best_component, cv2.CC_STAT_WIDTH])
         bh = int(stats[best_component, cv2.CC_STAT_HEIGHT])
         crop_x0, crop_y0 = float(crop_origin_xy[0]), float(crop_origin_xy[1])
-        component_mask = (labels == best_component)
-        ys_local, xs_local = np.where(component_mask)
-        if ys_local.size == 0:
-            dbg["reason"] = "selected_component_empty"
-            return dbg
-        x_tip_local = float(centroid_x_local)
-        y_tip_local = float(centroid_y_local)
+
+        if bool(getattr(self, "red_tip_debug_save_mask", False)):
+            dbg["selected_mask_local_u8"] = (selected_mask * 255).astype(np.uint8)
 
         dbg.update(
             {
                 "found": True,
-                "reason": "most_compact_pink_component_centroid",
+                "reason": "selected_red_mask_component_moments_centroid",
+                "selected_component": int(best_component),
+                "selected_component_debug": best_candidate_dbg,
+                "selected_component_area_px": int(stats[best_component, cv2.CC_STAT_AREA]),
                 "x_local": float(x_tip_local),
                 "y_local": float(y_tip_local),
                 "x_abs": float(crop_x0 + x_tip_local),
                 "y_abs": float(crop_y0 + y_tip_local),
-                "centroid_x_local": float(centroid_x_local),
-                "centroid_y_local": float(centroid_y_local),
+                "centroid_x_local": float(x_tip_local),
+                "centroid_y_local": float(y_tip_local),
                 "bbox_local_xyxy": [x0, y0, x0 + bw, y0 + bh],
+                "selection_mode": selection_mode,
+                "min_area_px": int(min_area_px),
+                "min_circularity": float(min_circularity),
             }
         )
         return dbg
@@ -3224,7 +3349,9 @@ class CTR_Shadow_Calibration:
         if not os.path.isdir("raw_image_data_folder"):
             os.mkdir("raw_image_data_folder")
         elif not bool(append_raw_data):
-            print("You already have raw image data for this project. This will overwrite the current data.")
+            removed_count = self.clear_raw_image_data_folder()
+            if removed_count == 0:
+                print("Raw image folder already existed, but there were no files to clear.")
 
         os.chdir("raw_image_data_folder")
 
@@ -3836,11 +3963,6 @@ class CTR_Shadow_Calibration:
         tip_y = float(np.clip(tip_row, 0, binary_image.shape[0] - 1))
         tip_x = float(np.clip(tip_column, 0, binary_image.shape[1] - 1))
 
-        zoom_x_min = int(max(int(round(tip_x)) - 75, 0))
-        zoom_x_max = int(min(int(round(tip_x)) + 75, binary_image.shape[1] - 1))
-        zoom_y_min = int(max(int(round(tip_y)) - 75, 0))
-        zoom_y_max = int(min(int(round(tip_y)) + 75, binary_image.shape[0] - 1))
-
         yy_refined, xx_refined, tip_refine_dbg = refine_tip_parallel_centerline(
             grayscale=grayscale_image,
             binary_image=binary_image,
@@ -3912,6 +4034,23 @@ class CTR_Shadow_Calibration:
             else:
                 tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
                 tip_select_dbg["red_dot_fallback_reason"] = red_tip_dbg.get("reason", "red_dot_not_found")
+
+        zoom_half_span_px = 75
+        zoom_points_xy = np.array(
+            [
+                [float(tip_x), float(tip_y)],
+                [float(xx_selected), float(yy_selected)],
+            ],
+            dtype=float,
+        )
+        zoom_x_center = float(np.mean(zoom_points_xy[:, 0]))
+        zoom_y_center = float(np.mean(zoom_points_xy[:, 1]))
+        zoom_x_radius = float(max(zoom_half_span_px, 0.5 * (np.max(zoom_points_xy[:, 0]) - np.min(zoom_points_xy[:, 0])) + 12.0))
+        zoom_y_radius = float(max(zoom_half_span_px, 0.5 * (np.max(zoom_points_xy[:, 1]) - np.min(zoom_points_xy[:, 1])) + 12.0))
+        zoom_x_min = int(max(np.floor(zoom_x_center - zoom_x_radius), 0))
+        zoom_x_max = int(min(np.ceil(zoom_x_center + zoom_x_radius), binary_image.shape[1] - 1))
+        zoom_y_min = int(max(np.floor(zoom_y_center - zoom_y_radius), 0))
+        zoom_y_max = int(min(np.ceil(zoom_y_center + zoom_y_radius), binary_image.shape[0] - 1))
 
         orientation = int(file_ctx['orientation'])
         ntnl_pos = float(file_ctx['ntnl_pos'])
@@ -4991,6 +5130,8 @@ class CTR_Shadow_Calibration:
 
         diameter_mm = float(diameter_mm)
         point_t = np.linspace(0.0, 1.0, n_points)
+        extension_length_mm = max(0.0, float(getattr(self, "skeleton_vertical_extension_mm", SKELETON_VERTICAL_EXTENSION_MM)))
+        extension_point_count = int(max(0, getattr(self, "skeleton_vertical_extension_points", SKELETON_VERTICAL_EXTENSION_POINTS)))
 
         motor_setup = cal_json.get("motor_setup", {})
         coeffs = cal_json.get("cubic_coefficients", {})
@@ -5121,6 +5262,36 @@ class CTR_Shadow_Calibration:
                 return None
             return int(np.argmin(np.abs(b_arr - float(b_target))))
 
+        def prepend_vertical_extension_points(ref_points_xyz, x_disp_mm, y_disp_mm, z_disp_mm):
+            ref_pts = np.asarray(ref_points_xyz, dtype=float)
+            x_disp_arr = np.asarray(x_disp_mm, dtype=float)
+            z_disp_arr = np.asarray(z_disp_mm, dtype=float)
+            y_disp_arr = None if y_disp_mm is None else np.asarray(y_disp_mm, dtype=float)
+            if (
+                extension_length_mm <= 0.0
+                or extension_point_count <= 0
+                or ref_pts.ndim != 2
+                or ref_pts.shape[0] < 1
+                or ref_pts.shape[1] != 3
+            ):
+                return ref_pts, x_disp_arr, y_disp_arr, z_disp_arr
+
+            base_ref = ref_pts[0].astype(float)
+            z_offsets = np.linspace(extension_length_mm, 0.0, extension_point_count + 1, dtype=float)[:-1]
+            ext_ref = np.repeat(base_ref[None, :], extension_point_count, axis=0)
+            ext_ref[:, 2] += z_offsets
+
+            ext_x_disp = np.repeat(x_disp_arr[:, :1], extension_point_count, axis=1)
+            ext_z_disp = np.repeat(z_disp_arr[:, :1], extension_point_count, axis=1)
+            if y_disp_arr is not None:
+                ext_y_disp = np.repeat(y_disp_arr[:, :1], extension_point_count, axis=1)
+                y_disp_arr = np.concatenate([ext_y_disp, y_disp_arr], axis=1).astype(float)
+
+            ref_pts = np.concatenate([ext_ref, ref_pts], axis=0).astype(float)
+            x_disp_arr = np.concatenate([ext_x_disp, x_disp_arr], axis=1).astype(float)
+            z_disp_arr = np.concatenate([ext_z_disp, z_disp_arr], axis=1).astype(float)
+            return ref_pts, x_disp_arr, y_disp_arr, z_disp_arr
+
         def build_phase_point_dataset(phase_code, pass_idx=1):
             phase_mask = (
                 np.isclose(rows[:, PHASE_COL], phase_code)
@@ -5172,6 +5343,18 @@ class CTR_Shadow_Calibration:
                 y_disp = None
 
             ref_points = np.column_stack([x_ref, y_ref, z_ref]).astype(float)
+            ref_points, x_disp, y_disp, z_disp = prepend_vertical_extension_points(
+                ref_points_xyz=ref_points,
+                x_disp_mm=x_disp,
+                y_disp_mm=y_disp,
+                z_disp_mm=z_disp,
+            )
+            x_abs = x_disp + ref_points[None, :, 0]
+            z_abs = z_disp + ref_points[None, :, 2]
+            if y_disp is not None:
+                y_abs = y_disp + ref_points[None, :, 1]
+            else:
+                y_abs = None
             return {
                 "phase_code": int(phase_code),
                 "pass_idx": int(pass_idx),
@@ -5238,6 +5421,21 @@ class CTR_Shadow_Calibration:
                     common_b_off = None
 
             ref_points = np.column_stack([x_ref, y_ref, z_ref]).astype(float)
+            x_disp = (x_abs - x_ref[None, :]).astype(float)
+            z_disp = (z_abs - z_ref[None, :]).astype(float)
+            y_disp = None if y_abs is None else (y_abs - y_ref[None, :]).astype(float)
+            ref_points, x_disp, y_disp, z_disp = prepend_vertical_extension_points(
+                ref_points_xyz=ref_points,
+                x_disp_mm=x_disp,
+                y_disp_mm=y_disp,
+                z_disp_mm=z_disp,
+            )
+            x_abs = x_disp + ref_points[None, :, 0]
+            z_abs = z_disp + ref_points[None, :, 2]
+            if y_disp is not None:
+                y_abs = y_disp + ref_points[None, :, 1]
+            else:
+                y_abs = None
             return {
                 "phase_code": int(ds_1["phase_code"]),
                 "pass_idx": None,
@@ -5248,9 +5446,9 @@ class CTR_Shadow_Calibration:
                 "x_abs_mm": x_abs.astype(float),
                 "z_abs_mm": z_abs.astype(float),
                 "y_abs_mm": None if y_abs is None else y_abs.astype(float),
-                "x_disp_mm": (x_abs - x_ref[None, :]).astype(float),
-                "z_disp_mm": (z_abs - z_ref[None, :]).astype(float),
-                "y_disp_mm": None if y_abs is None else (y_abs - y_ref[None, :]).astype(float),
+                "x_disp_mm": x_disp.astype(float),
+                "z_disp_mm": z_disp.astype(float),
+                "y_disp_mm": None if y_abs is None else y_disp.astype(float),
                 "reference_points_xyz_mm": ref_points.astype(float),
                 "combined_from_passes": [1, 2],
             }
@@ -5286,6 +5484,10 @@ class CTR_Shadow_Calibration:
         datasets_for_export = dict(datasets)
         datasets_for_export.update(combined_datasets)
 
+        sample_dataset = next(iter(datasets_for_export.values()))
+        n_points_export = int(np.asarray(sample_dataset["reference_points_xyz_mm"], dtype=float).shape[0])
+        point_t = np.linspace(0.0, 1.0, n_points_export)
+
         phase_aliases = {}
         if "pull_combined" in datasets_for_export:
             phase_aliases["pull"] = "pull_combined"
@@ -5313,7 +5515,7 @@ class CTR_Shadow_Calibration:
         phase_models = {}
         for phase_name, ds in datasets_for_export.items():
             point_models = []
-            for point_idx in range(n_points):
+            for point_idx in range(n_points_export):
                 x_model = fit_displacement_model(
                     ds["common_b"],
                     np.asarray(ds["x_disp_mm"], dtype=float)[:, point_idx],
@@ -5379,7 +5581,7 @@ class CTR_Shadow_Calibration:
             "units": "mm",
             "diameter_mm": diameter_mm,
             "radius_mm": diameter_mm / 2.0,
-            "n_skeleton_points": int(n_points),
+            "n_skeleton_points": int(n_points_export),
             "b_range": [b_min, b_max],
             "reference_b_pull_mm": float(b_ref),
             "default_phase_for_legacy_access": default_phase,
@@ -5390,6 +5592,14 @@ class CTR_Shadow_Calibration:
                     "Tracked points are sampled at equal arc-length spacing along the visible skeleton "
                     "from the top-most visible trunk point (t=0) to the distal tip (t=1) in each image."
                 ),
+                "vertical_extension": {
+                    "enabled": bool(extension_length_mm > 0.0 and extension_point_count > 0),
+                    "attached_end": "base",
+                    "direction": "+Z",
+                    "length_mm": float(extension_length_mm),
+                    "n_added_points": int(extension_point_count),
+                    "note": "Extra exported points are prepended above the base-side skeleton endpoint and inherit that endpoint's per-B displacement.",
+                },
             },
             "smoothing": {
                 "body_window_points": int(body_window),
@@ -5513,7 +5723,7 @@ def skeleton_points(b_pull_mm, phase=None):
             "predictor_py": py_path.name,
             "reference_stl": stl_path.name if stl_path is not None else None,
             "diameter_mm": diameter_mm,
-            "n_skeleton_points": int(n_points),
+            "n_skeleton_points": int(n_points_export),
             "reference_b_pull_mm": float(b_ref),
             "note": "Tracked visible-skeleton points with per-point displacement equations versus B pull.",
         }

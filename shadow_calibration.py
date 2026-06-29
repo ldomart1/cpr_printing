@@ -10,6 +10,7 @@ import cv2
 import os
 import sys
 import time
+import shutil
 import pandas as pd
 import pickle
 import inspect
@@ -1301,6 +1302,8 @@ class CTR_Shadow_Calibration:
         self.cam_port = None
         self.cam = None
         self.rrf = None
+        self.capture_metadata_records = []
+        self._curl_angle_pass_sequences_deg = {}
 
         # On 3840x2160 frames this maps to the GUI box:
         # x:[1394,2856] y:[458,1393]
@@ -1368,6 +1371,7 @@ class CTR_Shadow_Calibration:
         self.red_tip_use_rgb_excess = True
         self.red_tip_rgb_excess_min = 35
         self.red_tip_debug_save_mask = False
+        self.export_analysis_outputs = False
         self.red_tip_bottom_band_px = 3
         self.c90_y_compensation_from_planar_pchip = False
         self.tip_refiner_model_path = None
@@ -1379,6 +1383,7 @@ class CTR_Shadow_Calibration:
         self.tip_refiner_softargmax_temperature = None
         self.tip_refiner_enabled = False
         self._last_tip_locations_cnn = None
+        self._red_tip_anchor_by_pass = {}
         self.skeleton_tracking_point_count = 20
         self._last_skeleton_points_selected_xy = None
 
@@ -2466,7 +2471,13 @@ class CTR_Shadow_Calibration:
         patch[dst_y0:dst_y1, dst_x0:dst_x1] = gray_image[src_y0:src_y1, src_x0:src_x1]
         return patch, x0, y0
 
-    def detect_red_tip_marker(self, bgr_image, crop_origin_xy=(0, 0), anchor_yx_local=None):
+    def detect_red_tip_marker(
+        self,
+        bgr_image,
+        crop_origin_xy=(0, 0),
+        anchor_yx_local=None,
+        fallback_anchor_yx_local=None,
+    ):
         """
         Detect the red spherical tip marker and return the centroid of the selected
         masked red component.
@@ -2541,130 +2552,174 @@ class CTR_Shadow_Calibration:
             dbg["reason"] = "no_red_pixels_after_threshold"
             return dbg
 
-        # 4. Anchor and local search radius
-        anchor_xy = None
-        if anchor_yx_local is not None:
-            anchor_arr = np.asarray(anchor_yx_local, dtype=float).reshape(-1)
-            if anchor_arr.size >= 2 and np.all(np.isfinite(anchor_arr[:2])):
-                anchor_xy = np.array([float(anchor_arr[1]), float(anchor_arr[0])], dtype=np.float64)
-                dbg["anchor_xy_local"] = anchor_xy.tolist()
-
-        search_radius_px = float(max(1.0, getattr(self, "red_tip_search_radius_px", 80.0)))
-        if anchor_xy is not None:
-            yy, xx = np.indices(mask.shape)
-            dist_map = np.sqrt(
-                (xx.astype(float) - anchor_xy[0]) ** 2
-                + (yy.astype(float) - anchor_xy[1]) ** 2
-            )
-            local_gate = (dist_map <= search_radius_px).astype(np.uint8) * 255
-            mask = cv2.bitwise_and(mask, local_gate)
-            dbg["local_red_pixel_count"] = int(np.count_nonzero(mask))
-            if dbg["local_red_pixel_count"] <= 0:
-                dbg["reason"] = "no_red_pixels_inside_anchor_radius"
-                return dbg
-
-        if bool(getattr(self, "red_tip_debug_save_mask", False)):
-            dbg["mask_local_u8"] = mask.copy()
-
-        # 5. Connected components
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            (mask > 0).astype(np.uint8),
-            connectivity=8,
-        )
-        if num_labels <= 1:
-            dbg["reason"] = "no_connected_red_component"
-            return dbg
-
         global_min_area_px = int(max(1, getattr(self, "red_tip_min_area_px", 20)))
         local_min_area_px = int(max(1, getattr(self, "red_tip_local_min_area_px", 20)))
-        min_area_px = local_min_area_px if anchor_xy is not None else global_min_area_px
         min_circularity = float(np.clip(getattr(self, "red_tip_min_circularity", 0.0), 0.0, 1.0))
         selection_mode = str(getattr(self, "red_tip_component_selection", "nearest_largest")).strip().lower()
+        search_radius_px = float(max(1.0, getattr(self, "red_tip_search_radius_px", 80.0)))
 
-        candidates = []
-        component_debug = []
+        def _normalize_anchor_xy(anchor_yx):
+            if anchor_yx is None:
+                return None
+            anchor_arr = np.asarray(anchor_yx, dtype=float).reshape(-1)
+            if anchor_arr.size < 2 or not np.all(np.isfinite(anchor_arr[:2])):
+                return None
+            return np.array([float(anchor_arr[1]), float(anchor_arr[0])], dtype=np.float64)
 
-        for comp_idx in range(1, num_labels):
-            area_px = int(stats[comp_idx, cv2.CC_STAT_AREA])
-            if area_px < min_area_px:
-                component_debug.append(
-                    {
-                        "component": int(comp_idx),
-                        "area_px": area_px,
-                        "rejected": "area_below_min",
-                        "min_area_px": int(min_area_px),
-                    }
-                )
-                continue
-
-            cx, cy = centroids[comp_idx]
-            dist_px = None
-            if anchor_xy is not None:
-                dist_px = float(np.hypot(float(cx) - anchor_xy[0], float(cy) - anchor_xy[1]))
-
-            component_mask_u8 = (labels == comp_idx).astype(np.uint8)
-            contours, _ = cv2.findContours(
-                component_mask_u8,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE,
+        def _select_component(mask_u8, anchor_xy):
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                (mask_u8 > 0).astype(np.uint8),
+                connectivity=8,
             )
+            if num_labels <= 1:
+                return None, "no_connected_red_component", []
 
-            perimeter_px = 0.0
-            if contours:
-                perimeter_px = float(max(cv2.arcLength(cnt, True) for cnt in contours))
+            min_area_px = local_min_area_px if anchor_xy is not None else global_min_area_px
+            candidates = []
+            component_debug = []
+            for comp_idx in range(1, num_labels):
+                area_px = int(stats[comp_idx, cv2.CC_STAT_AREA])
+                if area_px < min_area_px:
+                    component_debug.append(
+                        {
+                            "component": int(comp_idx),
+                            "area_px": area_px,
+                            "rejected": "area_below_min",
+                            "min_area_px": int(min_area_px),
+                        }
+                    )
+                    continue
 
-            circularity = 0.0
-            if perimeter_px > 1e-6:
-                circularity = float(4.0 * np.pi * area_px / (perimeter_px * perimeter_px))
-            circularity = float(np.clip(circularity, 0.0, 1.0))
+                cx, cy = centroids[comp_idx]
+                dist_px = None
+                if anchor_xy is not None:
+                    dist_px = float(np.hypot(float(cx) - anchor_xy[0], float(cy) - anchor_xy[1]))
 
-            if circularity < min_circularity:
-                component_debug.append(
-                    {
-                        "component": int(comp_idx),
-                        "area_px": area_px,
-                        "centroid_local_xy": [float(cx), float(cy)],
-                        "distance_from_anchor_px": None if dist_px is None else float(dist_px),
-                        "circularity": float(circularity),
-                        "rejected": "circularity_below_min",
-                        "min_circularity": float(min_circularity),
-                    }
+                component_mask_u8 = (labels == comp_idx).astype(np.uint8)
+                contours, _ = cv2.findContours(
+                    component_mask_u8,
+                    cv2.RETR_EXTERNAL,
+                    cv2.CHAIN_APPROX_SIMPLE,
                 )
-                continue
 
-            if selection_mode == "largest":
-                score = (float(area_px), -float("inf") if dist_px is None else -dist_px)
-            elif selection_mode == "nearest":
-                score = (-float("inf") if dist_px is None else -dist_px, float(area_px))
-            else:
-                if dist_px is None:
-                    score = (float(area_px), float(circularity))
+                perimeter_px = 0.0
+                if contours:
+                    perimeter_px = float(max(cv2.arcLength(cnt, True) for cnt in contours))
+
+                circularity = 0.0
+                if perimeter_px > 1e-6:
+                    circularity = float(4.0 * np.pi * area_px / (perimeter_px * perimeter_px))
+                circularity = float(np.clip(circularity, 0.0, 1.0))
+
+                if circularity < min_circularity:
+                    component_debug.append(
+                        {
+                            "component": int(comp_idx),
+                            "area_px": area_px,
+                            "centroid_local_xy": [float(cx), float(cy)],
+                            "distance_from_anchor_px": None if dist_px is None else float(dist_px),
+                            "circularity": float(circularity),
+                            "rejected": "circularity_below_min",
+                            "min_circularity": float(min_circularity),
+                        }
+                    )
+                    continue
+
+                if selection_mode == "largest":
+                    score = (float(area_px), -float("inf") if dist_px is None else -dist_px)
+                elif selection_mode == "nearest":
+                    score = (-float("inf") if dist_px is None else -dist_px, float(area_px))
                 else:
-                    score = (-dist_px, float(area_px), float(circularity))
+                    if dist_px is None:
+                        score = (float(area_px), float(circularity))
+                    else:
+                        score = (-dist_px, float(area_px), float(circularity))
 
-            candidate = {
-                "component": int(comp_idx),
-                "area_px": int(area_px),
-                "centroid_local_xy": [float(cx), float(cy)],
-                "distance_from_anchor_px": None if dist_px is None else float(dist_px),
-                "circularity": float(circularity),
-                "score": [float(v) for v in score],
-            }
-            component_debug.append(candidate)
-            candidates.append((score, comp_idx, candidate))
+                candidate = {
+                    "component": int(comp_idx),
+                    "area_px": int(area_px),
+                    "centroid_local_xy": [float(cx), float(cy)],
+                    "distance_from_anchor_px": None if dist_px is None else float(dist_px),
+                    "circularity": float(circularity),
+                    "score": [float(v) for v in score],
+                }
+                component_debug.append(candidate)
+                candidates.append((score, comp_idx, candidate, labels, stats))
 
-        dbg["component_candidates"] = component_debug
-        if not candidates:
-            dbg["reason"] = (
-                "no_valid_red_component_inside_anchor_radius"
-                if anchor_xy is not None
-                else "no_valid_red_component"
+            if not candidates:
+                return None, (
+                    "no_valid_red_component_inside_anchor_radius"
+                    if anchor_xy is not None
+                    else "no_valid_red_component"
+                ), component_debug
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            _, best_component, best_candidate_dbg, labels, stats = candidates[0]
+            selected_mask = (labels == best_component).astype(np.uint8)
+            return {
+                "best_component": int(best_component),
+                "best_candidate_dbg": best_candidate_dbg,
+                "selected_mask": selected_mask,
+                "stats": stats,
+            }, None, component_debug
+
+        anchor_attempts = []
+        selected_min_area_px = global_min_area_px
+        for scope_name, anchor_xy in (
+            ("anchor", _normalize_anchor_xy(anchor_yx_local)),
+            ("fallback_anchor", _normalize_anchor_xy(fallback_anchor_yx_local)),
+            ("global", None),
+        ):
+            if scope_name != "global" and anchor_xy is None:
+                continue
+
+            scoped_mask = mask.copy()
+            scope_dbg = {"scope": scope_name}
+            if anchor_xy is not None:
+                yy, xx = np.indices(mask.shape)
+                dist_map = np.sqrt(
+                    (xx.astype(float) - anchor_xy[0]) ** 2
+                    + (yy.astype(float) - anchor_xy[1]) ** 2
+                )
+                local_gate = (dist_map <= search_radius_px).astype(np.uint8) * 255
+                scoped_mask = cv2.bitwise_and(scoped_mask, local_gate)
+                scope_dbg["anchor_xy_local"] = anchor_xy.tolist()
+                scope_dbg["local_red_pixel_count"] = int(np.count_nonzero(scoped_mask))
+                if scope_dbg["local_red_pixel_count"] <= 0:
+                    scope_dbg["reason"] = "no_red_pixels_inside_anchor_radius"
+                    anchor_attempts.append(scope_dbg)
+                    continue
+            else:
+                scope_dbg["global_red_pixel_count"] = int(np.count_nonzero(scoped_mask))
+
+            result, reason, component_debug = _select_component(scoped_mask, anchor_xy)
+            scope_dbg["component_candidates"] = component_debug
+            if result is None:
+                scope_dbg["reason"] = reason
+                anchor_attempts.append(scope_dbg)
+                continue
+
+            if bool(getattr(self, "red_tip_debug_save_mask", False)):
+                dbg["mask_local_u8"] = scoped_mask.copy()
+
+            dbg["search_attempts"] = anchor_attempts + [scope_dbg]
+            dbg["selected_search_scope"] = scope_name
+            if anchor_xy is not None:
+                dbg["anchor_xy_local"] = anchor_xy.tolist()
+                dbg["local_red_pixel_count"] = int(np.count_nonzero(scoped_mask))
+            dbg["component_candidates"] = component_debug
+            best_component = result["best_component"]
+            best_candidate_dbg = result["best_candidate_dbg"]
+            selected_mask = result["selected_mask"]
+            stats = result["stats"]
+            selected_min_area_px = (
+                local_min_area_px if anchor_xy is not None else global_min_area_px
             )
+            break
+        else:
+            dbg["search_attempts"] = anchor_attempts
+            dbg["reason"] = anchor_attempts[-1]["reason"] if anchor_attempts else "no_valid_red_component"
             return dbg
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        _, best_component, best_candidate_dbg = candidates[0]
-        selected_mask = (labels == best_component).astype(np.uint8)
 
         # 6. True mask centroid
         moments = cv2.moments(selected_mask, binaryImage=True)
@@ -2699,7 +2754,7 @@ class CTR_Shadow_Calibration:
                 "centroid_y_local": float(y_tip_local),
                 "bbox_local_xyxy": [x0, y0, x0 + bw, y0 + bh],
                 "selection_mode": selection_mode,
-                "min_area_px": int(min_area_px),
+                "min_area_px": int(selected_min_area_px),
                 "min_circularity": float(min_circularity),
             }
         )
@@ -3292,10 +3347,18 @@ class CTR_Shadow_Calibration:
                   combine_redundant_passes=True,
                   redundant_pass_combination="average",
                   save_pass_index_in_filename=True,
+                  capture_group="main",
+                  curl_angle_pass_name=None,
+                  curl_angle_sequence_deg=None,
                   orientation_ids=None,
                   append_raw_data=False,
                   stage_y_offset_models_by_phase=None,
-                  stage_y_offset_orientation_ids=None):
+                  stage_y_offset_orientation_ids=None,
+                  phase_b_values_by_phase=None,
+                  motion_mode="stepped",
+                  continuous_motion_feedrate=None,
+                  continuous_motion_accel_mm_s2=0.0,
+                  continuous_capture_period_s=None):
         """
         Probes at 5 XYZ locations and for each location:
         - Capture pull images while moving B from b_start toward the pulled state.
@@ -3339,6 +3402,38 @@ class CTR_Shadow_Calibration:
         save_pass_index_in_filename = bool(save_pass_index_in_filename)
         self._combine_redundant_passes = combine_redundant_passes
         self._redundant_pass_combination = redundant_pass_combination
+        motion_mode = str(motion_mode).strip().lower()
+        if motion_mode not in {"stepped", "continuous"}:
+            raise ValueError("motion_mode must be 'stepped' or 'continuous'.")
+        if continuous_motion_feedrate is None:
+            continuous_motion_feedrate = 0.3 * float(jogging_feedrate)
+        continuous_motion_feedrate = abs(float(continuous_motion_feedrate))
+        continuous_motion_accel_mm_s2 = max(0.0, float(continuous_motion_accel_mm_s2))
+        if continuous_capture_period_s is not None:
+            continuous_capture_period_s = float(continuous_capture_period_s)
+            if continuous_capture_period_s <= 0.0:
+                continuous_capture_period_s = None
+        normalized_phase_b_values_by_phase = None
+        if phase_b_values_by_phase is not None:
+            normalized_phase_b_values_by_phase = {}
+            for phase_name, raw_values in dict(phase_b_values_by_phase).items():
+                if raw_values is None:
+                    continue
+                phase_key = str(phase_name).strip().lower()
+                vals = np.asarray(list(raw_values), dtype=float).reshape(-1)
+                vals = vals[np.isfinite(vals)]
+                if vals.size == 0:
+                    continue
+                normalized_phase_b_values_by_phase[phase_key] = vals.astype(float).tolist()
+            if not normalized_phase_b_values_by_phase:
+                normalized_phase_b_values_by_phase = None
+        if curl_angle_sequence_deg is not None and curl_angle_pass_name is not None:
+            try:
+                self._curl_angle_pass_sequences_deg[str(curl_angle_pass_name)] = [
+                    float(v) for v in curl_angle_sequence_deg
+                ]
+            except Exception:
+                pass
 
         settling_time_large = 5.0
         settling_time_small = 0.2
@@ -3360,7 +3455,8 @@ class CTR_Shadow_Calibration:
         cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
 
         def capture_and_save(orientation: int, x: float, y: float, z: float, b: float,
-                             probe_idx: int, step_idx: int, motion_phase: str, pass_idx: int = 1):
+                             probe_idx: int, step_idx: int, motion_phase: str, pass_idx: int = 1,
+                             requested_accel_mm_s2: float = None, used_accel_mm_s2: float = None):
             _ = cam.read()
             ret, image = cam.read()
             if not ret:
@@ -3372,6 +3468,15 @@ class CTR_Shadow_Calibration:
             )
             if save_pass_index_in_filename:
                 filename += f"_PASS{int(pass_idx)}"
+            if requested_accel_mm_s2 is not None and np.isfinite(float(requested_accel_mm_s2)):
+                filename += f"_reqA{float(requested_accel_mm_s2):.3f}"
+            if used_accel_mm_s2 is not None and np.isfinite(float(used_accel_mm_s2)):
+                filename += f"_useA{float(used_accel_mm_s2):.3f}"
+            group_token = self._safe_output_stem(str(capture_group))
+            filename += f"_GRP{group_token}"
+            if curl_angle_pass_name is not None:
+                pass_token = self._safe_output_stem(str(curl_angle_pass_name))
+                filename += f"_CURLPASS{pass_token}"
             filename += ".png"
             if ret:
                 cv2.imwrite(filename, image)
@@ -3407,6 +3512,49 @@ class CTR_Shadow_Calibration:
             settle_s = bias_s + gain * move_time_s
             return float(np.clip(settle_s, min_s, max_s))
 
+        def accel_limited_displacement_mm(elapsed_s: float, feedrate_mm_min: float, accel_mm_s2: float) -> float:
+            t = max(0.0, float(elapsed_s))
+            v = abs(float(feedrate_mm_min)) / 60.0
+            accel = max(0.0, float(accel_mm_s2))
+            if v <= 1e-12:
+                return 0.0
+            if accel <= 1e-12:
+                return v * t
+            t_accel = v / accel
+            if t <= t_accel:
+                return 0.5 * accel * (t ** 2)
+            accel_distance = (v ** 2) / (2.0 * accel)
+            cruise_time = t - t_accel
+            return accel_distance + v * cruise_time
+
+        def accel_limited_move_time_seconds(distance_mm: float, feedrate_mm_min: float, accel_mm_s2: float) -> float:
+            distance = abs(float(distance_mm))
+            v = abs(float(feedrate_mm_min)) / 60.0
+            accel = max(0.0, float(accel_mm_s2))
+            if distance <= 1e-12 or v <= 1e-12:
+                return 0.0
+            if accel <= 1e-12:
+                return distance / v
+            accel_distance = (v ** 2) / (2.0 * accel)
+            if distance <= accel_distance:
+                return math.sqrt((2.0 * distance) / accel)
+            t_accel = v / accel
+            return t_accel + ((distance - accel_distance) / v)
+
+        def accel_limited_elapsed_for_displacement_seconds(displacement_mm: float, feedrate_mm_min: float, accel_mm_s2: float) -> float:
+            displacement = max(0.0, float(displacement_mm))
+            v = abs(float(feedrate_mm_min)) / 60.0
+            accel = max(0.0, float(accel_mm_s2))
+            if displacement <= 1e-12 or v <= 1e-12:
+                return 0.0
+            if accel <= 1e-12:
+                return displacement / v
+            accel_distance = (v ** 2) / (2.0 * accel)
+            if displacement <= accel_distance:
+                return math.sqrt((2.0 * displacement) / accel)
+            t_accel = v / accel
+            return t_accel + ((displacement - accel_distance) / v)
+
         def wait_for_move(cur: dict, tgt: dict, feedrate: float, extra_settle_override: float = None):
             distance = move_distance_mm(cur, tgt)
             if distance <= 1e-12:
@@ -3433,6 +3581,20 @@ class CTR_Shadow_Calibration:
             print(f" Command: {g}")
             self.rrf.send_code(g)
             wait_for_move(cur, tgt, fr, extra_settle_override=extra_settle_override)
+            return tgt
+
+        def move_abs_no_wait(fr: float, cur: dict, **axes_targets):
+            cmd = ["G90", "G1"]
+            tgt = dict(cur)
+            for ax, val in axes_targets.items():
+                if val is None:
+                    continue
+                cmd.append(f"{ax}{val}")
+                tgt[ax] = float(val)
+            cmd.append(f"F{fr}")
+            g = " ".join(cmd)
+            print(f" Command: {g}")
+            self.rrf.send_code(g)
             return tgt
 
         def rotate_rel(axis_name: str, c_units: float, fr=None):
@@ -3487,6 +3649,16 @@ class CTR_Shadow_Calibration:
             if orientation_id == 3:
                 return +1.0
             return 0.0
+
+        def uses_dynamic_stage_y_compensation(orientation_id: int) -> bool:
+            if stage_y_offset_models_by_phase is None:
+                return False
+            allowed_orientation_ids = (
+                {2}
+                if stage_y_offset_orientation_ids is None
+                else {int(v) for v in stage_y_offset_orientation_ids}
+            )
+            return int(orientation_id) in allowed_orientation_ids
 
         def run_motion_pass(orientation_id: int, x: float, y: float, z: float, probe_idx: int,
                             motion_phase: str, pass_idx: int, b_values, label_total: int,
@@ -3551,42 +3723,279 @@ class CTR_Shadow_Calibration:
                 capture_and_save(orientation_id, x, y_target, z, b_val, probe_idx, step_idx, motion_phase, pass_idx=pass_idx)
                 total_images += 1
 
+        def run_continuous_motion_pass(orientation_id: int, x: float, y: float, z: float, probe_idx: int,
+                                       motion_phase: str, pass_idx: int, b_values, label_total: int,
+                                       extra_stage_y_offset_mm: float = 0.0):
+            nonlocal pos, total_images
+            motion_phase = str(motion_phase).strip().lower()
+            if motion_phase == "pull":
+                print(f" Starting continuous pull pass {pass_idx}/{label_total}")
+            else:
+                print(f" Starting continuous release pass {pass_idx}/{label_total}")
+            if len(b_values) == 0:
+                return
+
+            start_b = float(pos.get(robot_rear_axis_name, b_values[0]))
+            end_b = float(b_values[-1])
+            direction = 0.0 if np.isclose(end_b, start_b, atol=1e-12) else np.sign(end_b - start_b)
+            travel_distance_mm = abs(end_b - start_b)
+            total_motion_time_s = accel_limited_move_time_seconds(
+                travel_distance_mm,
+                continuous_motion_feedrate,
+                continuous_motion_accel_mm_s2,
+            )
+
+            print(
+                f"  Continuous sweep: {robot_rear_axis_name} {start_b:.3f} -> {end_b:.3f} "
+                f"at {continuous_motion_feedrate:.1f} mm/min, accel={continuous_motion_accel_mm_s2:.3f} mm/s^2, "
+                f"estimated travel={total_motion_time_s:.3f}s"
+            )
+
+            def continuous_y_target_for_b(b_val: float) -> float:
+                y_offset_mm = (
+                    stage_y_compensation_sign(orientation_id)
+                    * evaluate_stage_y_offset_mm(orientation_id, motion_phase, b_val)
+                )
+                return float(y) + float(y_offset_mm) + float(extra_stage_y_offset_mm)
+
+            use_segmented_continuous_motion = uses_dynamic_stage_y_compensation(orientation_id)
+
+            if travel_distance_mm <= 1e-12 or total_motion_time_s <= 1e-12 or direction == 0.0:
+                y_target = continuous_y_target_for_b(start_b)
+                if not np.isclose(float(pos.get(robot_stage_y_axis_name, 0.0)), y_target, atol=1e-12):
+                    pos = move_abs(compensated_stage_y_feedrate, pos, **{robot_stage_y_axis_name: y_target})
+                capture_and_save(
+                    orientation_id, x, y_target, z, start_b, probe_idx, 0, motion_phase,
+                    pass_idx=pass_idx,
+                    requested_accel_mm_s2=continuous_motion_accel_mm_s2,
+                    used_accel_mm_s2=continuous_motion_accel_mm_s2,
+                )
+                total_images += 1
+                pos[robot_rear_axis_name] = start_b
+                pos[robot_stage_y_axis_name] = y_target
+                return
+
+            if continuous_capture_period_s is not None:
+                sample_times_s = np.arange(0.0, total_motion_time_s, float(continuous_capture_period_s), dtype=float).tolist()
+                if not sample_times_s or not np.isclose(sample_times_s[0], 0.0, atol=1e-12):
+                    sample_times_s.insert(0, 0.0)
+                if not np.isclose(sample_times_s[-1], total_motion_time_s, atol=1e-9):
+                    sample_times_s.append(float(total_motion_time_s))
+                sample_b_values = []
+                for sample_time_s in sample_times_s:
+                    displacement_mm = accel_limited_displacement_mm(
+                        sample_time_s,
+                        continuous_motion_feedrate,
+                        continuous_motion_accel_mm_s2,
+                    )
+                    displacement_mm = min(travel_distance_mm, displacement_mm)
+                    sample_b_values.append(start_b + (direction * displacement_mm))
+            else:
+                sample_b_values = [float(v) for v in b_values]
+                sample_times_s = [
+                    accel_limited_elapsed_for_displacement_seconds(
+                        abs(sample_b - start_b),
+                        continuous_motion_feedrate,
+                        continuous_motion_accel_mm_s2,
+                    )
+                    for sample_b in sample_b_values
+                ]
+                if sample_times_s:
+                    sample_times_s[0] = 0.0
+                    sample_times_s[-1] = float(total_motion_time_s)
+
+            sample_y_values = [continuous_y_target_for_b(sample_b) for sample_b in sample_b_values]
+            if use_segmented_continuous_motion:
+                print(
+                    f"  Continuous mode updates {robot_stage_y_axis_name} along the sweep using the "
+                    f"{motion_phase} compensation model ({len(sample_b_values)} scheduled waypoints)."
+                )
+            else:
+                print(
+                    f"  Continuous mode uses a single long {robot_rear_axis_name}-axis move with "
+                    f"{len(sample_b_values)} scheduled captures."
+                )
+
+            first_y_target = float(sample_y_values[0])
+            if not np.isclose(float(pos.get(robot_stage_y_axis_name, 0.0)), first_y_target, atol=1e-12):
+                pos = move_abs(compensated_stage_y_feedrate, pos, **{robot_stage_y_axis_name: first_y_target})
+
+            capture_and_save(
+                orientation_id, x, first_y_target, z, float(sample_b_values[0]), probe_idx, 0, motion_phase,
+                pass_idx=pass_idx,
+                requested_accel_mm_s2=continuous_motion_accel_mm_s2,
+                used_accel_mm_s2=continuous_motion_accel_mm_s2,
+            )
+            total_images += 1
+
+            if not use_segmented_continuous_motion:
+                if len(sample_b_values) > 1:
+                    pos = move_abs_no_wait(
+                        continuous_motion_feedrate,
+                        pos,
+                        **{robot_rear_axis_name: end_b},
+                    )
+                    motion_start_t = time.perf_counter()
+                    for step_idx in range(1, len(sample_b_values)):
+                        segment_deadline_s = float(sample_times_s[step_idx])
+                        while True:
+                            elapsed_s = time.perf_counter() - motion_start_t
+                            remaining_s = segment_deadline_s - elapsed_s
+                            if remaining_s <= 0.0:
+                                break
+                            time.sleep(min(0.01, remaining_s))
+
+                        b_target = float(sample_b_values[step_idx])
+                        capture_and_save(
+                            orientation_id, x, first_y_target, z, b_target, probe_idx, step_idx, motion_phase,
+                            pass_idx=pass_idx,
+                            requested_accel_mm_s2=continuous_motion_accel_mm_s2,
+                            used_accel_mm_s2=continuous_motion_accel_mm_s2,
+                        )
+                        total_images += 1
+
+                    remaining_motion_time_s = max(0.0, float(total_motion_time_s) - (time.perf_counter() - motion_start_t))
+                    if remaining_motion_time_s > 0.0:
+                        time.sleep(remaining_motion_time_s)
+                    if capture_dwell_s > 0.0:
+                        time.sleep(capture_dwell_s)
+                elif capture_dwell_s > 0.0:
+                    time.sleep(capture_dwell_s)
+                pos[robot_rear_axis_name] = end_b
+                pos[robot_stage_y_axis_name] = first_y_target
+                return
+
+            motion_start_t = time.perf_counter()
+            for step_idx in range(1, len(sample_b_values)):
+                b_target = float(sample_b_values[step_idx])
+                y_target = float(sample_y_values[step_idx])
+                prev_b = float(sample_b_values[step_idx - 1])
+                prev_y = float(sample_y_values[step_idx - 1])
+                segment_deadline_s = float(sample_times_s[step_idx])
+                segment_dt_s = max(0.0, segment_deadline_s - float(sample_times_s[step_idx - 1]))
+                segment_distance_mm = float(math.hypot(b_target - prev_b, y_target - prev_y))
+                segment_feedrate = continuous_motion_feedrate
+                if segment_dt_s > 1e-9 and segment_distance_mm > 1e-12:
+                    segment_feedrate = max(1e-6, 60.0 * segment_distance_mm / segment_dt_s)
+                move_abs_no_wait(
+                    segment_feedrate,
+                    pos,
+                    **{
+                        robot_rear_axis_name: b_target,
+                        robot_stage_y_axis_name: y_target,
+                    },
+                )
+                pos[robot_rear_axis_name] = b_target
+                pos[robot_stage_y_axis_name] = y_target
+
+                while True:
+                    elapsed_s = time.perf_counter() - motion_start_t
+                    remaining_s = segment_deadline_s - elapsed_s
+                    if remaining_s <= 0.0:
+                        break
+                    time.sleep(min(0.01, remaining_s))
+
+                capture_and_save(
+                    orientation_id, x, y_target, z, b_target, probe_idx, step_idx, motion_phase,
+                    pass_idx=pass_idx,
+                    requested_accel_mm_s2=continuous_motion_accel_mm_s2,
+                    used_accel_mm_s2=continuous_motion_accel_mm_s2,
+                )
+                total_images += 1
+
+            if capture_dwell_s > 0.0:
+                time.sleep(capture_dwell_s)
+            pos[robot_rear_axis_name] = end_b
+            pos[robot_stage_y_axis_name] = float(sample_y_values[-1])
+
         def run_pull_release_sequence_for_orientation(orientation_id: int, x: float, y: float, z: float,
                                                       probe_idx: int, max_pull_steps=None):
             nonlocal pos
-            steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
-            steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
+            if normalized_phase_b_values_by_phase is not None:
+                pull_b_values = list(normalized_phase_b_values_by_phase.get("pull", []))
+                release_b_values = list(normalized_phase_b_values_by_phase.get("release", []))
+                full_pull_point_count = len(pull_b_values)
+                if not enable_release_imaging:
+                    release_b_values = []
+                if (
+                    pull_b_values
+                    and len(release_b_values) > 1
+                    and np.isclose(float(release_b_values[0]), float(pull_b_values[-1]), atol=1e-12)
+                ):
+                    release_b_values = release_b_values[1:]
+                if max_pull_steps is not None:
+                    keep_point_count = max(1, int(max_pull_steps) + 1)
+                    pull_b_values = pull_b_values[:keep_point_count]
+                    if release_b_values:
+                        release_end_b = float(release_b_values[-1])
+                        release_start_b = float(pull_b_values[-1])
+                        if keep_point_count <= 1 or np.isclose(release_start_b, release_end_b, atol=1e-12):
+                            release_b_values = [release_start_b]
+                        else:
+                            release_b_values = np.linspace(
+                                release_start_b,
+                                release_end_b,
+                                keep_point_count,
+                                dtype=float,
+                            ).tolist()
+                if not pull_b_values:
+                    raise ValueError("phase_b_values_by_phase['pull'] must contain at least one finite B value.")
+            else:
+                steps_to_run = b_steps if max_pull_steps is None else int(max_pull_steps)
+                steps_to_run = int(np.clip(steps_to_run, 0, b_steps))
+                pull_b_values = [b_start + step_idx * b_step_size for step_idx in range(0, steps_to_run + 1)]
+                release_b_values = list(reversed(pull_b_values))
+                if len(release_b_values) > 1:
+                    release_b_values = release_b_values[1:]
+                full_pull_point_count = b_steps + 1
             extra_stage_y_offset_mm = (
                 -10.0
-                if stage_y_offset_models_by_phase is not None and int(orientation_id) in {2, 3} and steps_to_run < b_steps
+                if (
+                    stage_y_offset_models_by_phase is not None
+                    and int(orientation_id) in {2, 3}
+                    and len(pull_b_values) < int(full_pull_point_count)
+                )
                 else 0.0
             )
-            pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
-            pull_b_values = [b_start + step_idx * b_step_size for step_idx in range(0, steps_to_run + 1)]
-            release_b_values = list(reversed(pull_b_values))
-            if len(release_b_values) > 1:
-                release_b_values = release_b_values[1:]
+            sequence_start_b = float(pull_b_values[0])
+            pos = move_abs(0.3 * jogging_feedrate, pos, **{robot_rear_axis_name: sequence_start_b})
 
             total_pull_passes = num_curl_uncurl_cycles
             total_release_passes = num_curl_uncurl_cycles if enable_release_imaging else 0
             for motion_phase, pass_idx in build_phase_schedule():
                 if motion_phase == "pull":
-                    run_motion_pass(
-                        orientation_id, x, y, z, probe_idx,
-                        motion_phase="pull", pass_idx=pass_idx,
-                        b_values=pull_b_values, label_total=total_pull_passes,
-                        extra_stage_y_offset_mm=extra_stage_y_offset_mm,
-                    )
+                    if motion_mode == "continuous":
+                        run_continuous_motion_pass(
+                            orientation_id, x, y, z, probe_idx,
+                            motion_phase="pull", pass_idx=pass_idx,
+                            b_values=pull_b_values, label_total=total_pull_passes,
+                            extra_stage_y_offset_mm=extra_stage_y_offset_mm,
+                        )
+                    else:
+                        run_motion_pass(
+                            orientation_id, x, y, z, probe_idx,
+                            motion_phase="pull", pass_idx=pass_idx,
+                            b_values=pull_b_values, label_total=total_pull_passes,
+                            extra_stage_y_offset_mm=extra_stage_y_offset_mm,
+                        )
                 elif len(release_b_values) > 0:
-                    run_motion_pass(
-                        orientation_id, x, y, z, probe_idx,
-                        motion_phase="release", pass_idx=pass_idx,
-                        b_values=release_b_values, label_total=total_release_passes,
-                        extra_stage_y_offset_mm=extra_stage_y_offset_mm,
-                    )
+                    if motion_mode == "continuous":
+                        run_continuous_motion_pass(
+                            orientation_id, x, y, z, probe_idx,
+                            motion_phase="release", pass_idx=pass_idx,
+                            b_values=release_b_values, label_total=total_release_passes,
+                            extra_stage_y_offset_mm=extra_stage_y_offset_mm,
+                        )
+                    else:
+                        run_motion_pass(
+                            orientation_id, x, y, z, probe_idx,
+                            motion_phase="release", pass_idx=pass_idx,
+                            b_values=release_b_values, label_total=total_release_passes,
+                            extra_stage_y_offset_mm=extra_stage_y_offset_mm,
+                        )
 
             if not enable_release_imaging:
-                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+                pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: sequence_start_b})
             if stage_y_offset_models_by_phase is not None:
                 pos = move_abs(jogging_feedrate, pos, **{robot_stage_y_axis_name: y})
 
@@ -3610,15 +4019,37 @@ class CTR_Shadow_Calibration:
         print(f"Rotation axis: {robot_rotation_axis_name} | 180deg={robot_rotation_axis_180_deg} axis units")
         print(f"Release imaging enabled: {enable_release_imaging}")
         print(f"Redundant curl/uncurl cycles: {num_curl_uncurl_cycles}")
-        print(f"Capture dwell after M400: {capture_dwell_s:.2f}s")
+        if motion_mode == "continuous":
+            print(f"Capture dwell after continuous sweep: {capture_dwell_s:.2f}s")
+            print(f"Continuous B-sweep feedrate: {continuous_motion_feedrate:.1f} mm/min")
+            print(f"Continuous B-sweep accel estimate: {continuous_motion_accel_mm_s2:.3f} mm/s^2")
+            print(
+                "Continuous capture period: "
+                + ("auto from requested point count" if continuous_capture_period_s is None else f"{continuous_capture_period_s:.3f}s")
+            )
+        else:
+            print(f"Capture dwell after M400: {capture_dwell_s:.2f}s")
         print(f"Combine redundant passes: {combine_redundant_passes} ({redundant_pass_combination})")
         print(f"Tip detection mode: {tip_detection_mode}")
         print(f"Requested orientations: {orientation_ids}")
         print(f"Initial XYZ positioning feedrate: {float(initial_positioning_feedrate):.1f} mm/min")
         print(f"Compensated stage-Y travel feedrate: {float(compensated_stage_y_feedrate):.1f} mm/min")
+        if normalized_phase_b_values_by_phase is not None:
+            print(
+                "Custom phase-B schedules enabled: "
+                f"pull_points={len(normalized_phase_b_values_by_phase.get('pull', []))}, "
+                f"release_points={len(normalized_phase_b_values_by_phase.get('release', []))}"
+            )
+
+        if normalized_phase_b_values_by_phase is not None and normalized_phase_b_values_by_phase.get("pull"):
+            sequence_start_b_global = float(normalized_phase_b_values_by_phase["pull"][0])
+        elif normalized_phase_b_values_by_phase is not None and normalized_phase_b_values_by_phase.get("release"):
+            sequence_start_b_global = float(normalized_phase_b_values_by_phase["release"][0])
+        else:
+            sequence_start_b_global = float(b_start)
 
         print("\nMoving pull axis to start position...")
-        pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+        pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: sequence_start_b_global})
 
         partial_cneg90_reference_mode = bool(getattr(self, "full_c90_partial_cneg90_reference", False))
         if not use_red_dot_acquisition:
@@ -3632,7 +4063,7 @@ class CTR_Shadow_Calibration:
             pos90_max_pull_steps = b_steps
             neg90_max_pull_steps = b_steps
             if partial_cneg90_reference_mode and stage_y_offset_models_by_phase is not None:
-                offplane_step_fraction = 0.4
+                offplane_step_fraction = 0.3
                 neg90_max_pull_steps = max(1, int(np.floor(offplane_step_fraction * b_steps)))
                 print(
                     "Red-dot compensated partial-reference mode enabled: "
@@ -3659,8 +4090,8 @@ class CTR_Shadow_Calibration:
                 }
             )
 
-            print(f" Setting {robot_rear_axis_name} to start ({b_start:.2f})...")
-            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: b_start})
+            print(f" Setting {robot_rear_axis_name} to start ({sequence_start_b_global:.2f})...")
+            pos = move_abs(jogging_feedrate, pos, **{robot_rear_axis_name: sequence_start_b_global})
 
             c_quarter = robot_rotation_axis_180_deg / 2.0
             if 0 in orientation_ids:
@@ -3843,18 +4274,60 @@ class CTR_Shadow_Calibration:
         values = {}
         motion_phase = "pull"
         pass_idx = 1
-        for p in parts:
+        capture_group = "main"
+        curl_angle_pass = None
+
+        def is_token_boundary(token):
+            if token.startswith(("GRP", "CURLPASS", "DIR", "PASS")):
+                return True
+            if token.startswith(("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA")):
+                return True
+            if len(token) >= 2 and token[0] in ("X", "Y", "Z", "B", "C"):
+                try:
+                    float(token[1:])
+                    return True
+                except Exception:
+                    return False
+            if len(token) >= 2 and token[0] in ("P", "S"):
+                try:
+                    float(token[1:])
+                    return True
+                except Exception:
+                    return False
+            return False
+
+        idx = 0
+        while idx < len(parts):
+            p = parts[idx]
             matched_prefixed = False
+            if p.startswith("GRP"):
+                token_parts = [p[3:]]
+                idx += 1
+                while idx < len(parts) and not is_token_boundary(parts[idx]):
+                    token_parts.append(parts[idx])
+                    idx += 1
+                capture_group = "_".join([tok for tok in token_parts if tok != ""]) or "main"
+                continue
+            if p.startswith("CURLPASS"):
+                token_parts = [p[len("CURLPASS"):]]
+                idx += 1
+                while idx < len(parts) and not is_token_boundary(parts[idx]):
+                    token_parts.append(parts[idx])
+                    idx += 1
+                curl_angle_pass = "_".join([tok for tok in token_parts if tok != ""]) or None
+                continue
             if p.startswith("DIR"):
                 phase_val = p[3:].strip().lower()
                 if phase_val in ("pull", "release"):
                     motion_phase = phase_val
+                idx += 1
                 continue
-            if p.startswith("PASS"):
+            if p.startswith("PASS") and not p.startswith("CURLPASS"):
                 try:
                     pass_idx = max(1, int(float(p[4:])))
                 except Exception:
                     pass
+                idx += 1
                 continue
             for key in ("tipX", "tipY", "tipZ", "stageX", "stageY", "stageZ", "reqA", "useA"):
                 if p.startswith(key):
@@ -3865,12 +4338,19 @@ class CTR_Shadow_Calibration:
                         pass
                     break
             if matched_prefixed:
+                idx += 1
                 continue
             if len(p) >= 2 and p[0] in ("X", "Y", "Z", "B", "C"):
                 try:
                     values[p[0]] = float(p[1:])
                 except Exception:
                     pass
+            elif len(p) >= 2 and p[0] in ("P", "S"):
+                try:
+                    values[p[0]] = float(p[1:])
+                except Exception:
+                    pass
+            idx += 1
 
         x_value = values["tipX"] if "tipX" in values else values.get("X")
         if x_value is not None and "B" in values:
@@ -3890,15 +4370,106 @@ class CTR_Shadow_Calibration:
             "ntnl_pos": ntnl_pos,
             "ss_pos": ss_pos,
             "stage_y": None if "Y" not in values and "stageY" not in values else float(values.get("stageY", values.get("Y"))),
+            "stage_z": None if "Z" not in values and "stageZ" not in values else float(values.get("stageZ", values.get("Z"))),
+            "probe_idx": None if "P" not in values else int(round(float(values["P"]))),
             "motion_phase": motion_phase,
             "motion_phase_code": 0 if motion_phase == "pull" else 1,
             "pass_idx": int(pass_idx),
+            "capture_group": capture_group,
+            "curl_angle_pass": curl_angle_pass,
         }
 
-    def analyze_data(self, image_file_name, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, ):
-        """ Analyzes the data for the calibrations. Only analyzes one image. """
+    @staticmethod
+    def _build_capture_context_from_record(record, fallback_image_file=None):
+        """Build capture metadata from an external record instead of the filename."""
+        if record is None:
+            raise ValueError("capture metadata record is required")
 
-        file_ctx = self._parse_capture_context_from_filename(image_file_name)
+        def _pick(*keys, default=None):
+            for key in keys:
+                if key not in record:
+                    continue
+                value = record.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, float) and np.isnan(value):
+                    continue
+                return value
+            return default
+
+        def _to_int(value, default):
+            if value is None:
+                return int(default)
+            try:
+                if isinstance(value, str):
+                    digits = "".join(ch for ch in value if (ch.isdigit() or ch in "+-"))
+                    if digits not in ("", "+", "-"):
+                        return int(digits)
+                return int(round(float(value)))
+            except Exception:
+                return int(default)
+
+        def _to_float(value, default):
+            if value is None:
+                return float(default)
+            try:
+                return float(value)
+            except Exception:
+                return float(default)
+
+        motion_phase = str(_pick("motion_phase", "segment_name", default="pull")).strip().lower()
+        if "release" in motion_phase:
+            motion_phase = "release"
+            motion_phase_code = 1
+        elif "pull" in motion_phase:
+            motion_phase = "pull"
+            motion_phase_code = 0
+        else:
+            motion_phase_code = _to_int(_pick("motion_phase_code", default=0), 0)
+
+        image_file = str(_pick("image_file", default=fallback_image_file if fallback_image_file is not None else ""))
+        pass_name = str(_pick("pass_name", "capture_group", default="main"))
+        repeat_number = _to_int(_pick("repeat_number", "repeat_index", default=1), 1)
+        orientation = _to_int(_pick("orientation", default=repeat_number), repeat_number)
+        attack_angle_deg = _to_float(_pick("attack_angle_deg", "ntnl_pos", default=0.0), 0.0)
+        theta_deg = _to_float(_pick("theta_deg", "ss_pos", default=0.0), 0.0)
+
+        return {
+            "image_file": image_file,
+            "orientation": orientation,
+            "ntnl_pos": attack_angle_deg,
+            "ss_pos": theta_deg,
+            "stage_y": _pick("y_cmd", "stage_y", default=None),
+            "stage_z": _pick("z_cmd", "stage_z", default=None),
+            "probe_idx": _pick("point_order", "probe_idx", default=None),
+            "motion_phase": motion_phase,
+            "motion_phase_code": motion_phase_code,
+            "pass_idx": _to_int(_pick("repeat_number", "pass_idx", default=1), 1),
+            "capture_group": pass_name,
+            "curl_angle_pass": str(_pick("segment_name", "curl_angle_pass", default="")) or None,
+        }
+
+    def _red_tip_pass_anchor_key(self, file_ctx):
+        if not isinstance(file_ctx, dict):
+            return None
+        return (
+            str(file_ctx.get("capture_group", "main")),
+            None if file_ctx.get("curl_angle_pass") is None else str(file_ctx.get("curl_angle_pass")),
+            int(file_ctx.get("orientation", 0)),
+            str(file_ctx.get("motion_phase", "pull")),
+            int(file_ctx.get("pass_idx", 1)),
+            round(float(file_ctx.get("ntnl_pos", 0.0)), 6),
+            None if file_ctx.get("stage_z") is None else round(float(file_ctx.get("stage_z")), 6),
+            None if file_ctx.get("probe_idx") is None else int(file_ctx.get("probe_idx")),
+        )
+
+    def analyze_data(self, image_file_name, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, export_analysis_outputs=None, file_ctx=None):
+        """ Analyzes the data for the calibrations. Only analyzes one image. """
+        if export_analysis_outputs is None:
+            export_analysis_outputs = bool(getattr(self, "export_analysis_outputs", False))
+
+        if file_ctx is None:
+            file_ctx = self._parse_capture_context_from_filename(image_file_name)
 
         # Fixed path handling for Mac
         raw_data_folder = os.path.join(self.calibration_data_folder, "raw_image_data_folder")
@@ -4016,13 +4587,28 @@ class CTR_Shadow_Calibration:
         red_tip_abs = None
         red_tip_dbg = None
         if tip_detection_mode in ("red_dot", "auto_red_dot"):
+            red_tip_pass_key = self._red_tip_pass_anchor_key(file_ctx)
+            previous_red_tip_abs = None
+            if red_tip_pass_key is not None:
+                previous_red_tip_abs = self._red_tip_anchor_by_pass.get(red_tip_pass_key)
+            previous_anchor_yx_local = None
+            if previous_red_tip_abs is not None:
+                prev_arr = np.asarray(previous_red_tip_abs, dtype=float).reshape(-1)
+                if prev_arr.size >= 2 and np.all(np.isfinite(prev_arr[:2])):
+                    previous_anchor_yx_local = (
+                        float(prev_arr[0] - crop_y_min_img),
+                        float(prev_arr[1] - crop_x_min_img),
+                    )
             red_tip_dbg = self.detect_red_tip_marker(
                 cropped_image,
                 crop_origin_xy=(crop_x_min_img, crop_y_min_img),
-                anchor_yx_local=(yy_selected, xx_selected),
+                anchor_yx_local=previous_anchor_yx_local,
+                fallback_anchor_yx_local=(yy_selected, xx_selected),
             )
             if red_tip_dbg.get("found"):
                 red_tip_abs = (float(red_tip_dbg["y_abs"]), float(red_tip_dbg["x_abs"]))
+                if red_tip_pass_key is not None:
+                    self._red_tip_anchor_by_pass[red_tip_pass_key] = red_tip_abs
                 yy_selected = float(red_tip_dbg["y_local"])
                 xx_selected = float(red_tip_dbg["x_local"])
                 tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
@@ -4031,6 +4617,7 @@ class CTR_Shadow_Calibration:
                 tip_select_dbg["selected_tip_source"] = "red_dot"
                 tip_select_dbg["selected_tip_reason"] = "red_dot_centroid"
                 tip_select_dbg["mode"] = "red_dot"
+                tip_select_dbg["red_dot_anchor_source"] = red_tip_dbg.get("selected_search_scope", "global")
             else:
                 tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
                 tip_select_dbg["red_dot_fallback_reason"] = red_tip_dbg.get("reason", "red_dot_not_found")
@@ -4191,53 +4778,58 @@ class CTR_Shadow_Calibration:
         # tip_location = np.array([col, row])
         # break
 
-        fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+        fig = None
+        axs = None
+        zys = None
+        zxs = None
+        if bool(export_analysis_outputs):
+            fig, axs = plt.subplots(2, 2, figsize=(12, 10))
 
-        axs[0, 0].imshow(cropped_image)
-        axs[0, 0].set_title('Cropped image')
+            axs[0, 0].imshow(cropped_image)
+            axs[0, 0].set_title('Cropped image')
 
-        axs[0, 1].imshow(binary_image)
-        skel_ys, skel_xs = np.where(skel == 1)
-        axs[0, 1].scatter(skel_xs, skel_ys, s=2, c='cyan', alpha=0.7)
-        axs[0, 1].set_title('thresholded image')
+            axs[0, 1].imshow(binary_image)
+            skel_ys, skel_xs = np.where(skel == 1)
+            axs[0, 1].scatter(skel_xs, skel_ys, s=2, c='cyan', alpha=0.7)
+            axs[0, 1].set_title('thresholded image')
 
-        axs[1, 0].imshow(binary_image[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1])
-        skel_in_zoom = (skel[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1] == 1)
-        zys, zxs = np.where(skel_in_zoom)
-        axs[1, 0].scatter(zxs, zys, s=3, c='cyan', alpha=0.8)
-        axs[1, 0].scatter([tip_column - crop_x_min], [tip_row - crop_y_min])
-        axs[1, 0].set_title('Identified coarse tip')
+            axs[1, 0].imshow(binary_image[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1])
+            skel_in_zoom = (skel[crop_y_min:crop_y_max + 1, crop_x_min:crop_x_max + 1] == 1)
+            zys, zxs = np.where(skel_in_zoom)
+            axs[1, 0].scatter(zxs, zys, s=3, c='cyan', alpha=0.8)
+            axs[1, 0].scatter([tip_column - crop_x_min], [tip_row - crop_y_min])
+            axs[1, 0].set_title('Identified coarse tip')
 
-        axs[1, 1].imshow(grayscale_tip, cmap='gray')
-        axs[1, 1].scatter(zxs, zys, s=3, c='cyan', alpha=0.8)
+            axs[1, 1].imshow(grayscale_tip, cmap='gray')
+            axs[1, 1].scatter(zxs, zys, s=3, c='cyan', alpha=0.8)
 
-        if len(tip_path) >= 2:
-            path_y = np.array([p[0] - crop_y_min for p in tip_path], dtype=float)
-            path_x = np.array([p[1] - crop_x_min for p in tip_path], dtype=float)
-            valid = (
-                (path_y >= 0) & (path_y < grayscale_tip.shape[0]) &
-                (path_x >= 0) & (path_x < grayscale_tip.shape[1])
-            )
-            if np.any(valid):
-                axs[1, 1].plot(path_x[valid], path_y[valid], '-', color='yellow', linewidth=2)
+            if len(tip_path) >= 2:
+                path_y = np.array([p[0] - crop_y_min for p in tip_path], dtype=float)
+                path_x = np.array([p[1] - crop_x_min for p in tip_path], dtype=float)
+                valid = (
+                    (path_y >= 0) & (path_y < grayscale_tip.shape[0]) &
+                    (path_x >= 0) & (path_x < grayscale_tip.shape[1])
+                )
+                if np.any(valid):
+                    axs[1, 1].plot(path_x[valid], path_y[valid], '-', color='yellow', linewidth=2)
 
-        axs[1, 1].scatter([tip_column - crop_x_min], [tip_row - crop_y_min])
-        if cnn_tip_abs is not None:
-            axs[1, 1].scatter(
-                [cnn_tip_abs[1] - crop_x_min_img - crop_x_min],
-                [cnn_tip_abs[0] - crop_y_min_img - crop_y_min],
-                c="magenta",
-                marker="x",
-                s=80,
-            )
-        if red_tip_abs is not None:
-            axs[1, 1].scatter(
-                [red_tip_abs[1] - crop_x_min_img - crop_x_min],
-                [red_tip_abs[0] - crop_y_min_img - crop_y_min],
-                c="#00ff66",
-                marker="+",
-                s=90,
-            )
+            axs[1, 1].scatter([tip_column - crop_x_min], [tip_row - crop_y_min])
+            if cnn_tip_abs is not None:
+                axs[1, 1].scatter(
+                    [cnn_tip_abs[1] - crop_x_min_img - crop_x_min],
+                    [cnn_tip_abs[0] - crop_y_min_img - crop_y_min],
+                    c="magenta",
+                    marker="x",
+                    s=80,
+                )
+            if red_tip_abs is not None:
+                axs[1, 1].scatter(
+                    [red_tip_abs[1] - crop_x_min_img - crop_x_min],
+                    [red_tip_abs[0] - crop_y_min_img - crop_y_min],
+                    c="#00ff66",
+                    marker="+",
+                    s=90,
+                )
 
         # if p_1 is not None and x_points.size > 0:
         # axs[1, 1].scatter(np.unique(x_points), p_1(np.unique(x_points)))
@@ -4312,41 +4904,44 @@ class CTR_Shadow_Calibration:
         dbg_local["tip_detection_mode"] = tip_detection_mode
         self.tip_refine_debug_records[image_file_name] = dbg_local
 
-        _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
-        selected_tip_source = str(dbg_local.get("selected_tip_source", self.tip_refine_mode))
-        annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=f" ({selected_tip_source})")
+        if bool(export_analysis_outputs):
+            _remap_zoom_axes_to_crop_coordinates(axs, zoom_x_min, zoom_x_max, zoom_y_min, zoom_y_max)
+            selected_tip_source = str(dbg_local.get("selected_tip_source", self.tip_refine_mode))
+            annotate_tip_geometry_on_axes(axs, dbg_local, title_suffix=f" ({selected_tip_source})")
 
-        calibrated_tip_axes = None
-        if (
-            self.board_homography_mm_from_px is not None
-            or (
-                self.true_vertical_img_unit is not None
-                and self.board_mm_per_px_local is not None
-            )
-        ):
-            try:
-                calibrated_tip_axes = self.pixel_point_to_calibrated_axes(
-                    x_px=float(tip_locations_array_fine[i, 1]),
-                    y_px=float(tip_locations_array_fine[i, 0]),
+            calibrated_tip_axes = None
+            if (
+                self.board_homography_mm_from_px is not None
+                or (
+                    self.true_vertical_img_unit is not None
+                    and self.board_mm_per_px_local is not None
                 )
-            except Exception:
-                calibrated_tip_axes = None
+            ):
+                try:
+                    calibrated_tip_axes = self.pixel_point_to_calibrated_axes(
+                        x_px=float(tip_locations_array_fine[i, 1]),
+                        y_px=float(tip_locations_array_fine[i, 0]),
+                    )
+                except Exception:
+                    calibrated_tip_axes = None
 
-        if calibrated_tip_axes is not None:
-            u_mm, z_mm = calibrated_tip_axes
-            axs[1, 1].set_title(
-                f'Identified selected tip [{selected_tip_source}] (angle={tip_angle_deg:.2f} deg)\n'
-                f'Calibrated: u={u_mm:.2f} mm, z={z_mm:.2f} mm'
-            )
-        else:
-            axs[1, 1].set_title(
-                f'Identified selected tip [{selected_tip_source}] (angle={tip_angle_deg:.2f} deg)'
-            )
+            if calibrated_tip_axes is not None:
+                u_mm, z_mm = calibrated_tip_axes
+                axs[1, 1].set_title(
+                    f'Identified selected tip [{selected_tip_source}] (angle={tip_angle_deg:.2f} deg)\n'
+                    f'Calibrated: u={u_mm:.2f} mm, z={z_mm:.2f} mm'
+                )
+            else:
+                axs[1, 1].set_title(
+                    f'Identified selected tip [{selected_tip_source}] (angle={tip_angle_deg:.2f} deg)'
+                )
 
         return fig, axs, tip_locations_array_coarse[i, :], tip_locations_array_fine[i, :]
 
-    def analyze_data_batch(self, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, ):
+    def analyze_data_batch(self, crop_width_min=None, crop_width_max=None, crop_height_min=None, crop_height_max=None, threshold=200, export_analysis_outputs=None, capture_metadata_source=None):
         """ Analyzes the data for the calibrations. Analyzes all images in batch. """
+        if export_analysis_outputs is None:
+            export_analysis_outputs = bool(getattr(self, "export_analysis_outputs", False))
         current_dir = os.getcwd()
         print(f"Current working directory: {current_dir}")
 
@@ -4412,11 +5007,33 @@ class CTR_Shadow_Calibration:
         try:
             image_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif')
             image_files = []
-            for root, _, files in os.walk(raw_data_folder):
-                for file_name in files:
-                    if file_name.lower().endswith(image_extensions):
-                        image_files.append(os.path.relpath(os.path.join(root, file_name), raw_data_folder))
-            image_files = sorted(image_files)
+            metadata_records_by_image = {}
+            if capture_metadata_source is None:
+                for root, _, files in os.walk(raw_data_folder):
+                    for file_name in files:
+                        if file_name.lower().endswith(image_extensions):
+                            image_files.append(os.path.relpath(os.path.join(root, file_name), raw_data_folder))
+                image_files = sorted(image_files)
+            else:
+                if isinstance(capture_metadata_source, pd.DataFrame):
+                    metadata_df = capture_metadata_source.copy()
+                else:
+                    metadata_df = pd.read_csv(capture_metadata_source)
+                if "image_file" not in metadata_df.columns:
+                    raise ValueError("capture_metadata_source must contain an 'image_file' column.")
+                metadata_df = metadata_df.copy()
+                metadata_df["image_file"] = metadata_df["image_file"].astype(str)
+                for record in metadata_df.to_dict("records"):
+                    image_file = str(record.get("image_file", "")).strip()
+                    if image_file == "":
+                        continue
+                    if not image_file.lower().endswith(image_extensions):
+                        continue
+                    image_path = os.path.join(raw_data_folder, image_file)
+                    if not os.path.exists(image_path):
+                        raise FileNotFoundError(f"Metadata references missing image: {image_path}")
+                    image_files.append(image_file)
+                    metadata_records_by_image[image_file] = record
 
             if len(image_files) == 0:
                 print(f"Error: No image files found in {raw_data_folder}")
@@ -4437,11 +5054,12 @@ class CTR_Shadow_Calibration:
             else:
                 print(f"Using existing processed data folder: {processed_folder}")
 
-            if not os.path.exists(analysis_output_folder):
-                os.makedirs(analysis_output_folder)
-                print(f"Created analysis output folder: {analysis_output_folder}")
-            else:
-                print(f"Using existing analysis output folder: {analysis_output_folder}")
+            if bool(export_analysis_outputs):
+                if not os.path.exists(analysis_output_folder):
+                    os.makedirs(analysis_output_folder)
+                    print(f"Created analysis output folder: {analysis_output_folder}")
+                else:
+                    print(f"Using existing analysis output folder: {analysis_output_folder}")
         except OSError as e:
             print(f"Error creating processed folder: {e}")
             return
@@ -4452,12 +5070,33 @@ class CTR_Shadow_Calibration:
         self.tip_locations_array_cnn = np.full((num_images, 9), np.nan)
         n_skeleton_points = int(max(2, getattr(self, "skeleton_tracking_point_count", 20)))
         self.skeleton_points_array_selected_xy = np.full((num_images, n_skeleton_points, 2), np.nan, dtype=float)
+        self.capture_metadata_records = []
+        self._red_tip_anchor_by_pass = {}
 
         successful_analyses = 0
         failed_analyses = 0
 
+        def emit_progress(current_idx, image_name, status_text):
+            completed = int(current_idx) + 1
+            total = int(num_images)
+            frac = 0.0 if total <= 0 else completed / float(total)
+            bar_width = 28
+            filled = int(round(bar_width * frac))
+            filled = max(0, min(bar_width, filled))
+            bar = "#" * filled + "-" * (bar_width - filled)
+            line = (
+                f"\rProcessing images [{bar}] {completed}/{total} "
+                f"ok={successful_analyses} fail={failed_analyses} "
+                f"{status_text}: {os.path.basename(str(image_name))}"
+            )
+            sys.stdout.write(line[:220])
+            sys.stdout.flush()
+
         for i, image_file in enumerate(image_files):
-            print(f"\nProcessing image {i + 1}/{num_images}: {image_file}")
+            if image_file in metadata_records_by_image:
+                ctx = self._build_capture_context_from_record(metadata_records_by_image[image_file], fallback_image_file=image_file)
+            else:
+                ctx = self._parse_capture_context_from_filename(image_file)
             try:
                 fig, axs, coarse_tip, selected_tip = self.analyze_data(
                     image_file,
@@ -4465,7 +5104,9 @@ class CTR_Shadow_Calibration:
                     crop_width_max,
                     crop_height_min,
                     crop_height_max,
-                    threshold
+                    threshold,
+                    export_analysis_outputs=bool(export_analysis_outputs),
+                    file_ctx=ctx,
                 )
 
                 self.tip_locations_array_coarse[i, :] = coarse_tip
@@ -4482,22 +5123,33 @@ class CTR_Shadow_Calibration:
                     if pts_xy.shape[0] == n_skeleton_points:
                         self.skeleton_points_array_selected_xy[i, :, :] = pts_xy
 
-                output_filename = f"{self._safe_output_stem(image_file)}_analysis.png"
-                output_path = os.path.join(analysis_output_folder, output_filename)
-                self._apply_dark_theme_to_figure(fig)
-                fig.savefig(output_path, dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
-                plt.close(fig)
+                if bool(export_analysis_outputs) and fig is not None:
+                    output_filename = f"{self._safe_output_stem(image_file)}_analysis.png"
+                    output_path = os.path.join(analysis_output_folder, output_filename)
+                    self._apply_dark_theme_to_figure(fig)
+                    fig.savefig(output_path, dpi=150, bbox_inches='tight', transparent=True, facecolor='none')
+                    plt.close(fig)
 
                 successful_analyses += 1
-                print(f" ✓ Successfully processed and saved to analysis_outputs/{output_filename}")
+                emit_progress(i, image_file, "saved" if bool(export_analysis_outputs) else "processed")
 
             except Exception as e:
-                print(f" ✗ Error processing {image_file}: {e}")
                 failed_analyses += 1
                 self.tip_locations_array_coarse[i, :] = np.nan
                 self.tip_locations_array_selected[i, :] = np.nan
                 self.tip_locations_array_cnn[i, :] = np.nan
                 self.skeleton_points_array_selected_xy[i, :, :] = np.nan
+                emit_progress(i, image_file, "failed")
+                print(f"\n ✗ Error processing {image_file}: {e}")
+            self.capture_metadata_records.append({
+                "image_file": image_file,
+                "capture_group": ctx.get("capture_group", "main"),
+                "curl_angle_pass": ctx.get("curl_angle_pass"),
+            })
+
+        if num_images > 0:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         try:
             coarse_file = os.path.join(processed_folder, "tip_locations_coarse.npy")
@@ -4537,6 +5189,9 @@ class CTR_Shadow_Calibration:
                 skeleton_csv = os.path.join(processed_folder, "skeleton_points_selected_xy_px.csv")
                 df_skeleton.to_csv(skeleton_csv, index=False)
                 print(f"✓ Saved CSV file: {skeleton_csv}")
+                capture_metadata_csv = os.path.join(processed_folder, "capture_metadata.csv")
+                pd.DataFrame(self.capture_metadata_records).to_csv(capture_metadata_csv, index=False)
+                print(f"✓ Saved CSV file: {capture_metadata_csv}")
                 if self.tip_refiner_enabled:
                     df_cnn = pd.DataFrame(self.tip_locations_array_cnn, columns=columns)
                     df_cnn['image_file'] = image_files
@@ -4874,6 +5529,267 @@ class CTR_Shadow_Calibration:
             )
             for quantity, model_key in key_map[fit_family].items()
         }
+
+    def build_avg_phase_pchip_models(self, phases=("pull", "release")):
+        source_models = []
+        for phase in phases:
+            try:
+                model_bundle = self.get_fit_model(phase, fit_family="pchip")
+            except Exception:
+                continue
+            if isinstance(model_bundle, dict):
+                source_models.append((str(phase).strip().lower(), model_bundle))
+
+        if not source_models:
+            raise ValueError("No phase-specific PCHIP models are available to average.")
+
+        avg_models = {}
+        for quantity in ("r", "z", "tip_angle", "offplane_y"):
+            union_knots = []
+            models_for_quantity = []
+            for _, model_bundle in source_models:
+                descriptor = model_bundle.get(quantity)
+                if descriptor is None:
+                    continue
+                x_knots = descriptor.get("x_knots")
+                if x_knots is None:
+                    continue
+                x_knots = np.asarray(x_knots, dtype=float).ravel()
+                if x_knots.size == 0:
+                    continue
+                union_knots.append(x_knots)
+                models_for_quantity.append(descriptor)
+
+            if not union_knots:
+                avg_models[quantity] = None
+                continue
+
+            x_union = np.unique(np.concatenate(union_knots))
+            if x_union.size < 2:
+                avg_models[quantity] = None
+                continue
+
+            y_samples = []
+            for descriptor in models_for_quantity:
+                try:
+                    pred = self._evaluate_curve_model(descriptor, x_union)
+                except Exception:
+                    continue
+                pred = np.asarray(pred, dtype=float).reshape(-1)
+                if pred.size == x_union.size:
+                    y_samples.append(pred)
+
+            if not y_samples:
+                avg_models[quantity] = None
+                continue
+
+            y_stack = np.vstack(y_samples)
+            finite_counts = np.sum(np.isfinite(y_stack), axis=0)
+            y_avg = np.nanmean(y_stack, axis=0)
+            valid = np.isfinite(y_avg) & (finite_counts > 0)
+            if np.count_nonzero(valid) < 2:
+                avg_models[quantity] = None
+                continue
+
+            avg_models[quantity] = self._fit_curve_model(
+                x_union[valid],
+                y_avg[valid],
+                "pchip",
+                f"{quantity}_avg_phase_pchip",
+            )
+
+        return avg_models
+
+    @staticmethod
+    def _curve_model_input_domain(model_descriptor):
+        if model_descriptor is None:
+            return None
+        fit_x_range = model_descriptor.get("fit_x_range")
+        if fit_x_range is not None and len(fit_x_range) >= 2:
+            try:
+                lo = float(fit_x_range[0])
+                hi = float(fit_x_range[1])
+                if np.isfinite(lo) and np.isfinite(hi) and hi != lo:
+                    return (min(lo, hi), max(lo, hi))
+            except Exception:
+                pass
+        x_knots = model_descriptor.get("x_knots")
+        if x_knots is not None:
+            x_arr = np.asarray(x_knots, dtype=float).reshape(-1)
+            x_arr = x_arr[np.isfinite(x_arr)]
+            if x_arr.size >= 2:
+                return (float(np.min(x_arr)), float(np.max(x_arr)))
+        return None
+
+    def _solve_curve_model_input_for_target(
+        self,
+        model_descriptor,
+        target_value,
+        reference_b=None,
+        sample_count=4097,
+    ):
+        domain = self._curve_model_input_domain(model_descriptor)
+        if domain is None:
+            raise ValueError("Model descriptor has no usable input domain for inversion.")
+        b_grid = np.linspace(domain[0], domain[1], int(max(257, sample_count)), dtype=float)
+        y_grid = np.asarray(self._evaluate_curve_model(model_descriptor, b_grid), dtype=float).reshape(-1)
+        valid = np.isfinite(b_grid) & np.isfinite(y_grid)
+        if np.count_nonzero(valid) < 2:
+            raise ValueError("Model inversion failed because sampled values were not finite.")
+        b_grid = b_grid[valid]
+        y_grid = y_grid[valid]
+        delta = y_grid - float(target_value)
+
+        candidates = []
+        exact_idx = np.where(np.isclose(delta, 0.0, atol=1e-6))[0]
+        for idx in exact_idx.tolist():
+            candidates.append(float(b_grid[idx]))
+
+        sign_change_idx = np.where(np.signbit(delta[:-1]) != np.signbit(delta[1:]))[0]
+        for idx in sign_change_idx.tolist():
+            x0 = float(b_grid[idx])
+            x1 = float(b_grid[idx + 1])
+            y0 = float(y_grid[idx])
+            y1 = float(y_grid[idx + 1])
+            if np.isclose(y1, y0, atol=1e-12):
+                candidates.append(0.5 * (x0 + x1))
+                continue
+            frac = (float(target_value) - y0) / (y1 - y0)
+            frac = float(np.clip(frac, 0.0, 1.0))
+            candidates.append(x0 + frac * (x1 - x0))
+
+        if not candidates:
+            closest_idx = int(np.argmin(np.abs(delta)))
+            candidates.append(float(b_grid[closest_idx]))
+
+        if reference_b is None:
+            reference_b = 0.5 * (domain[0] + domain[1])
+        return float(min(candidates, key=lambda b_val: abs(float(b_val) - float(reference_b))))
+
+    def run_curl_angle_specific_daq(
+        self,
+        curl_angle_passes=None,
+        start_pose_models=None,
+        orientation_ids=(0, 1, 2, 3),
+        partial_cneg90_reference=True,
+        **calibrate_kwargs,
+    ):
+        calibrate_kwargs = dict(calibrate_kwargs)
+        if curl_angle_passes is None:
+            curl_angle_passes = [
+                {"name": "0-90-0", "angle_sequence_deg": [0, 90, 0]},
+                {"name": "0-180-0", "angle_sequence_deg": [0, 180, 0]},
+                {"name": "90-180-90", "angle_sequence_deg": [90, 180, 90]},
+            ]
+
+        probe_points = calibrate_kwargs.get("probe_points", None)
+        if probe_points is None:
+            probe_points = [
+                (30.0, 0.0, -80.0),
+                (90.0, 0.0, -80.0),
+                (90.0, 0.0, -110.0),
+                (30.0, 0.0, -110.0),
+                (75.0, 0.0, -90.0),
+            ]
+        probe_points = [tuple(float(v) for v in pt) for pt in probe_points]
+        calibrate_kwargs.pop("probe_points", None)
+        requested_b_start = float(calibrate_kwargs.get("b_start", 0.0))
+        points_per_phase = max(2, int(calibrate_kwargs.get("b_steps", 25)) + 1)
+        if "b_step_size" in calibrate_kwargs:
+            print(
+                "[INFO] Curl-angle-specific DAQ derives B step sizes from the target attack-angle sequence; "
+                f"configured b_step_size={float(calibrate_kwargs.get('b_step_size')):.4f} is ignored."
+            )
+
+        pull_models = self.get_fit_model("pull", fit_family="pchip")
+        release_models = self.get_fit_model("release", fit_family="pchip")
+        pull_tip_model = pull_models.get("tip_angle")
+        release_tip_model = release_models.get("tip_angle")
+        if pull_tip_model is None or release_tip_model is None:
+            raise RuntimeError("Curl-angle-specific DAQ requires phase-specific tip-angle PCHIP models.")
+        stage_y_offset_models_by_phase = {
+            "pull": pull_models.get("r"),
+        }
+        try:
+            stage_y_offset_models_by_phase["release"] = release_models.get("r")
+        except KeyError:
+            stage_y_offset_models_by_phase["release"] = stage_y_offset_models_by_phase.get("pull")
+
+        if stage_y_offset_models_by_phase.get("pull") is None:
+            raise RuntimeError("Could not build planar pull PCHIP model for curl-angle-specific DAQ.")
+        if stage_y_offset_models_by_phase.get("release") is None:
+            stage_y_offset_models_by_phase["release"] = stage_y_offset_models_by_phase.get("pull")
+
+        prev_partial_mode = bool(getattr(self, "full_c90_partial_cneg90_reference", False))
+        self.full_c90_partial_cneg90_reference = bool(partial_cneg90_reference)
+        try:
+            for pass_cfg in curl_angle_passes:
+                pass_calibrate_kwargs = dict(calibrate_kwargs)
+                pass_name = str(pass_cfg.get("name"))
+                angle_sequence_deg = [float(v) for v in pass_cfg.get("angle_sequence_deg", [])]
+                if len(angle_sequence_deg) != 3:
+                    raise ValueError(
+                        f"Curl-angle pass '{pass_name}' must provide exactly three angles [start, peak, end]."
+                    )
+                start_angle_deg, peak_angle_deg, end_angle_deg = angle_sequence_deg
+                start_pose_b = requested_b_start
+                start_tip_model = None
+                if isinstance(start_pose_models, dict):
+                    start_tip_model = start_pose_models.get("tip_angle")
+                if start_tip_model is not None:
+                    start_pose_b = self._solve_curve_model_input_for_target(
+                        start_tip_model,
+                        start_angle_deg,
+                        reference_b=requested_b_start,
+                    )
+
+                pull_start_b = self._solve_curve_model_input_for_target(
+                    pull_tip_model,
+                    start_angle_deg,
+                    reference_b=start_pose_b,
+                )
+                pull_peak_b = self._solve_curve_model_input_for_target(
+                    pull_tip_model,
+                    peak_angle_deg,
+                    reference_b=pull_start_b,
+                )
+                release_end_b = self._solve_curve_model_input_for_target(
+                    release_tip_model,
+                    end_angle_deg,
+                    reference_b=pull_peak_b,
+                )
+
+                phase_b_values_by_phase = {
+                    "pull": np.linspace(pull_start_b, pull_peak_b, points_per_phase, dtype=float).tolist(),
+                    "release": np.linspace(pull_peak_b, release_end_b, points_per_phase, dtype=float).tolist(),
+                }
+                print(
+                    f"[INFO] Running curl-angle-specific DAQ pass '{pass_name}' "
+                    f"with angle sequence {angle_sequence_deg}."
+                )
+                print(
+                    f"[INFO] {pass_name}: B-only start move to {start_pose_b:.3f}, "
+                    f"pull {start_angle_deg:.1f}deg -> {peak_angle_deg:.1f}deg "
+                    f"(B {pull_start_b:.3f} -> {pull_peak_b:.3f}, {points_per_phase} points), "
+                    f"release {peak_angle_deg:.1f}deg -> {end_angle_deg:.1f}deg "
+                    f"(B {pull_peak_b:.3f} -> {release_end_b:.3f}, {points_per_phase} points)."
+                )
+                pass_calibrate_kwargs.pop("b_start", None)
+                self.calibrate(
+                    orientation_ids=[int(v) for v in orientation_ids],
+                    append_raw_data=True,
+                    capture_group=f"curl_{pass_name}",
+                    curl_angle_pass_name=pass_name,
+                    curl_angle_sequence_deg=angle_sequence_deg,
+                    probe_points=probe_points,
+                    stage_y_offset_models_by_phase=stage_y_offset_models_by_phase,
+                    stage_y_offset_orientation_ids=[2, 3],
+                    b_start=float(pull_start_b),
+                    phase_b_values_by_phase=phase_b_values_by_phase,
+                    **pass_calibrate_kwargs,
+                )
+        finally:
+            self.full_c90_partial_cneg90_reference = prev_partial_mode
 
     @staticmethod
     def _apply_dark_theme_to_figure(fig):
@@ -5732,7 +6648,7 @@ def skeleton_points(b_pull_mm, phase=None):
 
         return param_path, py_path, stl_path, gcode_json_path
 
-    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=1.51, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="pchip"):
+    def postprocess_calibration_data(self, width_in_pixels=3025, width_in_mm=140, robot_name="calibrated_robot", save_plots=True, export_skeleton=False, skeleton_diameter_mm=1.51, skeleton_links=6, skeleton_reference_stl=False, fit_model="cubic", offplane_fit_model="pchip", capture_group_filter="main", append_curl_angle_models=False):
         """Postprocess calibration data and export separate pull/release fits."""
         if not hasattr(self, 'tip_locations_array_selected'):
             print("Tip location data not found in memory, attempting to load from saved files...")
@@ -5782,6 +6698,7 @@ def skeleton_points(b_pull_mm, phase=None):
             if not has_pass_idx:
                 arr = np.column_stack([arr, np.ones((arr.shape[0],), dtype=float)])
                 print("Pass index column not found; assuming PASS1 for all images.")
+            arr_all = arr.copy()
 
             ORI_COL = 2
             B_PULL_COL = 3
@@ -5789,6 +6706,48 @@ def skeleton_points(b_pull_mm, phase=None):
             PHASE_COL = 6
             PASS_COL = 7
             STAGEY_COL = 8 if has_stage_y_cmd else None
+
+            capture_group_mask = np.ones((arr_all.shape[0],), dtype=bool)
+            capture_metadata_csv = os.path.join(processed_folder, "capture_metadata.csv")
+            if capture_group_filter is not None and os.path.exists(capture_metadata_csv):
+                metadata_df = pd.read_csv(capture_metadata_csv)
+                if "image_file" in metadata_df.columns:
+                    self.capture_metadata_records = metadata_df.to_dict("records")
+                capture_group_series = None
+                if len(metadata_df) == arr_all.shape[0]:
+                    capture_group_series = metadata_df.get("capture_group", pd.Series(["main"] * len(metadata_df)))
+                else:
+                    selected_csv = os.path.join(processed_folder, "tip_locations_selected.csv")
+                    if os.path.exists(selected_csv):
+                        selected_df = pd.read_csv(selected_csv)
+                        if len(selected_df) == arr_all.shape[0] and "image_file" in selected_df.columns and "image_file" in metadata_df.columns:
+                            merged_df = selected_df[["image_file"]].merge(
+                                metadata_df[["image_file", "capture_group"]],
+                                on="image_file",
+                                how="left",
+                            )
+                            capture_group_series = merged_df.get("capture_group")
+                if capture_group_series is None or len(capture_group_series) != arr_all.shape[0]:
+                    raise ValueError(
+                        "capture_metadata.csv is present but could not be aligned with tip_locations_selected; "
+                        "refusing to fit mixed capture groups."
+                    )
+                capture_group_series = capture_group_series.fillna("main").astype(str)
+                capture_group_mask = (capture_group_series == str(capture_group_filter))
+                print(
+                    f"Capture-group filter '{capture_group_filter}': "
+                    f"{int(np.count_nonzero(capture_group_mask))}/{int(capture_group_mask.size)} rows selected."
+                )
+                if not np.any(capture_group_mask):
+                    raise ValueError(f"No calibration rows matched capture_group_filter='{capture_group_filter}'.")
+            elif capture_group_filter is not None:
+                print(
+                    f"Capture metadata not found; proceeding without capture-group filtering "
+                    f"(requested '{capture_group_filter}')."
+                )
+            arr = arr_all[capture_group_mask].copy()
+            if arr.size == 0:
+                raise ValueError("No calibration rows remain after capture-group filtering.")
 
             has_calibrated_axes = (
                 self.board_homography_mm_from_px is not None
@@ -5854,9 +6813,10 @@ def skeleton_points(b_pull_mm, phase=None):
                     print("Warning: tracked skeleton points were not found; skipping skeleton export.")
                 else:
                     skeleton_px = np.asarray(skeleton_px, dtype=float)
-                    if skeleton_px.ndim != 3 or skeleton_px.shape[0] != arr.shape[0] or skeleton_px.shape[2] != 2:
+                    if skeleton_px.ndim != 3 or skeleton_px.shape[0] != arr_all.shape[0] or skeleton_px.shape[2] != 2:
                         print("Warning: tracked skeleton point data has an unexpected shape; skipping skeleton export.")
                     else:
+                        skeleton_px = skeleton_px[capture_group_mask, :, :]
                         skeleton_points_mm = np.full_like(skeleton_px, np.nan, dtype=float)
                         if has_calibrated_axes:
                             for row_idx in range(skeleton_px.shape[0]):
@@ -6607,13 +7567,29 @@ def skeleton_points(b_pull_mm, phase=None):
                 [fr['tip_angle_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='tip_angle_avg',
             )
+            shared_tip_angle_linear_model = self._average_polynomial_models(
+                [self._fit_curve_model(fr['dataset']['common_b'][np.isfinite(fr['dataset']['tip_angle'])], fr['dataset']['tip_angle'][np.isfinite(fr['dataset']['tip_angle'])], 'linear', f"tip_angle_{phase_name}_avg_linear")
+                 for phase_name, fr in selected_phase_fit_results.items()
+                 if np.any(np.isfinite(fr['dataset']['tip_angle'])) and np.sum(np.isfinite(fr['dataset']['tip_angle'])) >= 2],
+                value_name='tip_angle_avg_linear',
+            )
             shared_r_cubic_model = self._average_polynomial_models(
                 [fr['r_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='r_avg',
             )
+            shared_r_linear_model = self._average_polynomial_models(
+                [self._fit_curve_model(fr['dataset']['common_b'], fr['dataset']['r_coords'], 'linear', f"r_{phase_name}_avg_linear")
+                 for phase_name, fr in selected_phase_fit_results.items()],
+                value_name='r_avg_linear',
+            )
             shared_z_cubic_model = self._average_polynomial_models(
                 [fr['z_cubic_model'] for fr in selected_phase_fit_results.values()],
                 value_name='z_avg',
+            )
+            shared_z_linear_model = self._average_polynomial_models(
+                [self._fit_curve_model(fr['dataset']['common_b'], fr['dataset']['z_coords'], 'linear', f"z_{phase_name}_avg_linear")
+                 for phase_name, fr in selected_phase_fit_results.items()],
+                value_name='z_avg_linear',
             )
             def shared_pair_average_xy(x_key, y_key, circular=False):
                 fr_pull = selected_phase_fit_results.get('pull')
@@ -6656,15 +7632,34 @@ def skeleton_points(b_pull_mm, phase=None):
                 return common_x.astype(float), y_avg.astype(float)
 
             shared_r_cubic_r2 = None
+            shared_r_linear_r2 = None
+            shared_r_pchip_r2 = None
             shared_z_cubic_r2 = None
+            shared_z_linear_r2 = None
+            shared_z_pchip_r2 = None
             shared_tip_angle_r2 = None
+            shared_tip_angle_linear_r2 = None
+            shared_tip_angle_pchip_r2 = None
             shared_offplane_y_r2 = None
             shared_offplane_y_linear_r2 = None
             shared_offplane_y_cubic_r2 = None
             shared_offplane_y_pchip_r2 = None
 
+            r_b_avg, r_y_avg = shared_pair_average_xy('common_b', 'r_coords', circular=False)
+            z_b_avg, z_y_avg = shared_pair_average_xy('common_b', 'z_coords', circular=False)
+            tip_b_avg, tip_y_avg = shared_pair_average_xy('common_b', 'tip_angle', circular=True)
+
+            shared_r_avg_pchip_model = None
+            shared_z_avg_pchip_model = None
+            shared_tip_angle_avg_pchip_model = None
+            if r_b_avg is not None and np.asarray(r_b_avg, dtype=float).size >= 2:
+                shared_r_avg_pchip_model = self._fit_curve_model(r_b_avg, r_y_avg, 'pchip', 'r_avg_pchip')
+            if z_b_avg is not None and np.asarray(z_b_avg, dtype=float).size >= 2:
+                shared_z_avg_pchip_model = self._fit_curve_model(z_b_avg, z_y_avg, 'pchip', 'z_avg_pchip')
+            if tip_b_avg is not None and np.asarray(tip_b_avg, dtype=float).size >= 2:
+                shared_tip_angle_avg_pchip_model = self._fit_curve_model(tip_b_avg, tip_y_avg, 'pchip', 'tip_angle_avg_pchip')
+
             if shared_r_cubic_model is not None:
-                r_b_avg, r_y_avg = shared_pair_average_xy('common_b', 'r_coords', circular=False)
                 if r_b_avg is not None:
                     shared_r_cubic_r2 = r2_score_safe(
                         r_y_avg,
@@ -6684,9 +7679,18 @@ def skeleton_points(b_pull_mm, phase=None):
                             r_y_all,
                             self._evaluate_curve_model(shared_r_cubic_model, r_b_all),
                         )
+            if shared_r_linear_model is not None and r_b_avg is not None:
+                shared_r_linear_r2 = r2_score_safe(
+                    r_y_avg,
+                    self._evaluate_curve_model(shared_r_linear_model, r_b_avg),
+                )
+            if shared_r_avg_pchip_model is not None and r_b_avg is not None:
+                shared_r_pchip_r2 = r2_score_safe(
+                    r_y_avg,
+                    self._evaluate_curve_model(shared_r_avg_pchip_model, r_b_avg),
+                )
 
             if shared_z_cubic_model is not None:
-                z_b_avg, z_y_avg = shared_pair_average_xy('common_b', 'z_coords', circular=False)
                 if z_b_avg is not None:
                     shared_z_cubic_r2 = r2_score_safe(
                         z_y_avg,
@@ -6706,9 +7710,18 @@ def skeleton_points(b_pull_mm, phase=None):
                             z_y_all,
                             self._evaluate_curve_model(shared_z_cubic_model, z_b_all),
                         )
+            if shared_z_linear_model is not None and z_b_avg is not None:
+                shared_z_linear_r2 = r2_score_safe(
+                    z_y_avg,
+                    self._evaluate_curve_model(shared_z_linear_model, z_b_avg),
+                )
+            if shared_z_avg_pchip_model is not None and z_b_avg is not None:
+                shared_z_pchip_r2 = r2_score_safe(
+                    z_y_avg,
+                    self._evaluate_curve_model(shared_z_avg_pchip_model, z_b_avg),
+                )
 
             if shared_tip_angle_model is not None:
-                tip_b_avg, tip_y_avg = shared_pair_average_xy('common_b', 'tip_angle', circular=True)
                 if tip_b_avg is not None:
                     shared_tip_angle_r2 = r2_score_safe(
                         tip_y_avg,
@@ -6730,6 +7743,16 @@ def skeleton_points(b_pull_mm, phase=None):
                             tip_y_all,
                             self._evaluate_curve_model(shared_tip_angle_model, tip_b_all),
                         )
+            if shared_tip_angle_linear_model is not None and tip_b_avg is not None:
+                shared_tip_angle_linear_r2 = r2_score_safe(
+                    tip_y_avg,
+                    self._evaluate_curve_model(shared_tip_angle_linear_model, tip_b_avg),
+                )
+            if shared_tip_angle_avg_pchip_model is not None and tip_b_avg is not None:
+                shared_tip_angle_pchip_r2 = r2_score_safe(
+                    tip_y_avg,
+                    self._evaluate_curve_model(shared_tip_angle_avg_pchip_model, tip_b_avg),
+                )
 
             off_b_avg, off_y_avg = shared_pair_average_xy('offplane_b', 'offplane_y', circular=False)
             if off_b_avg is None:
@@ -7495,15 +8518,20 @@ def skeleton_points(b_pull_mm, phase=None):
             for phase, fr in fit_results.items():
                 fit_models_by_phase[phase] = {
                     'r': fr['r_model'],
+                    'r_linear': shared_r_linear_model,
                     'z': fr['z_model'],
+                    'z_linear': shared_z_linear_model,
                     'r_pchip': fr['r_pchip_model'],
                     'y_offset_pchip': fr['r_pchip_model'],
                     'z_pchip': fr['z_pchip_model'],
                     'r_cubic': fr['r_cubic_model'],
                     'z_cubic': fr['z_cubic_model'],
                     'tip_angle': fr['tip_angle_model'],
+                    'tip_angle_linear': shared_tip_angle_linear_model,
                     'tip_angle_pchip': fr['tip_angle_pchip_model'],
                     'tip_angle_cubic': fr['tip_angle_cubic_model'],
+                    'tip_angle_avg_linear': shared_tip_angle_linear_model,
+                    'tip_angle_avg_pchip': shared_tip_angle_avg_pchip_model,
                     'tip_angle_avg_cubic': shared_tip_angle_model,
                     'offplane_y': fr['offplane_y_model'],
                     'offplane_y_linear': fr['offplane_y_linear_model'],
@@ -7512,7 +8540,11 @@ def skeleton_points(b_pull_mm, phase=None):
                     'offplane_y_avg_linear': shared_offplane_y_linear_model,
                     'offplane_y_avg_cubic': shared_offplane_y_cubic_model,
                     'offplane_y_avg_pchip': shared_offplane_y_pchip_model,
+                    'r_avg_linear': shared_r_linear_model,
+                    'r_avg_pchip': shared_r_avg_pchip_model,
                     'r_avg_cubic': shared_r_cubic_model,
+                    'z_avg_linear': shared_z_linear_model,
+                    'z_avg_pchip': shared_z_avg_pchip_model,
                     'z_avg_cubic': shared_z_cubic_model,
                 }
             datasets_with_aliases = dict(datasets_for_fitting)
@@ -7536,8 +8568,14 @@ def skeleton_points(b_pull_mm, phase=None):
                 'datasets_by_phase': datasets_with_aliases,
                 'redundancy_diagnostics': redundancy_diagnostics,
                 'shared_aux_fit_models': {
+                    'r_avg_linear': shared_r_linear_model,
+                    'r_avg_pchip': shared_r_avg_pchip_model,
                     'r_avg_cubic': shared_r_cubic_model,
+                    'z_avg_linear': shared_z_linear_model,
+                    'z_avg_pchip': shared_z_avg_pchip_model,
                     'z_avg_cubic': shared_z_cubic_model,
+                    'tip_angle_avg_linear': shared_tip_angle_linear_model,
+                    'tip_angle_avg_pchip': shared_tip_angle_avg_pchip_model,
                     'tip_angle_avg_cubic': shared_tip_angle_model,
                     'offplane_y': shared_offplane_y_model,
                     'offplane_y_avg_linear': shared_offplane_y_linear_model,
@@ -7547,11 +8585,17 @@ def skeleton_points(b_pull_mm, phase=None):
                 'phase_fit_metrics': {
                     phase: {
                         'r_r2': fr['r_r2'],
+                        'r_avg_linear_r2': shared_r_linear_r2,
+                        'r_avg_pchip_r2': shared_r_pchip_r2,
                         'y_offset_pchip_r2': fr['r_pchip_r2'],
                         'z_r2': fr['z_r2'],
+                        'z_avg_linear_r2': shared_z_linear_r2,
+                        'z_avg_pchip_r2': shared_z_pchip_r2,
                         'r_avg_cubic_r2': shared_r_cubic_r2,
                         'z_avg_cubic_r2': shared_z_cubic_r2,
                         'tip_angle_r2': fr['tip_angle_r2'],
+                        'tip_angle_avg_linear_r2': shared_tip_angle_linear_r2,
+                        'tip_angle_avg_pchip_r2': shared_tip_angle_pchip_r2,
                         'tip_angle_avg_cubic_r2': shared_tip_angle_r2,
                         'offplane_y_r2': fr['offplane_y_r2'],
                         'offplane_y_linear_r2': fr['offplane_y_linear_r2'],
@@ -7693,8 +8737,14 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                 'datasets_by_phase': datasets_with_aliases,
                 'redundancy_diagnostics': redundancy_diagnostics,
                 'shared_aux_fit_models': {
+                    'r_avg_linear': shared_r_linear_model,
+                    'r_avg_pchip': shared_r_avg_pchip_model,
                     'r_avg_cubic': shared_r_cubic_model,
+                    'z_avg_linear': shared_z_linear_model,
+                    'z_avg_pchip': shared_z_avg_pchip_model,
                     'z_avg_cubic': shared_z_cubic_model,
+                    'tip_angle_avg_linear': shared_tip_angle_linear_model,
+                    'tip_angle_avg_pchip': shared_tip_angle_avg_pchip_model,
                     'tip_angle_avg_cubic': shared_tip_angle_model,
                     'offplane_y': shared_offplane_y_model,
                     'offplane_y_avg_linear': shared_offplane_y_linear_model,
@@ -7704,11 +8754,17 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                 'phase_fit_metrics': {
                     phase: {
                         'r_r_squared': fr['r_r2'],
+                        'r_avg_linear_r_squared': shared_r_linear_r2,
+                        'r_avg_pchip_r_squared': shared_r_pchip_r2,
                         'y_offset_pchip_r_squared': fr['r_pchip_r2'],
                         'z_r_squared': fr['z_r2'],
+                        'z_avg_linear_r_squared': shared_z_linear_r2,
+                        'z_avg_pchip_r_squared': shared_z_pchip_r2,
                         'r_avg_cubic_r_squared': shared_r_cubic_r2,
                         'z_avg_cubic_r_squared': shared_z_cubic_r2,
                         'tip_angle_r_squared': fr['tip_angle_r2'],
+                        'tip_angle_avg_linear_r_squared': shared_tip_angle_linear_r2,
+                        'tip_angle_avg_pchip_r_squared': shared_tip_angle_pchip_r2,
                         'tip_angle_avg_cubic_r_squared': shared_tip_angle_r2,
                         'offplane_y_r_squared': fr['offplane_y_r2'],
                         'offplane_y_linear_r_squared': fr['offplane_y_linear_r2'],
@@ -7751,6 +8807,127 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                     'depth_axis': 'Y',
                 },
             }
+
+            curl_angle_specific_models = None
+            if bool(append_curl_angle_models):
+                main_state = (
+                    dict(datasets_with_aliases),
+                    dict(fit_models_with_aliases),
+                    dict(redundancy_diagnostics),
+                )
+                plot_names = [
+                    "10_dual_phase_fits.png",
+                    "11_xz_trajectory_hysteresis.png",
+                    "12_mirrored_phase_overlays.png",
+                ]
+                main_plot_backups = {}
+                for plot_name in plot_names:
+                    plot_path = os.path.join(processed_folder, plot_name)
+                    if os.path.exists(plot_path):
+                        backup_path = os.path.join(processed_folder, f"__main_backup__{plot_name}")
+                        shutil.copyfile(plot_path, backup_path)
+                        main_plot_backups[plot_name] = backup_path
+                curl_angle_specific_models = {}
+                default_curl_angle_sequences = {
+                    "0-90-0": [0, 90, 0],
+                    "0-180-0": [0, 180, 0],
+                    "90-180-90": [90, 180, 90],
+                }
+                curl_capture_groups = [
+                    "curl_0-90-0",
+                    "curl_0-180-0",
+                    "curl_90-180-90",
+                ]
+                curl_dual_phase_panel_inputs = []
+                for group in curl_capture_groups:
+                    pass_name = group[len("curl_"):] if group.startswith("curl_") else group
+                    print(f"[INFO] Postprocessing curl-angle capture group '{group}'.")
+                    try:
+                        group_result = self.postprocess_calibration_data(
+                            width_in_pixels=width_in_pixels,
+                            width_in_mm=width_in_mm,
+                            robot_name=f"{robot_name}_{group}",
+                            save_plots=True,
+                            export_skeleton=False,
+                            fit_model="pchip",
+                            offplane_fit_model="pchip",
+                            capture_group_filter=group,
+                            append_curl_angle_models=False,
+                        )
+                    except Exception as exc:
+                        print(f"[WARN] Failed to postprocess curl-angle capture group '{group}': {exc}")
+                        continue
+                    if group_result is None:
+                        continue
+                    for plot_name in plot_names:
+                        plot_path = os.path.join(processed_folder, plot_name)
+                        if os.path.exists(plot_path):
+                            stem, ext = os.path.splitext(plot_name)
+                            group_plot_path = os.path.join(processed_folder, f"{robot_name}_{group}_{stem}{ext}")
+                            shutil.move(plot_path, group_plot_path)
+                            if plot_name == "10_dual_phase_fits.png":
+                                curl_dual_phase_panel_inputs.append((pass_name, group_plot_path))
+                    group_fit_models = group_result.get("fit_models_by_phase", {})
+                    curl_angle_specific_models[pass_name] = {
+                        "angle_sequence_deg": (
+                            self._curl_angle_pass_sequences_deg.get(pass_name)
+                            or default_curl_angle_sequences.get(pass_name)
+                        ),
+                        "fit_models_by_phase": {
+                            phase_name: group_fit_models.get(phase_name)
+                            for phase_name in ("pull", "release")
+                            if group_fit_models.get(phase_name) is not None
+                        },
+                    }
+                if curl_dual_phase_panel_inputs:
+                    combined_panel_path = os.path.join(processed_folder, "13_curl_specific_dual_phase_panels.png")
+                    n_panels = len(curl_dual_phase_panel_inputs)
+                    panel_fig, panel_axes = plt.subplots(1, n_panels, figsize=(9.5 * n_panels, 10.5))
+                    if n_panels == 1:
+                        panel_axes = [panel_axes]
+                    for ax, (pass_name, img_path) in zip(panel_axes, curl_dual_phase_panel_inputs):
+                        try:
+                            img = plt.imread(img_path)
+                            ax.imshow(img)
+                            ax.set_title(f"{pass_name} dual-phase fits")
+                        except Exception as exc:
+                            ax.text(0.5, 0.5, f"Failed to load\n{pass_name}\n{exc}", ha="center", va="center")
+                        ax.axis("off")
+                        try:
+                            indiv_fig, indiv_ax = plt.subplots(figsize=(10.5, 10.5))
+                            indiv_ax.imshow(img)
+                            indiv_ax.set_title(f"{pass_name} dual-phase fits")
+                            indiv_ax.axis("off")
+                            indiv_fig.tight_layout()
+                            self._apply_dark_theme_to_figure(indiv_fig)
+                            indiv_fig.savefig(
+                                os.path.join(processed_folder, f"13_curl_specific_dual_phase_{pass_name}.png"),
+                                dpi=300,
+                                bbox_inches="tight",
+                                transparent=True,
+                                facecolor="none",
+                            )
+                            plt.close(indiv_fig)
+                        except Exception:
+                            pass
+                    panel_fig.tight_layout()
+                    self._apply_dark_theme_to_figure(panel_fig)
+                    panel_fig.savefig(
+                        combined_panel_path,
+                        dpi=300,
+                        bbox_inches="tight",
+                        transparent=True,
+                        facecolor="none",
+                    )
+                    plt.close(panel_fig)
+                for plot_name, backup_path in main_plot_backups.items():
+                    shutil.move(backup_path, os.path.join(processed_folder, plot_name))
+                self._postprocessed_datasets = main_state[0]
+                self._postprocessed_fit_models_by_phase = main_state[1]
+                self._postprocessed_redundancy_diagnostics = main_state[2]
+                gcode_calibration_data["curl_angle_specific_fit_models"] = curl_angle_specific_models
+                cubic_calibration_data["curl_angle_specific_fit_models"] = curl_angle_specific_models
+
             with open(f"{robot_name}_gcode_calibration.json", "w") as f:
                 json.dump(_to_json_compatible(gcode_calibration_data), f, indent=2)
 
@@ -7785,6 +8962,7 @@ def predict_cartesian_from_b(b_motor_pos, phase=None):
                 'default_phase': legacy_phase,
                 'redundancy_diagnostics': redundancy_diagnostics,
                 'phase_fit_metrics': gcode_calibration_data['phase_fit_metrics'],
+                'curl_angle_specific_fit_models': curl_angle_specific_models,
                 'json_path': os.path.join(processed_folder, f"{robot_name}_gcode_calibration.json"),
             }
         finally:

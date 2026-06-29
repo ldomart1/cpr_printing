@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import inspect
+import json
 import os
+from pathlib import Path
+import pickle
 import sys
 
 
@@ -13,21 +16,33 @@ from shadow_calibration import CTR_Shadow_Calibration
 import shadow_calibration
 
 
-DEFAULT_PROJECT_NAME = "Test_Calibration_2026-05-26_00"
+DEFAULT_PROJECT_NAME = "Test_Calibration_2026-06-27_04_dot"
 DEFAULT_MANUAL_CROP_ADJUSTMENT = True
 DEFAULT_THRESHOLD = 220
 DEFAULT_PULL_B_START = 0.0
 DEFAULT_PULL_B_STEPS = 28
-DEFAULT_PULL_B_STEP_SIZE = -0.20
+DEFAULT_PULL_B_STEP_SIZE = -0.1
+DEFAULT_MAIN_MOTION_MODE = "stepped"
+DEFAULT_MAIN_CONTINUOUS_FEEDRATE = 60.0
+DEFAULT_MAIN_CONTINUOUS_ACCEL_MM_S2 = 200.0
+DEFAULT_MAIN_CONTINUOUS_CAPTURE_PERIOD_S = None
+DEFAULT_CURL_PROBE_MODE = "middle"
+DEFAULT_CURL_PULL_B_START = DEFAULT_PULL_B_START
+DEFAULT_CURL_PULL_B_STEPS = DEFAULT_PULL_B_STEPS
+DEFAULT_CURL_PULL_B_STEP_SIZE = DEFAULT_PULL_B_STEP_SIZE
+DEFAULT_CURL_MOTION_MODE = "stepped"
+DEFAULT_CURL_CONTINUOUS_FEEDRATE = 100.0
+DEFAULT_CURL_CONTINUOUS_ACCEL_MM_S2 = 200.0
+DEFAULT_CURL_CONTINUOUS_CAPTURE_PERIOD_S = None
 DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
-DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260526_200532.png")
+DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260627_161714.png")
 DEFAULT_BOARD_XZ_AXIS_SIGN = 1
 DEFAULT_PROBE_MODE = "middle"
 DEFAULT_FIT_MODEL = "pchip"
-DEFAULT_OFFPLANE_FIT_MODEL = "pchip"
+DEFAULT_OFFPLANE_FIT_MODEL = "cubic"
 DEFAULT_TIP_REFINER_MODEL = os.path.join(
     SCRIPT_DIR,
-    "CNN_Calib",
+    "CNN_calib_2",
     "processed_image_data_folder",
     "tip_refinement_model",
     "best_tip_refiner.pt",
@@ -35,18 +50,50 @@ DEFAULT_TIP_REFINER_MODEL = os.path.join(
 DEFAULT_TIP_REFINER_ANCHOR = None
 DEFAULT_TIP_REFINER_COMPARE_ONLY = False
 DEFAULT_TIP_REFINE_MODE = "coarse"
-DEFAULT_TIP_DETECTION_MODE = "classical"
+DEFAULT_TIP_DETECTION_MODE = "red_dot"
+DEFAULT_CURL_PASS = "all"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Online runner for shadow_calibration.py")
     parser.add_argument("--project_name", type=str, default=DEFAULT_PROJECT_NAME)
+    parser.add_argument(
+        "--calibration_file",
+        type=str,
+        default=None,
+        help="Path to an existing calibrated_robot_gcode_calibration.json or calibrated_robot_cubic_calibration.pkl export.",
+    )
+    parser.add_argument(
+        "--curl_only",
+        action="store_true",
+        default=False,
+        help="Load an existing calibration export and run only the curl-angle-specific DAQ path.",
+    )
+    parser.add_argument(
+        "--curl_pass",
+        type=str,
+        default=DEFAULT_CURL_PASS,
+        choices=["all", "0-90-0", "0-180-0", "90-180-90"],
+        help="Curl-angle pass to run when curl DAQ is enabled. Use 'all' to run every predefined pass.",
+    )
     parser.add_argument("--manual_crop_adjustment", action="store_true", default=DEFAULT_MANUAL_CROP_ADJUSTMENT)
     parser.add_argument("--no_manual_crop_adjustment", dest="manual_crop_adjustment", action="store_false")
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--pull_b_start", type=float, default=DEFAULT_PULL_B_START)
     parser.add_argument("--pull_b_steps", type=int, default=DEFAULT_PULL_B_STEPS)
     parser.add_argument("--pull_b_step_size", type=float, default=DEFAULT_PULL_B_STEP_SIZE)
+    parser.add_argument("--main_motion_mode", type=str, default=DEFAULT_MAIN_MOTION_MODE, choices=["stepped", "continuous"])
+    parser.add_argument("--main_continuous_feedrate", type=float, default=DEFAULT_MAIN_CONTINUOUS_FEEDRATE)
+    parser.add_argument("--main_continuous_accel_mm_s2", type=float, default=DEFAULT_MAIN_CONTINUOUS_ACCEL_MM_S2)
+    parser.add_argument("--main_continuous_capture_period_s", type=float, default=DEFAULT_MAIN_CONTINUOUS_CAPTURE_PERIOD_S)
+    parser.add_argument("--curl_probe_mode", type=str, default=DEFAULT_CURL_PROBE_MODE, choices=["middle", "five"])
+    parser.add_argument("--curl_pull_b_start", type=float, default=DEFAULT_CURL_PULL_B_START)
+    parser.add_argument("--curl_pull_b_steps", type=int, default=DEFAULT_CURL_PULL_B_STEPS)
+    parser.add_argument("--curl_pull_b_step_size", type=float, default=DEFAULT_CURL_PULL_B_STEP_SIZE)
+    parser.add_argument("--curl_motion_mode", type=str, default=DEFAULT_CURL_MOTION_MODE, choices=["stepped", "continuous"])
+    parser.add_argument("--curl_continuous_feedrate", type=float, default=DEFAULT_CURL_CONTINUOUS_FEEDRATE)
+    parser.add_argument("--curl_continuous_accel_mm_s2", type=float, default=DEFAULT_CURL_CONTINUOUS_ACCEL_MM_S2)
+    parser.add_argument("--curl_continuous_capture_period_s", type=float, default=DEFAULT_CURL_CONTINUOUS_CAPTURE_PERIOD_S)
     parser.add_argument("--camera_calibration_file", type=str, default=DEFAULT_CAMERA_CALIBRATION_FILE)
     parser.add_argument("--board_reference_image", type=str, default=DEFAULT_BOARD_REFERENCE_IMAGE)
     parser.add_argument("--board_xz_axis_sign", type=int, choices=[-1, 1], default=DEFAULT_BOARD_XZ_AXIS_SIGN)
@@ -55,18 +102,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offplane_fit_model", type=str, default=DEFAULT_OFFPLANE_FIT_MODEL, choices=["linear", "cubic", "pchip"])
     parser.add_argument("--tip_refine_mode", type=str, default=DEFAULT_TIP_REFINE_MODE, choices=["coarse", "parallel_centerline", "auto"])
     parser.add_argument("--tip_detection_mode", type=str, default=DEFAULT_TIP_DETECTION_MODE, choices=["classical", "red_dot", "auto_red_dot"])
-    parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", help="Acquire C0/C180 first, fit planar pull/release PCHIP radial models, then apply that radial value as a stage-Y offset during the C90 pull/release pass.")
-    parser.add_argument("--full_c90_partial_cneg90_reference", action="store_true", help="Acquire full compensated C+90 pull/release, but only the first 40%% of compensated C-90 pull/release for reference mirroring. Off-plane equations are then fit from the full C+90 trajectory using the partial paired segment only to establish the reference mirror line.")
-    parser.add_argument("--red_tip_sat_min", type=int, default=25)
-    parser.add_argument("--red_tip_val_min", type=int, default=20)
-    parser.add_argument("--red_tip_min_area_px", type=int, default=50)
-    parser.add_argument("--red_tip_morph_kernel", type=int, default=2)
+    parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", default=True, help="Acquire C0/C180 first, fit planar pull/release PCHIP radial models, then apply that radial value as a stage-Y offset during the C90 pull/release pass.")
+    parser.add_argument("--no_c90_y_compensation_from_planar_pchip", dest="c90_y_compensation_from_planar_pchip", action="store_false")
+    parser.add_argument("--full_c90_partial_cneg90_reference", action="store_true", default=True, help="Acquire full compensated C+90 pull/release, but only the first 30%% of compensated C-90 pull/release for reference mirroring. Off-plane equations are then fit from the full C+90 trajectory using the partial paired segment only to establish the reference mirror line.")
+    parser.add_argument("--no_full_c90_partial_cneg90_reference", dest="full_c90_partial_cneg90_reference", action="store_false")
+    parser.add_argument("--run_curl_angle_specific_daq", action="store_true", default=True)
+    parser.add_argument("--no_run_curl_angle_specific_daq", dest="run_curl_angle_specific_daq", action="store_false")
+    parser.add_argument("--export_analysis_outputs", action="store_true", default=False, help="Export per-image analysis_outputs figures during analysis. Disabled by default for speed.")
+    parser.add_argument("--red_tip_sat_min", type=int, default=80)
+    parser.add_argument("--red_tip_val_min", type=int, default=80)
+    parser.add_argument("--red_tip_min_area_px", type=int, default=20)
+    parser.add_argument("--red_tip_morph_kernel", type=int, default=1)
     parser.add_argument("--red_tip_hue1_min", type=int, default=0)
     parser.add_argument("--red_tip_hue1_max", type=int, default=10)
-    parser.add_argument("--red_tip_hue2_min", type=int, default=130)
+    parser.add_argument("--red_tip_hue2_min", type=int, default=150)
     parser.add_argument("--red_tip_hue2_max", type=int, default=179)
-    parser.add_argument("--red_tip_search_radius_px", type=float, default=140.0)
-    parser.add_argument("--red_tip_local_min_area_px", type=int, default=50)
+    parser.add_argument("--red_tip_search_radius_px", type=float, default=320.0)
+    parser.add_argument("--red_tip_local_min_area_px", type=int, default=10)
     parser.add_argument("--red_tip_distance_weight", type=float, default=3.0)
     parser.add_argument("--red_tip_min_circularity", type=float, default=0.0)
     parser.add_argument(
@@ -78,7 +130,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess", action="store_true", default=True)
     parser.add_argument("--no_red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess", action="store_false")
     parser.add_argument("--red_tip_rgb_excess_min", type=int, default=35)
-    parser.add_argument("--red_tip_debug_save_mask", action="store_true")
+    parser.add_argument("--red_tip_debug_save_mask", action="store_true", default=True)
+    parser.add_argument("--no_red_tip_debug_save_mask", dest="red_tip_debug_save_mask", action="store_false")
     parser.add_argument("--tip_refiner_model", type=str, default=DEFAULT_TIP_REFINER_MODEL)
     parser.add_argument("--tip_refiner_anchor", type=str, default=DEFAULT_TIP_REFINER_ANCHOR)
     parser.add_argument("--tip_refiner_compare_only", action="store_true", default=DEFAULT_TIP_REFINER_COMPARE_ONLY)
@@ -92,7 +145,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def probe_points_for_mode(probe_mode: str):
     if probe_mode == "middle":
-        return [(100.0, 55.0, -70.0)]
+        return [(90.0, 40.0, -170.0)]
     if probe_mode == "five":
         return [
             (30.0, 0.0, -70.0),
@@ -104,20 +157,88 @@ def probe_points_for_mode(probe_mode: str):
     raise ValueError(f"Unknown PROBE_MODE: {probe_mode}")
 
 
+def load_calibration_export(path: str) -> dict:
+    export_path = Path(os.path.expanduser(str(path))).resolve()
+    if not export_path.exists():
+        raise FileNotFoundError(f"Calibration file not found: {export_path}")
+
+    if export_path.suffix.lower() == ".json":
+        with export_path.open("r") as f:
+            return json.load(f)
+
+    if export_path.suffix.lower() in {".pkl", ".pickle"}:
+        with export_path.open("rb") as f:
+            return pickle.load(f)
+
+    raise ValueError(f"Unsupported calibration file extension: {export_path.suffix}")
+
+
+def attach_calibration_state_for_class(cal: CTR_Shadow_Calibration, cal_data: dict) -> None:
+    if isinstance(cal_data.get("fit_models_by_phase"), dict):
+        cal._postprocessed_fit_models_by_phase = cal_data["fit_models_by_phase"]
+    if isinstance(cal_data.get("datasets_by_phase"), dict):
+        cal._postprocessed_datasets = cal_data["datasets_by_phase"]
+    if isinstance(cal_data.get("redundancy_diagnostics"), dict):
+        cal._postprocessed_redundancy_diagnostics = cal_data["redundancy_diagnostics"]
+
+
+def normalize_calibration_file_arg(args: argparse.Namespace) -> str | None:
+    if args.calibration_file is None:
+        return None
+    return str(Path(os.path.expanduser(str(args.calibration_file))).resolve())
+
+
+def resolve_project_location(args: argparse.Namespace) -> tuple[str, str]:
+    if not getattr(args, "curl_only", False) or not args.calibration_file:
+        return SCRIPT_DIR, str(args.project_name)
+
+    calibration_path = Path(str(args.calibration_file))
+    project_dir = calibration_path.parent
+    if project_dir.name == "processed_image_data_folder":
+        project_dir = project_dir.parent
+
+    if project_dir.is_dir() and str(args.project_name) == DEFAULT_PROJECT_NAME:
+        return str(project_dir.parent), project_dir.name
+
+    return SCRIPT_DIR, str(args.project_name)
+
+
+def get_curl_angle_passes(curl_pass: str) -> list[dict]:
+    predefined_passes = [
+        {"name": "0-90-0", "angle_sequence_deg": [0, 90, 0]},
+        {"name": "0-180-0", "angle_sequence_deg": [0, 180, 0]},
+        {"name": "90-180-90", "angle_sequence_deg": [90, 180, 90]},
+    ]
+    if str(curl_pass) == "all":
+        return predefined_passes
+    for pass_cfg in predefined_passes:
+        if pass_cfg["name"] == str(curl_pass):
+            return [pass_cfg]
+    raise ValueError(f"Unknown curl pass: {curl_pass}")
+
+
 def main(args: argparse.Namespace) -> None:
     print(f"[DEBUG] SCRIPT_DIR={SCRIPT_DIR}")
     print(f"[DEBUG] shadow_calibration loaded from: {inspect.getsourcefile(shadow_calibration)}")
 
+    args.calibration_file = normalize_calibration_file_arg(args)
+    if bool(args.curl_only) and not args.calibration_file:
+        raise ValueError("--curl_only requires --calibration_file.")
+
+    parent_directory, project_name = resolve_project_location(args)
     cal = CTR_Shadow_Calibration(
-        parent_directory=SCRIPT_DIR,
-        project_name=str(args.project_name),
+        parent_directory=parent_directory,
+        project_name=project_name,
         allow_existing=True,
         add_date=False,
     )
     print("Calibration object created!")
-    cal.clear_raw_image_data_folder()
+    if not bool(args.curl_only):
+        cal.clear_raw_image_data_folder()
 
     probe_points = probe_points_for_mode(str(args.probe_mode))
+    curl_probe_points = probe_points_for_mode(str(args.curl_probe_mode))
+    curl_angle_passes = get_curl_angle_passes(str(args.curl_pass))
 
     camera_calibration_file = None if args.camera_calibration_file is None else os.path.expanduser(str(args.camera_calibration_file))
     board_reference_image = None if args.board_reference_image is None else os.path.expanduser(str(args.board_reference_image))
@@ -160,6 +281,10 @@ def main(args: argparse.Namespace) -> None:
     cal.red_tip_use_rgb_excess = bool(args.red_tip_use_rgb_excess)
     cal.red_tip_rgb_excess_min = int(args.red_tip_rgb_excess_min)
     cal.red_tip_debug_save_mask = bool(args.red_tip_debug_save_mask)
+    cal.export_analysis_outputs = bool(args.export_analysis_outputs)
+
+    if bool(args.curl_only):
+        attach_calibration_state_for_class(cal, load_calibration_export(str(args.calibration_file)))
 
     if args.tip_refiner_model:
         tip_refiner_model = os.path.expanduser(str(args.tip_refiner_model))
@@ -175,72 +300,130 @@ def main(args: argparse.Namespace) -> None:
     cal.connect_to_camera(cam_port=0, show_preview=False)
     cal.setup_analysis_crop(enable_manual_adjustment=bool(args.manual_crop_adjustment))
     cal.connect_to_robot()
-    calibrate_kwargs = dict(
-        jogging_feedrate=200,
-        initial_positioning_feedrate=3000,
-        probe_points=probe_points,
-        b_start=float(args.pull_b_start),
-        b_steps=int(args.pull_b_steps),
-        b_step_size=float(args.pull_b_step_size),
-    )
+    try:
+        calibrate_kwargs = dict(
+            jogging_feedrate=400,
+            initial_positioning_feedrate=3000,
+            probe_points=probe_points,
+            b_start=float(args.pull_b_start),
+            b_steps=int(args.pull_b_steps),
+            b_step_size=float(args.pull_b_step_size),
+            motion_mode=str(args.main_motion_mode),
+            continuous_motion_feedrate=float(args.main_continuous_feedrate),
+            continuous_motion_accel_mm_s2=float(args.main_continuous_accel_mm_s2),
+            continuous_capture_period_s=args.main_continuous_capture_period_s,
+        )
+        curl_calibrate_kwargs = dict(
+            jogging_feedrate=400,
+            initial_positioning_feedrate=3000,
+            probe_points=curl_probe_points,
+            b_start=float(args.curl_pull_b_start),
+            b_steps=int(args.curl_pull_b_steps),
+            b_step_size=float(args.curl_pull_b_step_size),
+            motion_mode=str(args.curl_motion_mode),
+            continuous_motion_feedrate=float(args.curl_continuous_feedrate),
+            continuous_motion_accel_mm_s2=float(args.curl_continuous_accel_mm_s2),
+            continuous_capture_period_s=args.curl_continuous_capture_period_s,
+        )
 
-    if bool(args.c90_y_compensation_from_planar_pchip):
-        print("[INFO] C90 Y compensation enabled: acquiring planar C0/C180 seed pass first.")
-        cal.calibrate(
-            orientation_ids=[0, 1],
-            append_raw_data=False,
-            **calibrate_kwargs,
-        )
-        cal.analyze_data_batch(
-            threshold=int(args.threshold),
-        )
-        cal.postprocess_calibration_data(
-            save_plots=False,
-            fit_model=str(args.fit_model),
-            offplane_fit_model=str(args.offplane_fit_model),
-            robot_name="planar_seed_tmp",
-            export_skeleton=False,
-        )
-        pull_models = cal.get_fit_model("pull", fit_family="pchip")
-        stage_y_offset_models_by_phase = {
-            "pull": pull_models.get("r"),
-        }
-        try:
-            release_models = cal.get_fit_model("release", fit_family="pchip")
-            stage_y_offset_models_by_phase["release"] = release_models.get("r")
-        except KeyError:
-            print("[WARN] Planar seed export has no release dataset; reusing pull PCHIP model for release compensation.")
-            stage_y_offset_models_by_phase["release"] = stage_y_offset_models_by_phase.get("pull")
+        if bool(args.curl_only):
+            print(f"[INFO] Running curl-only DAQ using calibration export: {os.path.expanduser(str(args.calibration_file))}")
+        elif bool(args.c90_y_compensation_from_planar_pchip):
+            print("[INFO] C90 Y compensation enabled: acquiring planar C0/C180 seed pass first.")
+            cal.calibrate(
+                orientation_ids=[0, 1],
+                append_raw_data=False,
+                **calibrate_kwargs,
+            )
+            cal.analyze_data_batch(
+                threshold=int(args.threshold),
+                export_analysis_outputs=bool(args.export_analysis_outputs),
+            )
+            cal.postprocess_calibration_data(
+                save_plots=False,
+                fit_model=str(args.fit_model),
+                offplane_fit_model=str(args.offplane_fit_model),
+                robot_name="planar_seed_tmp",
+                export_skeleton=False,
+            )
+            pull_models = cal.get_fit_model("pull", fit_family="pchip")
+            stage_y_offset_models_by_phase = {
+                "pull": pull_models.get("r"),
+            }
+            try:
+                release_models = cal.get_fit_model("release", fit_family="pchip")
+                stage_y_offset_models_by_phase["release"] = release_models.get("r")
+            except KeyError:
+                print("[WARN] Planar seed export has no release dataset; reusing pull PCHIP model for release compensation.")
+                stage_y_offset_models_by_phase["release"] = stage_y_offset_models_by_phase.get("pull")
 
-        if stage_y_offset_models_by_phase.get("pull") is None:
-            raise RuntimeError("Could not build planar pull PCHIP model for C90 Y compensation.")
-        if stage_y_offset_models_by_phase.get("release") is None:
-            raise RuntimeError("Could not build planar release PCHIP model for C90 Y compensation.")
+            if stage_y_offset_models_by_phase.get("pull") is None:
+                raise RuntimeError("Could not build planar pull PCHIP model for C90 Y compensation.")
+            if stage_y_offset_models_by_phase.get("release") is None:
+                raise RuntimeError("Could not build planar release PCHIP model for C90 Y compensation.")
 
-        print("[INFO] Planar PCHIP seed models built; acquiring compensated C90 pass.")
-        cal.calibrate(
-            orientation_ids=[2, 3],
-            append_raw_data=True,
-            stage_y_offset_models_by_phase=stage_y_offset_models_by_phase,
-            stage_y_offset_orientation_ids=[2, 3],
-            **calibrate_kwargs,
-        )
-    else:
-        cal.calibrate(
-            **calibrate_kwargs,
-        )
-    cal.analyze_data_batch(
-        threshold=int(args.threshold),
-    )
-    cal.postprocess_calibration_data(
-        save_plots=True,
-        fit_model=str(args.fit_model),
-        offplane_fit_model=str(args.offplane_fit_model),
-        export_skeleton=bool(args.export_skeleton),
-        skeleton_diameter_mm=float(args.skeleton_diameter_mm),
-        skeleton_links=int(args.skeleton_links),
-        skeleton_reference_stl=bool(args.skeleton_reference_stl),
-    )
+            print("[INFO] Planar PCHIP seed models built; acquiring compensated C90 pass.")
+            cal.calibrate(
+                orientation_ids=[2, 3],
+                append_raw_data=True,
+                stage_y_offset_models_by_phase=stage_y_offset_models_by_phase,
+                stage_y_offset_orientation_ids=[2, 3],
+                **calibrate_kwargs,
+            )
+        else:
+            cal.calibrate(
+                **calibrate_kwargs,
+            )
+        if not bool(args.curl_only):
+            cal.analyze_data_batch(
+                threshold=int(args.threshold),
+                export_analysis_outputs=bool(args.export_analysis_outputs),
+            )
+            cal.postprocess_calibration_data(
+                save_plots=True,
+                fit_model=str(args.fit_model),
+                offplane_fit_model=str(args.offplane_fit_model),
+                export_skeleton=bool(args.export_skeleton),
+                skeleton_diameter_mm=float(args.skeleton_diameter_mm),
+                skeleton_links=int(args.skeleton_links),
+                skeleton_reference_stl=bool(args.skeleton_reference_stl),
+            )
+
+        if getattr(args, "run_curl_angle_specific_daq", True):
+            start_pose_models = cal.build_avg_phase_pchip_models(phases=("pull", "release"))
+
+            cal.run_curl_angle_specific_daq(
+                curl_angle_passes=curl_angle_passes,
+                start_pose_models=start_pose_models,
+                orientation_ids=(0, 1, 2, 3),
+                partial_cneg90_reference=bool(args.full_c90_partial_cneg90_reference),
+                **curl_calibrate_kwargs,
+            )
+
+            cal.analyze_data_batch(
+                threshold=int(args.threshold),
+                export_analysis_outputs=bool(args.export_analysis_outputs),
+            )
+
+            cal.postprocess_calibration_data(
+                save_plots=True,
+                fit_model=str(args.fit_model),
+                offplane_fit_model=str(args.offplane_fit_model),
+                export_skeleton=bool(args.export_skeleton),
+                skeleton_diameter_mm=float(args.skeleton_diameter_mm),
+                skeleton_links=int(args.skeleton_links),
+                skeleton_reference_stl=bool(args.skeleton_reference_stl),
+                capture_group_filter="main",
+                append_curl_angle_models=True,
+            )
+    finally:
+        if getattr(cal, "rrf", None) is not None:
+            try:
+                print("[INFO] Returning robot to B0 before exit.")
+                cal.rrf.send_code("G90 G1 B0 F200")
+                cal.rrf.send_code("M400")
+            except Exception as exc:
+                print(f"[WARN] Failed to return robot to B0: {exc}")
 
 
 if __name__ == "__main__":

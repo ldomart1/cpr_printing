@@ -31,6 +31,40 @@ from shadow_calibration import CTR_Shadow_Calibration
 
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_THRESHOLD = 220
+DEFAULT_FIT_MODEL = "pchip"
+DEFAULT_OFFPLANE_FIT_MODEL = "pchip"
+DEFAULT_CAMERA_CALIBRATION_FILE = SCRIPT_DIR / "captures" / "calibration_webcam_20260406_104136.npz"
+DEFAULT_BOARD_REFERENCE_IMAGE = SCRIPT_DIR / "captures" / "photo_20260615_174257.png"
+DEFAULT_TIP_REFINER_MODEL = SCRIPT_DIR / "CNN_Calib" / "processed_image_data_folder" / "tip_refinement_model" / "best_tip_refiner.pt"
+DEFAULT_TIP_REFINER_ANCHOR = None
+DEFAULT_TIP_REFINER_COMPARE_ONLY = False
+DEFAULT_TIP_REFINE_MODE = "coarse"
+DEFAULT_TIP_DETECTION_MODE = "red_dot"
+DEFAULT_TIP_PARALLEL_SECTION_NEAR_R = 0.75
+DEFAULT_TIP_PARALLEL_SECTION_FAR_R = 5.0
+DEFAULT_TIP_PARALLEL_SCAN_HALF_R = 2.5
+DEFAULT_TIP_PARALLEL_NUM_SECTIONS = 7
+DEFAULT_TIP_PARALLEL_CROSS_STEP_PX = 0.5
+DEFAULT_TIP_PARALLEL_RAY_STEP_PX = 0.5
+DEFAULT_TIP_PARALLEL_RAY_MAX_LEN_R = 10.0
+DEFAULT_RED_TIP_SAT_MIN = 80
+DEFAULT_RED_TIP_VAL_MIN = 80
+DEFAULT_RED_TIP_MIN_AREA_PX = 20
+DEFAULT_RED_TIP_MORPH_KERNEL = 1
+DEFAULT_RED_TIP_HUE1_MIN = 0
+DEFAULT_RED_TIP_HUE1_MAX = 10
+DEFAULT_RED_TIP_HUE2_MIN = 150
+DEFAULT_RED_TIP_HUE2_MAX = 179
+DEFAULT_RED_TIP_SEARCH_RADIUS_PX = 180.0
+DEFAULT_RED_TIP_LOCAL_MIN_AREA_PX = 10
+DEFAULT_RED_TIP_DISTANCE_WEIGHT = 3.0
+DEFAULT_RED_TIP_MIN_CIRCULARITY = 0.0
+DEFAULT_RED_TIP_COMPONENT_SELECTION = "nearest_largest"
+DEFAULT_RED_TIP_USE_RGB_EXCESS = True
+DEFAULT_RED_TIP_RGB_EXCESS_MIN = 35
+DEFAULT_RED_TIP_DEBUG_SAVE_MASK = True
 
 
 def list_images(folder: Path) -> list[Path]:
@@ -433,15 +467,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project_dir", type=str, default=None, help="Existing project folder containing raw_image_data_folder")
     parser.add_argument("--raw_dir", type=str, default=None, help="Folder of raw images or raw_image_data_folder")
     parser.add_argument("--link_mode", type=str, default="symlink", choices=["symlink", "copy"])
-    parser.add_argument("--threshold", type=int, default=200)
+    parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
     parser.add_argument("--robot_name", type=str, default="calibrated_robot")
     parser.add_argument("--width_in_pixels", type=float, default=3025.0)
     parser.add_argument("--width_in_mm", type=float, default=140.0)
-    parser.add_argument("--fit_model", type=str, default="pchip", choices=["cubic", "pchip"])
-    parser.add_argument("--offplane_fit_model", type=str, default="pchip", choices=["linear", "cubic", "pchip"])
+    parser.add_argument("--fit_model", type=str, default=DEFAULT_FIT_MODEL, choices=["cubic", "pchip"])
+    parser.add_argument("--offplane_fit_model", type=str, default=DEFAULT_OFFPLANE_FIT_MODEL, choices=["linear", "cubic", "pchip"])
     parser.add_argument("--save_plots", action="store_true")
+    parser.add_argument("--export_analysis_outputs", action="store_true", help="Export per-image analysis_outputs figures. Disabled by default for faster reprocessing.")
     parser.add_argument("--ruler_mm", type=float, default=150.0)
     parser.add_argument("--save_analysis_config", action="store_true")
+    parser.add_argument("--append_curl_angle_models", action="store_true", default=True, help="When capture_metadata.csv contains curl_* groups, re-export the main JSON with curl_angle_specific_fit_models appended.")
+    parser.add_argument("--no_append_curl_angle_models", dest="append_curl_angle_models", action="store_false")
     parser.add_argument(
         "--use_default_analysis_crop",
         action="store_true",
@@ -453,38 +490,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Do not collect a ruler reference. Use board calibration or width-based scaling during postprocessing.",
     )
 
-    parser.add_argument("--camera_calibration_file", type=str, default=None, help="Path to camera calibration .npz")
-    parser.add_argument("--board_reference_image", type=str, default=None, help="Path to checkerboard/board reference image")
+    parser.add_argument("--camera_calibration_file", type=str, default=str(DEFAULT_CAMERA_CALIBRATION_FILE), help="Path to camera calibration .npz")
+    parser.add_argument("--board_reference_image", type=str, default=str(DEFAULT_BOARD_REFERENCE_IMAGE), help="Path to checkerboard/board reference image")
     parser.add_argument("--board_inner_corners", type=str, default=None, help="Checkerboard inner corners as Nx,Ny")
     parser.add_argument("--board_square_size_mm", type=float, default=None)
     parser.add_argument("--board_xz_axis_sign", type=int, choices=[-1, 1], default=1, help="Set to -1 to flip the calibrated checkerboard-reference x and z axes.")
     parser.add_argument("--board_no_undistort", action="store_true")
 
-    parser.add_argument("--tip_parallel_section_near_r", type=float, default=1.0)
-    parser.add_argument("--tip_parallel_section_far_r", type=float, default=8.0)
-    parser.add_argument("--tip_parallel_scan_half_r", type=float, default=3.0)
-    parser.add_argument("--tip_parallel_num_sections", type=int, default=9)
-    parser.add_argument("--tip_parallel_cross_step_px", type=float, default=0.5)
-    parser.add_argument("--tip_parallel_ray_step_px", type=float, default=0.5)
-    parser.add_argument("--tip_parallel_ray_max_len_r", type=float, default=16.0)
-    parser.add_argument("--tip_refine_mode", type=str, default="coarse", choices=["coarse", "parallel_centerline", "auto"])
-    parser.add_argument("--tip_detection_mode", type=str, default="classical", choices=["classical", "red_dot", "auto_red_dot"])
+    parser.add_argument("--tip_parallel_section_near_r", type=float, default=DEFAULT_TIP_PARALLEL_SECTION_NEAR_R)
+    parser.add_argument("--tip_parallel_section_far_r", type=float, default=DEFAULT_TIP_PARALLEL_SECTION_FAR_R)
+    parser.add_argument("--tip_parallel_scan_half_r", type=float, default=DEFAULT_TIP_PARALLEL_SCAN_HALF_R)
+    parser.add_argument("--tip_parallel_num_sections", type=int, default=DEFAULT_TIP_PARALLEL_NUM_SECTIONS)
+    parser.add_argument("--tip_parallel_cross_step_px", type=float, default=DEFAULT_TIP_PARALLEL_CROSS_STEP_PX)
+    parser.add_argument("--tip_parallel_ray_step_px", type=float, default=DEFAULT_TIP_PARALLEL_RAY_STEP_PX)
+    parser.add_argument("--tip_parallel_ray_max_len_r", type=float, default=DEFAULT_TIP_PARALLEL_RAY_MAX_LEN_R)
+    parser.add_argument("--tip_refine_mode", type=str, default=DEFAULT_TIP_REFINE_MODE, choices=["coarse", "parallel_centerline", "auto"])
+    parser.add_argument("--tip_detection_mode", type=str, default=DEFAULT_TIP_DETECTION_MODE, choices=["classical", "red_dot", "auto_red_dot"])
     parser.add_argument("-c90_y_compensation_from_planar_pchip", "--c90_y_compensation_from_planar_pchip", action="store_true", help="Interpret C90 captures as having stage-Y compensation driven by planar pull/release PCHIP fits, and subtract that recorded Y offset during off-plane postprocessing.")
     parser.add_argument("--full_c90_partial_cneg90_reference", action="store_true", help="Interpret the project as using full compensated C+90 pull/release with only the first 40%% of compensated C-90 pull/release for off-plane reference mirroring. The exported off-plane equations are then fit from the full C+90 trajectory.")
-    parser.add_argument("--red_tip_sat_min", type=int, default=80)
-    parser.add_argument("--red_tip_val_min", type=int, default=40)
-    parser.add_argument("--red_tip_min_area_px", type=int, default=8)
-    parser.add_argument("--red_tip_morph_kernel", type=int, default=2)
-    parser.add_argument("--red_tip_hue1_min", type=int, default=0)
-    parser.add_argument("--red_tip_hue1_max", type=int, default=10)
-    parser.add_argument("--red_tip_hue2_min", type=int, default=130)
-    parser.add_argument("--red_tip_hue2_max", type=int, default=179)
-    parser.add_argument("--red_tip_search_radius_px", type=float, default=140.0)
-    parser.add_argument("--red_tip_local_min_area_px", type=int, default=2)
-    parser.add_argument("--red_tip_distance_weight", type=float, default=3.0)
-    parser.add_argument("--tip_refiner_model", type=str, default=None, help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt")
-    parser.add_argument("--tip_refiner_anchor", type=str, default=None, choices=["coarse", "selected", "refined"], help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
-    parser.add_argument("--tip_refiner_compare_only", action="store_true", help="Save tip_locations_cnn.* but keep classical selected tips for postprocessing.")
+    parser.add_argument("--red_tip_sat_min", type=int, default=DEFAULT_RED_TIP_SAT_MIN)
+    parser.add_argument("--red_tip_val_min", type=int, default=DEFAULT_RED_TIP_VAL_MIN)
+    parser.add_argument("--red_tip_min_area_px", type=int, default=DEFAULT_RED_TIP_MIN_AREA_PX)
+    parser.add_argument("--red_tip_morph_kernel", type=int, default=DEFAULT_RED_TIP_MORPH_KERNEL)
+    parser.add_argument("--red_tip_hue1_min", type=int, default=DEFAULT_RED_TIP_HUE1_MIN)
+    parser.add_argument("--red_tip_hue1_max", type=int, default=DEFAULT_RED_TIP_HUE1_MAX)
+    parser.add_argument("--red_tip_hue2_min", type=int, default=DEFAULT_RED_TIP_HUE2_MIN)
+    parser.add_argument("--red_tip_hue2_max", type=int, default=DEFAULT_RED_TIP_HUE2_MAX)
+    parser.add_argument("--red_tip_search_radius_px", type=float, default=DEFAULT_RED_TIP_SEARCH_RADIUS_PX)
+    parser.add_argument("--red_tip_local_min_area_px", type=int, default=DEFAULT_RED_TIP_LOCAL_MIN_AREA_PX)
+    parser.add_argument("--red_tip_distance_weight", type=float, default=DEFAULT_RED_TIP_DISTANCE_WEIGHT)
+    parser.add_argument("--red_tip_min_circularity", type=float, default=DEFAULT_RED_TIP_MIN_CIRCULARITY)
+    parser.add_argument("--red_tip_component_selection", type=str, default=DEFAULT_RED_TIP_COMPONENT_SELECTION, choices=["largest", "nearest", "nearest_largest"])
+    parser.add_argument("--red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess", action="store_true", default=DEFAULT_RED_TIP_USE_RGB_EXCESS)
+    parser.add_argument("--no_red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess", action="store_false")
+    parser.add_argument("--red_tip_rgb_excess_min", type=int, default=DEFAULT_RED_TIP_RGB_EXCESS_MIN)
+    parser.add_argument("--red_tip_debug_save_mask", action="store_true", default=DEFAULT_RED_TIP_DEBUG_SAVE_MASK)
+    parser.add_argument("--no_red_tip_debug_save_mask", dest="red_tip_debug_save_mask", action="store_false")
+    parser.add_argument("--tip_refiner_model", type=str, default=str(DEFAULT_TIP_REFINER_MODEL), help="Path to cnn/train_tip_refiner.py best_tip_refiner.pt")
+    parser.add_argument("--tip_refiner_anchor", type=str, default=DEFAULT_TIP_REFINER_ANCHOR, choices=["coarse", "selected", "refined"], help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
+    parser.add_argument("--tip_refiner_compare_only", action="store_true", default=DEFAULT_TIP_REFINER_COMPARE_ONLY, help="Save tip_locations_cnn.* but keep classical selected tips for postprocessing.")
 
     parser.add_argument("--export_skeleton", action="store_true")
     parser.add_argument("--skeleton_diameter_mm", type=float, default=1.51)
@@ -546,6 +590,12 @@ def main() -> None:
     cal.red_tip_search_radius_px = float(args.red_tip_search_radius_px)
     cal.red_tip_local_min_area_px = int(args.red_tip_local_min_area_px)
     cal.red_tip_distance_weight = float(args.red_tip_distance_weight)
+    cal.red_tip_min_circularity = float(args.red_tip_min_circularity)
+    cal.red_tip_component_selection = str(args.red_tip_component_selection)
+    cal.red_tip_use_rgb_excess = bool(args.red_tip_use_rgb_excess)
+    cal.red_tip_rgb_excess_min = int(args.red_tip_rgb_excess_min)
+    cal.red_tip_debug_save_mask = bool(args.red_tip_debug_save_mask)
+    cal.export_analysis_outputs = bool(args.export_analysis_outputs)
 
     if args.tip_refiner_model:
         cal.load_tip_refiner_model(
@@ -614,7 +664,10 @@ def main() -> None:
         print(f"Saved analysis config to {config_path}")
 
     print("\nRunning analyze_data_batch...")
-    cal.analyze_data_batch(threshold=int(args.threshold))
+    cal.analyze_data_batch(
+        threshold=int(args.threshold),
+        export_analysis_outputs=bool(args.export_analysis_outputs),
+    )
 
     print("\nRunning postprocess_calibration_data...")
     cal.postprocess_calibration_data(
@@ -628,6 +681,8 @@ def main() -> None:
         skeleton_diameter_mm=float(args.skeleton_diameter_mm),
         skeleton_links=int(args.skeleton_links),
         skeleton_reference_stl=bool(args.skeleton_reference_stl),
+        capture_group_filter="main",
+        append_curl_angle_models=bool(args.append_curl_angle_models),
     )
 
     print(f"\nDone. Outputs are in {project_dir / 'processed_image_data_folder'}")

@@ -46,6 +46,7 @@ New sign correction option:
 """
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -61,13 +62,14 @@ import cv2
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 try:
     from duetwebapi import DuetWebAPI
 except Exception:
-    raise ImportError(
-        "Missing duetwebapi. Install with:\n"
-        "    pip install duetwebapi==1.1.0"
-    )
+    # Export-only usage does not need a live Duet connection.  Defer the
+    # dependency error until connect_to_robot() is actually called.
+    DuetWebAPI = None
 
 
 # =========================
@@ -81,27 +83,31 @@ DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
 DEFAULT_POINT_X = 100.0
-DEFAULT_POINT_Y = 52.0
-DEFAULT_POINT_Z = -140.0
+DEFAULT_POINT_Y = 125.0
+DEFAULT_POINT_Z = -90.0
 
-DEFAULT_TRAVEL_FEED = 1000.0
-DEFAULT_FINE_APPROACH_FEED = 800.0
-DEFAULT_PROBE_FEED = 3000.0
-DEFAULT_C_FEED = 15000.0
-DEFAULT_C_MAX_FEED = 15000.0
+DEFAULT_TRAVEL_FEED = 2000.0
+DEFAULT_FINE_APPROACH_FEED = 1000.0
+DEFAULT_PROBE_FEED = 4000.0
+DEFAULT_C_FEED = 25000.0
+DEFAULT_C_MAX_FEED = 25000.0
 DEFAULT_C_ACCEL_TIME_S = 0.1
 DEFAULT_C_DECEL_TIME_S = 0.1
+DEFAULT_MOTION_MODE = "custom"
+DEFAULT_ROUTINE_REPEATS = 1
+DEFAULT_MOTION_ACCEL_MM_S2 = 0.0
 
 DEFAULT_CUSTOM_INV_SAMPLES = 20000
 
-DEFAULT_CYCLE_REPEATS = 1
+DEFAULT_CYCLE_REPEATS = 2
 DEFAULT_LEG_MOVE_STEPS = 400
 DEFAULT_LEG_CAPTURE_STEPS = 50
 DEFAULT_PHASE_TRANSITION_STEPS = 20
+DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION = 2
 
 DEFAULT_SWEEP_TIP_MIN_DEG = 0.0
 DEFAULT_SWEEP_TIP_MAX_DEG = 180.0
-DEFAULT_B_OSCILLATIONS_PER_SWEEP = 4.0
+DEFAULT_B_OSCILLATIONS_PER_SWEEP = 1.0
 DEFAULT_B_PHASE_OFFSET_DEG = -90.0  # starts at tip_min
 DEFAULT_B_0_TO_90_ONLY = False
 
@@ -116,27 +122,27 @@ DEFAULT_C_VISIBLE_WIN2_MAX = 255.0
 DEFAULT_C_BOUNDARY_EASE_FRAC = 0.04
 
 DEFAULT_START_X = 100.0
-DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -140.0
+DEFAULT_START_Y = 80.0
+DEFAULT_START_Z = 0.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
-DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -140.0
+DEFAULT_END_Y = 80.0
+DEFAULT_END_Z = 0.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
-DEFAULT_SAFE_APPROACH_Z = -140.0
+DEFAULT_SAFE_APPROACH_Z = 0.0
 
 DEFAULT_DWELL_BEFORE_MS = 0.1
 DEFAULT_DWELL_AFTER_MS = 0
 DEFAULT_INITIAL_SWEEP_WAIT_S = 6.0
 
 DEFAULT_BBOX_X_MIN = 0.0
-DEFAULT_BBOX_X_MAX = 200.0
-DEFAULT_BBOX_Y_MIN = -20.0
-DEFAULT_BBOX_Y_MAX = 200.0
+DEFAULT_BBOX_X_MAX = 180.0
+DEFAULT_BBOX_Y_MIN = 0.0
+DEFAULT_BBOX_Y_MAX = 170.0
 DEFAULT_BBOX_Z_MIN = -200.0
 DEFAULT_BBOX_Z_MAX = 0.0
 
@@ -153,16 +159,37 @@ DEFAULT_B_EXTRA_SETTLE_S = 0.0
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_INTER_COMMAND_DELAY_S = 0.002
 DEFAULT_SETTLED_CAPTURE_MODE = True
-DEFAULT_SETTLED_CAPTURE_BUFFER_S = 0.05
+DEFAULT_SETTLED_CAPTURE_BUFFER_S = 0.0
 DEFAULT_MIN_ESTIMATED_MOVE_TIME_S = 0.008
+DEFAULT_STREAMING_LOOKAHEAD_S = 0.12
 
 DEFAULT_FLIP_RZ_SIGN = True
 DEFAULT_Y_OFFSET_FIT = "avg_pchip"
+DEFAULT_CURVE_SET = "0-180-0"
+DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK = False
 
-DEFAULT_POST_CAMERA_CALIBRATION_FILE = "../captures/calibration_webcam_20260406_104136.npz"
-DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "../captures/photo_20260428_162904.png"
-DEFAULT_POST_THRESHOLD = 200
+DEFAULT_POST_CAMERA_CALIBRATION_FILE = str(SCRIPT_DIR / "captures" / "calibration_webcam_20260406_104136.npz")
+DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = str(SCRIPT_DIR / "captures" / "photo_20260526_200532.png")
+DEFAULT_POST_THRESHOLD = 220
 DEFAULT_POST_TIP_REFINE_MODE = "none"
+DEFAULT_POST_TIP_DETECTION_MODE = "red_dot"
+DEFAULT_POST_TRACKED_TIP_SOURCE = "auto"
+DEFAULT_POST_RED_TIP_SAT_MIN = 80
+DEFAULT_POST_RED_TIP_VAL_MIN = 80
+DEFAULT_POST_RED_TIP_MIN_AREA_PX = 20
+DEFAULT_POST_RED_TIP_MORPH_KERNEL = 1
+DEFAULT_POST_RED_TIP_HUE1_MIN = 0
+DEFAULT_POST_RED_TIP_HUE1_MAX = 10
+DEFAULT_POST_RED_TIP_HUE2_MIN = 150
+DEFAULT_POST_RED_TIP_HUE2_MAX = 179
+DEFAULT_POST_RED_TIP_SEARCH_RADIUS_PX = 320.0
+DEFAULT_POST_RED_TIP_LOCAL_MIN_AREA_PX = 10
+DEFAULT_POST_RED_TIP_DISTANCE_WEIGHT = 3.0
+DEFAULT_POST_RED_TIP_MIN_CIRCULARITY = 0.0
+DEFAULT_POST_RED_TIP_COMPONENT_SELECTION = "nearest_largest"
+DEFAULT_POST_RED_TIP_USE_RGB_EXCESS = True
+DEFAULT_POST_RED_TIP_RGB_EXCESS_MIN = 35
+DEFAULT_POST_RED_TIP_DEBUG_SAVE_MASK = True
 
 OFFPLANE_SIGN = -1.0
 
@@ -190,6 +217,8 @@ class Calibration:
     c_axis: str
 
     c_180_deg: float
+    selected_curve_set: str
+    y_offset_fit: str
 
     offplane_y_equation: Optional[str] = None
     offplane_y_r_squared: Optional[float] = None
@@ -300,6 +329,78 @@ def _extract_phase_models(data: dict) -> Tuple[dict, str]:
     return phase_models, default_phase
 
 
+def _normalize_curve_set_name(value: Any) -> str:
+    return str(value).strip().lower().replace("_", "-")
+
+
+def _extract_selected_phase_payload(
+    data: dict,
+    curve_set: str,
+    allow_global_fallback: bool = DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
+) -> Tuple[dict, str]:
+    requested_norm = _normalize_curve_set_name(curve_set)
+    curl_payload = data.get("curl_angle_specific_fit_models") or {}
+
+    if requested_norm in {"", "global", "fitmodelsbyphase", "globalfallback"}:
+        return {"fit_models_by_phase": data.get("fit_models_by_phase", {})}, "global"
+
+    if isinstance(curl_payload, dict):
+        for key, payload in curl_payload.items():
+            if _normalize_curve_set_name(key) == requested_norm and isinstance(payload, dict):
+                return payload, str(key)
+
+    if allow_global_fallback:
+        return {"fit_models_by_phase": data.get("fit_models_by_phase", {})}, "global_fallback"
+
+    available = sorted(str(k) for k in curl_payload.keys()) if isinstance(curl_payload, dict) else []
+    raise KeyError(
+        f"Calibration does not contain curl_angle_specific_fit_models['{curve_set}']. "
+        f"Available curl-specific sets: {available}. "
+        "Use --curve-set global, or pass --allow-global-curve-set-fallback."
+    )
+
+
+def _get_phase_model_descriptor(bundle: dict, quantity: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -> Optional[dict]:
+    quantity = str(quantity).strip().lower()
+    mode = str(y_offset_fit).strip().lower()
+
+    if quantity == "tip_angle":
+        candidates = [
+            "tip_angle_pchip",
+            "tip_angle",
+            "tip_angle_avg_pchip",
+            "angle_pchip",
+            "angle",
+        ]
+    elif quantity == "offplane_y":
+        if mode == "avg_pchip":
+            candidates = ["offplane_y_avg_pchip", "offplane_y_pchip", "offplane_y"]
+        elif mode == "avg_cubic":
+            candidates = ["offplane_y_avg_cubic", "offplane_y_cubic", "offplane_y"]
+        elif mode == "pchip":
+            candidates = ["offplane_y_pchip", "offplane_y", "offplane_y_avg_pchip"]
+        elif mode == "cubic":
+            candidates = ["offplane_y_cubic", "offplane_y", "offplane_y_avg_cubic"]
+        elif mode == "legacy":
+            candidates = ["offplane_y"]
+        else:
+            raise ValueError(f"Unsupported y-offset fit selection: {y_offset_fit}")
+    else:
+        candidates = [
+            f"{quantity}_pchip",
+            quantity,
+            f"{quantity}_avg_pchip",
+            f"{quantity}_cubic",
+            f"{quantity}_avg_cubic",
+        ]
+
+    for key in candidates:
+        descriptor = bundle.get(key)
+        if isinstance(descriptor, dict):
+            return descriptor
+    return None
+
+
 def _select_y_offset_model(
     fit_models: dict,
     default_phase_models: dict,
@@ -379,7 +480,12 @@ def _select_y_offset_model(
     raise ValueError(f"Unsupported y-offset fit selection: {y_offset_fit}")
 
 
-def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -> Calibration:
+def load_calibration(
+    json_path: str,
+    y_offset_fit: str = DEFAULT_Y_OFFSET_FIT,
+    curve_set: str = DEFAULT_CURVE_SET,
+    allow_global_curve_set_fallback: bool = DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
+) -> Calibration:
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Calibration JSON not found: {json_path}")
@@ -387,17 +493,22 @@ def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -
     with p.open("r") as f:
         data = json.load(f)
 
-    phase_models, default_phase = _extract_phase_models(data)
+    selected_phase_payload, selected_curve_set = _extract_selected_phase_payload(
+        data,
+        curve_set=curve_set,
+        allow_global_fallback=allow_global_curve_set_fallback,
+    )
+    phase_models, default_phase = _extract_phase_models(selected_phase_payload)
     fit_models = data.get("fit_models", {})
     cubic = data.get("cubic_coefficients", {})
     default_phase_models = phase_models.get(default_phase, {})
 
-    r_model = fit_models.get("r") or default_phase_models.get("r") or legacy_poly_model(
+    r_model = _get_phase_model_descriptor(default_phase_models, "r", y_offset_fit=y_offset_fit) or fit_models.get("r") or legacy_poly_model(
         cubic.get("r_coeffs"),
         cubic.get("r_equation"),
         "r",
     )
-    z_model = fit_models.get("z") or default_phase_models.get("z") or legacy_poly_model(
+    z_model = _get_phase_model_descriptor(default_phase_models, "z", y_offset_fit=y_offset_fit) or fit_models.get("z") or legacy_poly_model(
         cubic.get("z_coeffs"),
         cubic.get("z_equation"),
         "z",
@@ -408,7 +519,7 @@ def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -
         cubic=cubic,
         y_offset_fit=y_offset_fit,
     )
-    tip_angle_model = fit_models.get("tip_angle") or default_phase_models.get("tip_angle") or legacy_poly_model(
+    tip_angle_model = _get_phase_model_descriptor(default_phase_models, "tip_angle", y_offset_fit=y_offset_fit) or fit_models.get("tip_angle") or legacy_poly_model(
         cubic.get("tip_angle_coeffs"),
         cubic.get("tip_angle_equation"),
         "tip_angle_deg",
@@ -447,6 +558,8 @@ def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -
         b_axis=b_axis,
         c_axis=c_axis,
         c_180_deg=c_180,
+        selected_curve_set=selected_curve_set,
+        y_offset_fit=str(y_offset_fit),
         offplane_y_equation=cubic.get("offplane_y_equation"),
         offplane_y_r_squared=(
             None if cubic.get("offplane_y_r_squared") is None
@@ -457,7 +570,11 @@ def load_calibration(json_path: str, y_offset_fit: str = DEFAULT_Y_OFFSET_FIT) -
 
 def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Any:
     phase_name = _normalize_motion_phase_name(motion_phase) or cal.default_motion_phase
-    phase_model = cal.phase_models.get(phase_name, {}).get(model_name)
+    phase_model = _get_phase_model_descriptor(
+        cal.phase_models.get(phase_name, {}),
+        model_name,
+        y_offset_fit=cal.y_offset_fit,
+    )
     if phase_model is not None:
         return phase_model
 
@@ -608,6 +725,24 @@ def build_tip_angle_inverse_table(
     return angle_unique, b_unique
 
 
+def build_tip_angle_phase_samples(
+    cal: Calibration,
+    num_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
+    motion_phase: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if cal.tip_angle_model is None:
+        raise ValueError(
+            "This motion mode requires a tip-angle fit model in the calibration JSON."
+        )
+
+    ns = max(1000, int(num_samples))
+    b_samples = np.linspace(float(cal.b_min), float(cal.b_max), ns, dtype=float)
+    angle_samples = np.asarray(eval_tip_angle_deg(cal, b_samples, motion_phase=motion_phase), dtype=float)
+    if b_samples.size < 2 or angle_samples.size < 2:
+        raise ValueError("Could not build usable phase tip-angle samples from calibration.")
+    return b_samples, angle_samples
+
+
 def tip_angle_deg_to_b_clipped(
     requested_tip_angle_deg: float,
     angle_table_deg: np.ndarray,
@@ -618,6 +753,58 @@ def tip_angle_deg_to_b_clipped(
     used_angle = clamp(float(requested_tip_angle_deg), amin, amax)
     b_val = float(np.interp(used_angle, angle_table_deg, b_table))
     return b_val, used_angle
+
+
+def tip_angle_deg_to_b_continuous(
+    requested_tip_angle_deg: float,
+    b_samples: np.ndarray,
+    angle_samples_deg: np.ndarray,
+    prev_b: Optional[float] = None,
+) -> Tuple[float, float]:
+    angle_arr = np.asarray(angle_samples_deg, dtype=float).reshape(-1)
+    b_arr = np.asarray(b_samples, dtype=float).reshape(-1)
+    if angle_arr.size != b_arr.size or angle_arr.size < 2:
+        raise ValueError("Continuous tip-angle inversion requires matched dense B/angle samples.")
+
+    amin = float(np.nanmin(angle_arr))
+    amax = float(np.nanmax(angle_arr))
+    used_angle = clamp(float(requested_tip_angle_deg), amin, amax)
+
+    candidates: List[float] = []
+    tol = 1e-9
+    for i in range(len(angle_arr) - 1):
+        a0 = float(angle_arr[i])
+        a1 = float(angle_arr[i + 1])
+        b0 = float(b_arr[i])
+        b1 = float(b_arr[i + 1])
+        if not (np.isfinite(a0) and np.isfinite(a1) and np.isfinite(b0) and np.isfinite(b1)):
+            continue
+        lo = min(a0, a1) - tol
+        hi = max(a0, a1) + tol
+        if used_angle < lo or used_angle > hi:
+            continue
+        if abs(a1 - a0) <= tol:
+            candidates.append(0.5 * (b0 + b1))
+            continue
+        t = (used_angle - a0) / (a1 - a0)
+        if -tol <= t <= 1.0 + tol:
+            t = clamp(t, 0.0, 1.0)
+            candidates.append((1.0 - t) * b0 + t * b1)
+
+    if not candidates:
+        nearest_idx = int(np.nanargmin(np.abs(angle_arr - used_angle)))
+        return float(b_arr[nearest_idx]), used_angle
+
+    cand_arr = np.asarray(candidates, dtype=float)
+    cand_arr = np.unique(np.round(cand_arr, decimals=9))
+    if prev_b is not None and np.isfinite(prev_b):
+        pick_idx = int(np.argmin(np.abs(cand_arr - float(prev_b))))
+        return float(cand_arr[pick_idx]), used_angle
+
+    nearest_idx = int(np.nanargmin(np.abs(angle_arr - used_angle)))
+    seed_b = float(b_arr[nearest_idx])
+    pick_idx = int(np.argmin(np.abs(cand_arr - seed_b)))
+    return float(cand_arr[pick_idx]), used_angle
 
 
 def _smooth_cosine_edge_map_01(u: float, edge_frac: float) -> float:
@@ -648,9 +835,29 @@ def _c_deg_for_leg_phase(
     c_end_deg: float,
     boundary_ease_frac: float,
 ) -> float:
-    s = _smooth_cosine_edge_map_01(leg_phase_01, boundary_ease_frac)
+    s = _smoothstep01(_smooth_cosine_edge_map_01(leg_phase_01, boundary_ease_frac))
     c = (1.0 - s) * float(c_start_deg) + s * float(c_end_deg)
     return clamp_c_bounded(c)
+
+
+def _tip_angle_leg_deg(
+    leg_phase_01: float,
+    tip_start_deg: float,
+    tip_end_deg: float,
+    boundary_ease_frac: float,
+) -> float:
+    s = _smoothstep01(_smooth_cosine_edge_map_01(leg_phase_01, boundary_ease_frac))
+    return float((1.0 - s) * float(tip_start_deg) + s * float(tip_end_deg))
+
+
+def _tip_angle_monotone_cycle_deg(
+    cycle_phase_01: float,
+    tip_min_deg: float,
+    tip_max_deg: float,
+    boundary_ease_frac: float,
+) -> float:
+    s = _smoothstep01(_smooth_cosine_edge_map_01(cycle_phase_01, boundary_ease_frac))
+    return float((1.0 - s) * float(tip_min_deg) + s * float(tip_max_deg))
 
 
 def _tip_angle_cycle_deg(
@@ -664,6 +871,21 @@ def _tip_angle_cycle_deg(
     amp = 0.5 * (float(tip_max_deg) - float(tip_min_deg))
     ph = math.radians(float(phase_offset_deg))
     return float(center + amp * math.sin(2.0 * math.pi * float(oscillations_per_cycle) * float(cycle_phase_01) + ph))
+
+
+def accel_limited_move_time_seconds(distance_mm: float, feedrate_mm_min: float, accel_mm_s2: float) -> float:
+    distance = abs(float(distance_mm))
+    v = abs(float(feedrate_mm_min)) / 60.0
+    accel = max(0.0, float(accel_mm_s2))
+    if distance <= 1e-12 or v <= 1e-12:
+        return 0.0
+    if accel <= 1e-12:
+        return distance / v
+    accel_distance = (v ** 2) / (2.0 * accel)
+    if distance <= accel_distance:
+        return math.sqrt((2.0 * distance) / accel)
+    t_accel = v / accel
+    return t_accel + ((distance - accel_distance) / v)
 
 
 def _is_c_visible_high_tip(
@@ -797,6 +1019,7 @@ def _append_recorded_phase_leg(
 ):
     nmove = max(1, int(move_steps))
     ncap = max(1, int(capture_steps))
+    monotone_tip_leg = float(b_oscillations_per_cycle) <= 1.0 + 1e-9
 
     capture_move_indices: Set[int] = set()
 
@@ -809,13 +1032,21 @@ def _append_recorded_phase_leg(
             c_end_deg=c_end_deg,
             boundary_ease_frac=boundary_ease_frac,
         )
-        req_tip = _tip_angle_cycle_deg(
-            cycle_phase_01=cycle_phase,
-            tip_min_deg=tip_min_deg,
-            tip_max_deg=tip_max_deg,
-            oscillations_per_cycle=b_oscillations_per_cycle,
-            phase_offset_deg=b_phase_offset_deg,
-        )
+        if monotone_tip_leg:
+            req_tip = _tip_angle_monotone_cycle_deg(
+                cycle_phase_01=cycle_phase,
+                tip_min_deg=tip_min_deg,
+                tip_max_deg=tip_max_deg,
+                boundary_ease_frac=tip_boundary_ease_frac,
+            )
+        else:
+            req_tip = _tip_angle_cycle_deg(
+                cycle_phase_01=cycle_phase,
+                tip_min_deg=tip_min_deg,
+                tip_max_deg=tip_max_deg,
+                oscillations_per_cycle=b_oscillations_per_cycle,
+                phase_offset_deg=b_phase_offset_deg,
+            )
         if _capture_allowed(
             tip_angle_deg=req_tip,
             c_deg=c_cmd,
@@ -835,18 +1066,25 @@ def _append_recorded_phase_leg(
     for i in range(i_start, nmove + 1):
         leg_phase = i / float(nmove)
         cycle_phase = (1.0 - leg_phase) * float(cycle_phase_start) + leg_phase * float(cycle_phase_end)
-        tip_phase = _smooth_cosine_edge_map_01(leg_phase, tip_boundary_ease_frac)
-        cycle_phase_for_tip = (
-            (1.0 - tip_phase) * float(cycle_phase_start) + tip_phase * float(cycle_phase_end)
-        )
-
-        req_tip = _tip_angle_cycle_deg(
-            cycle_phase_01=cycle_phase_for_tip,
-            tip_min_deg=tip_min_deg,
-            tip_max_deg=tip_max_deg,
-            oscillations_per_cycle=b_oscillations_per_cycle,
-            phase_offset_deg=b_phase_offset_deg,
-        )
+        if monotone_tip_leg:
+            req_tip = _tip_angle_monotone_cycle_deg(
+                cycle_phase_01=cycle_phase,
+                tip_min_deg=tip_min_deg,
+                tip_max_deg=tip_max_deg,
+                boundary_ease_frac=tip_boundary_ease_frac,
+            )
+        else:
+            tip_phase = _smoothstep01(_smooth_cosine_edge_map_01(leg_phase, tip_boundary_ease_frac))
+            cycle_phase_for_tip = (
+                (1.0 - tip_phase) * float(cycle_phase_start) + tip_phase * float(cycle_phase_end)
+            )
+            req_tip = _tip_angle_cycle_deg(
+                cycle_phase_01=cycle_phase_for_tip,
+                tip_min_deg=tip_min_deg,
+                tip_max_deg=tip_max_deg,
+                oscillations_per_cycle=b_oscillations_per_cycle,
+                phase_offset_deg=b_phase_offset_deg,
+            )
         b_cmd, used_tip = tip_angle_deg_to_b_clipped(
             requested_tip_angle_deg=req_tip,
             angle_table_deg=angle_table_deg,
@@ -942,21 +1180,33 @@ def _append_phase_transition_ramp(
     leg_name: str,
     motion_phase: str,
     steps: int,
+    stage_xyz_start: Optional[np.ndarray] = None,
+    stage_xyz_end: Optional[np.ndarray] = None,
+    tip_angle_start_deg: Optional[float] = None,
+    tip_angle_end_deg: Optional[float] = None,
     flip_rz_sign: bool = False,
 ):
     nsteps = max(1, int(steps))
+    stage_start = None if stage_xyz_start is None else np.asarray(stage_xyz_start, dtype=float)
+    stage_end = None if stage_xyz_end is None else np.asarray(stage_xyz_end, dtype=float)
     for i in range(1, nsteps + 1):
         s = _smoothstep01(i / float(nsteps))
         b_i = (1.0 - s) * float(b_start) + s * float(b_end)
-        stage_xyz = stage_xyz_for_fixed_tip(
-            cal=cal,
-            p_tip_xyz=p_tip_fixed,
-            b=float(b_i),
-            c_deg=float(c),
-            flip_rz_sign=flip_rz_sign,
-            motion_phase=motion_phase,
-        )
-        tip_angle_deg = float(eval_tip_angle_deg(cal, float(b_i), motion_phase=motion_phase))
+        if stage_start is not None and stage_end is not None:
+            stage_xyz = (1.0 - s) * stage_start + s * stage_end
+        else:
+            stage_xyz = stage_xyz_for_fixed_tip(
+                cal=cal,
+                p_tip_xyz=p_tip_fixed,
+                b=float(b_i),
+                c_deg=float(c),
+                flip_rz_sign=flip_rz_sign,
+                motion_phase=motion_phase,
+            )
+        if tip_angle_start_deg is not None and tip_angle_end_deg is not None:
+            tip_angle_deg = (1.0 - s) * float(tip_angle_start_deg) + s * float(tip_angle_end_deg)
+        else:
+            tip_angle_deg = float(eval_tip_angle_deg(cal, float(b_i), motion_phase=motion_phase))
         traj.append(
             TrajectoryPoint(
                 b=float(b_i),
@@ -970,6 +1220,74 @@ def _append_phase_transition_ramp(
                 leg_name=str(leg_name),
                 motion_phase=str(motion_phase),
             )
+        )
+
+
+def _append_multi_sweep_monotone_leg(
+    traj: List[TrajectoryPoint],
+    cal: Calibration,
+    p_tip_fixed: np.ndarray,
+    angle_table_deg: np.ndarray,
+    b_table: np.ndarray,
+    leg_name: str,
+    c_first_deg: float,
+    c_second_deg: float,
+    cycle_phase_start: float,
+    cycle_phase_end: float,
+    move_steps_per_sweep: int,
+    capture_steps_per_sweep: int,
+    tip_min_deg: float,
+    tip_max_deg: float,
+    tip_full_visible_min_deg: float,
+    tip_full_visible_max_deg: float,
+    vis1_min_deg: float,
+    vis1_max_deg: float,
+    vis2_min_deg: float,
+    vis2_max_deg: float,
+    boundary_ease_frac: float,
+    tip_boundary_ease_frac: float,
+    forced_motion_phase: str,
+    c_two_way_sweeps: int,
+    flip_rz_sign: bool = False,
+    include_first_point: bool = False,
+):
+    n_two_way = max(1, int(c_two_way_sweeps))
+    n_sublegs = max(1, 2 * n_two_way - 1)
+    dc = float(cycle_phase_end) - float(cycle_phase_start)
+
+    for subleg_idx in range(n_sublegs):
+        leg_c_start = float(c_first_deg if (subleg_idx % 2 == 0) else c_second_deg)
+        leg_c_end = float(c_second_deg if (subleg_idx % 2 == 0) else c_first_deg)
+        sub_phase_start = float(cycle_phase_start) + dc * (float(subleg_idx) / float(n_sublegs))
+        sub_phase_end = float(cycle_phase_start) + dc * (float(subleg_idx + 1) / float(n_sublegs))
+        _append_recorded_phase_leg(
+            traj=traj,
+            cal=cal,
+            p_tip_fixed=p_tip_fixed,
+            angle_table_deg=angle_table_deg,
+            b_table=b_table,
+            leg_name=leg_name,
+            c_start_deg=leg_c_start,
+            c_end_deg=leg_c_end,
+            cycle_phase_start=sub_phase_start,
+            cycle_phase_end=sub_phase_end,
+            move_steps=int(move_steps_per_sweep),
+            capture_steps=int(capture_steps_per_sweep),
+            tip_min_deg=float(tip_min_deg),
+            tip_max_deg=float(tip_max_deg),
+            b_oscillations_per_cycle=1.0,
+            b_phase_offset_deg=-90.0,
+            tip_full_visible_min_deg=float(tip_full_visible_min_deg),
+            tip_full_visible_max_deg=float(tip_full_visible_max_deg),
+            vis1_min_deg=float(vis1_min_deg),
+            vis1_max_deg=float(vis1_max_deg),
+            vis2_min_deg=float(vis2_min_deg),
+            vis2_max_deg=float(vis2_max_deg),
+            boundary_ease_frac=float(boundary_ease_frac),
+            tip_boundary_ease_frac=float(tip_boundary_ease_frac),
+            forced_motion_phase=str(forced_motion_phase),
+            flip_rz_sign=flip_rz_sign,
+            include_first_point=bool(include_first_point and subleg_idx == 0),
         )
 
 
@@ -992,8 +1310,20 @@ def generate_cyclic_visibility_gated_trajectory(
     boundary_ease_frac: float = DEFAULT_C_BOUNDARY_EASE_FRAC,
     inverse_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
     phase_transition_steps: int = DEFAULT_PHASE_TRANSITION_STEPS,
+    c_two_way_sweeps_per_b_oscillation: int = DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION,
     flip_rz_sign: bool = False,
 ) -> Tuple[List[TrajectoryPoint], dict]:
+    pull_b_dense, pull_angle_dense = build_tip_angle_phase_samples(
+        cal=cal,
+        num_samples=int(inverse_samples),
+        motion_phase="pull",
+    )
+    release_b_dense, release_angle_dense = build_tip_angle_phase_samples(
+        cal=cal,
+        num_samples=int(inverse_samples),
+        motion_phase="release",
+    )
+
     pull_angle_table_deg, pull_b_table = build_tip_angle_inverse_table(
         cal=cal,
         num_samples=int(inverse_samples),
@@ -1016,7 +1346,9 @@ def generate_cyclic_visibility_gated_trajectory(
         used_tip_min, used_tip_max = used_tip_max, used_tip_min
 
     # One cycle = recorded curl rotation + reposition + recorded uncurl rotation + reposition.
-    b_oscillations_per_cycle = 0.5
+    # This parameter is intentionally "per sweep", so each one-way C leg gets the requested count.
+    b_oscillations_per_cycle = float(b_oscillations_per_sweep)
+    monotone_multi_sweep = float(b_oscillations_per_cycle) <= 1.0 + 1e-9
 
     traj: List[TrajectoryPoint] = []
 
@@ -1051,104 +1383,209 @@ def generate_cyclic_visibility_gated_trajectory(
     )
 
     for rep in range(max(1, int(repeats))):
-        _append_recorded_phase_leg(
-            traj=traj,
-            cal=cal,
-            p_tip_fixed=p_tip_fixed,
-            angle_table_deg=pull_angle_table_deg,
-            b_table=pull_b_table,
-            leg_name="curl_record",
-            c_start_deg=-360.0,
-            c_end_deg=360.0,
-            cycle_phase_start=0.0,
-            cycle_phase_end=1.0,
-            move_steps=int(leg_move_steps),
-            capture_steps=int(leg_capture_steps),
-            tip_min_deg=float(used_tip_min),
-            tip_max_deg=float(used_tip_max),
-            b_oscillations_per_cycle=0.5,
-            b_phase_offset_deg=-90.0,
-            tip_full_visible_min_deg=float(tip_full_visible_min_deg),
-            tip_full_visible_max_deg=float(tip_full_visible_max_deg),
-            vis1_min_deg=float(vis1_min_deg),
-            vis1_max_deg=float(vis1_max_deg),
-            vis2_min_deg=float(vis2_min_deg),
-            vis2_max_deg=float(vis2_max_deg),
-            boundary_ease_frac=float(boundary_ease_frac),
-            tip_boundary_ease_frac=float(boundary_ease_frac),
-            forced_motion_phase="pull",
-            flip_rz_sign=flip_rz_sign,
-            include_first_point=False,
-        )
+        if monotone_multi_sweep:
+            _append_multi_sweep_monotone_leg(
+                traj=traj,
+                cal=cal,
+                p_tip_fixed=p_tip_fixed,
+                angle_table_deg=pull_angle_table_deg,
+                b_table=pull_b_table,
+                leg_name="curl_record",
+                c_first_deg=-360.0,
+                c_second_deg=360.0,
+                cycle_phase_start=0.0,
+                cycle_phase_end=1.0,
+                move_steps_per_sweep=int(leg_move_steps),
+                capture_steps_per_sweep=int(leg_capture_steps),
+                tip_min_deg=float(used_tip_min),
+                tip_max_deg=float(used_tip_max),
+                tip_full_visible_min_deg=float(tip_full_visible_min_deg),
+                tip_full_visible_max_deg=float(tip_full_visible_max_deg),
+                vis1_min_deg=float(vis1_min_deg),
+                vis1_max_deg=float(vis1_max_deg),
+                vis2_min_deg=float(vis2_min_deg),
+                vis2_max_deg=float(vis2_max_deg),
+                boundary_ease_frac=float(boundary_ease_frac),
+                tip_boundary_ease_frac=float(boundary_ease_frac),
+                forced_motion_phase="pull",
+                c_two_way_sweeps=int(c_two_way_sweeps_per_b_oscillation),
+                flip_rz_sign=flip_rz_sign,
+                include_first_point=bool(rep > 0),
+            )
+        else:
+            _append_recorded_phase_leg(
+                traj=traj,
+                cal=cal,
+                p_tip_fixed=p_tip_fixed,
+                angle_table_deg=pull_angle_table_deg,
+                b_table=pull_b_table,
+                leg_name="curl_record",
+                c_start_deg=-360.0,
+                c_end_deg=360.0,
+                cycle_phase_start=0.0,
+                cycle_phase_end=1.0,
+                move_steps=int(leg_move_steps),
+                capture_steps=int(leg_capture_steps),
+                tip_min_deg=float(used_tip_min),
+                tip_max_deg=float(used_tip_max),
+                b_oscillations_per_cycle=b_oscillations_per_cycle,
+                b_phase_offset_deg=-90.0,
+                tip_full_visible_min_deg=float(tip_full_visible_min_deg),
+                tip_full_visible_max_deg=float(tip_full_visible_max_deg),
+                vis1_min_deg=float(vis1_min_deg),
+                vis1_max_deg=float(vis1_max_deg),
+                vis2_min_deg=float(vis2_min_deg),
+                vis2_max_deg=float(vis2_max_deg),
+                boundary_ease_frac=float(boundary_ease_frac),
+                tip_boundary_ease_frac=float(boundary_ease_frac),
+                forced_motion_phase="pull",
+                flip_rz_sign=flip_rz_sign,
+                include_first_point=bool(monotone_multi_sweep and rep > 0),
+            )
 
-        pull_b_end = float(traj[-1].b)
+        pull_end = traj[-1]
+        pull_b_end = float(pull_end.b)
+        pull_tip_end = float(
+            pull_end.tip_angle_deg
+            if pull_end.tip_angle_deg is not None
+            else eval_tip_angle_deg(cal, float(pull_end.b), motion_phase="pull")
+        )
         release_b_start, release_tip_start = tip_angle_deg_to_b_clipped(
             used_tip_max,
             release_angle_table_deg,
             release_b_table,
         )
-        _append_phase_transition_ramp(
-            traj=traj,
-            cal=cal,
-            p_tip_fixed=p_tip_fixed,
-            b_start=float(pull_b_end),
-            b_end=float(release_b_start),
-            c=360.0,
-            leg_name="to_uncurl_transition",
-            motion_phase="release",
-            steps=int(phase_transition_steps),
-            flip_rz_sign=flip_rz_sign,
-        )
-
-        _append_recorded_phase_leg(
-            traj=traj,
-            cal=cal,
-            p_tip_fixed=p_tip_fixed,
-            angle_table_deg=release_angle_table_deg,
-            b_table=release_b_table,
-            leg_name="uncurl_record",
-            c_start_deg=360.0,
-            c_end_deg=-360.0,
-            cycle_phase_start=1.0,
-            cycle_phase_end=0.0,
-            move_steps=int(leg_move_steps),
-            capture_steps=int(leg_capture_steps),
-            tip_min_deg=float(used_tip_min),
-            tip_max_deg=float(used_tip_max),
-            b_oscillations_per_cycle=0.5,
-            b_phase_offset_deg=-90.0,
-            tip_full_visible_min_deg=float(tip_full_visible_min_deg),
-            tip_full_visible_max_deg=float(tip_full_visible_max_deg),
-            vis1_min_deg=float(vis1_min_deg),
-            vis1_max_deg=float(vis1_max_deg),
-            vis2_min_deg=float(vis2_min_deg),
-            vis2_max_deg=float(vis2_max_deg),
-            boundary_ease_frac=float(boundary_ease_frac),
-            tip_boundary_ease_frac=float(boundary_ease_frac),
-            forced_motion_phase="release",
-            flip_rz_sign=flip_rz_sign,
-            include_first_point=False,
-        )
-
-        if rep + 1 < max(1, int(repeats)):
-            release_b_end = float(traj[-1].b)
-            pull_b_start, _ = tip_angle_deg_to_b_clipped(
-                used_tip_min,
-                pull_angle_table_deg,
-                pull_b_table,
+        if monotone_multi_sweep:
+            # Match the 0-180-0 circle branch switch behavior: do not insert an
+            # explicit jump point. Start the next branch directly at the shared
+            # boundary sample so the geometry changes inside the sampled motion.
+            pass
+        else:
+            release_stage_start = stage_xyz_for_fixed_tip(
+                cal=cal,
+                p_tip_xyz=p_tip_fixed,
+                b=float(release_b_start),
+                c_deg=360.0,
+                flip_rz_sign=flip_rz_sign,
+                motion_phase="release",
             )
             _append_phase_transition_ramp(
                 traj=traj,
                 cal=cal,
                 p_tip_fixed=p_tip_fixed,
-                b_start=float(release_b_end),
-                b_end=float(pull_b_start),
-                c=-360.0,
-                leg_name="to_curl_transition",
-                motion_phase="pull",
+                b_start=float(pull_b_end),
+                b_end=float(release_b_start),
+                c=360.0,
+                leg_name="to_uncurl_transition",
+                motion_phase="release",
                 steps=int(phase_transition_steps),
+                stage_xyz_start=np.asarray(pull_end.stage_xyz, dtype=float),
+                stage_xyz_end=release_stage_start,
+                tip_angle_start_deg=float(pull_tip_end),
+                tip_angle_end_deg=float(release_tip_start),
                 flip_rz_sign=flip_rz_sign,
             )
+
+        if monotone_multi_sweep:
+            _append_multi_sweep_monotone_leg(
+                traj=traj,
+                cal=cal,
+                p_tip_fixed=p_tip_fixed,
+                angle_table_deg=release_angle_table_deg,
+                b_table=release_b_table,
+                leg_name="uncurl_record",
+                c_first_deg=360.0,
+                c_second_deg=-360.0,
+                cycle_phase_start=1.0,
+                cycle_phase_end=0.0,
+                move_steps_per_sweep=int(leg_move_steps),
+                capture_steps_per_sweep=int(leg_capture_steps),
+                tip_min_deg=float(used_tip_min),
+                tip_max_deg=float(used_tip_max),
+                tip_full_visible_min_deg=float(tip_full_visible_min_deg),
+                tip_full_visible_max_deg=float(tip_full_visible_max_deg),
+                vis1_min_deg=float(vis1_min_deg),
+                vis1_max_deg=float(vis1_max_deg),
+                vis2_min_deg=float(vis2_min_deg),
+                vis2_max_deg=float(vis2_max_deg),
+                boundary_ease_frac=float(boundary_ease_frac),
+                tip_boundary_ease_frac=float(boundary_ease_frac),
+                forced_motion_phase="release",
+                c_two_way_sweeps=int(c_two_way_sweeps_per_b_oscillation),
+                flip_rz_sign=flip_rz_sign,
+                include_first_point=True,
+            )
+        else:
+            _append_recorded_phase_leg(
+                traj=traj,
+                cal=cal,
+                p_tip_fixed=p_tip_fixed,
+                angle_table_deg=release_angle_table_deg,
+                b_table=release_b_table,
+                leg_name="uncurl_record",
+                c_start_deg=360.0,
+                c_end_deg=-360.0,
+                cycle_phase_start=1.0,
+                cycle_phase_end=0.0,
+                move_steps=int(leg_move_steps),
+                capture_steps=int(leg_capture_steps),
+                tip_min_deg=float(used_tip_min),
+                tip_max_deg=float(used_tip_max),
+                b_oscillations_per_cycle=b_oscillations_per_cycle,
+                b_phase_offset_deg=-90.0,
+                tip_full_visible_min_deg=float(tip_full_visible_min_deg),
+                tip_full_visible_max_deg=float(tip_full_visible_max_deg),
+                vis1_min_deg=float(vis1_min_deg),
+                vis1_max_deg=float(vis1_max_deg),
+                vis2_min_deg=float(vis2_min_deg),
+                vis2_max_deg=float(vis2_max_deg),
+                boundary_ease_frac=float(boundary_ease_frac),
+                tip_boundary_ease_frac=float(boundary_ease_frac),
+                forced_motion_phase="release",
+                flip_rz_sign=flip_rz_sign,
+                include_first_point=bool(monotone_multi_sweep),
+            )
+
+        if rep + 1 < max(1, int(repeats)):
+            release_end = traj[-1]
+            release_b_end = float(release_end.b)
+            release_tip_end = float(
+                release_end.tip_angle_deg
+                if release_end.tip_angle_deg is not None
+                else eval_tip_angle_deg(cal, float(release_end.b), motion_phase="release")
+            )
+            pull_b_start, _ = tip_angle_deg_to_b_clipped(
+                used_tip_min,
+                pull_angle_table_deg,
+                pull_b_table,
+            )
+            if monotone_multi_sweep:
+                pass
+            else:
+                pull_stage_start = stage_xyz_for_fixed_tip(
+                    cal=cal,
+                    p_tip_xyz=p_tip_fixed,
+                    b=float(pull_b_start),
+                    c_deg=-360.0,
+                    flip_rz_sign=flip_rz_sign,
+                    motion_phase="pull",
+                )
+                _append_phase_transition_ramp(
+                    traj=traj,
+                    cal=cal,
+                    p_tip_fixed=p_tip_fixed,
+                    b_start=float(release_b_end),
+                    b_end=float(pull_b_start),
+                    c=-360.0,
+                    leg_name="to_curl_transition",
+                    motion_phase="pull",
+                    steps=int(phase_transition_steps),
+                    stage_xyz_start=np.asarray(release_end.stage_xyz, dtype=float),
+                    stage_xyz_end=pull_stage_start,
+                    tip_angle_start_deg=float(release_tip_end),
+                    tip_angle_end_deg=float(used_tip_min),
+                    flip_rz_sign=flip_rz_sign,
+                )
 
     n_captures = int(sum(1 for pt in traj if pt.capture_image))
     meta = {
@@ -1160,8 +1597,9 @@ def generate_cyclic_visibility_gated_trajectory(
         "leg_move_steps": int(leg_move_steps),
         "leg_capture_steps": int(leg_capture_steps),
         "boundary_ease_frac": float(boundary_ease_frac),
-        "b_oscillations_per_sweep": 0.5,
-        "b_oscillations_per_cycle": 0.5,
+        "b_oscillations_per_sweep": float(b_oscillations_per_sweep),
+        "b_oscillations_per_cycle": float(b_oscillations_per_cycle),
+        "c_two_way_sweeps_per_b_oscillation": int(c_two_way_sweeps_per_b_oscillation),
         "b_phase_offset_deg": float(b_phase_offset_deg),
         "capture_tip_full_visible_min_deg": float(tip_full_visible_min_deg),
         "capture_tip_full_visible_max_deg": float(tip_full_visible_max_deg),
@@ -1173,6 +1611,220 @@ def generate_cyclic_visibility_gated_trajectory(
         "flip_rz_sign": bool(flip_rz_sign),
         "phase_sequence": ["pull_record", "release_record"],
         "phase_transition_steps": int(phase_transition_steps),
+        "phase_transition_mode": (
+            "direct_branch_boundary_sample" if monotone_multi_sweep else "blended_ramp"
+        ),
+    }
+    return traj, meta
+
+
+def generate_fast_routine_trajectory(
+    cal: Calibration,
+    p_tip_fixed: np.ndarray,
+    repeats: int = DEFAULT_ROUTINE_REPEATS,
+    move_steps_per_routine: int = DEFAULT_LEG_MOVE_STEPS * 2,
+    capture_steps_per_routine: int = DEFAULT_LEG_CAPTURE_STEPS * 2,
+    tip_min_deg: float = DEFAULT_SWEEP_TIP_MIN_DEG,
+    tip_max_deg: float = DEFAULT_SWEEP_TIP_MAX_DEG,
+    tip_full_visible_min_deg: float = DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MIN_DEG,
+    tip_full_visible_max_deg: float = DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MAX_DEG,
+    vis1_min_deg: float = DEFAULT_C_VISIBLE_WIN1_MIN,
+    vis1_max_deg: float = DEFAULT_C_VISIBLE_WIN1_MAX,
+    vis2_min_deg: float = DEFAULT_C_VISIBLE_WIN2_MIN,
+    vis2_max_deg: float = DEFAULT_C_VISIBLE_WIN2_MAX,
+    inverse_samples: int = DEFAULT_CUSTOM_INV_SAMPLES,
+    flip_rz_sign: bool = False,
+) -> Tuple[List[TrajectoryPoint], dict]:
+    c_cycles_per_routine = 5.0
+    b_cycles_per_routine = 3.0
+    c_center_deg = 0.0
+    c_amp_deg = 360.0
+    b_phase_offset_deg = -90.0
+
+    pull_b_dense, pull_angle_dense = build_tip_angle_phase_samples(
+        cal=cal,
+        num_samples=int(inverse_samples),
+        motion_phase="pull",
+    )
+    release_b_dense, release_angle_dense = build_tip_angle_phase_samples(
+        cal=cal,
+        num_samples=int(inverse_samples),
+        motion_phase="release",
+    )
+
+    pull_angle_table_deg, pull_b_table = build_tip_angle_inverse_table(
+        cal=cal,
+        num_samples=int(inverse_samples),
+        motion_phase="pull",
+    )
+    release_angle_table_deg, release_b_table = build_tip_angle_inverse_table(
+        cal=cal,
+        num_samples=int(inverse_samples),
+        motion_phase="release",
+    )
+
+    available_tip_min = max(float(pull_angle_table_deg[0]), float(release_angle_table_deg[0]))
+    available_tip_max = min(float(pull_angle_table_deg[-1]), float(release_angle_table_deg[-1]))
+    if available_tip_min >= available_tip_max:
+        raise ValueError("Pull/release tip-angle ranges do not overlap enough to build a fast routine trajectory.")
+
+    used_tip_min = clamp(float(tip_min_deg), available_tip_min, available_tip_max)
+    used_tip_max = clamp(float(tip_max_deg), available_tip_min, available_tip_max)
+    if used_tip_min > used_tip_max:
+        used_tip_min, used_tip_max = used_tip_max, used_tip_min
+
+    nmove = max(8, int(move_steps_per_routine))
+    ncap = max(4, int(capture_steps_per_routine))
+    capture_indices: Set[Tuple[int, int]] = set()
+    repeats = max(1, int(repeats))
+
+    def c_for_phase(t01: float) -> float:
+        return float(c_center_deg + c_amp_deg * math.sin(2.0 * math.pi * c_cycles_per_routine * float(t01)))
+
+    def tip_for_phase(t01: float) -> float:
+        return _tip_angle_cycle_deg(
+            cycle_phase_01=float(t01),
+            tip_min_deg=used_tip_min,
+            tip_max_deg=used_tip_max,
+            oscillations_per_cycle=b_cycles_per_routine,
+            phase_offset_deg=b_phase_offset_deg,
+        )
+
+    for rep in range(repeats):
+        for j in range(1, ncap + 1):
+            t01 = j / float(ncap)
+            c_cmd = c_for_phase(t01)
+            tip_cmd = tip_for_phase(t01)
+            if _capture_allowed(
+                tip_angle_deg=tip_cmd,
+                c_deg=c_cmd,
+                tip_full_visible_min_deg=float(tip_full_visible_min_deg),
+                tip_full_visible_max_deg=float(tip_full_visible_max_deg),
+                vis1_min_deg=float(vis1_min_deg),
+                vis1_max_deg=float(vis1_max_deg),
+                vis2_min_deg=float(vis2_min_deg),
+                vis2_max_deg=float(vis2_max_deg),
+            ):
+                idx = int(round(t01 * nmove))
+                idx = max(1, min(nmove, idx))
+                capture_indices.add((rep, idx))
+
+    raw_points: List[dict] = []
+    for rep in range(repeats):
+        i_start = 0 if rep == 0 else 1
+        for i in range(i_start, nmove + 1):
+            t01 = i / float(nmove)
+            raw_points.append(
+                {
+                    "rep": rep,
+                    "i": i,
+                    "routine_phase_01": float(t01),
+                    "c": c_for_phase(t01),
+                    "tip": tip_for_phase(t01),
+                    "capture_image": ((rep, i) in capture_indices),
+                }
+            )
+
+    traj: List[TrajectoryPoint] = []
+    segment_stage_offset = np.zeros(3, dtype=float)
+    prev_phase: Optional[str] = None
+    prev_stage_xyz: Optional[np.ndarray] = None
+    prev_b_cmd: Optional[float] = None
+    phase_switch_count = 0
+
+    for idx, point in enumerate(raw_points):
+        prev_tip = None if idx == 0 else float(raw_points[idx - 1]["tip"])
+        next_tip = None if idx + 1 >= len(raw_points) else float(raw_points[idx + 1]["tip"])
+        deltas = []
+        if prev_tip is not None:
+            deltas.append(float(point["tip"]) - prev_tip)
+        if next_tip is not None:
+            deltas.append(next_tip - float(point["tip"]))
+        motion_phase = cal.default_motion_phase
+        for delta in deltas:
+            if abs(delta) <= 1e-9:
+                continue
+            motion_phase = "pull" if delta > 0.0 else "release"
+            break
+
+        if motion_phase == "pull":
+            b_cmd, used_tip = tip_angle_deg_to_b_continuous(
+                requested_tip_angle_deg=float(point["tip"]),
+                b_samples=pull_b_dense,
+                angle_samples_deg=pull_angle_dense,
+                prev_b=prev_b_cmd,
+            )
+        else:
+            b_cmd, used_tip = tip_angle_deg_to_b_continuous(
+                requested_tip_angle_deg=float(point["tip"]),
+                b_samples=release_b_dense,
+                angle_samples_deg=release_angle_dense,
+                prev_b=prev_b_cmd,
+            )
+
+        raw_stage_xyz = stage_xyz_for_fixed_tip(
+            cal=cal,
+            p_tip_xyz=p_tip_fixed,
+            b=float(b_cmd),
+            c_deg=float(point["c"]),
+            flip_rz_sign=flip_rz_sign,
+            motion_phase=motion_phase,
+        )
+        if prev_phase is None:
+            segment_stage_offset = np.zeros(3, dtype=float)
+        elif motion_phase != prev_phase:
+            phase_switch_count += 1
+            if prev_stage_xyz is not None:
+                # Branch switches happen with no motor move, so anchor the new phase to the
+                # current commanded stage pose and follow the new branch from there.
+                segment_stage_offset = prev_stage_xyz - raw_stage_xyz
+        stage_xyz = np.asarray(raw_stage_xyz, dtype=float) + np.asarray(segment_stage_offset, dtype=float)
+        traj.append(
+            TrajectoryPoint(
+                b=float(b_cmd),
+                c=float(point["c"]),
+                stage_xyz=stage_xyz,
+                segment_kind=("start" if idx == 0 else "cycle"),
+                capture_image=bool(point["capture_image"]),
+                tip_angle_deg=float(used_tip),
+                cycle_phase_01=float(point["routine_phase_01"]),
+                leg_phase_01=float(point["routine_phase_01"]),
+                leg_name="fast_routine",
+                motion_phase=str(motion_phase),
+            )
+        )
+        prev_phase = motion_phase
+        prev_b_cmd = float(b_cmd)
+        prev_stage_xyz = np.asarray(stage_xyz, dtype=float)
+
+    n_captures = int(sum(1 for pt in traj if pt.capture_image))
+    meta = {
+        "requested_tip_min_deg": float(tip_min_deg),
+        "requested_tip_max_deg": float(tip_max_deg),
+        "used_tip_min_deg": float(used_tip_min),
+        "used_tip_max_deg": float(used_tip_max),
+        "available_tip_angle_range_deg": [available_tip_min, available_tip_max],
+        "leg_move_steps": int(nmove),
+        "leg_capture_steps": int(ncap),
+        "boundary_ease_frac": 0.0,
+        "phase_transition_steps": 0,
+        "b_oscillations_per_sweep": float(b_cycles_per_routine),
+        "b_oscillations_per_cycle": float(b_cycles_per_routine),
+        "b_phase_offset_deg": float(b_phase_offset_deg),
+        "capture_tip_full_visible_min_deg": float(tip_full_visible_min_deg),
+        "capture_tip_full_visible_max_deg": float(tip_full_visible_max_deg),
+        "visible_c_windows_deg": [
+            [float(vis1_min_deg), float(vis1_max_deg)],
+            [float(vis2_min_deg), float(vis2_max_deg)],
+        ],
+        "planned_capture_points": n_captures,
+        "flip_rz_sign": bool(flip_rz_sign),
+        "phase_sequence": ["fast_routine"],
+        "fast_routine": True,
+        "routine_repeats": int(repeats),
+        "c_cycles_per_routine": float(c_cycles_per_routine),
+        "b_cycles_per_routine": float(b_cycles_per_routine),
+        "phase_switch_count": int(phase_switch_count),
     }
     return traj, meta
 
@@ -1377,39 +2029,138 @@ def build_absolute_move_gcode(feedrate: float, **axes_targets) -> str:
     return " ".join(parts)
 
 
+def _pose_axes(cal: Calibration, pose: Tuple[float, float, float, float, float]) -> dict:
+    x, y, z, b, c = [float(v) for v in pose]
+    return {
+        cal.x_axis: x,
+        cal.y_axis: y,
+        cal.z_axis: z,
+        cal.b_axis: b,
+        cal.c_axis: clamp_c_bounded(c),
+    }
+
+
+def _append_move_record(
+    commands: List[str],
+    command_records: List[dict],
+    current_axes: dict,
+    cal: Calibration,
+    command_type: str,
+    feedrate: float,
+    source_trajectory_index: Optional[int] = None,
+    **axes_targets,
+) -> str:
+    gcode = build_absolute_move_gcode(float(feedrate), **axes_targets)
+    commands.append(gcode)
+    for ax, val in axes_targets.items():
+        if val is not None:
+            current_axes[str(ax)] = float(val)
+
+    command_records.append(
+        {
+            "command_index": int(len(command_records) + 1),
+            "command_type": str(command_type),
+            "source_trajectory_index": source_trajectory_index,
+            "feedrate": float(feedrate),
+            "gcode": gcode,
+            "x_axis_name": cal.x_axis,
+            "y_axis_name": cal.y_axis,
+            "z_axis_name": cal.z_axis,
+            "b_axis_name": cal.b_axis,
+            "c_axis_name": cal.c_axis,
+            "x_cmd": current_axes.get(cal.x_axis),
+            "y_cmd": current_axes.get(cal.y_axis),
+            "z_cmd": current_axes.get(cal.z_axis),
+            "b_cmd": current_axes.get(cal.b_axis),
+            "c_cmd": current_axes.get(cal.c_axis),
+        }
+    )
+    return gcode
+
+
+def _append_wait_command(
+    commands: List[str],
+    command_records: List[dict],
+    current_axes: dict,
+    cal: Calibration,
+    command_type: str,
+    gcode: str,
+):
+    commands.append(str(gcode))
+    command_records.append(
+        {
+            "command_index": int(len(command_records) + 1),
+            "command_type": str(command_type),
+            "source_trajectory_index": None,
+            "feedrate": None,
+            "gcode": str(gcode),
+            "x_axis_name": cal.x_axis,
+            "y_axis_name": cal.y_axis,
+            "z_axis_name": cal.z_axis,
+            "b_axis_name": cal.b_axis,
+            "c_axis_name": cal.c_axis,
+            "x_cmd": current_axes.get(cal.x_axis),
+            "y_cmd": current_axes.get(cal.y_axis),
+            "z_cmd": current_axes.get(cal.z_axis),
+            "b_cmd": current_axes.get(cal.b_axis),
+            "c_cmd": current_axes.get(cal.c_axis),
+        }
+    )
+
+
 def _append_safe_pose_moves(
     commands: List[str],
+    command_records: List[dict],
+    current_axes: dict,
     cal: Calibration,
     pose: Tuple[float, float, float, float, float],
     safe_approach_z: float,
     travel_feed: float,
+    label: str,
+    include_m400: bool = True,
+    include_z_landing: bool = True,
 ):
+    """Append the same three-step safe approach/retreat used by robot execution."""
     x, y, z, b, c = [float(v) for v in pose]
-    commands.append(
-        build_absolute_move_gcode(
-            travel_feed,
-            **{
-                cal.z_axis: float(safe_approach_z),
-                cal.b_axis: b,
-                cal.c_axis: clamp_c_bounded(c),
-            },
-        )
+
+    _append_move_record(
+        commands,
+        command_records,
+        current_axes,
+        cal,
+        f"{label}_safe_z",
+        travel_feed,
+        **{
+            cal.z_axis: float(safe_approach_z),
+        },
     )
-    commands.append("M400")
-    commands.append(
-        build_absolute_move_gcode(
-            travel_feed,
-            **{
-                cal.x_axis: x,
-                cal.y_axis: y,
-                cal.b_axis: b,
-                cal.c_axis: clamp_c_bounded(c),
-            },
-        )
+    if include_m400:
+        _append_wait_command(commands, command_records, current_axes, cal, f"{label}_safe_z_wait", "M400")
+
+    _append_move_record(
+        commands,
+        command_records,
+        current_axes,
+        cal,
+        f"{label}_safe_xy",
+        travel_feed,
+        **{
+            cal.x_axis: x,
+            cal.y_axis: y,
+            cal.b_axis: b,
+            cal.c_axis: clamp_c_bounded(c),
+        },
     )
-    commands.append("M400")
-    commands.append(
-        build_absolute_move_gcode(
+    if include_m400:
+        _append_wait_command(commands, command_records, current_axes, cal, f"{label}_safe_xy_wait", "M400")
+
+    if include_z_landing:
+        _append_move_record(
+            commands,
+            command_records,
+            current_axes,
+            cal,
+            f"{label}_safe_z_landing",
             travel_feed,
             **{
                 cal.z_axis: z,
@@ -1417,10 +2168,557 @@ def _append_safe_pose_moves(
                 cal.c_axis: clamp_c_bounded(c),
             },
         )
+        if include_m400:
+            _append_wait_command(commands, command_records, current_axes, cal, f"{label}_safe_z_landing_wait", "M400")
+
+
+def _trajectory_rows_for_export(traj: List[TrajectoryPoint], seg_feeds: List[float]) -> List[dict]:
+    rows: List[dict] = []
+    for i, point in enumerate(traj):
+        feed_to_point = None
+        if i > 0:
+            feed_to_point = seg_feeds[i - 1] if (i - 1) < len(seg_feeds) else None
+        rows.append(
+            {
+                "trajectory_index": int(i),
+                "segment_kind": point.segment_kind,
+                "capture_image": bool(point.capture_image),
+                "x_stage": float(point.stage_xyz[0]),
+                "y_stage": float(point.stage_xyz[1]),
+                "z_stage": float(point.stage_xyz[2]),
+                "b_cmd": float(point.b),
+                "c_cmd": float(clamp_c_bounded(point.c)),
+                "c_raw_cmd": float(point.c),
+                "tip_angle_deg": point.tip_angle_deg,
+                "cycle_phase_01": point.cycle_phase_01,
+                "leg_phase_01": point.leg_phase_01,
+                "leg_name": point.leg_name,
+                "motion_phase": point.motion_phase,
+                "feed_to_point": feed_to_point,
+            }
+        )
+    return rows
+
+
+def _write_dict_csv(path: Path, rows: List[dict], fieldnames: Optional[List[str]] = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fieldnames is None:
+        keys: List[str] = []
+        for row in rows:
+            for key in row.keys():
+                if key not in keys:
+                    keys.append(key)
+        fieldnames = keys
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return [_json_safe(v) for v in value.tolist()]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def build_smooth_tracking_gcode(
+    cal: Calibration,
+    traj: List[TrajectoryPoint],
+    start_pose: Tuple[float, float, float, float, float],
+    end_pose: Tuple[float, float, float, float, float],
+    safe_approach_z: float,
+    travel_feed: float,
+    fine_approach_feed: float,
+    probe_feed: float,
+    c_max_feed: float,
+    c_accel_time_s: float,
+    c_decel_time_s: float,
+    virtual_bbox: dict,
+    dwell_before_ms: int = 0,
+    dwell_after_ms: int = 0,
+    initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
+    use_segment_feed_scheduler: bool = True,
+    include_startup_waits: bool = False,
+    include_boundary_m400: bool = True,
+    include_final_tracked_m400: bool = True,
+) -> dict:
+    """
+    Build motion-only G-code for the dense tracking trajectory.
+
+    Important: no M400/G4/camera waits are inserted at capture points. Capture
+    flags are preserved in the trajectory CSV only so exported motion follows
+    the same planned path but does not stop for image recording.
+    """
+    bbox_warnings: List[str] = []
+    current_axes = _pose_axes(cal, start_pose)
+    command_records: List[dict] = []
+    commands: List[str] = [
+        "; Exported by cyclic fixed-tip tracking script",
+        "; Smooth motion-only program: capture markers are ignored, so the tracked sweep does not stop for images.",
+        "G90",
+    ]
+
+    seg_feeds: List[float] = []
+    sched_meta = {"est_total_time_s": 0.0, "max_est_c_speed_deg_min": 0.0, "mean_seg_time_ms": 0.0}
+    if use_segment_feed_scheduler and len(traj) > 1:
+        seg_feeds, sched_meta = plan_segment_feeds_with_c_envelope(
+            traj=traj,
+            probe_feed_mm_min=float(probe_feed),
+            c_max_feed_deg_min=float(c_max_feed),
+            c_accel_time_s=float(c_accel_time_s),
+            c_decel_time_s=float(c_decel_time_s),
+        )
+
+    _append_safe_pose_moves(
+        commands=commands,
+        command_records=command_records,
+        current_axes=current_axes,
+        cal=cal,
+        pose=start_pose,
+        safe_approach_z=float(safe_approach_z),
+        travel_feed=float(travel_feed),
+        label="startup",
+        include_m400=bool(include_boundary_m400),
+        include_z_landing=True,
     )
-    commands.append("M400")
+
+    if traj:
+        p0 = traj[0]
+        x0, y0, z0 = _clamp_stage_xyz_to_bbox(
+            p0.stage_xyz[0], p0.stage_xyz[1], p0.stage_xyz[2],
+            virtual_bbox,
+            "move to tracked start",
+            bbox_warnings,
+        )
+        _append_move_record(
+            commands,
+            command_records,
+            current_axes,
+            cal,
+            "tracked_start_transition",
+            float(travel_feed),
+            source_trajectory_index=0,
+            **{
+                cal.x_axis: x0,
+                cal.y_axis: y0,
+                cal.z_axis: z0,
+                cal.b_axis: float(p0.b),
+                cal.c_axis: clamp_c_bounded(float(p0.c)),
+            },
+        )
+        if include_boundary_m400:
+            _append_wait_command(commands, command_records, current_axes, cal, "tracked_start_transition_wait", "M400")
+
+        _append_move_record(
+            commands,
+            command_records,
+            current_axes,
+            cal,
+            "tracked_start_fine_land",
+            float(fine_approach_feed),
+            source_trajectory_index=0,
+            **{
+                cal.x_axis: x0,
+                cal.y_axis: y0,
+                cal.z_axis: z0,
+                cal.b_axis: float(p0.b),
+                cal.c_axis: clamp_c_bounded(float(p0.c)),
+            },
+        )
+        if include_boundary_m400:
+            _append_wait_command(commands, command_records, current_axes, cal, "tracked_start_fine_land_wait", "M400")
+
+        if bool(include_startup_waits):
+            if float(initial_sweep_wait_s) > 0:
+                _append_wait_command(
+                    commands,
+                    command_records,
+                    current_axes,
+                    cal,
+                    "initial_sweep_wait",
+                    f"G4 S{float(initial_sweep_wait_s):.3f}",
+                )
+            if int(dwell_before_ms) > 0:
+                _append_wait_command(
+                    commands,
+                    command_records,
+                    current_axes,
+                    cal,
+                    "dwell_before_motion",
+                    f"G4 P{int(dwell_before_ms)}",
+                )
+
+        commands.append("; Begin dense tracked motion. No capture waits inside this block.")
+        for i, point in enumerate(traj[1:], start=1):
+            x, y, z = _clamp_stage_xyz_to_bbox(
+                point.stage_xyz[0], point.stage_xyz[1], point.stage_xyz[2],
+                virtual_bbox,
+                f"tracked sample {i}",
+                bbox_warnings,
+            )
+            if point.segment_kind == "phase_transition":
+                fseg = max(float(probe_feed), float(travel_feed))
+            elif seg_feeds:
+                fseg = float(seg_feeds[i - 1])
+            else:
+                fseg = float(probe_feed)
+            _append_move_record(
+                commands,
+                command_records,
+                current_axes,
+                cal,
+                "tracked_motion",
+                fseg,
+                source_trajectory_index=i,
+                **{
+                    cal.x_axis: x,
+                    cal.y_axis: y,
+                    cal.z_axis: z,
+                    cal.b_axis: float(point.b),
+                    cal.c_axis: clamp_c_bounded(float(point.c)),
+                },
+            )
+        commands.append("; End dense tracked motion.")
+
+        if len(traj) > 1 and bool(include_final_tracked_m400):
+            _append_wait_command(commands, command_records, current_axes, cal, "tracked_motion_final_wait", "M400")
+
+        if bool(include_startup_waits) and int(dwell_after_ms) > 0:
+            _append_wait_command(
+                commands,
+                command_records,
+                current_axes,
+                cal,
+                "dwell_after_motion",
+                f"G4 P{int(dwell_after_ms)}",
+            )
+
+    _append_safe_pose_moves(
+        commands=commands,
+        command_records=command_records,
+        current_axes=current_axes,
+        cal=cal,
+        pose=end_pose,
+        safe_approach_z=float(safe_approach_z),
+        travel_feed=float(travel_feed),
+        label="ending",
+        include_m400=bool(include_boundary_m400),
+        include_z_landing=True,
+    )
+
+    capture_markers = int(sum(1 for pt in traj if pt.capture_image))
+    return {
+        "commands": commands,
+        "command_records": command_records,
+        "trajectory_rows": _trajectory_rows_for_export(traj, seg_feeds),
+        "bbox_warnings": bbox_warnings,
+        "scheduler_meta": sched_meta,
+        "capture_markers_ignored": capture_markers,
+        "tracked_command_count": int(max(0, len(traj) - 1)),
+        "contains_capture_waits": False,
+    }
 
 
+def export_gcode_from_trajectory(
+    output_path: Path,
+    cal: Calibration,
+    traj: List[TrajectoryPoint],
+    start_pose: Tuple[float, float, float, float, float],
+    end_pose: Tuple[float, float, float, float, float],
+    safe_approach_z: float,
+    travel_feed: float,
+    fine_approach_feed: float,
+    probe_feed: float,
+    c_max_feed: float,
+    c_accel_time_s: float,
+    c_decel_time_s: float,
+    virtual_bbox: dict,
+    motion_meta: Optional[dict] = None,
+    dwell_before_ms: int = 0,
+    dwell_after_ms: int = 0,
+    initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
+    use_segment_feed_scheduler: bool = True,
+    include_startup_waits: bool = False,
+    include_boundary_m400: bool = True,
+    include_final_tracked_m400: bool = True,
+) -> dict:
+    output_path = Path(output_path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base = output_path.with_suffix("")
+
+    built = build_smooth_tracking_gcode(
+        cal=cal,
+        traj=traj,
+        start_pose=start_pose,
+        end_pose=end_pose,
+        safe_approach_z=float(safe_approach_z),
+        travel_feed=float(travel_feed),
+        fine_approach_feed=float(fine_approach_feed),
+        probe_feed=float(probe_feed),
+        c_max_feed=float(c_max_feed),
+        c_accel_time_s=float(c_accel_time_s),
+        c_decel_time_s=float(c_decel_time_s),
+        virtual_bbox=virtual_bbox,
+        dwell_before_ms=int(dwell_before_ms),
+        dwell_after_ms=int(dwell_after_ms),
+        initial_sweep_wait_s=float(initial_sweep_wait_s),
+        use_segment_feed_scheduler=bool(use_segment_feed_scheduler),
+        include_startup_waits=bool(include_startup_waits),
+        include_boundary_m400=bool(include_boundary_m400),
+        include_final_tracked_m400=bool(include_final_tracked_m400),
+    )
+
+    output_path.write_text("\n".join(built["commands"]) + "\n", encoding="utf-8")
+
+    command_csv_path = base.parent / f"{base.name}_commanded_motor_positions.csv"
+    trajectory_csv_path = base.parent / f"{base.name}_trajectory_points.csv"
+    metadata_path = base.parent / f"{base.name}_export_metadata.json"
+
+    _write_dict_csv(command_csv_path, built["command_records"])
+    _write_dict_csv(trajectory_csv_path, built["trajectory_rows"])
+
+    metadata = {
+        "gcode_path": str(output_path),
+        "commanded_motor_positions_csv": str(command_csv_path),
+        "trajectory_points_csv": str(trajectory_csv_path),
+        "command_count": int(len(built["commands"])),
+        "motion_command_count": int(len(built["command_records"])),
+        "tracked_command_count": built["tracked_command_count"],
+        "capture_markers_ignored": built["capture_markers_ignored"],
+        "contains_capture_waits": built["contains_capture_waits"],
+        "scheduler_meta": built["scheduler_meta"],
+        "trajectory_meta": compute_traj_meta(traj),
+        "motion_meta": motion_meta or {},
+        "bbox_warnings": built["bbox_warnings"],
+        "export_options": {
+            "use_segment_feed_scheduler": bool(use_segment_feed_scheduler),
+            "include_startup_waits": bool(include_startup_waits),
+            "include_boundary_m400": bool(include_boundary_m400),
+            "include_final_tracked_m400": bool(include_final_tracked_m400),
+        },
+    }
+    metadata_path.write_text(json.dumps(_json_safe(metadata), indent=2) + "\n", encoding="utf-8")
+
+    return {
+        "path": str(output_path),
+        "command_count": len(built["commands"]),
+        "motion_command_count": len(built["command_records"]),
+        "commanded_motor_positions_csv": str(command_csv_path),
+        "trajectory_points_csv": str(trajectory_csv_path),
+        "metadata_json": str(metadata_path),
+        "bbox_warnings": built["bbox_warnings"],
+        "capture_markers_ignored": built["capture_markers_ignored"],
+        "scheduler_meta": built["scheduler_meta"],
+    }
+
+
+def _default_export_config() -> dict:
+    return {
+        "y_offset_fit": DEFAULT_Y_OFFSET_FIT,
+        "curve_set": DEFAULT_CURVE_SET,
+        "allow_global_curve_set_fallback": DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
+        "motion_mode": DEFAULT_MOTION_MODE,
+        "point_x": DEFAULT_POINT_X,
+        "point_y": DEFAULT_POINT_Y,
+        "point_z": DEFAULT_POINT_Z,
+        "cycle_repeats": DEFAULT_CYCLE_REPEATS,
+        "routine_repeats": DEFAULT_ROUTINE_REPEATS,
+        "leg_move_steps": DEFAULT_LEG_MOVE_STEPS,
+        "leg_capture_steps": DEFAULT_LEG_CAPTURE_STEPS,
+        "sweep_tip_min_deg": DEFAULT_SWEEP_TIP_MIN_DEG,
+        "sweep_tip_max_deg": DEFAULT_SWEEP_TIP_MAX_DEG,
+        "b_0_to_90_only": DEFAULT_B_0_TO_90_ONLY,
+        "b_oscillations_per_sweep": DEFAULT_B_OSCILLATIONS_PER_SWEEP,
+        "b_phase_offset_deg": DEFAULT_B_PHASE_OFFSET_DEG,
+        "c_boundary_ease_frac": DEFAULT_C_BOUNDARY_EASE_FRAC,
+        "custom_inverse_samples": DEFAULT_CUSTOM_INV_SAMPLES,
+        "phase_transition_steps": DEFAULT_PHASE_TRANSITION_STEPS,
+        "capture_tip_full_visible_min_deg": DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MIN_DEG,
+        "capture_tip_full_visible_max_deg": DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MAX_DEG,
+        "c_visible_win1_min_deg": DEFAULT_C_VISIBLE_WIN1_MIN,
+        "c_visible_win1_max_deg": DEFAULT_C_VISIBLE_WIN1_MAX,
+        "c_visible_win2_min_deg": DEFAULT_C_VISIBLE_WIN2_MIN,
+        "c_visible_win2_max_deg": DEFAULT_C_VISIBLE_WIN2_MAX,
+        "flip_rz_sign": DEFAULT_FLIP_RZ_SIGN,
+        "start_x": DEFAULT_START_X,
+        "start_y": DEFAULT_START_Y,
+        "start_z": DEFAULT_START_Z,
+        "start_b": DEFAULT_START_B,
+        "start_c": DEFAULT_START_C,
+        "end_x": DEFAULT_END_X,
+        "end_y": DEFAULT_END_Y,
+        "end_z": DEFAULT_END_Z,
+        "end_b": DEFAULT_END_B,
+        "end_c": DEFAULT_END_C,
+        "safe_approach_z": DEFAULT_SAFE_APPROACH_Z,
+        "bbox_x_min": DEFAULT_BBOX_X_MIN,
+        "bbox_x_max": DEFAULT_BBOX_X_MAX,
+        "bbox_y_min": DEFAULT_BBOX_Y_MIN,
+        "bbox_y_max": DEFAULT_BBOX_Y_MAX,
+        "bbox_z_min": DEFAULT_BBOX_Z_MIN,
+        "bbox_z_max": DEFAULT_BBOX_Z_MAX,
+        "travel_feed": DEFAULT_TRAVEL_FEED,
+        "fine_approach_feed": DEFAULT_FINE_APPROACH_FEED,
+        "probe_feed": DEFAULT_PROBE_FEED,
+        "c_max_feed": DEFAULT_C_MAX_FEED,
+        "c_accel_time_s": DEFAULT_C_ACCEL_TIME_S,
+        "c_decel_time_s": DEFAULT_C_DECEL_TIME_S,
+        "dwell_before_ms": DEFAULT_DWELL_BEFORE_MS,
+        "dwell_after_ms": DEFAULT_DWELL_AFTER_MS,
+        "initial_sweep_wait_s": DEFAULT_INITIAL_SWEEP_WAIT_S,
+        "use_segment_feed_scheduler": True,
+        "include_startup_waits": False,
+        "include_boundary_m400": True,
+        "include_final_tracked_m400": True,
+    }
+
+
+def _generate_trajectory_from_config(cal: Calibration, cfg: dict) -> Tuple[List[TrajectoryPoint], dict]:
+    p_tip_fixed = np.array(
+        [float(cfg["point_x"]), float(cfg["point_y"]), float(cfg["point_z"])],
+        dtype=float,
+    )
+    sweep_tip_min_deg = float(cfg["sweep_tip_min_deg"])
+    sweep_tip_max_deg = float(cfg["sweep_tip_max_deg"])
+    if bool(cfg.get("b_0_to_90_only", False)):
+        sweep_tip_min_deg = 0.0
+        sweep_tip_max_deg = 90.0
+
+    motion_mode = str(cfg.get("motion_mode", DEFAULT_MOTION_MODE)).lower()
+    if motion_mode == "fast_routine":
+        return generate_fast_routine_trajectory(
+            cal=cal,
+            p_tip_fixed=p_tip_fixed,
+            repeats=int(cfg["routine_repeats"]),
+            move_steps_per_routine=int(cfg["leg_move_steps"]) * 2,
+            capture_steps_per_routine=int(cfg["leg_capture_steps"]) * 2,
+            tip_min_deg=sweep_tip_min_deg,
+            tip_max_deg=sweep_tip_max_deg,
+            tip_full_visible_min_deg=float(cfg["capture_tip_full_visible_min_deg"]),
+            tip_full_visible_max_deg=float(cfg["capture_tip_full_visible_max_deg"]),
+            vis1_min_deg=float(cfg["c_visible_win1_min_deg"]),
+            vis1_max_deg=float(cfg["c_visible_win1_max_deg"]),
+            vis2_min_deg=float(cfg["c_visible_win2_min_deg"]),
+            vis2_max_deg=float(cfg["c_visible_win2_max_deg"]),
+            inverse_samples=int(cfg["custom_inverse_samples"]),
+            flip_rz_sign=bool(cfg["flip_rz_sign"]),
+        )
+
+    return generate_cyclic_visibility_gated_trajectory(
+        cal=cal,
+        p_tip_fixed=p_tip_fixed,
+        repeats=int(cfg["cycle_repeats"]),
+        leg_move_steps=int(cfg["leg_move_steps"]),
+        leg_capture_steps=int(cfg["leg_capture_steps"]),
+        tip_min_deg=sweep_tip_min_deg,
+        tip_max_deg=sweep_tip_max_deg,
+        b_oscillations_per_sweep=float(cfg["b_oscillations_per_sweep"]),
+        b_phase_offset_deg=float(cfg["b_phase_offset_deg"]),
+        tip_full_visible_min_deg=float(cfg["capture_tip_full_visible_min_deg"]),
+        tip_full_visible_max_deg=float(cfg["capture_tip_full_visible_max_deg"]),
+        vis1_min_deg=float(cfg["c_visible_win1_min_deg"]),
+        vis1_max_deg=float(cfg["c_visible_win1_max_deg"]),
+        vis2_min_deg=float(cfg["c_visible_win2_min_deg"]),
+        vis2_max_deg=float(cfg["c_visible_win2_max_deg"]),
+        boundary_ease_frac=float(cfg["c_boundary_ease_frac"]),
+        inverse_samples=int(cfg["custom_inverse_samples"]),
+        phase_transition_steps=int(cfg["phase_transition_steps"]),
+        flip_rz_sign=bool(cfg["flip_rz_sign"]),
+    )
+
+
+def _bbox_from_config(cfg: dict) -> dict:
+    virtual_bbox = {
+        "x_min": float(cfg["bbox_x_min"]),
+        "x_max": float(cfg["bbox_x_max"]),
+        "y_min": float(cfg["bbox_y_min"]),
+        "y_max": float(cfg["bbox_y_max"]),
+        "z_min": float(cfg["bbox_z_min"]),
+        "z_max": float(cfg["bbox_z_max"]),
+    }
+    if virtual_bbox["x_min"] > virtual_bbox["x_max"]:
+        virtual_bbox["x_min"], virtual_bbox["x_max"] = virtual_bbox["x_max"], virtual_bbox["x_min"]
+    if virtual_bbox["y_min"] > virtual_bbox["y_max"]:
+        virtual_bbox["y_min"], virtual_bbox["y_max"] = virtual_bbox["y_max"], virtual_bbox["y_min"]
+    if virtual_bbox["z_min"] > virtual_bbox["z_max"]:
+        virtual_bbox["z_min"], virtual_bbox["z_max"] = virtual_bbox["z_max"], virtual_bbox["z_min"]
+    return virtual_bbox
+
+
+def export_gcode(calibration: str, output_path: str, **overrides) -> dict:
+    """
+    Importable convenience function for smooth motion-only export.
+
+    Example:
+        export_gcode(
+            "calibration.json",
+            "smooth_tracking_motion.gcode",
+            cycle_repeats=2,
+            leg_move_steps=800,
+            include_startup_waits=False,
+        )
+
+    Keyword overrides use the same names as the CLI options with dashes changed
+    to underscores. The exported tracked sweep has no image-capture stops.
+    """
+    cfg = _default_export_config()
+    unknown = sorted(set(overrides.keys()) - set(cfg.keys()))
+    if unknown:
+        raise TypeError(f"Unknown export_gcode override(s): {unknown}")
+    cfg.update(overrides)
+
+    cal = load_calibration(
+        str(calibration),
+        y_offset_fit=str(cfg["y_offset_fit"]),
+        curve_set=str(cfg["curve_set"]),
+        allow_global_curve_set_fallback=bool(cfg["allow_global_curve_set_fallback"]),
+    )
+    traj, custom_meta = _generate_trajectory_from_config(cal, cfg)
+    start_pose = (
+        float(cfg["start_x"]), float(cfg["start_y"]), float(cfg["start_z"]),
+        float(cfg["start_b"]), float(cfg["start_c"]),
+    )
+    end_pose = (
+        float(cfg["end_x"]), float(cfg["end_y"]), float(cfg["end_z"]),
+        float(cfg["end_b"]), float(cfg["end_c"]),
+    )
+    return export_gcode_from_trajectory(
+        output_path=Path(output_path),
+        cal=cal,
+        traj=traj,
+        start_pose=start_pose,
+        end_pose=end_pose,
+        safe_approach_z=float(cfg["safe_approach_z"]),
+        travel_feed=float(cfg["travel_feed"]),
+        fine_approach_feed=float(cfg["fine_approach_feed"]),
+        probe_feed=float(cfg["probe_feed"]),
+        c_max_feed=float(cfg["c_max_feed"]),
+        c_accel_time_s=float(cfg["c_accel_time_s"]),
+        c_decel_time_s=float(cfg["c_decel_time_s"]),
+        virtual_bbox=_bbox_from_config(cfg),
+        motion_meta=custom_meta,
+        dwell_before_ms=int(cfg["dwell_before_ms"]),
+        dwell_after_ms=int(cfg["dwell_after_ms"]),
+        initial_sweep_wait_s=float(cfg["initial_sweep_wait_s"]),
+        use_segment_feed_scheduler=bool(cfg["use_segment_feed_scheduler"]),
+        include_startup_waits=bool(cfg["include_startup_waits"]),
+        include_boundary_m400=bool(cfg["include_boundary_m400"]),
+        include_final_tracked_m400=bool(cfg["include_final_tracked_m400"]),
+    )
+
+
+# Backwards-compatible wrapper for the old export name.
 def export_commanded_gcode(
     output_path: Path,
     cal: Calibration,
@@ -1435,102 +2733,33 @@ def export_commanded_gcode(
     dwell_before_ms: int = 0,
     dwell_after_ms: int = 0,
     initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
+    c_max_feed: float = DEFAULT_C_MAX_FEED,
+    c_accel_time_s: float = DEFAULT_C_ACCEL_TIME_S,
+    c_decel_time_s: float = DEFAULT_C_DECEL_TIME_S,
+    use_segment_feed_scheduler: bool = True,
+    include_startup_waits: bool = False,
 ) -> dict:
-    commands: List[str] = [
-        "; Exported by calib_point_track_daq.py",
-        "; Motion-only program derived from the commanded execution sequence",
-    ]
-    bbox_warnings: List[str] = []
-
-    _append_safe_pose_moves(
-        commands=commands,
+    return export_gcode_from_trajectory(
+        output_path=Path(output_path),
         cal=cal,
-        pose=start_pose,
+        traj=traj,
+        start_pose=start_pose,
+        end_pose=end_pose,
         safe_approach_z=float(safe_approach_z),
         travel_feed=float(travel_feed),
+        fine_approach_feed=float(fine_approach_feed),
+        probe_feed=float(probe_feed),
+        c_max_feed=float(c_max_feed),
+        c_accel_time_s=float(c_accel_time_s),
+        c_decel_time_s=float(c_decel_time_s),
+        virtual_bbox=virtual_bbox,
+        motion_meta={},
+        dwell_before_ms=int(dwell_before_ms),
+        dwell_after_ms=int(dwell_after_ms),
+        initial_sweep_wait_s=float(initial_sweep_wait_s),
+        use_segment_feed_scheduler=bool(use_segment_feed_scheduler),
+        include_startup_waits=bool(include_startup_waits),
     )
-
-    if traj:
-        p0 = traj[0]
-        x0, y0, z0 = _clamp_stage_xyz_to_bbox(
-            p0.stage_xyz[0], p0.stage_xyz[1], p0.stage_xyz[2],
-            virtual_bbox,
-            "move to tracked start",
-            bbox_warnings,
-        )
-        commands.append(
-            build_absolute_move_gcode(
-                travel_feed,
-                **{
-                    cal.x_axis: x0,
-                    cal.y_axis: y0,
-                    cal.z_axis: z0,
-                    cal.b_axis: p0.b,
-                    cal.c_axis: clamp_c_bounded(p0.c),
-                },
-            )
-        )
-        commands.append("M400")
-        commands.append(
-            build_absolute_move_gcode(
-                fine_approach_feed,
-                **{
-                    cal.x_axis: x0,
-                    cal.y_axis: y0,
-                    cal.z_axis: z0,
-                    cal.b_axis: float(p0.b),
-                    cal.c_axis: clamp_c_bounded(float(p0.c)),
-                },
-            )
-        )
-        commands.append("M400")
-
-        if float(initial_sweep_wait_s) > 0:
-            commands.append(f"G4 S{float(initial_sweep_wait_s):.3f}")
-        if int(dwell_before_ms) > 0:
-            commands.append(f"G4 P{int(dwell_before_ms)}")
-
-        for i, point in enumerate(traj[1:], start=1):
-            x, y, z = _clamp_stage_xyz_to_bbox(
-                point.stage_xyz[0], point.stage_xyz[1], point.stage_xyz[2],
-                virtual_bbox,
-                f"tracked sample {i}",
-                bbox_warnings,
-            )
-            feed = max(float(probe_feed), float(travel_feed)) if point.segment_kind == "phase_transition" else float(probe_feed)
-            commands.append(
-                build_absolute_move_gcode(
-                    feed,
-                    **{
-                        cal.x_axis: x,
-                        cal.y_axis: y,
-                        cal.z_axis: z,
-                        cal.b_axis: point.b,
-                        cal.c_axis: clamp_c_bounded(point.c),
-                    },
-                )
-            )
-
-        if len(traj) > 1:
-            commands.append("M400")
-
-        if int(dwell_after_ms) > 0:
-            commands.append(f"G4 P{int(dwell_after_ms)}")
-
-    _append_safe_pose_moves(
-        commands=commands,
-        cal=cal,
-        pose=end_pose,
-        safe_approach_z=float(safe_approach_z),
-        travel_feed=float(travel_feed),
-    )
-
-    output_path.write_text("\n".join(commands) + "\n", encoding="utf-8")
-    return {
-        "path": str(output_path),
-        "command_count": len(commands),
-        "bbox_warnings": bbox_warnings,
-    }
 
 
 # =========================
@@ -1691,6 +2920,11 @@ class FixedTipPointTracker:
     # ---------- Robot ----------
 
     def connect_to_robot(self, duet_web_address: str):
+        if DuetWebAPI is None:
+            raise ImportError(
+                "Missing duetwebapi. Install with:\n"
+                "    pip install duetwebapi==1.1.0"
+            )
         self.rrf = DuetWebAPI(duet_web_address)
         print("Connection attempted. Requesting diagnostics.")
         resp = self.rrf.send_code("M122")
@@ -1708,6 +2942,7 @@ class FixedTipPointTracker:
         axes_targets: dict,
         feedrate: float,
         c_max_feed: float,
+        motion_accel_mm_s2: float = DEFAULT_MOTION_ACCEL_MM_S2,
         min_move_time_s: float = DEFAULT_MIN_ESTIMATED_MOVE_TIME_S,
     ) -> float:
         feed_s = max(1e-9, float(feedrate) / 60.0)
@@ -1721,7 +2956,12 @@ class FixedTipPointTracker:
                 continue
             delta = float(tgt) - float(prev)
             xyz_sq += delta * delta
-        xyz_t = math.sqrt(xyz_sq) / feed_s if xyz_sq > 0 else 0.0
+        xyz_dist = math.sqrt(xyz_sq) if xyz_sq > 0 else 0.0
+        xyz_t = accel_limited_move_time_seconds(
+            distance_mm=xyz_dist,
+            feedrate_mm_min=float(feedrate),
+            accel_mm_s2=float(motion_accel_mm_s2),
+        ) if xyz_dist > 0 else 0.0
 
         c_t = 0.0
         prev_c = previous_axes.get(str(cal.c_axis))
@@ -1766,6 +3006,7 @@ class FixedTipPointTracker:
         cal: Calibration,
         command_record: dict,
         c_max_feed: float,
+        motion_accel_mm_s2: float = DEFAULT_MOTION_ACCEL_MM_S2,
     ) -> float:
         est_s = self._estimate_move_time_s(
             cal=cal,
@@ -1773,6 +3014,7 @@ class FixedTipPointTracker:
             axes_targets=command_record["axes_targets"],
             feedrate=command_record["feedrate"],
             c_max_feed=float(c_max_feed),
+            motion_accel_mm_s2=float(motion_accel_mm_s2),
         )
         now = time.monotonic()
         self.estimated_motion_done_at = max(now, self.estimated_motion_done_at) + est_s
@@ -1784,6 +3026,20 @@ class FixedTipPointTracker:
             print(f" Estimated wait for {reason}: {wait_s:.3f} s")
             time.sleep(wait_s)
         self.estimated_motion_done_at = max(self.estimated_motion_done_at, time.monotonic())
+
+    def _wait_for_estimated_motion_progress(
+        self,
+        lookahead_s: float = DEFAULT_STREAMING_LOOKAHEAD_S,
+        extra_settle: float = 0.0,
+        reason: str = "motion",
+    ):
+        wait_s = max(
+            0.0,
+            self.estimated_motion_done_at - time.monotonic() - max(0.0, float(lookahead_s)),
+        ) + max(0.0, float(extra_settle))
+        if wait_s > 0:
+            print(f" Estimated paced wait for {reason}: {wait_s:.3f} s")
+            time.sleep(wait_s)
 
     def send_absolute_move(self, feedrate: float, **axes_targets) -> dict:
         if self.rrf is None:
@@ -1817,6 +3073,8 @@ class FixedTipPointTracker:
         settle_s: float,
         use_estimated_waits: bool = False,
         c_max_feed: float = DEFAULT_C_MAX_FEED,
+        motion_accel_mm_s2: float = DEFAULT_MOTION_ACCEL_MM_S2,
+        include_z_landing: bool = True,
     ):
         x, y, z, b, c = [float(v) for v in pose]
 
@@ -1824,15 +3082,18 @@ class FixedTipPointTracker:
             travel_feed,
             **{
                 cal.z_axis: float(safe_approach_z),
-                cal.b_axis: b,
-                cal.c_axis: clamp_c_bounded(c),
             }
         )
         if use_estimated_waits:
-            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
-            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z approach")
+            self._record_estimated_motion(
+                cal=cal,
+                command_record=cmd,
+                c_max_feed=c_max_feed,
+                motion_accel_mm_s2=motion_accel_mm_s2,
+            )
+            self._wait_for_estimated_motion_complete(extra_settle=0.0, reason="safe Z raise")
         else:
-            self.wait_for_duet_motion_complete(extra_settle=settle_s)
+            self.wait_for_duet_motion_complete(extra_settle=0.0)
 
         cmd = self.send_absolute_move(
             travel_feed,
@@ -1844,24 +3105,35 @@ class FixedTipPointTracker:
             }
         )
         if use_estimated_waits:
-            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
-            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe XY approach")
+            self._record_estimated_motion(
+                cal=cal,
+                command_record=cmd,
+                c_max_feed=c_max_feed,
+                motion_accel_mm_s2=motion_accel_mm_s2,
+            )
+            self._wait_for_estimated_motion_complete(extra_settle=0.0, reason="safe XYBC reposition")
         else:
-            self.wait_for_duet_motion_complete(extra_settle=settle_s)
+            self.wait_for_duet_motion_complete(extra_settle=0.0)
 
-        cmd = self.send_absolute_move(
-            travel_feed,
-            **{
-                cal.z_axis: z,
-                cal.b_axis: b,
-                cal.c_axis: clamp_c_bounded(c),
-            }
-        )
-        if use_estimated_waits:
-            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
-            self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z landing")
-        else:
-            self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        if include_z_landing:
+            cmd = self.send_absolute_move(
+                travel_feed,
+                **{
+                    cal.z_axis: z,
+                }
+            )
+            if use_estimated_waits:
+                self._record_estimated_motion(
+                    cal=cal,
+                    command_record=cmd,
+                    c_max_feed=c_max_feed,
+                    motion_accel_mm_s2=motion_accel_mm_s2,
+                )
+                self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="safe Z landing")
+            else:
+                self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        elif settle_s > 0:
+            time.sleep(float(settle_s))
 
     def _fine_land_on_point(
         self,
@@ -1875,6 +3147,7 @@ class FixedTipPointTracker:
         settle_s: float,
         use_estimated_waits: bool = False,
         c_max_feed: float = DEFAULT_C_MAX_FEED,
+        motion_accel_mm_s2: float = DEFAULT_MOTION_ACCEL_MM_S2,
     ):
         print(" Fine landing move for accuracy...")
         cmd = self.send_absolute_move(
@@ -1888,7 +3161,12 @@ class FixedTipPointTracker:
             }
         )
         if use_estimated_waits:
-            self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=c_max_feed)
+            self._record_estimated_motion(
+                cal=cal,
+                command_record=cmd,
+                c_max_feed=c_max_feed,
+                motion_accel_mm_s2=motion_accel_mm_s2,
+            )
             self._wait_for_estimated_motion_complete(extra_settle=settle_s, reason="fine landing")
         else:
             self.wait_for_duet_motion_complete(extra_settle=settle_s)
@@ -1921,6 +3199,8 @@ class FixedTipPointTracker:
         initial_sweep_wait_s: float = DEFAULT_INITIAL_SWEEP_WAIT_S,
         settled_capture_mode: bool = DEFAULT_SETTLED_CAPTURE_MODE,
         settled_capture_buffer_s: float = DEFAULT_SETTLED_CAPTURE_BUFFER_S,
+        motion_accel_mm_s2: float = DEFAULT_MOTION_ACCEL_MM_S2,
+        streaming_lookahead_s: float = DEFAULT_STREAMING_LOOKAHEAD_S,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1931,6 +3211,11 @@ class FixedTipPointTracker:
         sample_counter = 0
         self.commanded_axes = {}
         self._seed_commanded_pose(cal=cal, pose=start_pose)
+        is_fast_routine = bool(traj) and str(traj[0].leg_name) == "fast_routine"
+        effective_streaming_lookahead_s = (
+            max(float(streaming_lookahead_s), 0.25) if is_fast_routine else float(streaming_lookahead_s)
+        )
+        settled_capture_buffer_s = 0.0
 
         seg_feeds: List[float] = []
         sched_meta = {"est_total_time_s": 0.0, "max_est_c_speed_deg_min": 0.0, "mean_seg_time_ms": 0.0}
@@ -1951,16 +3236,16 @@ class FixedTipPointTracker:
         print(f"Estimated max C speed: {sched_meta['max_est_c_speed_deg_min']:.1f} deg/min")
         print(f"Mean segment time: {sched_meta['mean_seg_time_ms']:.2f} ms")
         if use_segment_feed_scheduler:
-            print(
-                "Segment feed scheduling disabled for execution; "
-                "using controller-side acceleration with constant queued feed."
-            )
+            print("Segment feed scheduling enabled for tracked execution.")
         print(f"Tracked block feed: {float(probe_feed):.3f}")
         if settled_capture_mode:
             print(
-                f"Settled capture mode: streaming commands, waiting only at captures "
-                f"(buffer={float(settled_capture_buffer_s):.3f} s)."
+                f"Settled capture mode: streaming commands with estimated pacing "
+                f"(lookahead={float(effective_streaming_lookahead_s):.3f} s, "
+                f"accel={float(motion_accel_mm_s2):.3f} mm/s^2)."
             )
+        if is_fast_routine:
+            print("Fast routine execution: capture samples stay in-stream; only the routine boundaries fully stop.")
 
         print("\nSafe startup approach...")
         self._move_to_pose_safe(
@@ -1971,6 +3256,8 @@ class FixedTipPointTracker:
             settle_s=float(travel_move_settle_s),
             use_estimated_waits=bool(settled_capture_mode),
             c_max_feed=float(c_max_feed),
+            motion_accel_mm_s2=float(motion_accel_mm_s2),
+            include_z_landing=True,
         )
 
         if not traj:
@@ -1998,7 +3285,12 @@ class FixedTipPointTracker:
                 }
             )
             if settled_capture_mode:
-                self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=float(c_max_feed))
+                self._record_estimated_motion(
+                    cal=cal,
+                    command_record=cmd,
+                    c_max_feed=float(c_max_feed),
+                    motion_accel_mm_s2=float(motion_accel_mm_s2),
+                )
                 self._wait_for_estimated_motion_complete(
                     extra_settle=float(travel_move_settle_s),
                     reason="tracked start transition",
@@ -2017,6 +3309,7 @@ class FixedTipPointTracker:
                 settle_s=max(float(tracked_move_settle_s), 0.05),
                 use_estimated_waits=bool(settled_capture_mode),
                 c_max_feed=float(c_max_feed),
+                motion_accel_mm_s2=float(motion_accel_mm_s2),
             )
 
             if float(initial_sweep_wait_s) > 0:
@@ -2062,8 +3355,6 @@ class FixedTipPointTracker:
                     fseg = seg_feeds[i - 1]
                 else:
                     fseg = float(probe_feed)
-                if point.segment_kind != "phase_transition":
-                    fseg = float(probe_feed)
 
                 cmd = self.send_absolute_move(
                     fseg,
@@ -2076,12 +3367,28 @@ class FixedTipPointTracker:
                     }
                 )
                 if settled_capture_mode:
-                    self._record_estimated_motion(cal=cal, command_record=cmd, c_max_feed=float(c_max_feed))
+                    self._record_estimated_motion(
+                        cal=cal,
+                        command_record=cmd,
+                        c_max_feed=float(c_max_feed),
+                        motion_accel_mm_s2=float(motion_accel_mm_s2),
+                    )
+                    if point.capture_image and not is_fast_routine:
+                        self._wait_for_estimated_motion_complete(
+                            extra_settle=0.0,
+                            reason=f"tracked sample {i} capture",
+                        )
+                    else:
+                        self._wait_for_estimated_motion_progress(
+                            lookahead_s=float(effective_streaming_lookahead_s),
+                            reason=f"tracked sample {i}",
+                        )
                 if float(inter_command_delay_s) > 0:
                     time.sleep(float(inter_command_delay_s))
 
                 if point.capture_image:
-                    self.wait_for_duet_motion_complete(extra_settle=float(settled_capture_buffer_s))
+                    if not settled_capture_mode:
+                        self.wait_for_duet_motion_complete(extra_settle=0.0)
                     sample_counter += 1
                     self.capture_and_save(
                         sample_idx=sample_counter,
@@ -2102,7 +3409,7 @@ class FixedTipPointTracker:
                 if settled_capture_mode:
                     self._wait_for_estimated_motion_complete(
                         extra_settle=float(tracked_move_settle_s),
-                        reason="tracked motion completion",
+                        reason="tracked motion end",
                     )
                 else:
                     self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
@@ -2122,6 +3429,8 @@ class FixedTipPointTracker:
             settle_s=float(travel_move_settle_s),
             use_estimated_waits=bool(settled_capture_mode),
             c_max_feed=float(c_max_feed),
+            motion_accel_mm_s2=float(motion_accel_mm_s2),
+            include_z_landing=True,
         )
 
         print("\n" + "=" * 72)
@@ -2146,7 +3455,12 @@ class FixedTipPointTracker:
 
 def main(args):
     script_dir = Path(__file__).resolve().parent
-    cal = load_calibration(args.calibration, y_offset_fit=args.y_offset_fit)
+    cal = load_calibration(
+        args.calibration,
+        y_offset_fit=args.y_offset_fit,
+        curve_set=args.curve_set,
+        allow_global_curve_set_fallback=bool(args.allow_global_curve_set_fallback),
+    )
 
     p_tip_fixed = np.array(
         [float(args.point_x), float(args.point_y), float(args.point_z)],
@@ -2159,33 +3473,58 @@ def main(args):
         sweep_tip_min_deg = 0.0
         sweep_tip_max_deg = 90.0
 
-    traj, custom_meta = generate_cyclic_visibility_gated_trajectory(
-        cal=cal,
-        p_tip_fixed=p_tip_fixed,
-        repeats=int(args.cycle_repeats),
-        leg_move_steps=int(args.leg_move_steps),
-        leg_capture_steps=int(args.leg_capture_steps),
-        tip_min_deg=sweep_tip_min_deg,
-        tip_max_deg=sweep_tip_max_deg,
-        b_oscillations_per_sweep=float(args.b_oscillations_per_sweep),
-        b_phase_offset_deg=float(args.b_phase_offset_deg),
-        tip_full_visible_min_deg=float(args.capture_tip_full_visible_min_deg),
-        tip_full_visible_max_deg=float(args.capture_tip_full_visible_max_deg),
-        vis1_min_deg=float(args.c_visible_win1_min_deg),
-        vis1_max_deg=float(args.c_visible_win1_max_deg),
-        vis2_min_deg=float(args.c_visible_win2_min_deg),
-        vis2_max_deg=float(args.c_visible_win2_max_deg),
-        boundary_ease_frac=float(args.c_boundary_ease_frac),
-        inverse_samples=int(args.custom_inverse_samples),
-        phase_transition_steps=int(args.phase_transition_steps),
-        flip_rz_sign=bool(args.flip_rz_sign),
-    )
+    motion_mode = str(args.motion_mode).lower()
+    cycle_repeats = int(args.cycle_repeats)
+    if motion_mode == "fast_routine":
+        cycle_repeats = int(args.routine_repeats)
+        traj, custom_meta = generate_fast_routine_trajectory(
+            cal=cal,
+            p_tip_fixed=p_tip_fixed,
+            repeats=cycle_repeats,
+            move_steps_per_routine=int(args.leg_move_steps) * 2,
+            capture_steps_per_routine=int(args.leg_capture_steps) * 2,
+            tip_min_deg=sweep_tip_min_deg,
+            tip_max_deg=sweep_tip_max_deg,
+            tip_full_visible_min_deg=float(args.capture_tip_full_visible_min_deg),
+            tip_full_visible_max_deg=float(args.capture_tip_full_visible_max_deg),
+            vis1_min_deg=float(args.c_visible_win1_min_deg),
+            vis1_max_deg=float(args.c_visible_win1_max_deg),
+            vis2_min_deg=float(args.c_visible_win2_min_deg),
+            vis2_max_deg=float(args.c_visible_win2_max_deg),
+            inverse_samples=int(args.custom_inverse_samples),
+            flip_rz_sign=bool(args.flip_rz_sign),
+        )
+    else:
+        traj, custom_meta = generate_cyclic_visibility_gated_trajectory(
+            cal=cal,
+            p_tip_fixed=p_tip_fixed,
+            repeats=cycle_repeats,
+            leg_move_steps=int(args.leg_move_steps),
+            leg_capture_steps=int(args.leg_capture_steps),
+            tip_min_deg=sweep_tip_min_deg,
+            tip_max_deg=sweep_tip_max_deg,
+            b_oscillations_per_sweep=float(args.b_oscillations_per_sweep),
+            b_phase_offset_deg=float(args.b_phase_offset_deg),
+            tip_full_visible_min_deg=float(args.capture_tip_full_visible_min_deg),
+            tip_full_visible_max_deg=float(args.capture_tip_full_visible_max_deg),
+            vis1_min_deg=float(args.c_visible_win1_min_deg),
+            vis1_max_deg=float(args.c_visible_win1_max_deg),
+            vis2_min_deg=float(args.c_visible_win2_min_deg),
+            vis2_max_deg=float(args.c_visible_win2_max_deg),
+            boundary_ease_frac=float(args.c_boundary_ease_frac),
+            inverse_samples=int(args.custom_inverse_samples),
+            phase_transition_steps=int(args.phase_transition_steps),
+            c_two_way_sweeps_per_b_oscillation=int(args.c_two_way_sweeps_per_b_oscillation),
+            flip_rz_sign=bool(args.flip_rz_sign),
+        )
 
     meta = compute_traj_meta(traj)
     print("Trajectory summary:")
+    print(f"  Motion mode: {motion_mode}")
     print(f"  Samples: {meta['n_samples']} (segments={meta['n_segments']})")
     print(f"  Capture points: {meta['n_capture_points']}")
     print(f"  B range used: [{meta['b_min_used']:.3f}, {meta['b_max_used']:.3f}]")
+    print(f"  Curve set: {cal.selected_curve_set}")
     if cal.tip_angle_model is not None and meta["n_samples"] > 0:
         bb = np.array([meta["b_min_used"], meta["b_max_used"]], dtype=float)
         tip_angle_used = eval_tip_angle_deg(cal, bb)
@@ -2205,14 +3544,20 @@ def main(args):
     print(f"  Leg capture steps: {custom_meta['leg_capture_steps']}")
     print(f"  Boundary ease fraction: {custom_meta['boundary_ease_frac']}")
     print(f"  Phase transition steps: {custom_meta['phase_transition_steps']}")
+    if "phase_transition_mode" in custom_meta:
+        print(f"  Phase transition mode: {custom_meta['phase_transition_mode']}")
     print(f"  B oscillations per sweep: {custom_meta['b_oscillations_per_sweep']}")
     print(f"  B oscillations per cycle: {custom_meta['b_oscillations_per_cycle']}")
+    if "c_two_way_sweeps_per_b_oscillation" in custom_meta:
+        print(f"  C two-way sweeps per B oscillation: {custom_meta['c_two_way_sweeps_per_b_oscillation']}")
     print(f"  B phase offset deg: {custom_meta['b_phase_offset_deg']}")
     print(f"  Full-visible tip range: [{custom_meta['capture_tip_full_visible_min_deg']}, "
           f"{custom_meta['capture_tip_full_visible_max_deg']}]")
     print(f"  Visible C windows (deg): {custom_meta['visible_c_windows_deg']}")
     print(f"  Planned capture points: {custom_meta['planned_capture_points']}")
     print(f"  flip_rz_sign: {custom_meta['flip_rz_sign']}")
+    if "phase_switch_count" in custom_meta:
+        print(f"  Phase switches: {custom_meta['phase_switch_count']}")
 
     start_pose = (
         float(args.start_x),
@@ -2251,9 +3596,14 @@ def main(args):
         add_date=bool(args.add_date),
     )
 
-    if bool(args.export_gcode_only):
-        export_path = Path(runner.run_folder) / "commanded_motion.gcode"
-        export_result = export_commanded_gcode(
+    export_requested = bool(args.export_gcode_only) or (args.export_gcode is not None)
+    if export_requested:
+        export_name = args.export_gcode or "commanded_motion.gcode"
+        export_path = Path(export_name).expanduser()
+        if not export_path.is_absolute():
+            export_path = Path(runner.run_folder) / export_path
+
+        export_result = export_gcode_from_trajectory(
             output_path=export_path,
             cal=cal,
             traj=traj,
@@ -2263,18 +3613,30 @@ def main(args):
             travel_feed=float(args.travel_feed),
             fine_approach_feed=float(args.fine_approach_feed),
             probe_feed=float(args.probe_feed),
+            c_max_feed=float(args.c_max_feed),
+            c_accel_time_s=float(args.c_accel_time),
+            c_decel_time_s=float(args.c_decel_time),
             virtual_bbox=virtual_bbox,
+            motion_meta=custom_meta,
             dwell_before_ms=int(args.dwell_before_ms),
             dwell_after_ms=int(args.dwell_after_ms),
             initial_sweep_wait_s=float(args.initial_sweep_wait_s),
+            use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
+            include_startup_waits=bool(args.export_include_startup_waits),
         )
-        print("\nExport-only mode enabled; skipped camera, robot, acquisition, and post-processing.")
-        print(f"Exported commanded G-code: {export_result['path']}")
+        print("\nExported smooth motion-only G-code; capture markers were not converted into waits/stops.")
+        print(f"Exported G-code: {export_result['path']}")
+        print(f"Commanded-motor CSV: {export_result['commanded_motor_positions_csv']}")
+        print(f"Trajectory CSV: {export_result['trajectory_points_csv']}")
+        print(f"Export metadata: {export_result['metadata_json']}")
         print(f"Exported command count: {export_result['command_count']}")
+        print(f"Capture markers ignored during export: {export_result['capture_markers_ignored']}")
         print(f"BBox warnings: {len(export_result['bbox_warnings'])}")
         for msg in export_result["bbox_warnings"]:
             print(msg)
-        return
+        if bool(args.export_gcode_only):
+            print("Export-only mode enabled; skipped camera, robot, acquisition, and post-processing.")
+            return
 
     try:
         runner.connect_to_camera(
@@ -2315,6 +3677,8 @@ def main(args):
             initial_sweep_wait_s=float(args.initial_sweep_wait_s),
             settled_capture_mode=bool(args.settled_capture_mode),
             settled_capture_buffer_s=float(args.settled_capture_buffer_s),
+            motion_accel_mm_s2=float(args.motion_accel_mm_s2),
+            streaming_lookahead_s=float(args.streaming_lookahead_s),
         )
 
         print("\nFinal results:")
@@ -2334,7 +3698,47 @@ def main(args):
                 str(int(args.post_threshold)),
                 "--tip_refine_mode",
                 str(args.post_tip_refine_mode),
+                "--tip_detection_mode",
+                str(args.post_tip_detection_mode),
+                "--tracked_tip_source",
+                str(args.post_tracked_tip_source),
+                "--red_tip_sat_min",
+                str(int(args.post_red_tip_sat_min)),
+                "--red_tip_val_min",
+                str(int(args.post_red_tip_val_min)),
+                "--red_tip_min_area_px",
+                str(int(args.post_red_tip_min_area_px)),
+                "--red_tip_morph_kernel",
+                str(int(args.post_red_tip_morph_kernel)),
+                "--red_tip_hue1_min",
+                str(int(args.post_red_tip_hue1_min)),
+                "--red_tip_hue1_max",
+                str(int(args.post_red_tip_hue1_max)),
+                "--red_tip_hue2_min",
+                str(int(args.post_red_tip_hue2_min)),
+                "--red_tip_hue2_max",
+                str(int(args.post_red_tip_hue2_max)),
+                "--red_tip_search_radius_px",
+                str(float(args.post_red_tip_search_radius_px)),
+                "--red_tip_local_min_area_px",
+                str(int(args.post_red_tip_local_min_area_px)),
+                "--red_tip_distance_weight",
+                str(float(args.post_red_tip_distance_weight)),
+                "--red_tip_min_circularity",
+                str(float(args.post_red_tip_min_circularity)),
+                "--red_tip_component_selection",
+                str(args.post_red_tip_component_selection),
+                "--red_tip_rgb_excess_min",
+                str(int(args.post_red_tip_rgb_excess_min)),
             ]
+            if bool(args.post_red_tip_use_rgb_excess):
+                post_cmd.append("--red_tip_use_rgb_excess")
+            else:
+                post_cmd.append("--no_red_tip_use_rgb_excess")
+            if bool(args.post_red_tip_debug_save_mask):
+                post_cmd.append("--red_tip_debug_save_mask")
+            else:
+                post_cmd.append("--no_red_tip_debug_save_mask")
             if bool(args.post_save_plots):
                 post_cmd.append("--save_plots")
 
@@ -2366,8 +3770,12 @@ if __name__ == "__main__":
                     help="Append timestamp to the run folder name.")
     ap.add_argument("--enable-post", action="store_true",
                     help="Run calib_point_process.py on the generated project directory after acquisition.")
+    ap.add_argument("--export-gcode", nargs="?", const="commanded_motion.gcode", default=None,
+                    help="Export a smooth motion-only G-code file. If a relative path is given, it is written inside the run folder.")
     ap.add_argument("--export-gcode-only", action="store_true",
-                    help="Only export the commanded motion G-code file and skip robot/camera execution.")
+                    help="Only export the smooth motion-only G-code file and skip robot/camera execution.")
+    ap.add_argument("--export-include-startup-waits", action="store_true", default=False,
+                    help="Include initial-sweep and dwell waits in exported G-code. Capture waits are never inserted.")
 
     # Connectivity
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet web address.")
@@ -2391,6 +3799,16 @@ if __name__ == "__main__":
     ap.add_argument("--y-offset-fit", type=str, default=DEFAULT_Y_OFFSET_FIT,
                     choices=["avg_pchip", "avg_cubic", "pchip", "cubic", "legacy"],
                     help="Which calibration y-offset fit to use for DAQ motion.")
+    ap.add_argument("--curve-set", type=str, default=DEFAULT_CURVE_SET,
+                    help="Branch model source to use from curl_angle_specific_fit_models. Use 'global' for top-level fit_models_by_phase. Default: 0-180-0.")
+    ap.add_argument("--allow-global-curve-set-fallback", action="store_true",
+                    default=DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
+                    help="If the requested --curve-set is missing, fall back to global fit_models_by_phase instead of raising.")
+    ap.add_argument("--motion-mode", type=str, default=DEFAULT_MOTION_MODE,
+                    choices=["custom", "fast_routine"],
+                    help="Use the legacy cyclic trajectory ('custom') or the requested fast routine preset.")
+    ap.add_argument("--routine-repeats", type=int, default=DEFAULT_ROUTINE_REPEATS,
+                    help="Repeat the fast routine this many times. Alias for cycle repeats in fast_routine mode.")
 
     # Fixed tip point
     ap.add_argument("--point-x", type=float, default=DEFAULT_POINT_X, help="Fixed tip X (Cartesian/world).")
@@ -2419,7 +3837,7 @@ if __name__ == "__main__":
     ap.add_argument("--b-0-to-90-only", action="store_true", default=DEFAULT_B_0_TO_90_ONLY,
                     help="Force the cyclic B/tip oscillation range to 0..90 deg.")
     ap.add_argument("--b-oscillations-per-sweep", type=float, default=DEFAULT_B_OSCILLATIONS_PER_SWEEP,
-                    help="How many B oscillations occur during one one-way sweep of C (e.g. 2).")
+                    help="How many B oscillations occur during one one-way sweep of C. Use 1 for one full curl or uncurl per sweep.")
     ap.add_argument("--b-phase-offset-deg", type=float, default=DEFAULT_B_PHASE_OFFSET_DEG,
                     help="Phase offset for the B oscillation. -90 starts at tip_min.")
     ap.add_argument("--c-boundary-ease-frac", type=float, default=DEFAULT_C_BOUNDARY_EASE_FRAC,
@@ -2428,6 +3846,9 @@ if __name__ == "__main__":
                     help="Dense sampling count used for numeric tip-angle -> B inversion.")
     ap.add_argument("--phase-transition-steps", type=int, default=DEFAULT_PHASE_TRANSITION_STEPS,
                     help="Non-recorded smoothing steps inserted when switching between curl/pull and uncurl/release.")
+    ap.add_argument("--c-two-way-sweeps-per-b-oscillation", type=int,
+                    default=DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION,
+                    help="For monotonic B curl/uncurl mode, how many back-and-forth C sweep groups are spread across one B oscillation. 2 gives -360->360->-360->360 during one curl.")
 
     # Capture visibility controls
     ap.add_argument("--capture-tip-full-visible-min-deg", type=float,
@@ -2451,6 +3872,8 @@ if __name__ == "__main__":
     ap.add_argument("--c-max-feed", type=float, default=DEFAULT_C_MAX_FEED)
     ap.add_argument("--c-accel-time", type=float, default=DEFAULT_C_ACCEL_TIME_S)
     ap.add_argument("--c-decel-time", type=float, default=DEFAULT_C_DECEL_TIME_S)
+    ap.add_argument("--motion-accel-mm-s2", type=float, default=DEFAULT_MOTION_ACCEL_MM_S2,
+                    help="Acceleration used for settled-capture move-time estimates.")
     ap.add_argument("--disable-segment-feed-scheduler", action="store_true",
                     help="Disable per-segment feed scheduling.")
 
@@ -2473,6 +3896,8 @@ if __name__ == "__main__":
                     help="Stream commands without M400 waits; wait only at capture points using estimated timing.")
     ap.add_argument("--settled-capture-buffer-s", type=float, default=DEFAULT_SETTLED_CAPTURE_BUFFER_S,
                     help="Extra idle time after estimated motion completion before each capture.")
+    ap.add_argument("--streaming-lookahead-s", type=float, default=DEFAULT_STREAMING_LOOKAHEAD_S,
+                    help="How early to send the next non-capture tracked command before the previous one is estimated to finish.")
 
     # Post-processing
     ap.add_argument("--post-camera-calibration-file", type=str, default=DEFAULT_POST_CAMERA_CALIBRATION_FILE,
@@ -2484,6 +3909,35 @@ if __name__ == "__main__":
                     help="Threshold passed to calib_point_process.py.")
     ap.add_argument("--post-tip-refine-mode", type=str, default=DEFAULT_POST_TIP_REFINE_MODE,
                     help="Tip refinement mode passed to calib_point_process.py.")
+    ap.add_argument("--post-tip-detection-mode", type=str, default=DEFAULT_POST_TIP_DETECTION_MODE,
+                    choices=["classical", "red_dot", "auto_red_dot"],
+                    help="Tip detection mode passed to calib_point_process.py.")
+    ap.add_argument("--post-tracked-tip-source", type=str, default=DEFAULT_POST_TRACKED_TIP_SOURCE,
+                    choices=["auto", "coarse", "selected", "cnn"],
+                    help="Tracked tip source passed to calib_point_process.py. Use auto or selected for red-dot post-processing.")
+    ap.add_argument("--post-red-tip-sat-min", type=int, default=DEFAULT_POST_RED_TIP_SAT_MIN)
+    ap.add_argument("--post-red-tip-val-min", type=int, default=DEFAULT_POST_RED_TIP_VAL_MIN)
+    ap.add_argument("--post-red-tip-min-area-px", type=int, default=DEFAULT_POST_RED_TIP_MIN_AREA_PX)
+    ap.add_argument("--post-red-tip-morph-kernel", type=int, default=DEFAULT_POST_RED_TIP_MORPH_KERNEL)
+    ap.add_argument("--post-red-tip-hue1-min", type=int, default=DEFAULT_POST_RED_TIP_HUE1_MIN)
+    ap.add_argument("--post-red-tip-hue1-max", type=int, default=DEFAULT_POST_RED_TIP_HUE1_MAX)
+    ap.add_argument("--post-red-tip-hue2-min", type=int, default=DEFAULT_POST_RED_TIP_HUE2_MIN)
+    ap.add_argument("--post-red-tip-hue2-max", type=int, default=DEFAULT_POST_RED_TIP_HUE2_MAX)
+    ap.add_argument("--post-red-tip-search-radius-px", type=float, default=DEFAULT_POST_RED_TIP_SEARCH_RADIUS_PX)
+    ap.add_argument("--post-red-tip-local-min-area-px", type=int, default=DEFAULT_POST_RED_TIP_LOCAL_MIN_AREA_PX)
+    ap.add_argument("--post-red-tip-distance-weight", type=float, default=DEFAULT_POST_RED_TIP_DISTANCE_WEIGHT)
+    ap.add_argument("--post-red-tip-min-circularity", type=float, default=DEFAULT_POST_RED_TIP_MIN_CIRCULARITY)
+    ap.add_argument("--post-red-tip-component-selection", type=str, default=DEFAULT_POST_RED_TIP_COMPONENT_SELECTION,
+                    choices=["largest", "nearest", "nearest_largest"])
+    ap.add_argument("--post-red-tip-use-rgb-excess", dest="post_red_tip_use_rgb_excess",
+                    action="store_true", default=DEFAULT_POST_RED_TIP_USE_RGB_EXCESS)
+    ap.add_argument("--no-post-red-tip-use-rgb-excess", dest="post_red_tip_use_rgb_excess",
+                    action="store_false")
+    ap.add_argument("--post-red-tip-rgb-excess-min", type=int, default=DEFAULT_POST_RED_TIP_RGB_EXCESS_MIN)
+    ap.add_argument("--post-red-tip-debug-save-mask", dest="post_red_tip_debug_save_mask",
+                    action="store_true", default=DEFAULT_POST_RED_TIP_DEBUG_SAVE_MASK)
+    ap.add_argument("--no-post-red-tip-debug-save-mask", dest="post_red_tip_debug_save_mask",
+                    action="store_false")
     ap.add_argument("--post-save-plots", dest="post_save_plots", action="store_true", default=True,
                     help="Pass --save_plots to calib_point_process.py.")
     ap.add_argument("--no-post-save-plots", dest="post_save_plots", action="store_false",

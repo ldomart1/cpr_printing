@@ -93,12 +93,14 @@ CIRCLE_RADIUS_DEFAULT = 18.0
 CIRCLE_SAMPLES_PER_QUARTER_DEFAULT = 50
 
 HOURGLASS_RECORDED_PHASES_ORDER = [
-    "top_arc_pull",
+    "top_arc_right_pull",
     "right_diag_upper_release",
     "right_diag_lower_pull",
-    "bottom_arc_release",
-    "left_diag_lower_pull",
-    "left_diag_upper_release",
+    "bottom_arc_right_release",
+    "bottom_arc_left_pull",
+    "left_diag_lower_release",
+    "left_diag_upper_pull",
+    "top_arc_left_release",
 ]
 HOURGLASS_RECORDED_PHASES = set(HOURGLASS_RECORDED_PHASES_ORDER)
 
@@ -109,13 +111,15 @@ LEGACY_STAR_RECORDED_PHASES_ORDER = ["right", "left"]
 LEGACY_STAR_RECORDED_PHASES = set(LEGACY_STAR_RECORDED_PHASES_ORDER)
 
 _TRACKED_PHASE_TOKENS = [
-    "top_arc_pull_start",
-    "top_arc_pull",
+    "top_arc_right_pull_start",
+    "top_arc_right_pull",
     "right_diag_upper_release",
     "right_diag_lower_pull",
-    "bottom_arc_release",
-    "left_diag_lower_pull",
-    "left_diag_upper_release",
+    "bottom_arc_right_release",
+    "bottom_arc_left_pull",
+    "left_diag_lower_release",
+    "left_diag_upper_pull",
+    "top_arc_left_release",
     "final_recenter",
     "q1_pull_start",
     "q1_pull",
@@ -137,6 +141,8 @@ _TRACKED_PHASE_TOKENS = [
 _TRACKED_SAMPLE_RE = re.compile(
     r"(?:^|_)(\d{5})_(" + "|".join(re.escape(t) for t in _TRACKED_PHASE_TOKENS) + r")(?:_|$)"
 )
+_TRACKED_CYCLE_RE = re.compile(r"_CY(\d+)OF(\d+)")
+_TRACKED_POINT_IN_CYCLE_RE = re.compile(r"_PI(\d+)")
 
 
 
@@ -207,6 +213,10 @@ def load_optional_tip_refiner(cal: CTR_Shadow_Calibration, args) -> None:
         anchor_name=args.tip_refiner_anchor,
         use_as_selected=(not bool(args.tip_refiner_compare_only)),
     )
+
+
+DEFAULT_TIP_DETECTION_MODE = "red_dot"
+DEFAULT_TRACKED_TIP_SOURCE = "selected"
 
 
 def select_tracked_rows_for_analysis(cal: CTR_Shadow_Calibration, args) -> Tuple[np.ndarray, str]:
@@ -371,6 +381,28 @@ def parse_tracked_sample_metadata(file_name: str) -> Tuple[Optional[int], Option
     return int(m.group(1)), str(m.group(2))
 
 
+def parse_tracked_cycle_metadata(file_name: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    base = os.path.basename(file_name)
+    cycle_match = _TRACKED_CYCLE_RE.search(base)
+    point_match = _TRACKED_POINT_IN_CYCLE_RE.search(base)
+    cycle_index = None
+    cycle_count = None
+    point_index_in_cycle = None
+    if cycle_match:
+        try:
+            cycle_index = max(0, int(cycle_match.group(1)) - 1)
+            cycle_count = int(cycle_match.group(2))
+        except Exception:
+            cycle_index = None
+            cycle_count = None
+    if point_match:
+        try:
+            point_index_in_cycle = int(point_match.group(1))
+        except Exception:
+            point_index_in_cycle = None
+    return cycle_index, cycle_count, point_index_in_cycle
+
+
 def _image_sort_key(path: Path):
     sample_idx, phase = parse_tracked_sample_metadata(path.name)
     if sample_idx is not None:
@@ -442,27 +474,43 @@ def build_hourglass_tip_rows(
     top_center_z = float(center_z) + 0.5 * float(arc_vertical_gap_mm) + float(radius)
     bottom_center_z = float(center_z) - 0.5 * float(arc_vertical_gap_mm) - float(radius)
 
-    top_arc = make_arc_points(
+    top_arc_right = make_arc_points(
+        center_x=float(center_x),
+        center_z=float(top_center_z),
+        radius=float(radius),
+        theta_start_deg=0.0,
+        theta_end_deg=-phi_deg,
+        n=max(2, int(math.ceil(n_arc * (phi_deg / 180.0)))) + 1,
+    )
+    top_arc_left = make_arc_points(
         center_x=float(center_x),
         center_z=float(top_center_z),
         radius=float(radius),
         theta_start_deg=180.0 + phi_deg,
-        theta_end_deg=-phi_deg,
-        n=n_arc,
+        theta_end_deg=0.0,
+        n=max(2, int(math.ceil(n_arc * ((180.0 + phi_deg) / 180.0)))) + 1,
     )
-    bottom_arc = make_arc_points(
+    bottom_arc_right = make_arc_points(
         center_x=float(center_x),
         center_z=float(bottom_center_z),
         radius=float(radius),
         theta_start_deg=phi_deg,
+        theta_end_deg=-90.0,
+        n=max(2, int(math.ceil(n_arc * ((90.0 + phi_deg) / (180.0 + 2.0 * phi_deg))))) + 1,
+    )
+    bottom_arc_left = make_arc_points(
+        center_x=float(center_x),
+        center_z=float(bottom_center_z),
+        radius=float(radius),
+        theta_start_deg=-90.0,
         theta_end_deg=-(180.0 + phi_deg),
-        n=n_arc,
+        n=max(2, int(math.ceil(n_arc * ((90.0 + phi_deg) / (180.0 + 2.0 * phi_deg))))) + 1,
     )
 
-    top_left = np.asarray(top_arc[0], dtype=np.float64)
-    top_right = np.asarray(top_arc[-1], dtype=np.float64)
-    bottom_right = np.asarray(bottom_arc[0], dtype=np.float64)
-    bottom_left = np.asarray(bottom_arc[-1], dtype=np.float64)
+    top_left = np.asarray(top_arc_left[0], dtype=np.float64)
+    top_right = np.asarray(top_arc_right[-1], dtype=np.float64)
+    bottom_right = np.asarray(bottom_arc_right[0], dtype=np.float64)
+    bottom_left = np.asarray(bottom_arc_left[-1], dtype=np.float64)
     waist_right = np.array([float(center_x) + 0.5 * float(middle_gap_mm), float(center_z)], dtype=np.float64)
     waist_left = np.array([float(center_x) - 0.5 * float(middle_gap_mm), float(center_z)], dtype=np.float64)
 
@@ -472,12 +520,14 @@ def build_hourglass_tip_rows(
     left_diag_upper = make_line_points(waist_left, top_left, n_diag)
 
     segments = [
-        ("top_arc_pull", top_arc),
+        ("top_arc_right_pull", top_arc_right),
         ("right_diag_upper_release", right_diag_upper),
         ("right_diag_lower_pull", right_diag_lower),
-        ("bottom_arc_release", bottom_arc),
-        ("left_diag_lower_pull", left_diag_lower),
-        ("left_diag_upper_release", left_diag_upper),
+        ("bottom_arc_right_release", bottom_arc_right),
+        ("bottom_arc_left_pull", bottom_arc_left),
+        ("left_diag_lower_release", left_diag_lower),
+        ("left_diag_upper_pull", left_diag_upper),
+        ("top_arc_left_release", top_arc_left),
     ]
 
     rows: List[Dict[str, float]] = []
@@ -2108,6 +2158,7 @@ def compute_tracked_tip_positions_mm(
     for i, row in enumerate(np.asarray(tracked_rows, dtype=float)):
         file_name = image_files[i].name if i < len(image_files) else f"sample_{i:04d}"
         tracked_sample_idx, tracked_phase = parse_tracked_sample_metadata(file_name)
+        cycle_index, cycle_count, point_index_in_cycle = parse_tracked_cycle_metadata(file_name)
         csv_sample_index = int(tracked_sample_idx) if tracked_sample_idx is not None else int(i)
 
         named_values = extract_named_values_from_filename(file_name)
@@ -2121,6 +2172,9 @@ def compute_tracked_tip_positions_mm(
             "z_mm": None,
             "b_pull_mm": _extract_b_value_from_row(row),
             "phase": tracked_phase,
+            "cycle_index": cycle_index,
+            "cycle_count": cycle_count,
+            "point_index_in_cycle": point_index_in_cycle,
             "stage_x_mm": float(named_values["X"]) if "X" in named_values else None,
             "stage_y_mm": float(named_values["Y"]) if "Y" in named_values else None,
             "stage_z_mm": float(named_values["Z"]) if "Z" in named_values else None,
@@ -2512,11 +2566,79 @@ def compute_segment_error_stats(records: List[Dict[str, Any]]) -> Dict[str, Dict
     return stats
 
 
+def compute_augmented_cycle_metrics(
+    records: List[Dict[str, Any]],
+    desired_curve_mm_points: Optional[np.ndarray] = None,
+    error_alignment: str = "mean",
+) -> Optional[Dict[str, Any]]:
+    grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    repeated_groups = 0
+    for rec in records:
+        if not rec.get("valid", False):
+            continue
+        if rec.get("u_mm") is None or rec.get("z_mm") is None:
+            continue
+        if rec.get("desired_x_mm") is None or rec.get("desired_z_mm") is None:
+            continue
+        key = (
+            _phase_to_segment_label(rec.get("phase")) or rec.get("phase"),
+            None if rec.get("point_index_in_cycle") is None else int(rec.get("point_index_in_cycle")),
+            round(float(rec["desired_x_mm"]), 6),
+            round(float(rec["desired_z_mm"]), 6),
+            None if rec.get("desired_projection_segment_index") is None else int(rec.get("desired_projection_segment_index")),
+        )
+        grouped.setdefault(key, []).append(rec)
+
+    if not grouped:
+        return None
+
+    aug_records: List[Dict[str, Any]] = []
+    measured = []
+    desired = []
+    for key, recs in grouped.items():
+        if len(recs) > 1:
+            repeated_groups += 1
+        measured.append([
+            float(np.mean([float(r["u_mm"]) for r in recs])),
+            float(np.mean([float(r["z_mm"]) for r in recs])),
+        ])
+        desired.append([float(key[2]), float(key[3])])
+        aug_records.append({
+            "phase": key[0],
+            "point_index_in_cycle": key[1],
+            "desired_x_mm": float(key[2]),
+            "desired_z_mm": float(key[3]),
+            "desired_projection_segment_index": key[4],
+            "repeat_count": int(len(recs)),
+        })
+
+    if repeated_groups == 0:
+        return None
+
+    measured_arr = np.asarray(measured, dtype=float)
+    desired_arr = np.asarray(desired, dtype=float)
+    metrics = compute_error_metrics(
+        measured_arr,
+        desired_arr,
+        desired_curve_mm_points=desired_curve_mm_points,
+        error_alignment=error_alignment,
+    )
+    for rec, err in zip(aug_records, metrics["errors_mm"]):
+        rec["error_distance_mm"] = float(err)
+    metrics["num_augmented_targets"] = int(len(aug_records))
+    metrics["num_repeated_target_groups"] = int(repeated_groups)
+    metrics["augmented_records"] = aug_records
+    return metrics
+
+
 def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
     fieldnames = [
         "sample_index",
         "image_name",
         "phase",
+        "cycle_index",
+        "cycle_count",
+        "point_index_in_cycle",
         "tip_y_px",
         "tip_x_px",
         "u_mm",
@@ -2991,6 +3113,7 @@ def save_metrics_json(
         "samplewise_rmse_mm": metrics.get("samplewise_rmse_mm"),
         "samplewise_mean_error_mm": metrics.get("samplewise_mean_error_mm"),
         "num_samples": metrics["num_samples"],
+        "augmented_metrics": metrics.get("augmented_metrics"),
         "analysis_crop": getattr(cal, "analysis_crop", None),
         "board_reference": collect_board_reference_info(cal),
         "settings": {
@@ -3099,7 +3222,7 @@ def main():
                     help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
     ap.add_argument("--tip_refiner_compare_only", "--post-tip-refiner-compare-only", dest="tip_refiner_compare_only", action="store_true",
                     help="Save CNN tips but keep non-CNN tips as the default tracked source.")
-    ap.add_argument("--tip_detection_mode", type=str, default="classical",
+    ap.add_argument("--tip_detection_mode", type=str, default=DEFAULT_TIP_DETECTION_MODE,
                     choices=["classical", "red_dot", "auto_red_dot"],
                     help="Tip detection mode from CTR shadow calibration. red_dot uses the red marker centroid as the selected tip.")
     ap.add_argument(
@@ -3109,9 +3232,9 @@ def main():
         "--post_tracked_tip_source",
         dest="tracked_tip_source",
         type=str,
-        default="auto",
+        default=DEFAULT_TRACKED_TIP_SOURCE,
         choices=["auto", "coarse", "selected", "cnn"],
-        help="Which tip rows to convert to mm. auto uses selected rows when red-dot or CNN-selected tips are active, otherwise coarse. Compatibility aliases: --tracked-tip-source, --post-tracked-tip-source, --post_tracked_tip_source.",
+        help="Which tip rows to convert to mm. Defaults to selected so hourglass post-processing uses red-dot-selected rows unless overridden. Compatibility aliases: --tracked-tip-source, --post-tracked-tip-source, --post_tracked_tip_source.",
     )
 
     ap.add_argument("--hourglass_center_x_mm", type=float, default=HOURGLASS_CENTER_X_DEFAULT)
@@ -3139,7 +3262,7 @@ def main():
     ap.add_argument("--debug_worst_n", type=int, default=12,
     help="Number of largest-error samples to label/draw in the debug alignment plot.")
     ap.add_argument("--capture_at_start", action="store_true",
-    help="Match acquisition runs that also captured the initial top_arc_pull_start point.")
+    help="Match acquisition runs that also captured the initial top_arc_right_pull_start point.")
     ap.add_argument("--capture_every_n_shape_moves", "--capture_every_n_circle_moves", dest="capture_every_n_shape_moves", type=int, default=1,
     help="Match acquisition subsampling: one saved image every N recorded hourglass moves.")
 
@@ -3345,6 +3468,11 @@ def main():
         samplewise_errors_mm=metrics["samplewise_errors_mm"],
     )
     metrics["segment_error_stats"] = compute_segment_error_stats(records)
+    metrics["augmented_metrics"] = compute_augmented_cycle_metrics(
+        records,
+        desired_curve_mm_points=desired_curve_mm_points,
+        error_alignment=str(args.error_alignment),
+    )
 
     csv_path = processed_dir / "tracked_tip_positions_mm.csv"
     metrics_json_path = processed_dir / "tracked_tip_error_metrics.json"
@@ -3443,6 +3571,13 @@ def main():
     print(f"Median error: {metrics['median_error_mm']:.6f} mm")
     print(f"Min error:    {metrics['min_error_mm']:.6f} mm")
     print(f"Max error:    {metrics['max_error_mm']:.6f} mm")
+    if metrics.get("augmented_metrics") is not None:
+        am = metrics["augmented_metrics"]
+        print(
+            f"Augmented RMSE: {float(am['rmse_mm']):.6f} mm "
+            f"(repeat-averaged targets: {int(am['num_augmented_targets'])}, "
+            f"repeated groups: {int(am['num_repeated_target_groups'])})"
+        )
     print("Per-segment error stats:")
     for segment in HOURGLASS_RECORDED_PHASES_ORDER:
         sstats = metrics["segment_error_stats"].get(segment, {})

@@ -78,13 +78,14 @@ _NEI8_W = [
 ]
 
 HOURGLASS_CENTER_X_DEFAULT = 100.0
-HOURGLASS_CENTER_Z_DEFAULT = -130.0
+HOURGLASS_CENTER_Z_DEFAULT = -140.0
 HOURGLASS_ARC_VERTICAL_GAP_MM_DEFAULT = 18.0
 HOURGLASS_CIRCLE_DIAMETER_MM_DEFAULT = 18.0
-HOURGLASS_MIDDLE_GAP_MM_DEFAULT = 6.0
+HOURGLASS_MIDDLE_GAP_MM_DEFAULT = 9.0
 HOURGLASS_ARC_OVERTRAVEL_DEG_DEFAULT = 20.0
 HOURGLASS_SAMPLES_PER_ARC_DEFAULT = 180
 HOURGLASS_SAMPLES_PER_DIAGONAL_DEFAULT = 120
+HOURGLASS_SAMPLE_SPACING_MM_DEFAULT = 0.0
 
 CIRCLE_CENTER_X_DEFAULT = 100.0
 CIRCLE_CENTER_Z_DEFAULT = -125.0
@@ -92,12 +93,14 @@ CIRCLE_RADIUS_DEFAULT = 18.0
 CIRCLE_SAMPLES_PER_QUARTER_DEFAULT = 50
 
 HOURGLASS_RECORDED_PHASES_ORDER = [
-    "top_arc_pull",
+    "top_arc_right_pull",
     "right_diag_upper_release",
     "right_diag_lower_pull",
-    "bottom_arc_release",
-    "left_diag_lower_pull",
-    "left_diag_upper_release",
+    "bottom_arc_right_release",
+    "bottom_arc_left_pull",
+    "left_diag_lower_release",
+    "left_diag_upper_pull",
+    "top_arc_left_release",
 ]
 HOURGLASS_RECORDED_PHASES = set(HOURGLASS_RECORDED_PHASES_ORDER)
 
@@ -108,13 +111,15 @@ LEGACY_STAR_RECORDED_PHASES_ORDER = ["right", "left"]
 LEGACY_STAR_RECORDED_PHASES = set(LEGACY_STAR_RECORDED_PHASES_ORDER)
 
 _TRACKED_PHASE_TOKENS = [
-    "top_arc_pull_start",
-    "top_arc_pull",
+    "top_arc_right_pull_start",
+    "top_arc_right_pull",
     "right_diag_upper_release",
     "right_diag_lower_pull",
-    "bottom_arc_release",
-    "left_diag_lower_pull",
-    "left_diag_upper_release",
+    "bottom_arc_right_release",
+    "bottom_arc_left_pull",
+    "left_diag_lower_release",
+    "left_diag_upper_pull",
+    "top_arc_left_release",
     "final_recenter",
     "q1_pull_start",
     "q1_pull",
@@ -136,6 +141,8 @@ _TRACKED_PHASE_TOKENS = [
 _TRACKED_SAMPLE_RE = re.compile(
     r"(?:^|_)(\d{5})_(" + "|".join(re.escape(t) for t in _TRACKED_PHASE_TOKENS) + r")(?:_|$)"
 )
+_TRACKED_CYCLE_RE = re.compile(r"_CY(\d+)OF(\d+)")
+_TRACKED_POINT_IN_CYCLE_RE = re.compile(r"_PI(\d+)")
 
 
 
@@ -370,6 +377,28 @@ def parse_tracked_sample_metadata(file_name: str) -> Tuple[Optional[int], Option
     return int(m.group(1)), str(m.group(2))
 
 
+def parse_tracked_cycle_metadata(file_name: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    base = os.path.basename(file_name)
+    cycle_match = _TRACKED_CYCLE_RE.search(base)
+    point_match = _TRACKED_POINT_IN_CYCLE_RE.search(base)
+    cycle_index = None
+    cycle_count = None
+    point_index_in_cycle = None
+    if cycle_match:
+        try:
+            cycle_index = max(0, int(cycle_match.group(1)) - 1)
+            cycle_count = int(cycle_match.group(2))
+        except Exception:
+            cycle_index = None
+            cycle_count = None
+    if point_match:
+        try:
+            point_index_in_cycle = int(point_match.group(1))
+        except Exception:
+            point_index_in_cycle = None
+    return cycle_index, cycle_count, point_index_in_cycle
+
+
 def _image_sort_key(path: Path):
     sample_idx, phase = parse_tracked_sample_metadata(path.name)
     if sample_idx is not None:
@@ -413,6 +442,98 @@ def make_line_points(p0: np.ndarray, p1: np.ndarray, n: int) -> np.ndarray:
     return ((1.0 - tt) * p0[None, :] + tt * p1[None, :]).astype(np.float64)
 
 
+def _hourglass_segment_length(segment_spec: Dict[str, Any]) -> float:
+    kind = str(segment_spec["kind"]).strip().lower()
+    if kind == "arc":
+        radius = float(segment_spec["radius"])
+        theta_start = float(segment_spec["theta_start_deg"])
+        theta_end = float(segment_spec["theta_end_deg"])
+        return abs(radius * math.radians(theta_end - theta_start))
+    if kind == "line":
+        p0 = np.asarray(segment_spec["p0"], dtype=np.float64).reshape(2)
+        p1 = np.asarray(segment_spec["p1"], dtype=np.float64).reshape(2)
+        return float(np.linalg.norm(p1 - p0))
+    raise ValueError(f"Unsupported hourglass segment kind: {segment_spec['kind']}")
+
+
+def _point_on_hourglass_segment(segment_spec: Dict[str, Any], frac: float) -> np.ndarray:
+    u = min(1.0, max(0.0, float(frac)))
+    kind = str(segment_spec["kind"]).strip().lower()
+    if kind == "arc":
+        theta_start = math.radians(float(segment_spec["theta_start_deg"]))
+        theta_end = math.radians(float(segment_spec["theta_end_deg"]))
+        theta = theta_start + u * (theta_end - theta_start)
+        radius = float(segment_spec["radius"])
+        center_x = float(segment_spec["center_x"])
+        center_z = float(segment_spec["center_z"])
+        return np.array(
+            [center_x + radius * math.cos(theta), center_z + radius * math.sin(theta)],
+            dtype=np.float64,
+        )
+    if kind == "line":
+        p0 = np.asarray(segment_spec["p0"], dtype=np.float64).reshape(2)
+        p1 = np.asarray(segment_spec["p1"], dtype=np.float64).reshape(2)
+        return ((1.0 - u) * p0 + u * p1).astype(np.float64)
+    raise ValueError(f"Unsupported hourglass segment kind: {segment_spec['kind']}")
+
+
+def _resample_hourglass_segments_continuous(
+    segment_specs: List[Dict[str, Any]],
+    sample_spacing_mm: float,
+) -> List[Dict[str, Any]]:
+    if not segment_specs:
+        raise ValueError("segment_specs must not be empty.")
+
+    lengths = [max(0.0, _hourglass_segment_length(spec)) for spec in segment_specs]
+    total_length = float(sum(lengths))
+    if total_length <= 1e-12:
+        raise RuntimeError("Hourglass path length is degenerate.")
+
+    legacy_total_points = 1
+    for spec in segment_specs:
+        legacy_total_points += max(2, int(spec["legacy_n"])) - 1
+
+    spacing_req = float(sample_spacing_mm)
+    if spacing_req > 1e-9:
+        total_points = max(2, int(math.ceil(total_length / spacing_req)) + 1)
+    else:
+        total_points = max(2, int(legacy_total_points))
+
+    sample_s = np.linspace(0.0, total_length, total_points, dtype=np.float64)
+    sampled_specs: List[Dict[str, Any]] = []
+    seg_start_s = 0.0
+    tol = 1e-9 * max(1.0, total_length)
+
+    for seg_idx, (spec, seg_length) in enumerate(zip(segment_specs, lengths)):
+        seg_end_s = seg_start_s + seg_length
+        if seg_idx == 0:
+            mask = sample_s <= seg_end_s + tol
+        elif seg_idx == len(segment_specs) - 1:
+            mask = sample_s > seg_start_s + tol
+        else:
+            mask = (sample_s > seg_start_s + tol) & (sample_s <= seg_end_s + tol)
+
+        seg_sample_s = sample_s[mask]
+        if seg_sample_s.size < 2:
+            raise RuntimeError(
+                f"Uniform hourglass sampling produced only {int(seg_sample_s.size)} point(s) for "
+                f"segment '{spec['phase_name']}'. Reduce --sample-spacing-mm or increase the legacy sample counts."
+            )
+
+        if seg_length <= 1e-12:
+            frac = np.zeros(seg_sample_s.shape[0], dtype=np.float64)
+        else:
+            frac = np.clip((seg_sample_s - seg_start_s) / seg_length, 0.0, 1.0)
+
+        pts = np.vstack([_point_on_hourglass_segment(spec, f) for f in frac]).astype(np.float64)
+        spec_out = dict(spec)
+        spec_out["points"] = pts
+        sampled_specs.append(spec_out)
+        seg_start_s = seg_end_s
+
+    return sampled_specs
+
+
 def build_hourglass_tip_rows(
     center_x: float,
     center_z: float,
@@ -422,8 +543,11 @@ def build_hourglass_tip_rows(
     arc_overtravel_deg: float,
     samples_per_arc: int,
     samples_per_diagonal: int,
+    sample_spacing_mm: float,
     final_recenter: bool = True,
 ) -> List[Dict[str, float]]:
+    if float(sample_spacing_mm) < 0.0:
+        raise ValueError("sample_spacing_mm must be non-negative.")
     radius = 0.5 * float(circle_diameter_mm)
     if radius <= 0.0:
         raise ValueError("circle_diameter_mm must be positive.")
@@ -441,27 +565,48 @@ def build_hourglass_tip_rows(
     top_center_z = float(center_z) + 0.5 * float(arc_vertical_gap_mm) + float(radius)
     bottom_center_z = float(center_z) - 0.5 * float(arc_vertical_gap_mm) - float(radius)
 
-    top_arc = make_arc_points(
+    top_arc_right_n = max(2, int(math.ceil(n_arc * (phi_deg / 180.0)))) + 1
+    top_arc_left_n = max(2, int(math.ceil(n_arc * ((180.0 + phi_deg) / 180.0)))) + 1
+    bottom_arc_right_n = max(2, int(math.ceil(n_arc * ((90.0 + phi_deg) / (180.0 + 2.0 * phi_deg))))) + 1
+    bottom_arc_left_n = max(2, int(math.ceil(n_arc * ((90.0 + phi_deg) / (180.0 + 2.0 * phi_deg))))) + 1
+
+    top_arc_right = make_arc_points(
+        center_x=float(center_x),
+        center_z=float(top_center_z),
+        radius=float(radius),
+        theta_start_deg=0.0,
+        theta_end_deg=-phi_deg,
+        n=top_arc_right_n,
+    )
+    top_arc_left = make_arc_points(
         center_x=float(center_x),
         center_z=float(top_center_z),
         radius=float(radius),
         theta_start_deg=180.0 + phi_deg,
-        theta_end_deg=-phi_deg,
-        n=n_arc,
+        theta_end_deg=0.0,
+        n=top_arc_left_n,
     )
-    bottom_arc = make_arc_points(
+    bottom_arc_right = make_arc_points(
         center_x=float(center_x),
         center_z=float(bottom_center_z),
         radius=float(radius),
         theta_start_deg=phi_deg,
+        theta_end_deg=-90.0,
+        n=bottom_arc_right_n,
+    )
+    bottom_arc_left = make_arc_points(
+        center_x=float(center_x),
+        center_z=float(bottom_center_z),
+        radius=float(radius),
+        theta_start_deg=-90.0,
         theta_end_deg=-(180.0 + phi_deg),
-        n=n_arc,
+        n=bottom_arc_left_n,
     )
 
-    top_left = np.asarray(top_arc[0], dtype=np.float64)
-    top_right = np.asarray(top_arc[-1], dtype=np.float64)
-    bottom_right = np.asarray(bottom_arc[0], dtype=np.float64)
-    bottom_left = np.asarray(bottom_arc[-1], dtype=np.float64)
+    top_left = np.asarray(top_arc_left[0], dtype=np.float64)
+    top_right = np.asarray(top_arc_right[-1], dtype=np.float64)
+    bottom_right = np.asarray(bottom_arc_right[0], dtype=np.float64)
+    bottom_left = np.asarray(bottom_arc_left[-1], dtype=np.float64)
     waist_right = np.array([float(center_x) + 0.5 * float(middle_gap_mm), float(center_z)], dtype=np.float64)
     waist_left = np.array([float(center_x) - 0.5 * float(middle_gap_mm), float(center_z)], dtype=np.float64)
 
@@ -470,18 +615,85 @@ def build_hourglass_tip_rows(
     left_diag_lower = make_line_points(bottom_left, waist_left, n_diag)
     left_diag_upper = make_line_points(waist_left, top_left, n_diag)
 
-    segments = [
-        ("top_arc_pull", top_arc),
-        ("right_diag_upper_release", right_diag_upper),
-        ("right_diag_lower_pull", right_diag_lower),
-        ("bottom_arc_release", bottom_arc),
-        ("left_diag_lower_pull", left_diag_lower),
-        ("left_diag_upper_release", left_diag_upper),
+    segment_specs = [
+        {
+            "kind": "arc",
+            "phase_name": "top_arc_right_pull",
+            "center_x": float(center_x),
+            "center_z": float(top_center_z),
+            "radius": float(radius),
+            "theta_start_deg": 0.0,
+            "theta_end_deg": -phi_deg,
+            "legacy_n": int(top_arc_right_n),
+        },
+        {
+            "kind": "line",
+            "phase_name": "right_diag_upper_release",
+            "p0": top_right.tolist(),
+            "p1": waist_right.tolist(),
+            "legacy_n": int(n_diag),
+        },
+        {
+            "kind": "line",
+            "phase_name": "right_diag_lower_pull",
+            "p0": waist_right.tolist(),
+            "p1": bottom_right.tolist(),
+            "legacy_n": int(n_diag),
+        },
+        {
+            "kind": "arc",
+            "phase_name": "bottom_arc_right_release",
+            "center_x": float(center_x),
+            "center_z": float(bottom_center_z),
+            "radius": float(radius),
+            "theta_start_deg": phi_deg,
+            "theta_end_deg": -90.0,
+            "legacy_n": int(bottom_arc_right_n),
+        },
+        {
+            "kind": "arc",
+            "phase_name": "bottom_arc_left_pull",
+            "center_x": float(center_x),
+            "center_z": float(bottom_center_z),
+            "radius": float(radius),
+            "theta_start_deg": -90.0,
+            "theta_end_deg": -(180.0 + phi_deg),
+            "legacy_n": int(bottom_arc_left_n),
+        },
+        {
+            "kind": "line",
+            "phase_name": "left_diag_lower_release",
+            "p0": bottom_left.tolist(),
+            "p1": waist_left.tolist(),
+            "legacy_n": int(n_diag),
+        },
+        {
+            "kind": "line",
+            "phase_name": "left_diag_upper_pull",
+            "p0": waist_left.tolist(),
+            "p1": top_left.tolist(),
+            "legacy_n": int(n_diag),
+        },
+        {
+            "kind": "arc",
+            "phase_name": "top_arc_left_release",
+            "center_x": float(center_x),
+            "center_z": float(top_center_z),
+            "radius": float(radius),
+            "theta_start_deg": 180.0 + phi_deg,
+            "theta_end_deg": 0.0,
+            "legacy_n": int(top_arc_left_n),
+        },
     ]
+    segments = _resample_hourglass_segments_continuous(
+        segment_specs=segment_specs,
+        sample_spacing_mm=float(sample_spacing_mm),
+    )
 
     rows: List[Dict[str, float]] = []
-    for seg_idx, (phase_name, tip_xz_points) in enumerate(segments):
-        tip_xz_points = np.asarray(tip_xz_points, dtype=np.float64)
+    for seg_idx, spec in enumerate(segments):
+        phase_name = str(spec["phase_name"])
+        tip_xz_points = np.asarray(spec["points"], dtype=np.float64)
         for i, pt in enumerate(tip_xz_points):
             if seg_idx > 0 and i == 0:
                 continue
@@ -513,6 +725,7 @@ def build_hourglass_tip_lookup(
     arc_overtravel_deg: float,
     samples_per_arc: int,
     samples_per_diagonal: int,
+    sample_spacing_mm: float,
     capture_at_start: bool = False,
     capture_every_n_shape_moves: int = 1,
 ) -> Dict[int, Dict[str, float]]:
@@ -525,6 +738,7 @@ def build_hourglass_tip_lookup(
         arc_overtravel_deg=float(arc_overtravel_deg),
         samples_per_arc=int(samples_per_arc),
         samples_per_diagonal=int(samples_per_diagonal),
+        sample_spacing_mm=float(sample_spacing_mm),
         final_recenter=True,
     )
 
@@ -633,6 +847,7 @@ def resolve_desired_tip_lookup(project_dir: Path, args) -> Dict[int, Dict[str, f
         arc_overtravel_deg=float(args.arc_overtravel_deg),
         samples_per_arc=int(args.samples_per_arc),
         samples_per_diagonal=int(args.samples_per_diagonal),
+        sample_spacing_mm=float(args.sample_spacing_mm),
         capture_at_start=bool(args.capture_at_start),
         capture_every_n_shape_moves=int(args.capture_every_n_shape_moves),
     )
@@ -1891,6 +2106,7 @@ def compute_tracked_tip_positions_mm(
     for i, row in enumerate(np.asarray(tracked_rows, dtype=float)):
         file_name = image_files[i].name if i < len(image_files) else f"sample_{i:04d}"
         tracked_sample_idx, tracked_phase = parse_tracked_sample_metadata(file_name)
+        cycle_index, cycle_count, point_index_in_cycle = parse_tracked_cycle_metadata(file_name)
         csv_sample_index = int(tracked_sample_idx) if tracked_sample_idx is not None else int(i)
         if row.size < 2 or not np.all(np.isfinite(row[:2])):
             records.append({
@@ -1902,6 +2118,9 @@ def compute_tracked_tip_positions_mm(
                 "z_mm": None,
                 "b_pull_mm": None,
                 "phase": tracked_phase,
+                "cycle_index": cycle_index,
+                "cycle_count": cycle_count,
+                "point_index_in_cycle": point_index_in_cycle,
                 "valid": False,
             })
             continue
@@ -1931,6 +2150,9 @@ def compute_tracked_tip_positions_mm(
             "z_mm": z_mm if valid else None,
             "b_pull_mm": _extract_b_value_from_row(row),
             "phase": tracked_phase,
+            "cycle_index": cycle_index,
+            "cycle_count": cycle_count,
+            "point_index_in_cycle": point_index_in_cycle,
             "valid": bool(valid),
         }
         named_values = extract_named_values_from_filename(file_name)
@@ -2167,11 +2389,70 @@ def compute_segment_error_stats(records: List[Dict[str, Any]]) -> Dict[str, Dict
     return stats
 
 
+def compute_augmented_cycle_metrics(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    repeated_groups = 0
+    for rec in records:
+        if not rec.get("valid", False):
+            continue
+        if rec.get("u_mm") is None or rec.get("z_mm") is None:
+            continue
+        if rec.get("desired_x_mm") is None or rec.get("desired_z_mm") is None:
+            continue
+        key = (
+            _phase_to_segment_label(rec.get("phase")) or rec.get("phase"),
+            None if rec.get("point_index_in_cycle") is None else int(rec.get("point_index_in_cycle")),
+            round(float(rec["desired_x_mm"]), 6),
+            round(float(rec["desired_z_mm"]), 6),
+        )
+        grouped.setdefault(key, []).append(rec)
+
+    if not grouped:
+        return None
+
+    aug_records: List[Dict[str, Any]] = []
+    measured = []
+    desired = []
+    for key, recs in grouped.items():
+        if len(recs) > 1:
+            repeated_groups += 1
+        measured.append([
+            float(np.mean([float(r["u_mm"]) for r in recs])),
+            float(np.mean([float(r["z_mm"]) for r in recs])),
+        ])
+        desired.append([float(key[2]), float(key[3])])
+        aug_records.append({
+            "phase": key[0],
+            "point_index_in_cycle": key[1],
+            "desired_x_mm": float(key[2]),
+            "desired_z_mm": float(key[3]),
+            "repeat_count": int(len(recs)),
+        })
+
+    if repeated_groups == 0:
+        return None
+
+    measured_arr = np.asarray(measured, dtype=float)
+    desired_arr = np.asarray(desired, dtype=float)
+    metrics = compute_error_metrics(measured_arr, desired_arr)
+    for rec, err, du, dz in zip(aug_records, metrics["errors_mm"], metrics["deltas_mm"][:, 0], metrics["deltas_mm"][:, 1]):
+        rec["error_distance_mm"] = float(err)
+        rec["du_aligned_to_desired_mm"] = float(du)
+        rec["dz_aligned_to_desired_mm"] = float(dz)
+    metrics["num_augmented_targets"] = int(len(aug_records))
+    metrics["num_repeated_target_groups"] = int(repeated_groups)
+    metrics["augmented_records"] = aug_records
+    return metrics
+
+
 def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
     fieldnames = [
         "sample_index",
         "image_name",
         "phase",
+        "cycle_index",
+        "cycle_count",
+        "point_index_in_cycle",
         "tip_y_px",
         "tip_x_px",
         "u_mm",
@@ -2413,6 +2694,7 @@ def save_metrics_json(
         "min_error_mm": metrics["min_error_mm"],
         "max_error_mm": metrics["max_error_mm"],
         "num_samples": metrics["num_samples"],
+        "augmented_metrics": metrics.get("augmented_metrics"),
         "analysis_crop": getattr(cal, "analysis_crop", None),
         "board_reference": collect_board_reference_info(cal),
         "settings": {
@@ -2446,6 +2728,7 @@ def save_metrics_json(
             "arc_overtravel_deg": float(args.arc_overtravel_deg),
             "samples_per_arc": int(args.samples_per_arc),
             "samples_per_diagonal": int(args.samples_per_diagonal),
+            "sample_spacing_mm": float(args.sample_spacing_mm),
             "planned_command_csv": (None if args.planned_command_csv is None else str(args.planned_command_csv)),
             "capture_at_start": bool(args.capture_at_start),
             "capture_every_n_shape_moves": int(args.capture_every_n_shape_moves),
@@ -2530,10 +2813,12 @@ def main():
     help="Fallback ideal-hourglass arc sampling used only when the planned command CSV is unavailable.")
     ap.add_argument("--samples_per_diagonal", type=int, default=HOURGLASS_SAMPLES_PER_DIAGONAL_DEFAULT,
     help="Fallback ideal-hourglass diagonal sampling used only when the planned command CSV is unavailable.")
+    ap.add_argument("--sample_spacing_mm", type=float, default=HOURGLASS_SAMPLE_SPACING_MM_DEFAULT,
+    help="Continuous desired tip spacing along the full fallback hourglass curve. Use 0 to keep the legacy total sample count and redistribute it uniformly by arc length.")
     ap.add_argument("--planned_command_csv", type=str, default=None,
     help="Optional path to the planned hourglass command CSV. Defaults to <project_dir>/planned_hourglass_command_sequence.csv when present.")
     ap.add_argument("--capture_at_start", action="store_true",
-    help="Match acquisition runs that also captured the initial top_arc_pull_start point.")
+    help="Match acquisition runs that also captured the initial top_arc_right_pull_start point.")
     ap.add_argument("--capture_every_n_shape_moves", "--capture_every_n_circle_moves", dest="capture_every_n_shape_moves", type=int, default=1,
     help="Match acquisition subsampling: one saved image every N recorded hourglass moves.")
 
@@ -2720,6 +3005,7 @@ def main():
         closest_desired_mm_points=metrics["closest_desired_mm_points"],
     )
     metrics["segment_error_stats"] = compute_segment_error_stats(records)
+    metrics["augmented_metrics"] = compute_augmented_cycle_metrics(records)
 
     csv_path = processed_dir / "tracked_tip_positions_mm.csv"
     metrics_json_path = processed_dir / "tracked_tip_error_metrics.json"
@@ -2788,6 +3074,13 @@ def main():
     print(f"Median error: {metrics['median_error_mm']:.6f} mm")
     print(f"Min error:    {metrics['min_error_mm']:.6f} mm")
     print(f"Max error:    {metrics['max_error_mm']:.6f} mm")
+    if metrics.get("augmented_metrics") is not None:
+        am = metrics["augmented_metrics"]
+        print(
+            f"Augmented RMSE: {float(am['rmse_mm']):.6f} mm "
+            f"(repeat-averaged targets: {int(am['num_augmented_targets'])}, "
+            f"repeated groups: {int(am['num_repeated_target_groups'])})"
+        )
     print("Per-segment error stats:")
     for segment in HOURGLASS_RECORDED_PHASES_ORDER:
         sstats = metrics["segment_error_stats"].get(segment, {})

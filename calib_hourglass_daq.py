@@ -60,12 +60,12 @@ DEFAULT_CAMERA_WIDTH = 3840
 DEFAULT_CAMERA_HEIGHT = 2160
 DEFAULT_CAMERA_FLUSH_FRAMES = 1
 
-DEFAULT_TRAVEL_FEED = 4000.0
-DEFAULT_PRINT_FEED = 4000.0
-DEFAULT_FINE_APPROACH_FEED = 300.0
-DEFAULT_PRINT_FEED_B = 400.0
+DEFAULT_TRAVEL_FEED = 4500.0
+DEFAULT_PRINT_FEED = 4500.0
+DEFAULT_FINE_APPROACH_FEED = 120.0
+DEFAULT_PRINT_FEED_B = 350.0
 DEFAULT_PRINT_FEED_C = 20000.0
-DEFAULT_TRANSITION_FEED = 1200.0
+DEFAULT_TRANSITION_FEED = 1600.0
 DEFAULT_C_FLIP_DELAY_S = 4.0
 
 DEFAULT_DWELL_BEFORE_MS = 0
@@ -74,19 +74,21 @@ DEFAULT_INITIAL_SWEEP_WAIT_S = 6.0
 DEFAULT_TRACKED_MOVE_SETTLE_S = 0.0
 DEFAULT_TRAVEL_MOVE_SETTLE_S = 0.0
 DEFAULT_B_EXTRA_SETTLE_S = 0.0
+DEFAULT_CAPTURE_BUFFER_S = 0.30
 DEFAULT_CAPTURE_AT_START = False
 DEFAULT_INTER_COMMAND_DELAY_S = 0.005
 DEFAULT_FINAL_RECENTER = True
 DEFAULT_ENABLE_POST = False
 DEFAULT_USE_AVERAGE_CUBIC_FIT = False
+DEFAULT_B_0_TO_90_PREFERRED = True
 
 DEFAULT_POST_CAMERA_CALIBRATION_FILE = "captures/calibration_webcam_20260406_104136.npz"
-DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "captures/photo_20260406_104134.png"
+DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "captures/photo_20260627_161714.png"
 DEFAULT_POST_SCRIPT = "calib_hourglass_process.py"
-DEFAULT_POST_TRACKED_TIP_SOURCE = "cnn"
+DEFAULT_POST_TRACKED_TIP_SOURCE = "selected"
 
 DEFAULT_POST_TIP_REFINER_MODEL = (
-    "Test_Calibration_2026-04-07_02_daq/"
+    "CNN_Calib/"
     "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
 )
 
@@ -113,20 +115,25 @@ DEFAULT_BBOX_Z_MAX = 0.0
 
 DEFAULT_SAMPLES_PER_QUARTER = 200
 DEFAULT_CAPTURE_EVERY_N_CIRCLE_MOVES = 7
+DEFAULT_CYCLES = 5
 DEFAULT_C0_DEG = 0.0
 DEFAULT_FLIP_RZ_SIGN = True
-DEFAULT_QUARTER_GAP_MM = 15.0
-DEFAULT_Y_OFFSET_FIT = "avg_pchip"
-DEFAULT_POST_TIP_DETECTION_MODE = "classical"
+DEFAULT_QUARTER_GAP_MM = 10.0
+DEFAULT_Y_OFFSET_FIT = "avg_cubic"
+DEFAULT_POST_TIP_DETECTION_MODE = "red_dot"
 DEFAULT_HOURGLASS_CENTER_X = 100.0
 DEFAULT_HOURGLASS_CENTER_Y = 52.0
 DEFAULT_HOURGLASS_CENTER_Z = -140.0
-DEFAULT_ARC_VERTICAL_GAP_MM = 20.0
-DEFAULT_CIRCLE_DIAMETER_MM = 20.0
-DEFAULT_MIDDLE_GAP_MM = 10.0
+DEFAULT_ARC_VERTICAL_GAP_MM = 18.0
+DEFAULT_CIRCLE_DIAMETER_MM = 18.0
+DEFAULT_MIDDLE_GAP_MM = 9.0
 DEFAULT_ARC_OVERTRAVEL_DEG = 20.0
 DEFAULT_SAMPLES_PER_ARC = 180
 DEFAULT_SAMPLES_PER_DIAGONAL = 120
+DEFAULT_SAMPLE_SPACING_MM = 0.0
+DEFAULT_USE_SOLENOID_EXTRUSION = False
+SOLENOID_EXTRUSION_ON_GCODE = "M42 P0 S1"
+SOLENOID_EXTRUSION_OFF_GCODE = "M42 P0 S0"
 
 OFFPLANE_SIGN = -1.0
 C_HARD_MIN_DEG = -360.0
@@ -146,12 +153,14 @@ TRANSITION_PHASES = {
 }
 
 HOURGLASS_RECORDED_PHASES = {
-    "top_arc_pull",
+    "top_arc_right_pull",
     "right_diag_upper_release",
     "right_diag_lower_pull",
-    "bottom_arc_release",
-    "left_diag_lower_pull",
-    "left_diag_upper_release",
+    "bottom_arc_right_release",
+    "bottom_arc_left_pull",
+    "left_diag_lower_release",
+    "left_diag_upper_pull",
+    "top_arc_left_release",
 }
 HOURGLASS_TRANSITION_PHASES = {
     "final_recenter",
@@ -199,6 +208,9 @@ class CommandPoint:
     tip_y: float
     tip_z: float
     motion_phase: str
+    cycle_index: int = 0
+    cycle_count: int = 1
+    point_index_in_cycle: int = 0
 
 
 # =========================
@@ -602,6 +614,13 @@ def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None
     )
 
 
+def eval_tip_angle_deg(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    return evaluate_fit_model(
+        _select_fit_model(cal, "tip_angle", motion_phase=motion_phase),
+        b,
+    )
+
+
 def tip_offset_xyz_physical(
     cal: Calibration,
     b: float,
@@ -692,6 +711,7 @@ def choose_segment_b_endpoint(
     pull_phase: str,
     release_phase: str,
     segment_b_override: Optional[float] = None,
+    prefer_0_to_90_deg: bool = False,
 ) -> float:
     common_lo, common_hi = common_b_window_for_pull_release(
         cal=cal,
@@ -715,7 +735,39 @@ def choose_segment_b_endpoint(
             )
         if abs(b_ext) < 1e-9:
             raise ValueError("--segment-b must differ from 0 so the tracked motion is non-degenerate.")
+        if bool(prefer_0_to_90_deg):
+            in_band = [
+                bool(_tip_angle_primary_branch_mask(cal, [b_ext], motion_phase=str(phase))[0])
+                for phase in (pull_phase, release_phase)
+            ]
+            if not all(in_band):
+                raise ValueError(
+                    f"--segment-b={b_ext:.3f} does not stay on the enforced 0..90 deg attack-angle branch "
+                    f"for phases '{pull_phase}' and '{release_phase}'."
+                )
         return float(b_ext)
+
+    if bool(prefer_0_to_90_deg):
+        b_samples = np.linspace(float(common_lo), float(common_hi), 4001, dtype=float)
+        nonzero_mask = np.abs(b_samples) > 1e-9
+        if np.any(nonzero_mask):
+            b_nonzero = b_samples[nonzero_mask]
+            inside_band = _tip_angle_primary_branch_mask(
+                cal,
+                b_nonzero,
+                motion_phase=str(pull_phase),
+            ) & _tip_angle_primary_branch_mask(
+                cal,
+                b_nonzero,
+                motion_phase=str(release_phase),
+            )
+            if np.any(inside_band):
+                valid_b = b_nonzero[inside_band]
+                return float(valid_b[np.argmax(np.abs(valid_b))])
+        raise RuntimeError(
+            "Could not find any non-zero B endpoint that stays on the enforced 0..90 deg attack-angle "
+            f"branch for both '{pull_phase}' and '{release_phase}' inside [{common_lo:.3f}, {common_hi:.3f}]."
+        )
 
     candidates = [float(v) for v in (common_lo, common_hi) if abs(float(v)) > 1e-9]
     if not candidates:
@@ -745,6 +797,110 @@ def make_line_points(p0: np.ndarray, p1: np.ndarray, n: int) -> np.ndarray:
     t = np.linspace(0.0, 1.0, max(2, int(n)), dtype=float)
     pts = (1.0 - t)[:, None] * p0[None, :] + t[:, None] * p1[None, :]
     return np.asarray(pts, dtype=float)
+
+
+def _hourglass_segment_length(segment_spec: Dict[str, Any]) -> float:
+    kind = str(segment_spec["kind"]).strip().lower()
+    if kind == "arc":
+        radius = float(segment_spec["radius"])
+        theta_start = float(segment_spec["theta_start_deg"])
+        theta_end = float(segment_spec["theta_end_deg"])
+        return abs(radius * math.radians(theta_end - theta_start))
+    if kind == "line":
+        p0 = np.asarray(segment_spec["p0"], dtype=float).reshape(2)
+        p1 = np.asarray(segment_spec["p1"], dtype=float).reshape(2)
+        return float(np.linalg.norm(p1 - p0))
+    raise ValueError(f"Unsupported hourglass segment kind: {segment_spec['kind']}")
+
+
+def _point_on_hourglass_segment(segment_spec: Dict[str, Any], frac: float) -> np.ndarray:
+    u = min(1.0, max(0.0, float(frac)))
+    kind = str(segment_spec["kind"]).strip().lower()
+    if kind == "arc":
+        theta_start = math.radians(float(segment_spec["theta_start_deg"]))
+        theta_end = math.radians(float(segment_spec["theta_end_deg"]))
+        theta = theta_start + u * (theta_end - theta_start)
+        radius = float(segment_spec["radius"])
+        center_x = float(segment_spec["center_x"])
+        center_z = float(segment_spec["center_z"])
+        return np.array(
+            [center_x + radius * math.cos(theta), center_z + radius * math.sin(theta)],
+            dtype=float,
+        )
+    if kind == "line":
+        p0 = np.asarray(segment_spec["p0"], dtype=float).reshape(2)
+        p1 = np.asarray(segment_spec["p1"], dtype=float).reshape(2)
+        return ((1.0 - u) * p0 + u * p1).astype(float)
+    raise ValueError(f"Unsupported hourglass segment kind: {segment_spec['kind']}")
+
+
+def _resample_hourglass_segments_continuous(
+    segment_specs: List[Dict[str, Any]],
+    sample_spacing_mm: float,
+) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+    if not segment_specs:
+        raise ValueError("segment_specs must not be empty.")
+
+    lengths = [max(0.0, _hourglass_segment_length(spec)) for spec in segment_specs]
+    total_length = float(sum(lengths))
+    if total_length <= 1e-12:
+        raise RuntimeError("Hourglass path length is degenerate.")
+
+    legacy_total_points = 1
+    for spec in segment_specs:
+        legacy_total_points += max(2, int(spec["legacy_n"])) - 1
+
+    spacing_req = float(sample_spacing_mm)
+    if spacing_req > 1e-9:
+        total_points = max(2, int(math.ceil(total_length / spacing_req)) + 1)
+        spacing_mode = "explicit_spacing_mm"
+    else:
+        total_points = max(2, int(legacy_total_points))
+        spacing_mode = "uniform_redistribute_legacy_count"
+
+    sample_s = np.linspace(0.0, total_length, total_points, dtype=float)
+    sampled_specs: List[Dict[str, Any]] = []
+    seg_start_s = 0.0
+    tol = 1e-9 * max(1.0, total_length)
+
+    for seg_idx, (spec, seg_length) in enumerate(zip(segment_specs, lengths)):
+        seg_end_s = seg_start_s + seg_length
+        if seg_idx == 0:
+            mask = sample_s <= seg_end_s + tol
+        elif seg_idx == len(segment_specs) - 1:
+            mask = sample_s > seg_start_s + tol
+        else:
+            mask = (sample_s > seg_start_s + tol) & (sample_s <= seg_end_s + tol)
+
+        seg_sample_s = sample_s[mask]
+        if seg_sample_s.size < 2:
+            raise RuntimeError(
+                f"Uniform hourglass sampling produced only {int(seg_sample_s.size)} point(s) for "
+                f"segment '{spec['phase_name']}'. Reduce --sample-spacing-mm or increase the legacy sample counts."
+            )
+
+        if seg_length <= 1e-12:
+            frac = np.zeros(seg_sample_s.shape[0], dtype=float)
+        else:
+            frac = np.clip((seg_sample_s - seg_start_s) / seg_length, 0.0, 1.0)
+
+        pts = np.vstack([_point_on_hourglass_segment(spec, f) for f in frac]).astype(float)
+        spec_out = dict(spec)
+        spec_out["points"] = pts
+        spec_out["sample_count"] = int(pts.shape[0])
+        spec_out["path_length_mm"] = float(seg_length)
+        sampled_specs.append(spec_out)
+        seg_start_s = seg_end_s
+
+    actual_spacing = float(total_length / max(1, total_points - 1))
+    return sampled_specs, {
+        "spacing_mode": spacing_mode,
+        "requested_sample_spacing_mm": float(spacing_req),
+        "actual_sample_spacing_mm": actual_spacing,
+        "total_path_length_mm": float(total_length),
+        "total_sample_count": int(total_points),
+        "legacy_total_sample_count": int(legacy_total_points),
+    }
 
 
 def build_recorded_segment_from_tip_targets(
@@ -872,11 +1028,29 @@ def _dense_b_and_x_for_phase(
     return b_dense, x_dense
 
 
+def _tip_angle_primary_branch_mask(
+    cal: Calibration,
+    b_values: Any,
+    motion_phase: str,
+    atol_deg: float = 1e-6,
+) -> np.ndarray:
+    model = _select_fit_model(cal, "tip_angle", motion_phase=motion_phase)
+    if model is None:
+        raise RuntimeError(
+            f"Cannot enforce the 0..90 deg attack-angle branch because phase '{motion_phase}' "
+            f"has no tip-angle calibration model."
+        )
+    angles = np.asarray(eval_tip_angle_deg(cal, b_values, motion_phase=motion_phase), dtype=float)
+    return np.isfinite(angles) & (angles >= -float(atol_deg)) & (angles <= 90.0 + float(atol_deg))
+
 
 def _invert_b_from_x_targets(
+    cal: Calibration,
+    motion_phase: str,
     x_targets: np.ndarray,
     b_dense: np.ndarray,
     x_dense: np.ndarray,
+    require_0_to_90_deg: bool = False,
 ) -> np.ndarray:
     x_targets = np.asarray(x_targets, dtype=float).reshape(-1)
     b_dense = np.asarray(b_dense, dtype=float).reshape(-1)
@@ -884,26 +1058,104 @@ def _invert_b_from_x_targets(
     if b_dense.size != x_dense.size or b_dense.size < 2:
         raise ValueError('Dense B/X samples are invalid for inversion.')
 
-    order = np.argsort(x_dense)
-    x_sorted = x_dense[order]
-    b_sorted = b_dense[order]
-
-    keep = np.ones_like(x_sorted, dtype=bool)
-    keep[1:] = np.abs(np.diff(x_sorted)) > 1e-9
-    x_unique = x_sorted[keep]
-    b_unique = b_sorted[keep]
-    if x_unique.size < 2:
-        raise RuntimeError('Could not invert B from X because the sampled radial X curve is degenerate.')
-
-    x_min = float(np.min(x_unique))
-    x_max = float(np.max(x_unique))
+    x_min = float(np.min(x_dense))
+    x_max = float(np.max(x_dense))
     if np.min(x_targets) < x_min - 1e-6 or np.max(x_targets) > x_max + 1e-6:
         raise RuntimeError(
             f'Target X values [{np.min(x_targets):.6f}, {np.max(x_targets):.6f}] are outside the reachable range '
             f'[{x_min:.6f}, {x_max:.6f}] for this motion phase.'
         )
 
-    return np.interp(x_targets, x_unique, b_unique).astype(float)
+    def _candidate_b_roots_for_x_target(x_target: float) -> np.ndarray:
+        roots: List[float] = []
+        x_t = float(x_target)
+        tol = 1e-9
+
+        for i in range(b_dense.size - 1):
+            b0 = float(b_dense[i])
+            b1 = float(b_dense[i + 1])
+            x0 = float(x_dense[i])
+            x1 = float(x_dense[i + 1])
+
+            lo = min(x0, x1)
+            hi = max(x0, x1)
+            if x_t < lo - tol or x_t > hi + tol:
+                continue
+
+            dx = x1 - x0
+            if abs(dx) <= tol:
+                if abs(x_t - x0) <= tol:
+                    roots.append(b0)
+                    roots.append(b1)
+                continue
+
+            t = (x_t - x0) / dx
+            if t < -tol or t > 1.0 + tol:
+                continue
+            t = min(1.0, max(0.0, float(t)))
+            roots.append((1.0 - t) * b0 + t * b1)
+
+        if not roots:
+            nearest_idx = int(np.argmin(np.abs(x_dense - x_t)))
+            nearest_x = float(x_dense[nearest_idx])
+            if abs(nearest_x - x_t) <= 1e-6:
+                return np.asarray([float(b_dense[nearest_idx])], dtype=float)
+            raise RuntimeError(
+                f'Could not find any valid B roots for target X={x_t:.6f} on the sampled phase curve.'
+            )
+
+        roots_arr = np.sort(np.asarray(roots, dtype=float))
+        deduped = [float(roots_arr[0])]
+        for root in roots_arr[1:]:
+            if abs(float(root) - deduped[-1]) > 1e-6:
+                deduped.append(float(root))
+        roots_out = np.asarray(deduped, dtype=float)
+        if bool(require_0_to_90_deg):
+            branch_mask = _tip_angle_primary_branch_mask(
+                cal,
+                roots_out,
+                motion_phase=str(motion_phase),
+            )
+            if not np.any(branch_mask):
+                angles = np.asarray(
+                    eval_tip_angle_deg(cal, roots_out, motion_phase=str(motion_phase)),
+                    dtype=float,
+                )
+                raise RuntimeError(
+                    f"No 0..90 deg attack-angle B root is available for target X={x_t:.6f} "
+                    f"in phase '{motion_phase}'. Candidate angles: "
+                    + ", ".join(f"{float(a):.3f}" for a in angles[:8])
+                )
+            roots_out = roots_out[branch_mask]
+        return roots_out
+
+    candidate_lists = [_candidate_b_roots_for_x_target(float(x_t)) for x_t in x_targets]
+    if not candidate_lists:
+        return np.empty((0,), dtype=float)
+
+    path_costs: List[np.ndarray] = [np.zeros(candidate_lists[0].shape[0], dtype=float)]
+    back_ptrs: List[np.ndarray] = [np.full(candidate_lists[0].shape[0], -1, dtype=int)]
+
+    for i in range(1, len(candidate_lists)):
+        prev = candidate_lists[i - 1]
+        curr = candidate_lists[i]
+        transition_cost = np.abs(curr[:, None] - prev[None, :]) ** 2
+        total_cost = transition_cost + path_costs[-1][None, :]
+        best_prev_idx = np.argmin(total_cost, axis=1)
+        best_cost = total_cost[np.arange(curr.shape[0]), best_prev_idx]
+        path_costs.append(best_cost.astype(float))
+        back_ptrs.append(best_prev_idx.astype(int))
+
+    best_last_idx = int(np.argmin(path_costs[-1]))
+    chosen = np.empty((len(candidate_lists),), dtype=float)
+    chosen[-1] = float(candidate_lists[-1][best_last_idx])
+
+    prev_idx = best_last_idx
+    for i in range(len(candidate_lists) - 1, 0, -1):
+        prev_idx = int(back_ptrs[i][prev_idx])
+        chosen[i - 1] = float(candidate_lists[i - 1][prev_idx])
+
+    return chosen.astype(float)
 
 
 
@@ -920,6 +1172,7 @@ def build_fixed_x_segment_from_desired_tip_targets(
     phase_name: str,
     move_feed_start: float,
     move_feed_rest: float,
+    require_b_0_to_90_tip_angle: bool = False,
 ) -> Tuple[List[CommandPoint], Dict[str, float]]:
     c_state = assert_c_in_safe_range('c_state', c_state)
     desired_tip_xz_points = np.asarray(desired_tip_xz_points, dtype=float)
@@ -935,7 +1188,14 @@ def build_fixed_x_segment_from_desired_tip_targets(
         flip_rz_sign=flip_rz_sign,
     )
     target_offsets_x = desired_tip_xz_points[:, 0] - float(stage_x_const)
-    b_values = _invert_b_from_x_targets(target_offsets_x, b_dense=b_dense, x_dense=x_dense)
+    b_values = _invert_b_from_x_targets(
+        cal=cal,
+        motion_phase=str(motion_phase),
+        x_targets=target_offsets_x,
+        b_dense=b_dense,
+        x_dense=x_dense,
+        require_0_to_90_deg=bool(require_b_0_to_90_tip_angle),
+    )
 
     pts: List[CommandPoint] = []
     stage_x_trace: List[float] = []
@@ -945,6 +1205,8 @@ def build_fixed_x_segment_from_desired_tip_targets(
     tip_y_trace: List[float] = []
     tip_z_trace: List[float] = []
     x_error_trace: List[float] = []
+    tip_angle_trace: List[float] = []
+    tip_angle_model = _select_fit_model(cal, "tip_angle", motion_phase=str(motion_phase))
 
     for i, ((desired_tip_x, desired_tip_z), b_i) in enumerate(zip(desired_tip_xz_points, b_values)):
         offset_xyz = tip_offset_xyz_physical(
@@ -970,6 +1232,8 @@ def build_fixed_x_segment_from_desired_tip_targets(
         tip_y_trace.append(actual_tip_y)
         tip_z_trace.append(actual_tip_z)
         x_error_trace.append(actual_tip_x - float(desired_tip_x))
+        if tip_angle_model is not None:
+            tip_angle_trace.append(float(eval_tip_angle_deg(cal, float(b_i), motion_phase=str(motion_phase))))
 
         pts.append(
             CommandPoint(
@@ -1005,6 +1269,21 @@ def build_fixed_x_segment_from_desired_tip_targets(
         'tip_z_max': float(max(tip_z_trace)),
         'max_abs_tip_x_error_mm': float(np.max(np.abs(np.asarray(x_error_trace, dtype=float)))),
         'mean_abs_tip_x_error_mm': float(np.mean(np.abs(np.asarray(x_error_trace, dtype=float)))),
+        'tip_angle_min_deg': None if not tip_angle_trace else float(min(tip_angle_trace)),
+        'tip_angle_max_deg': None if not tip_angle_trace else float(max(tip_angle_trace)),
+        'tip_angle_all_in_0_90_deg': (
+            None
+            if tip_angle_model is None
+            else bool(
+                np.all(
+                    _tip_angle_primary_branch_mask(
+                        cal,
+                        np.asarray(b_values, dtype=float),
+                        motion_phase=str(motion_phase),
+                    )
+                )
+            )
+        ),
     }
     return pts, meta
 
@@ -1022,6 +1301,7 @@ def build_hourglass_command_sequence(
     arc_overtravel_deg: float,
     samples_per_arc: int,
     samples_per_diagonal: int,
+    sample_spacing_mm: float,
     b_lo: float,
     b_hi: float,
     c0_deg: float,
@@ -1029,9 +1309,12 @@ def build_hourglass_command_sequence(
     print_feed_b: float,
     transition_feed: float,
     segment_b_override: Optional[float] = None,
+    b_0_to_90_preferred: bool = False,
     final_recenter: bool = True,
 ) -> Tuple[List[CommandPoint], dict]:
     c0_deg = assert_c_in_safe_range('c0_deg', c0_deg)
+    if float(sample_spacing_mm) < 0.0:
+        raise ValueError('--sample-spacing-mm must be non-negative.')
 
     radius_req = 0.5 * float(circle_diameter_mm)
     if radius_req <= 0.0:
@@ -1056,6 +1339,7 @@ def build_hourglass_command_sequence(
         pull_phase=pull_phase,
         release_phase=release_phase,
         segment_b_override=segment_b_override,
+        prefer_0_to_90_deg=bool(b_0_to_90_preferred),
     )
 
     b_pull_dense, x_pull_dense = _dense_b_and_x_for_phase(
@@ -1131,26 +1415,49 @@ def build_hourglass_command_sequence(
     top_center_z = float(center_z) + 0.5 * float(scaled_arc_vertical_gap) + float(scaled_radius)
     bottom_center_z = float(center_z) - 0.5 * float(scaled_arc_vertical_gap) - float(scaled_radius)
 
-    top_arc = make_arc_points(
+    top_arc_right_n = max(2, int(math.ceil(n_arc * (phi_deg / 180.0)))) + 1
+    top_arc_left_n = max(2, int(math.ceil(n_arc * ((180.0 + phi_deg) / 180.0)))) + 1
+    bottom_arc_right_n = max(2, int(math.ceil(n_arc * ((90.0 + phi_deg) / (180.0 + 2.0 * phi_deg))))) + 1
+    bottom_arc_left_n = max(2, int(math.ceil(n_arc * ((90.0 + phi_deg) / (180.0 + 2.0 * phi_deg))))) + 1
+
+    top_arc_right = make_arc_points(
+        center_x=float(center_x),
+        center_z=float(top_center_z),
+        radius=float(scaled_radius),
+        theta_start_deg=0.0,
+        theta_end_deg=-phi_deg,
+        n=top_arc_right_n,
+    )
+    top_arc_left = make_arc_points(
         center_x=float(center_x),
         center_z=float(top_center_z),
         radius=float(scaled_radius),
         theta_start_deg=180.0 + phi_deg,
-        theta_end_deg=-phi_deg,
-        n=n_arc,
+        theta_end_deg=0.0,
+        n=top_arc_left_n,
     )
-    bottom_arc = make_arc_points(
+    bottom_arc_right = make_arc_points(
         center_x=float(center_x),
         center_z=float(bottom_center_z),
         radius=float(scaled_radius),
         theta_start_deg=phi_deg,
-        theta_end_deg=-(180.0 + phi_deg),
-        n=n_arc,
+        theta_end_deg=-90.0,
+        n=bottom_arc_right_n,
     )
-    top_left = np.asarray(top_arc[0], dtype=float)
-    top_right = np.asarray(top_arc[-1], dtype=float)
-    bottom_right = np.asarray(bottom_arc[0], dtype=float)
-    bottom_left = np.asarray(bottom_arc[-1], dtype=float)
+    bottom_arc_left = make_arc_points(
+        center_x=float(center_x),
+        center_z=float(bottom_center_z),
+        radius=float(scaled_radius),
+        theta_start_deg=-90.0,
+        theta_end_deg=-(180.0 + phi_deg),
+        n=bottom_arc_left_n,
+    )
+    top_start = np.asarray(top_arc_right[0], dtype=float)
+    top_right = np.asarray(top_arc_right[-1], dtype=float)
+    top_left = np.asarray(top_arc_left[0], dtype=float)
+    bottom_right = np.asarray(bottom_arc_right[0], dtype=float)
+    bottom_mid = np.asarray(bottom_arc_right[-1], dtype=float)
+    bottom_left = np.asarray(bottom_arc_left[-1], dtype=float)
     waist_right = np.array([float(center_x) + 0.5 * float(scaled_middle_gap), float(center_z)], dtype=float)
     waist_left = np.array([float(center_x) - 0.5 * float(scaled_middle_gap), float(center_z)], dtype=float)
 
@@ -1159,32 +1466,142 @@ def build_hourglass_command_sequence(
     left_diag_lower = make_line_points(bottom_left, waist_left, n_diag)
     left_diag_upper = make_line_points(waist_left, top_left, n_diag)
 
-    segments = [
-        ('top_arc_pull', top_arc, pull_phase, 0.0, b_ext, float(jog_feed), float(print_feed_b)),
-        ('right_diag_upper_release', right_diag_upper, release_phase, b_ext, 0.0, float(transition_feed), float(print_feed_b)),
-        ('right_diag_lower_pull', right_diag_lower, pull_phase, 0.0, b_ext, float(transition_feed), float(print_feed_b)),
-        ('bottom_arc_release', bottom_arc, release_phase, b_ext, 0.0, float(transition_feed), float(print_feed_b)),
-        ('left_diag_lower_pull', left_diag_lower, pull_phase, 0.0, b_ext, float(transition_feed), float(print_feed_b)),
-        ('left_diag_upper_release', left_diag_upper, release_phase, b_ext, 0.0, float(transition_feed), float(print_feed_b)),
+    segment_specs = [
+        {
+            'kind': 'arc',
+            'phase_name': 'top_arc_right_pull',
+            'motion_phase': str(pull_phase),
+            'b_start': 0.0,
+            'b_end': float(b_ext),
+            'move_feed_start': float(jog_feed),
+            'move_feed_rest': float(print_feed_b),
+            'center_x': float(center_x),
+            'center_z': float(top_center_z),
+            'radius': float(scaled_radius),
+            'theta_start_deg': 0.0,
+            'theta_end_deg': -phi_deg,
+            'legacy_n': int(top_arc_right_n),
+        },
+        {
+            'kind': 'line',
+            'phase_name': 'right_diag_upper_release',
+            'motion_phase': str(release_phase),
+            'b_start': float(b_ext),
+            'b_end': 0.0,
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'p0': top_right.tolist(),
+            'p1': waist_right.tolist(),
+            'legacy_n': int(n_diag),
+        },
+        {
+            'kind': 'line',
+            'phase_name': 'right_diag_lower_pull',
+            'motion_phase': str(pull_phase),
+            'b_start': 0.0,
+            'b_end': float(b_ext),
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'p0': waist_right.tolist(),
+            'p1': bottom_right.tolist(),
+            'legacy_n': int(n_diag),
+        },
+        {
+            'kind': 'arc',
+            'phase_name': 'bottom_arc_right_release',
+            'motion_phase': str(release_phase),
+            'b_start': float(b_ext),
+            'b_end': 0.0,
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'center_x': float(center_x),
+            'center_z': float(bottom_center_z),
+            'radius': float(scaled_radius),
+            'theta_start_deg': phi_deg,
+            'theta_end_deg': -90.0,
+            'legacy_n': int(bottom_arc_right_n),
+        },
+        {
+            'kind': 'arc',
+            'phase_name': 'bottom_arc_left_pull',
+            'motion_phase': str(pull_phase),
+            'b_start': 0.0,
+            'b_end': float(b_ext),
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'center_x': float(center_x),
+            'center_z': float(bottom_center_z),
+            'radius': float(scaled_radius),
+            'theta_start_deg': -90.0,
+            'theta_end_deg': -(180.0 + phi_deg),
+            'legacy_n': int(bottom_arc_left_n),
+        },
+        {
+            'kind': 'line',
+            'phase_name': 'left_diag_lower_release',
+            'motion_phase': str(release_phase),
+            'b_start': float(b_ext),
+            'b_end': 0.0,
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'p0': bottom_left.tolist(),
+            'p1': waist_left.tolist(),
+            'legacy_n': int(n_diag),
+        },
+        {
+            'kind': 'line',
+            'phase_name': 'left_diag_upper_pull',
+            'motion_phase': str(pull_phase),
+            'b_start': 0.0,
+            'b_end': float(b_ext),
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'p0': waist_left.tolist(),
+            'p1': top_left.tolist(),
+            'legacy_n': int(n_diag),
+        },
+        {
+            'kind': 'arc',
+            'phase_name': 'top_arc_left_release',
+            'motion_phase': str(release_phase),
+            'b_start': float(b_ext),
+            'b_end': 0.0,
+            'move_feed_start': float(transition_feed),
+            'move_feed_rest': float(print_feed_b),
+            'center_x': float(center_x),
+            'center_z': float(top_center_z),
+            'radius': float(scaled_radius),
+            'theta_start_deg': 180.0 + phi_deg,
+            'theta_end_deg': 0.0,
+            'legacy_n': int(top_arc_left_n),
+        },
     ]
+    segments, resample_meta = _resample_hourglass_segments_continuous(
+        segment_specs=segment_specs,
+        sample_spacing_mm=float(sample_spacing_mm),
+    )
 
     sequence: List[CommandPoint] = []
     segment_meta: Dict[str, Dict[str, float]] = {}
-    for seg_idx, (phase_name, desired_tip_xz, motion_phase, b_start, b_end, move_feed_start, move_feed_rest) in enumerate(segments):
+    for seg_idx, spec in enumerate(segments):
+        phase_name = str(spec['phase_name'])
         pts, meta_seg = build_fixed_x_segment_from_desired_tip_targets(
             cal=cal,
             flip_rz_sign=flip_rz_sign,
             center_y=float(center_y),
-            desired_tip_xz_points=np.asarray(desired_tip_xz, dtype=float),
+            desired_tip_xz_points=np.asarray(spec['points'], dtype=float),
             stage_x_const=float(stage_x_const),
-            b_start=float(b_start),
-            b_end=float(b_end),
+            b_start=float(spec['b_start']),
+            b_end=float(spec['b_end']),
             c_state=float(c0_deg),
-            motion_phase=str(motion_phase),
+            motion_phase=str(spec['motion_phase']),
             phase_name=str(phase_name),
-            move_feed_start=float(move_feed_start),
-            move_feed_rest=float(move_feed_rest),
+            move_feed_start=float(spec['move_feed_start']),
+            move_feed_rest=float(spec['move_feed_rest']),
+            require_b_0_to_90_tip_angle=bool(b_0_to_90_preferred),
         )
+        meta_seg['desired_path_length_mm'] = float(spec['path_length_mm'])
+        meta_seg['uniform_sample_count'] = int(spec['sample_count'])
         segment_meta[str(phase_name)] = meta_seg
         if seg_idx > 0:
             pts = pts[1:]
@@ -1235,6 +1652,7 @@ def build_hourglass_command_sequence(
         'pull_phase': str(pull_phase),
         'release_phase': str(release_phase),
         'segment_b': float(b_ext),
+        'b_0_to_90_preferred': bool(b_0_to_90_preferred),
         'center_x': float(center_x),
         'center_y': float(center_y),
         'center_z': float(center_z),
@@ -1254,14 +1672,22 @@ def build_hourglass_command_sequence(
         'flip_rz_sign': bool(flip_rz_sign),
         'samples_per_arc': int(n_arc),
         'samples_per_diagonal': int(n_diag),
+        'sample_spacing_mm_requested': float(sample_spacing_mm),
+        'uniform_sampling_mode': str(resample_meta['spacing_mode']),
+        'uniform_sample_spacing_mm_actual': float(resample_meta['actual_sample_spacing_mm']),
+        'uniform_sample_count': int(resample_meta['total_sample_count']),
+        'legacy_total_sample_count': int(resample_meta['legacy_total_sample_count']),
+        'recorded_path_length_mm': float(resample_meta['total_path_length_mm']),
         'x_stage_const_after_start': float(stage_x_const),
         'common_radial_x_offset_range_pull_release': [float(common_x_min_off), float(common_x_max_off)],
         'common_radial_half_span_mm': float(common_half_span),
         'nominal_half_width_mm': float(nominal_half_width),
         'segment_meta': segment_meta,
         'connection_points': {
+            'top_start': top_start.tolist(),
             'top_left': top_left.tolist(),
             'top_right': top_right.tolist(),
+            'bottom_mid': bottom_mid.tolist(),
             'waist_right': waist_right.tolist(),
             'bottom_right': bottom_right.tolist(),
             'bottom_left': bottom_left.tolist(),
@@ -1284,6 +1710,32 @@ def build_hourglass_command_sequence(
         'final_recenter_point': None if final_recenter_cp is None else asdict(final_recenter_cp),
     }
     return sequence, meta
+
+
+def repeat_command_sequence(
+    base_sequence: List[CommandPoint],
+    cycles: int,
+) -> List[CommandPoint]:
+    cycle_count = max(1, int(cycles))
+    if cycle_count == 1:
+        out: List[CommandPoint] = []
+        for point_idx, cp in enumerate(base_sequence):
+            new_cp = copy.deepcopy(cp)
+            new_cp.cycle_index = 0
+            new_cp.cycle_count = 1
+            new_cp.point_index_in_cycle = int(point_idx)
+            out.append(new_cp)
+        return out
+
+    repeated: List[CommandPoint] = []
+    for cycle_index in range(cycle_count):
+        for point_idx, cp in enumerate(base_sequence):
+            new_cp = copy.deepcopy(cp)
+            new_cp.cycle_index = int(cycle_index)
+            new_cp.cycle_count = int(cycle_count)
+            new_cp.point_index_in_cycle = int(point_idx)
+            repeated.append(new_cp)
+    return repeated
 
 # =========================
 # Utilities
@@ -1383,7 +1835,8 @@ def save_desired_hourglass_motion_plot(plot_path: str, command_sequence: List[Co
 
 def save_command_sequence_csv(csv_path: str, command_sequence: List[CommandPoint]) -> str:
     fieldnames = [
-        "idx", "phase", "motion_phase", "x", "y", "z", "b", "c", "feed", "tip_x", "tip_y", "tip_z"
+        "idx", "phase", "motion_phase", "cycle_index", "cycle_count", "point_index_in_cycle",
+        "x", "y", "z", "b", "c", "feed", "tip_x", "tip_y", "tip_z"
     ]
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1504,6 +1957,9 @@ class CircleTrackerRunner:
         b: float,
         c: float,
         flush_frames: int = 1,
+        cycle_index: Optional[int] = None,
+        cycle_count: Optional[int] = None,
+        point_index_in_cycle: Optional[int] = None,
     ) -> Optional[str]:
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1516,11 +1972,17 @@ class CircleTrackerRunner:
             ret, image = self.cam.read()
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        extra = ""
+        if cycle_index is not None and cycle_count is not None:
+            extra += f"_CY{int(cycle_index) + 1}OF{int(cycle_count)}"
+        if point_index_in_cycle is not None:
+            extra += f"_PI{int(point_index_in_cycle):04d}"
         filename = (
             f"{sample_idx:05d}"
             f"_{phase}"
             f"_X{x:.3f}_Y{y:.3f}_Z{z:.3f}"
             f"_B{b:.3f}_C{c:.3f}"
+            f"{extra}"
             f"_{timestamp}.png"
         ).replace(" ", "_")
 
@@ -1547,47 +2009,80 @@ class CircleTrackerRunner:
         print("Robot connected.")
 
     def disconnect_robot(self):
+        if self.rrf is not None:
+            try:
+                self.send_gcode(SOLENOID_EXTRUSION_OFF_GCODE)
+            except Exception:
+                pass
         self.rrf = None
 
     def _estimate_move_time_s(self, feedrate: float, axes_targets: dict) -> float:
         feed = max(1e-6, float(feedrate))
-        deltas = []
-        for ax, val in axes_targets.items():
-            if val is None:
-                continue
-            prev = self.commanded_axes.get(str(ax))
-            if prev is None:
-                continue
-            deltas.append(abs(float(val) - float(prev)))
+        def _lookup_axis_value(source: dict, axis_letter: str):
+            axis_letter = str(axis_letter).strip().upper()
+            for key, value in source.items():
+                if str(key).strip().upper() == axis_letter:
+                    return value
+            return None
 
-        if not deltas:
+        prev_x = _lookup_axis_value(self.commanded_axes, "X")
+        prev_y = _lookup_axis_value(self.commanded_axes, "Y")
+        prev_z = _lookup_axis_value(self.commanded_axes, "Z")
+        cur_x = _lookup_axis_value(axes_targets, "X")
+        cur_y = _lookup_axis_value(axes_targets, "Y")
+        cur_z = _lookup_axis_value(axes_targets, "Z")
+        cur_x = prev_x if cur_x is None else cur_x
+        cur_y = prev_y if cur_y is None else cur_y
+        cur_z = prev_z if cur_z is None else cur_z
+        if prev_x is None or prev_y is None or prev_z is None:
+            return 0.0
+        if cur_x is None or cur_y is None or cur_z is None:
             return 0.0
 
-        return 60.0 * max(deltas) / feed
+        dx = float(cur_x) - float(prev_x)
+        dy = float(cur_y) - float(prev_y)
+        dz = float(cur_z) - float(prev_z)
+        xyz_distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+        return 60.0 * xyz_distance / feed
 
     def _compute_inter_command_wait_s(
         self,
         est_move_time_s: float,
         configured_floor_s: float = 0.0,
+        extra_buffer_s: float = 0.0,
     ) -> float:
         est = max(0.0, float(est_move_time_s))
         floor_s = max(0.0, float(configured_floor_s))
-        if est <= 0.0:
-            return floor_s
-        paced_wait = min(2.0, max(0.05, 0.95 * est))
-        return max(floor_s, paced_wait)
+        buffer_s = max(0.0, float(extra_buffer_s))
+        return max(floor_s, est + buffer_s)
 
-    def wait_for_duet_motion_complete(self, extra_settle: float = 0.0):
+    def wait_for_duet_motion_complete(
+        self,
+        est_move_time_s: float = 0.0,
+        extra_settle: float = 0.0,
+    ):
+        wait_s = self._compute_inter_command_wait_s(
+            est_move_time_s=est_move_time_s,
+            configured_floor_s=0.0,
+            extra_buffer_s=float(extra_settle),
+        )
+        if wait_s > 0.0:
+            time.sleep(wait_s)
+
+    def send_gcode(self, gcode: str):
         if self.rrf is None:
             raise RuntimeError("Robot is not connected.")
+        gcode_clean = str(gcode).strip()
+        if not gcode_clean:
+            raise ValueError("Cannot send empty G-code.")
+        print(f" Command: {gcode_clean}")
+        self.rrf.send_code(gcode_clean)
 
-        try:
-            self.rrf.send_code("M400")
-        except Exception as e:
-            print(f"Warning: M400 wait failed ({e}); applying settle only.")
-
-        if extra_settle > 0:
-            time.sleep(extra_settle)
+    def set_solenoid_extrusion_enabled(self, enabled: bool):
+        gcode = SOLENOID_EXTRUSION_ON_GCODE if bool(enabled) else SOLENOID_EXTRUSION_OFF_GCODE
+        state = "ON" if bool(enabled) else "OFF"
+        print(f"Setting solenoid extrusion {state}...")
+        self.send_gcode(gcode)
 
     def send_absolute_move(self, feedrate: float, **axes_targets) -> float:
         if self.rrf is None:
@@ -1620,7 +2115,7 @@ class CircleTrackerRunner:
         x, y, z, b, c = [float(v) for v in pose]
         c = assert_c_in_safe_range("safe pose C", c)
 
-        self.send_absolute_move(
+        est_move_time_s = self.send_absolute_move(
             travel_feed,
             **{
                 cal.z_axis: float(safe_approach_z),
@@ -1628,9 +2123,9 @@ class CircleTrackerRunner:
                 cal.c_axis: c,
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        self.wait_for_duet_motion_complete(est_move_time_s=est_move_time_s, extra_settle=settle_s)
 
-        self.send_absolute_move(
+        est_move_time_s = self.send_absolute_move(
             travel_feed,
             **{
                 cal.x_axis: x,
@@ -1639,9 +2134,9 @@ class CircleTrackerRunner:
                 cal.c_axis: c,
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        self.wait_for_duet_motion_complete(est_move_time_s=est_move_time_s, extra_settle=settle_s)
 
-        self.send_absolute_move(
+        est_move_time_s = self.send_absolute_move(
             travel_feed,
             **{
                 cal.z_axis: z,
@@ -1649,7 +2144,7 @@ class CircleTrackerRunner:
                 cal.c_axis: c,
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        self.wait_for_duet_motion_complete(est_move_time_s=est_move_time_s, extra_settle=settle_s)
 
     def _fine_land_on_point(
         self,
@@ -1663,7 +2158,7 @@ class CircleTrackerRunner:
         settle_s: float,
     ):
         print(" Fine landing move for accuracy...")
-        self.send_absolute_move(
+        est_move_time_s = self.send_absolute_move(
             fine_feed,
             **{
                 cal.x_axis: x,
@@ -1673,7 +2168,7 @@ class CircleTrackerRunner:
                 cal.c_axis: assert_c_in_safe_range("fine approach C", c),
             }
         )
-        self.wait_for_duet_motion_complete(extra_settle=settle_s)
+        self.wait_for_duet_motion_complete(est_move_time_s=est_move_time_s, extra_settle=settle_s)
 
     def execute_circle_motion_and_capture(
         self,
@@ -1692,9 +2187,11 @@ class CircleTrackerRunner:
         travel_move_settle_s: float = 0.0,
         b_extra_settle_s: float = 0.0,
         inter_command_delay_s: float = 0.0,
+        capture_buffer_s: float = DEFAULT_CAPTURE_BUFFER_S,
         camera_flush_frames: int = 1,
         capture_at_start: bool = True,
         capture_every_n_circle_moves: int = 1,
+        use_solenoid_extrusion: bool = False,
     ):
         if self.cam is None:
             raise RuntimeError("Camera is not connected.")
@@ -1732,7 +2229,7 @@ class CircleTrackerRunner:
             )
 
             print("\nMoving to first tracked sample...")
-            self.send_absolute_move(
+            est_move_time_s = self.send_absolute_move(
                 first.feed,
                 **{
                     cal.x_axis: x0,
@@ -1742,7 +2239,10 @@ class CircleTrackerRunner:
                     cal.c_axis: first.c,
                 }
             )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+            self.wait_for_duet_motion_complete(
+                est_move_time_s=est_move_time_s,
+                extra_settle=travel_move_settle_s,
+            )
 
             self._fine_land_on_point(
                 cal=cal,
@@ -1770,6 +2270,9 @@ class CircleTrackerRunner:
                     b=first.b,
                     c=first.c,
                     flush_frames=camera_flush_frames,
+                    cycle_index=first.cycle_index,
+                    cycle_count=first.cycle_count,
+                    point_index_in_cycle=first.point_index_in_cycle,
                 )
 
             if int(dwell_before_ms) > 0:
@@ -1777,46 +2280,69 @@ class CircleTrackerRunner:
                 time.sleep(float(dwell_before_ms) / 1000.0)
 
             print("\nExecuting hourglass tracking motion...")
-            for i, cp in enumerate(command_sequence[1:], start=1):
-                x, y, z = _clamp_stage_xyz_to_bbox(
-                    cp.x, cp.y, cp.z, virtual_bbox, f"tracked sample {i}", bbox_warnings
-                )
+            solenoid_enabled = False
+            try:
+                if use_solenoid_extrusion:
+                    self.set_solenoid_extrusion_enabled(True)
+                    solenoid_enabled = True
 
-                est_move_time_s = self.send_absolute_move(
-                    cp.feed,
-                    **{
-                        cal.x_axis: x,
-                        cal.y_axis: y,
-                        cal.z_axis: z,
-                        cal.b_axis: cp.b,
-                        cal.c_axis: cp.c,
-                    }
-                )
-                wait_s = self._compute_inter_command_wait_s(
-                    est_move_time_s=est_move_time_s,
-                    configured_floor_s=float(inter_command_delay_s),
-                )
-                if wait_s > 0.0:
-                    time.sleep(wait_s)
+                for i, cp in enumerate(command_sequence[1:], start=1):
+                    x, y, z = _clamp_stage_xyz_to_bbox(
+                        cp.x, cp.y, cp.z, virtual_bbox, f"tracked sample {i}", bbox_warnings
+                    )
 
-                if cp.phase == "midpoint_c_flip":
-                    print(f"Holding {float(DEFAULT_C_FLIP_DELAY_S):.3f} s after C rotation...")
-                    time.sleep(float(DEFAULT_C_FLIP_DELAY_S))
+                    est_move_time_s = self.send_absolute_move(
+                        cp.feed,
+                        **{
+                            cal.x_axis: x,
+                            cal.y_axis: y,
+                            cal.z_axis: z,
+                            cal.b_axis: cp.b,
+                            cal.c_axis: cp.c,
+                        }
+                    )
+                    wait_s = self._compute_inter_command_wait_s(
+                        est_move_time_s=est_move_time_s,
+                        configured_floor_s=float(inter_command_delay_s),
+                        extra_buffer_s=(
+                            float(capture_buffer_s)
+                            if (
+                                cp.phase in HOURGLASS_RECORDED_PHASES
+                                and (circle_move_counter + 1) % capture_every_n_circle_moves == 0
+                            )
+                            else 0.0
+                        ),
+                    )
+                    if wait_s > 0.0:
+                        time.sleep(wait_s)
 
-                if cp.phase in HOURGLASS_RECORDED_PHASES:
-                    circle_move_counter += 1
-                    if (circle_move_counter % capture_every_n_circle_moves) == 0:
-                        sample_counter += 1
-                        self.capture_and_save(
-                            sample_idx=sample_counter,
-                            phase=cp.phase,
-                            x=x,
-                            y=y,
-                            z=z,
-                            b=cp.b,
-                            c=cp.c,
-                            flush_frames=camera_flush_frames,
-                        )
+                    if cp.phase == "midpoint_c_flip":
+                        print(f"Holding {float(DEFAULT_C_FLIP_DELAY_S):.3f} s after C rotation...")
+                        time.sleep(float(DEFAULT_C_FLIP_DELAY_S))
+
+                    if cp.phase in HOURGLASS_RECORDED_PHASES:
+                        circle_move_counter += 1
+                        if (circle_move_counter % capture_every_n_circle_moves) == 0:
+                            sample_counter += 1
+                            self.capture_and_save(
+                                sample_idx=sample_counter,
+                                phase=cp.phase,
+                                x=x,
+                                y=y,
+                                z=z,
+                                b=cp.b,
+                                c=cp.c,
+                                flush_frames=camera_flush_frames,
+                                cycle_index=cp.cycle_index,
+                                cycle_count=cp.cycle_count,
+                                point_index_in_cycle=cp.point_index_in_cycle,
+                            )
+            finally:
+                if solenoid_enabled:
+                    try:
+                        self.set_solenoid_extrusion_enabled(False)
+                    except Exception as e:
+                        print(f"Warning: failed to disable solenoid extrusion ({e}).")
 
             if len(command_sequence) > 1:
                 self.wait_for_duet_motion_complete(extra_settle=float(tracked_move_settle_s))
@@ -1883,6 +2409,7 @@ def main(args):
         arc_overtravel_deg=float(args.arc_overtravel_deg),
         samples_per_arc=int(args.samples_per_arc),
         samples_per_diagonal=int(args.samples_per_diagonal),
+        sample_spacing_mm=float(args.sample_spacing_mm),
         b_lo=b_lo,
         b_hi=b_hi,
         c0_deg=c0_deg,
@@ -1890,12 +2417,27 @@ def main(args):
         print_feed_b=float(args.print_feed if args.print_feed_b is None else args.print_feed_b),
         transition_feed=float(args.transition_feed),
         segment_b_override=(None if args.segment_b is None else float(args.segment_b)),
+        b_0_to_90_preferred=bool(args.b_0_to_90_only),
         final_recenter=bool(args.final_recenter),
     )
+    command_sequence = repeat_command_sequence(command_sequence, cycles=int(args.cycles))
     meta["fit_mode"] = "shared_average_cubic" if bool(args.use_average_cubic_fit) else "phase_specific_default"
+    meta["y_offset_fit"] = str(args.y_offset_fit)
+    meta["use_solenoid_extrusion"] = bool(args.use_solenoid_extrusion)
+    meta["capture_buffer_s"] = float(args.capture_buffer_s)
+    meta["b_0_to_90_only"] = bool(args.b_0_to_90_only)
+    meta["cycles"] = int(max(1, int(args.cycles)))
 
     print("Trajectory summary:")
     print(f"  fit_mode: {'shared_average_cubic' if bool(args.use_average_cubic_fit) else 'phase_specific_default'}")
+    print(f"  y_offset_fit: {args.y_offset_fit}")
+    print(f"  capture_buffer_s: {float(args.capture_buffer_s):.3f}")
+    print(f"  cycles: {int(meta['cycles'])}")
+    print(f"  B 0..90 enforcement: {bool(args.b_0_to_90_only)}")
+    print(
+        f"  sample_spacing_mm: requested={float(args.sample_spacing_mm):.4f}, "
+        f"actual={float(meta['uniform_sample_spacing_mm_actual']):.4f}"
+    )
     print(f"  pull_phase: {meta['pull_phase']}")
     print(f"  release_phase: {meta['release_phase']}")
     circle_diameter_requested = float(
@@ -2008,9 +2550,11 @@ def main(args):
             travel_move_settle_s=float(args.travel_move_settle_s),
             b_extra_settle_s=float(args.b_extra_settle_s),
             inter_command_delay_s=float(args.inter_command_delay_s),
+            capture_buffer_s=float(args.capture_buffer_s),
             camera_flush_frames=int(args.camera_flush_frames),
             capture_at_start=bool(args.capture_at_start),
             capture_every_n_circle_moves=int(args.capture_every_n_shape_moves),
+            use_solenoid_extrusion=bool(args.use_solenoid_extrusion),
         )
 
         print("\nFinal results:")
@@ -2184,6 +2728,8 @@ if __name__ == "__main__":
                     help="Interpolation points used for each circular half-arc.")
     ap.add_argument("--samples-per-diagonal", type=int, default=DEFAULT_SAMPLES_PER_DIAGONAL,
                     help="Interpolation points used for each straight diagonal segment.")
+    ap.add_argument("--sample-spacing-mm", type=float, default=DEFAULT_SAMPLE_SPACING_MM,
+                    help="Continuous desired tip spacing along the full recorded hourglass curve. Use 0 to keep the legacy total sample count and redistribute it uniformly by arc length.")
 
     # Motion / feeds
     ap.add_argument("--travel-feed", type=float, default=DEFAULT_TRAVEL_FEED,
@@ -2204,6 +2750,8 @@ if __name__ == "__main__":
     ap.add_argument("--max-b", type=float, default=None, help="Upper bound for commanded B (default: calibration).")
     ap.add_argument("--segment-b", type=float, default=None,
                     help="Optional non-zero B endpoint used for each tracked segment. Default: farthest valid common pull/release value from 0.")
+    ap.add_argument("--b-0-to-90-only", action="store_true", default=DEFAULT_B_0_TO_90_PREFERRED,
+                    help="Enforce the 0..90 deg attack-angle branch when choosing the hourglass B endpoint and all fixed-X inverse-B roots.")
     ap.add_argument("--c0-deg", type=float, default=DEFAULT_C0_DEG,
                     help="Fixed C value used for the full hourglass path.")
 
@@ -2220,6 +2768,12 @@ if __name__ == "__main__":
                     help="Additional hold after the queued trajectory motion to let the mechanism settle.")
     ap.add_argument("--inter-command-delay-s", type=float, default=DEFAULT_INTER_COMMAND_DELAY_S,
                     help="Small delay between queued tracked commands.")
+    ap.add_argument("--capture-buffer-s", type=float, default=DEFAULT_CAPTURE_BUFFER_S,
+                    help="Extra time added after estimated XYZ move completion before taking a capture image.")
+    ap.add_argument("--cycles", type=int, default=DEFAULT_CYCLES,
+                    help="How many times to repeat the full hourglass curl/uncurl path.")
+    ap.add_argument("--use-solenoid-extrusion", action="store_true", default=DEFAULT_USE_SOLENOID_EXTRUSION,
+                    help="Enable pressure solenoid extrusion during the traced motion using M42 P0 S1 / M42 P0 S0.")
     ap.add_argument("--capture-every-n-shape-moves", type=int, default=DEFAULT_CAPTURE_EVERY_N_CIRCLE_MOVES,
                     help="Capture one image every N recorded trajectory moves. Transition moves are never captured.")
     ap.add_argument("--capture-at-start", action="store_true", default=DEFAULT_CAPTURE_AT_START,
@@ -2244,7 +2798,7 @@ if __name__ == "__main__":
                     help="Tip detection mode passed to calib_hourglass_process.py during --enable-post.")
     ap.add_argument("--post-tracked-tip-source", default=DEFAULT_POST_TRACKED_TIP_SOURCE,
                     choices=["auto", "coarse", "selected", "cnn"],
-                    help="Tracked tip source to use during automatic hourglass post-processing. Defaults to cnn when the tip refiner model is available.")
+                    help="Tracked tip source to use during automatic hourglass post-processing. Defaults to selected so red-dot post-processing uses the marker-derived tip rows.")
     ap.add_argument("--post-save-plots", action="store_true",
                     help="Pass --save_plots to the post-processing script.")
 

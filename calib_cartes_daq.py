@@ -34,6 +34,8 @@ import argparse
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -117,6 +119,35 @@ DEFAULT_CUSTOM_INV_SAMPLES = 20000
 DEFAULT_FLIP_RZ_SIGN = True
 
 OFFPLANE_SIGN = -1.0
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
+DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260627_161714.png")
+DEFAULT_POST_THRESHOLD = 200
+DEFAULT_POST_TIP_REFINE_MODE = "none"
+DEFAULT_POST_TIP_DETECTION_MODE = "red_dot"
+DEFAULT_POST_TRACKED_TIP_SOURCE = "auto"
+DEFAULT_POST_RED_TIP_SAT_MIN = 80
+DEFAULT_POST_RED_TIP_VAL_MIN = 80
+DEFAULT_POST_RED_TIP_MIN_AREA_PX = 20
+DEFAULT_POST_RED_TIP_MORPH_KERNEL = 1
+DEFAULT_POST_RED_TIP_HUE1_MIN = 0
+DEFAULT_POST_RED_TIP_HUE1_MAX = 10
+DEFAULT_POST_RED_TIP_HUE2_MIN = 150
+DEFAULT_POST_RED_TIP_HUE2_MAX = 179
+DEFAULT_POST_RED_TIP_SEARCH_RADIUS_PX = 320.0
+DEFAULT_POST_RED_TIP_LOCAL_MIN_AREA_PX = 10
+DEFAULT_POST_RED_TIP_DISTANCE_WEIGHT = 3.0
+DEFAULT_POST_RED_TIP_MIN_CIRCULARITY = 0.0
+DEFAULT_POST_RED_TIP_COMPONENT_SELECTION = "nearest_largest"
+DEFAULT_POST_RED_TIP_USE_RGB_EXCESS = True
+DEFAULT_POST_RED_TIP_RGB_EXCESS_MIN = 35
+DEFAULT_POST_RED_TIP_DEBUG_SAVE_MASK = True
+DEFAULT_CYCLE_REPEATS = 5
+DEFAULT_INITIAL_PREPOSITION_XYZC_FEED = 5000.0
+DEFAULT_INITIAL_PREPOSITION_B_FEED = 400.0
+DEFAULT_INITIAL_DAQ_WAIT_S = 6.0
+DEFAULT_PASS_TRANSITION_XYZC_FEED = 3000.0
+DEFAULT_PASS_TRANSITION_B_FEED = 600.0
 
 
 # =========================
@@ -765,6 +796,7 @@ class FixedOrientationGridRunner:
     def capture_and_save(
         self,
         sample_idx: int,
+        cycle_idx: int,
         pass_idx: int,
         requested_tip_angle_deg: float,
         used_tip_angle_deg: float,
@@ -797,6 +829,7 @@ class FixedOrientationGridRunner:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = (
             f"{sample_idx:05d}"
+            f"_cycle{cycle_idx:02d}"
             f"_pass{pass_idx:02d}"
             f"_reqA{requested_tip_angle_deg:.1f}"
             f"_useA{used_tip_angle_deg:.3f}"
@@ -858,17 +891,23 @@ class FixedOrientationGridRunner:
         self,
         cal: Calibration,
         passes: List[FixedAnglePass],
+        cycle_repeats: int,
         start_pose: Tuple[float, float, float, float, float],
         end_pose: Tuple[float, float, float, float, float],
         safe_approach_z: float,
         travel_feed: float,
         scan_feed: float,
+        initial_preposition_xyzc_feed: float,
+        initial_preposition_b_feed: float,
+        pass_transition_xyzc_feed: float,
+        pass_transition_b_feed: float,
         virtual_bbox: dict,
         dwell_before_ms: int = 0,
         dwell_after_ms: int = 0,
         capture_settle_s: float = 0.0,
         travel_move_settle_s: float = 0.0,
         inter_grid_wait_s: float = 0.0,
+        initial_daq_wait_s: float = 0.0,
         camera_flush_frames: int = 1,
     ):
         if self.cam is None:
@@ -878,6 +917,10 @@ class FixedOrientationGridRunner:
 
         bbox_warnings: List[str] = []
         total_images_saved = 0
+        total_points_per_cycle = sum(len(pass_plan.grid_points) for pass_plan in passes)
+        total_points = max(1, int(total_points_per_cycle * max(1, int(cycle_repeats))))
+        progress_bar_width = 32
+        progress_count = 0
 
         print("\n" + "=" * 72)
         print("STARTING FIXED-ORIENTATION GRID ACQUISITION RUN")
@@ -923,175 +966,179 @@ class FixedOrientationGridRunner:
             print(f"Dwell before run: {int(dwell_before_ms)} ms")
             time.sleep(float(dwell_before_ms) / 1000.0)
 
-        for pass_idx, pass_plan in enumerate(passes, start=1):
+        for cycle_idx in range(1, max(1, int(cycle_repeats)) + 1):
             print("\n" + "-" * 72)
-            print(
-                f"Pass {pass_idx}/{len(passes)}: "
-                f"requested tip angle={pass_plan.requested_tip_angle_deg:.3f} deg, "
-                f"used tip angle={pass_plan.used_tip_angle_deg:.3f} deg, "
-                f"B={pass_plan.b_cmd:.3f}, C={pass_plan.c_cmd:.3f}"
-            )
-            print(f"Grid points in this pass: {len(pass_plan.grid_points)}")
+            print(f"Cycle {cycle_idx}/{max(1, int(cycle_repeats))}")
             print("-" * 72)
 
-            if not pass_plan.grid_points:
-                print("Skipping empty pass.")
-                continue
-
-            print("Returning to start pose before pass...")
-            self.send_absolute_move(
-                travel_feed,
-                **{
-                    cal.z_axis: float(safe_approach_z),
-                    cal.b_axis: current_pose[3],
-                    cal.c_axis: current_pose[4],
-                }
-            )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-            self.send_absolute_move(
-                travel_feed,
-                **{
-                    cal.x_axis: sx,
-                    cal.y_axis: sy,
-                    cal.b_axis: sb,
-                    cal.c_axis: clamp_c_bounded(sc),
-                }
-            )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-            self.send_absolute_move(
-                travel_feed,
-                **{
-                    cal.z_axis: sz,
-                    cal.b_axis: sb,
-                    cal.c_axis: clamp_c_bounded(sc),
-                }
-            )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-            current_pose = (sx, sy, sz, sb, clamp_c_bounded(sc))
-
-            if inter_grid_wait_s > 0:
-                print(f"Waiting at start pose before pass: {inter_grid_wait_s:.3f} s")
-                time.sleep(inter_grid_wait_s)
-
-            first_pt = pass_plan.grid_points[0]
-            x0, y0, z0 = _clamp_stage_xyz_to_bbox(
-                first_pt.stage_x, first_pt.stage_y, first_pt.stage_z,
-                virtual_bbox,
-                f"pass {pass_idx} first grid point",
-                bbox_warnings,
-            )
-            pass_entry_segments = [
-                ((current_pose[0], current_pose[1], current_pose[2], current_pose[3], current_pose[4]),
-                 (current_pose[0], current_pose[1], float(safe_approach_z), pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))),
-                ((current_pose[0], current_pose[1], float(safe_approach_z), pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd)),
-                 (x0, y0, float(safe_approach_z), pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))),
-                ((x0, y0, float(safe_approach_z), pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd)),
-                 (x0, y0, z0, pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))),
-            ]
-            pass_entry_travel_dwell_s = sum(
-                estimate_move_duration_s(seg_start, seg_end, travel_feed)
-                for seg_start, seg_end in pass_entry_segments
-            )
-
-            print("Moving to pass safe approach with fixed B/C...")
-            self.send_absolute_move(
-                travel_feed,
-                **{
-                    cal.z_axis: float(safe_approach_z),
-                    cal.b_axis: pass_plan.b_cmd,
-                    cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
-                }
-            )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-            self.send_absolute_move(
-                travel_feed,
-                **{
-                    cal.x_axis: x0,
-                    cal.y_axis: y0,
-                    cal.b_axis: pass_plan.b_cmd,
-                    cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
-                }
-            )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-            self.send_absolute_move(
-                travel_feed,
-                **{
-                    cal.z_axis: z0,
-                    cal.b_axis: pass_plan.b_cmd,
-                    cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
-                }
-            )
-            self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
-
-            if pass_entry_travel_dwell_s > 0:
+            for pass_idx, pass_plan in enumerate(passes, start=1):
+                print("\n" + "-" * 72)
                 print(
-                    "Waiting for pass entry travel to settle before first capture: "
-                    f"{pass_entry_travel_dwell_s:.3f} s"
+                    f"Pass {pass_idx}/{len(passes)}: "
+                    f"requested tip angle={pass_plan.requested_tip_angle_deg:.3f} deg, "
+                    f"used tip angle={pass_plan.used_tip_angle_deg:.3f} deg, "
+                    f"B={pass_plan.b_cmd:.3f}, C={pass_plan.c_cmd:.3f}"
                 )
-                time.sleep(pass_entry_travel_dwell_s)
+                print(f"Grid points in this pass: {len(pass_plan.grid_points)}")
+                print("-" * 72)
 
-            # Capture the first point only after the initial approach move has fully settled.
-            self.wait_for_duet_motion_complete(extra_settle=capture_settle_s)
+                if not pass_plan.grid_points:
+                    print("Skipping empty pass.")
+                    continue
 
-            total_images_saved += 1
-            self.capture_and_save(
-                sample_idx=total_images_saved,
-                pass_idx=pass_idx,
-                requested_tip_angle_deg=pass_plan.requested_tip_angle_deg,
-                used_tip_angle_deg=pass_plan.used_tip_angle_deg,
-                tip_x=first_pt.tip_x,
-                tip_y=first_pt.tip_y,
-                tip_z=first_pt.tip_z,
-                stage_x=x0,
-                stage_y=y0,
-                stage_z=z0,
-                b=pass_plan.b_cmd,
-                c=clamp_c_bounded(pass_plan.c_cmd),
-                flush_frames=camera_flush_frames,
-            )
-            current_pose = (x0, y0, z0, pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))
-
-            for point_idx, pt in enumerate(pass_plan.grid_points[1:], start=2):
-                xg, yg, zg = _clamp_stage_xyz_to_bbox(
-                    pt.stage_x, pt.stage_y, pt.stage_z,
+                first_pt = pass_plan.grid_points[0]
+                x0, y0, z0 = _clamp_stage_xyz_to_bbox(
+                    first_pt.stage_x, first_pt.stage_y, first_pt.stage_z,
                     virtual_bbox,
-                    f"pass {pass_idx} point {point_idx}",
+                    f"cycle {cycle_idx} pass {pass_idx} first grid point",
                     bbox_warnings,
                 )
 
-                self.send_absolute_move(
-                    scan_feed,
-                    **{
-                        cal.x_axis: xg,
-                        cal.y_axis: yg,
-                        cal.z_axis: zg,
-                        cal.b_axis: pass_plan.b_cmd,
-                        cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
-                    }
-                )
+                is_first_test_point = (cycle_idx == 1 and pass_idx == 1)
+                if is_first_test_point:
+                    print("Initial DAQ positioning: fast XYZC preposition, then B preposition...")
+                    self.send_absolute_move(
+                        initial_preposition_xyzc_feed,
+                        **{
+                            cal.x_axis: x0,
+                            cal.y_axis: y0,
+                            cal.z_axis: z0,
+                            cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
+                        }
+                    )
+                    self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+
+                    self.send_absolute_move(
+                        initial_preposition_b_feed,
+                        **{
+                            cal.b_axis: pass_plan.b_cmd,
+                        }
+                    )
+                    self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+
+                    if initial_daq_wait_s > 0:
+                        print(f"Waiting {initial_daq_wait_s:.3f} s before starting DAQ...")
+                        time.sleep(initial_daq_wait_s)
+                else:
+                    print("Transitioning to next pass: B preposition, then XYZC to next grid start...")
+                    self.send_absolute_move(
+                        pass_transition_b_feed,
+                        **{
+                            cal.b_axis: pass_plan.b_cmd,
+                            cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
+                        }
+                    )
+                    self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+
+                    self.send_absolute_move(
+                        pass_transition_xyzc_feed,
+                        **{
+                            cal.x_axis: x0,
+                            cal.y_axis: y0,
+                            cal.z_axis: z0,
+                            cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
+                        }
+                    )
+                    self.wait_for_duet_motion_complete(extra_settle=travel_move_settle_s)
+
+                    if initial_daq_wait_s > 0:
+                        print(f"Waiting {initial_daq_wait_s:.3f} s before starting DAQ...")
+                        time.sleep(initial_daq_wait_s)
+
+                # Capture the first point only after the initial approach move has fully settled.
                 self.wait_for_duet_motion_complete(extra_settle=capture_settle_s)
+
+                progress_count += 1
+                progress_fraction = float(progress_count) / float(total_points)
+                progress_percent = 100.0 * progress_fraction
+                filled = min(progress_bar_width, int(round(progress_fraction * progress_bar_width)))
+                bar = "#" * filled + "-" * (progress_bar_width - filled)
+                print("\n" + "=" * 72)
+                print(
+                    f"Progress [{bar}] {progress_percent:6.2f}% "
+                    f"({progress_count}/{total_points}) | cycle {cycle_idx}/{max(1, int(cycle_repeats))} | "
+                    f"pass {pass_idx}/{len(passes)} | point 1/{len(pass_plan.grid_points)}"
+                )
+                print(
+                    f"B={pass_plan.b_cmd:.5f}, X={x0:.5f}, Y={y0:.5f}, Z={z0:.5f}, "
+                    f"C={clamp_c_bounded(pass_plan.c_cmd):.5f}, F={float(scan_feed):.0f}"
+                )
+                print("=" * 72)
 
                 total_images_saved += 1
                 self.capture_and_save(
                     sample_idx=total_images_saved,
+                    cycle_idx=cycle_idx,
                     pass_idx=pass_idx,
                     requested_tip_angle_deg=pass_plan.requested_tip_angle_deg,
                     used_tip_angle_deg=pass_plan.used_tip_angle_deg,
-                    tip_x=pt.tip_x,
-                    tip_y=pt.tip_y,
-                    tip_z=pt.tip_z,
-                    stage_x=xg,
-                    stage_y=yg,
-                    stage_z=zg,
+                    tip_x=first_pt.tip_x,
+                    tip_y=first_pt.tip_y,
+                    tip_z=first_pt.tip_z,
+                    stage_x=x0,
+                    stage_y=y0,
+                    stage_z=z0,
                     b=pass_plan.b_cmd,
                     c=clamp_c_bounded(pass_plan.c_cmd),
                     flush_frames=camera_flush_frames,
                 )
-                current_pose = (xg, yg, zg, pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))
+                current_pose = (x0, y0, z0, pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))
+
+                for point_idx, pt in enumerate(pass_plan.grid_points[1:], start=2):
+                    xg, yg, zg = _clamp_stage_xyz_to_bbox(
+                        pt.stage_x, pt.stage_y, pt.stage_z,
+                        virtual_bbox,
+                        f"cycle {cycle_idx} pass {pass_idx} point {point_idx}",
+                        bbox_warnings,
+                    )
+
+                    self.send_absolute_move(
+                        scan_feed,
+                        **{
+                            cal.x_axis: xg,
+                            cal.y_axis: yg,
+                            cal.z_axis: zg,
+                            cal.b_axis: pass_plan.b_cmd,
+                            cal.c_axis: clamp_c_bounded(pass_plan.c_cmd),
+                        }
+                    )
+                    self.wait_for_duet_motion_complete(extra_settle=capture_settle_s)
+
+                    progress_count += 1
+                    progress_fraction = float(progress_count) / float(total_points)
+                    progress_percent = 100.0 * progress_fraction
+                    filled = min(progress_bar_width, int(round(progress_fraction * progress_bar_width)))
+                    bar = "#" * filled + "-" * (progress_bar_width - filled)
+                    print("\n" + "=" * 72)
+                    print(
+                        f"Progress [{bar}] {progress_percent:6.2f}% "
+                        f"({progress_count}/{total_points}) | cycle {cycle_idx}/{max(1, int(cycle_repeats))} | "
+                        f"pass {pass_idx}/{len(passes)} | point {point_idx}/{len(pass_plan.grid_points)}"
+                    )
+                    print(
+                        f"B={pass_plan.b_cmd:.5f}, X={xg:.5f}, Y={yg:.5f}, Z={zg:.5f}, "
+                        f"C={clamp_c_bounded(pass_plan.c_cmd):.5f}, F={float(scan_feed):.0f}"
+                    )
+                    print("=" * 72)
+
+                    total_images_saved += 1
+                    self.capture_and_save(
+                        sample_idx=total_images_saved,
+                        cycle_idx=cycle_idx,
+                        pass_idx=pass_idx,
+                        requested_tip_angle_deg=pass_plan.requested_tip_angle_deg,
+                        used_tip_angle_deg=pass_plan.used_tip_angle_deg,
+                        tip_x=pt.tip_x,
+                        tip_y=pt.tip_y,
+                        tip_z=pt.tip_z,
+                        stage_x=xg,
+                        stage_y=yg,
+                        stage_z=zg,
+                        b=pass_plan.b_cmd,
+                        c=clamp_c_bounded(pass_plan.c_cmd),
+                        flush_frames=camera_flush_frames,
+                    )
+                    current_pose = (xg, yg, zg, pass_plan.b_cmd, clamp_c_bounded(pass_plan.c_cmd))
 
         if int(dwell_after_ms) > 0:
             print(f"Dwell after run: {int(dwell_after_ms)} ms")
@@ -1194,7 +1241,8 @@ def main(args):
     print(f"  Tip X values: {len(x_values)} points from {x_values[0]:.3f} to {x_values[-1]:.3f}")
     print(f"  Tip Z values: {len(z_values)} points from {z_values[0]:.3f} to {z_values[-1]:.3f}")
     print(f"  Tip Y fixed: {float(args.point_y):.3f}")
-    print(f"  Total captures planned: {sum(len(p.grid_points) for p in passes)}")
+    print(f"  Cycle repeats: {int(args.cycle_repeats)}")
+    print(f"  Total captures planned: {sum(len(p.grid_points) for p in passes) * max(1, int(args.cycle_repeats))}")
     print(f"  C fixed for all passes: {float(args.fixed_c):.3f}")
     print(f"  flip_rz_sign: {bool(args.flip_rz_sign)}")
     print(f"  motion_phase: {motion_phase}")
@@ -1251,22 +1299,95 @@ def main(args):
         results = runner.execute_passes_and_capture(
             cal=cal,
             passes=passes,
+            cycle_repeats=int(args.cycle_repeats),
             start_pose=start_pose,
             end_pose=end_pose,
             safe_approach_z=float(args.safe_approach_z),
             travel_feed=float(args.travel_feed),
             scan_feed=float(args.scan_feed),
+            initial_preposition_xyzc_feed=float(args.initial_preposition_xyzc_feed),
+            initial_preposition_b_feed=float(args.initial_preposition_b_feed),
+            pass_transition_xyzc_feed=float(args.pass_transition_xyzc_feed),
+            pass_transition_b_feed=float(args.pass_transition_b_feed),
             virtual_bbox=virtual_bbox,
             dwell_before_ms=int(args.dwell_before_ms),
             dwell_after_ms=int(args.dwell_after_ms),
             capture_settle_s=float(args.capture_settle_s),
             travel_move_settle_s=float(args.travel_move_settle_s),
             inter_grid_wait_s=float(args.inter_grid_wait_s),
+            initial_daq_wait_s=float(args.initial_daq_wait_s),
             camera_flush_frames=int(args.camera_flush_frames),
         )
 
         print("\nFinal results:")
         print(results)
+
+        if bool(args.enable_post):
+            script_dir = Path(__file__).resolve().parent
+            post_camera_calibration_file = Path(args.post_camera_calibration_file).expanduser().resolve()
+            post_checkerboard_reference_image = Path(args.post_checkerboard_reference_image).expanduser().resolve()
+            post_cmd = [
+                sys.executable,
+                str(script_dir / "calib_point_process.py"),
+                "--project_dir",
+                runner.run_folder,
+                "--camera_calibration_file",
+                str(post_camera_calibration_file),
+                "--checkerboard_reference_image",
+                str(post_checkerboard_reference_image),
+                "--threshold",
+                str(int(args.post_threshold)),
+                "--tip_refine_mode",
+                str(args.post_tip_refine_mode),
+                "--tip_detection_mode",
+                str(args.post_tip_detection_mode),
+                "--tracked_tip_source",
+                str(args.post_tracked_tip_source),
+                "--red_tip_sat_min",
+                str(int(args.post_red_tip_sat_min)),
+                "--red_tip_val_min",
+                str(int(args.post_red_tip_val_min)),
+                "--red_tip_min_area_px",
+                str(int(args.post_red_tip_min_area_px)),
+                "--red_tip_morph_kernel",
+                str(int(args.post_red_tip_morph_kernel)),
+                "--red_tip_hue1_min",
+                str(int(args.post_red_tip_hue1_min)),
+                "--red_tip_hue1_max",
+                str(int(args.post_red_tip_hue1_max)),
+                "--red_tip_hue2_min",
+                str(int(args.post_red_tip_hue2_min)),
+                "--red_tip_hue2_max",
+                str(int(args.post_red_tip_hue2_max)),
+                "--red_tip_search_radius_px",
+                str(float(args.post_red_tip_search_radius_px)),
+                "--red_tip_local_min_area_px",
+                str(int(args.post_red_tip_local_min_area_px)),
+                "--red_tip_distance_weight",
+                str(float(args.post_red_tip_distance_weight)),
+                "--red_tip_min_circularity",
+                str(float(args.post_red_tip_min_circularity)),
+                "--red_tip_component_selection",
+                str(args.post_red_tip_component_selection),
+                "--red_tip_rgb_excess_min",
+                str(int(args.post_red_tip_rgb_excess_min)),
+            ]
+            if bool(args.post_red_tip_use_rgb_excess):
+                post_cmd.append("--red_tip_use_rgb_excess")
+            else:
+                post_cmd.append("--no_red_tip_use_rgb_excess")
+            if bool(args.post_red_tip_debug_save_mask):
+                post_cmd.append("--red_tip_debug_save_mask")
+            else:
+                post_cmd.append("--no_red_tip_debug_save_mask")
+            if bool(args.post_save_plots):
+                post_cmd.append("--save_plots")
+            if bool(args.post_save_analysis_config):
+                post_cmd.append("--save_analysis_config")
+
+            print("\nRunning post-processing:")
+            print(" ".join(post_cmd))
+            subprocess.run(post_cmd, check=True, cwd=str(script_dir))
 
     finally:
         try:
@@ -1291,6 +1412,8 @@ if __name__ == "__main__":
                     help="Allow reuse of an existing run folder.")
     ap.add_argument("--add-date", action="store_true", default=DEFAULT_ADD_DATE,
                     help="Append timestamp to the run folder.")
+    ap.add_argument("--enable-post", action="store_true",
+                    help="Run calib_point_process.py on the generated project directory after acquisition.")
 
     # Connectivity
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet web address.")
@@ -1319,10 +1442,10 @@ if __name__ == "__main__":
     # Tip-space grid
     ap.add_argument("--x-start", type=float, default=DEFAULT_X_START, help="Grid tip X start.")
     ap.add_argument("--x-end", type=float, default=DEFAULT_X_END, help="Grid tip X end.")
-    ap.add_argument("--x-step", type=float, default=DEFAULT_X_STEP, help="Grid tip X step.")
+    ap.add_argument("--x-step", "--desired_x_step_mm", dest="x_step", type=float, default=DEFAULT_X_STEP, help="Grid tip X step.")
     ap.add_argument("--z-start", type=float, default=DEFAULT_Z_START, help="Grid tip Z start.")
     ap.add_argument("--z-end", type=float, default=DEFAULT_Z_END, help="Grid tip Z end.")
-    ap.add_argument("--z-step", type=float, default=DEFAULT_Z_STEP, help="Grid tip Z step.")
+    ap.add_argument("--z-step", "--desired_z_step_mm", dest="z_step", type=float, default=DEFAULT_Z_STEP, help="Grid tip Z step.")
 
     # Fixed orientation
     ap.add_argument("--fixed-c", type=float, default=DEFAULT_FIXED_C,
@@ -1360,12 +1483,73 @@ if __name__ == "__main__":
     # Optional waits
     ap.add_argument("--dwell-before-ms", type=int, default=DEFAULT_DWELL_BEFORE_MS)
     ap.add_argument("--dwell-after-ms", type=int, default=DEFAULT_DWELL_AFTER_MS)
+    ap.add_argument("--cycle-repeats", type=int, default=DEFAULT_CYCLE_REPEATS,
+                    help="Repeat the full fixed-angle pass set this many times.")
     ap.add_argument("--capture-settle-s", type=float, default=DEFAULT_CAPTURE_SETTLE_S,
                     help="Extra settle time after each scan move, before capture (default: 0.5 s).")
     ap.add_argument("--travel-move-settle-s", type=float, default=DEFAULT_TRAVEL_MOVE_SETTLE_S,
                     help="Extra settle time after travel moves.")
     ap.add_argument("--inter-grid-wait-s", type=float, default=DEFAULT_INTER_GRID_WAIT_S,
                     help="Wait time at the configured start pose before each grid/pass.")
+    ap.add_argument("--initial-preposition-xyzc-feed", type=float, default=DEFAULT_INITIAL_PREPOSITION_XYZC_FEED,
+                    help="Feedrate for the very first XYZC prepositioning move before DAQ starts.")
+    ap.add_argument("--initial-preposition-b-feed", type=float, default=DEFAULT_INITIAL_PREPOSITION_B_FEED,
+                    help="Feedrate for the very first B prepositioning move before DAQ starts.")
+    ap.add_argument("--pass-transition-xyzc-feed", type=float, default=DEFAULT_PASS_TRANSITION_XYZC_FEED,
+                    help="Feedrate for XYZC motion to the next grid start after finishing a pass.")
+    ap.add_argument("--pass-transition-b-feed", type=float, default=DEFAULT_PASS_TRANSITION_B_FEED,
+                    help="Feedrate for the B move to the next pass angle after finishing a grid.")
+    ap.add_argument("--initial-daq-wait-s", type=float, default=DEFAULT_INITIAL_DAQ_WAIT_S,
+                    help="Wait time after the prepositioning sequence before starting each DAQ grid.")
+
+    # Post-processing
+    ap.add_argument("--post-camera-calibration-file", type=str, default=DEFAULT_CAMERA_CALIBRATION_FILE,
+                    help="Camera calibration file passed to calib_point_process.py.")
+    ap.add_argument("--post-checkerboard-reference-image", type=str, default=DEFAULT_BOARD_REFERENCE_IMAGE,
+                    help="Board/checkerboard reference image passed to calib_point_process.py.")
+    ap.add_argument("--post-threshold", type=int, default=DEFAULT_POST_THRESHOLD,
+                    help="Threshold passed to calib_point_process.py.")
+    ap.add_argument("--post-tip-refine-mode", type=str, default=DEFAULT_POST_TIP_REFINE_MODE,
+                    help="Tip refinement mode passed to calib_point_process.py.")
+    ap.add_argument("--post-tip-detection-mode", type=str, default=DEFAULT_POST_TIP_DETECTION_MODE,
+                    choices=["classical", "red_dot", "auto_red_dot"],
+                    help="Tip detection mode passed to calib_point_process.py.")
+    ap.add_argument("--post-tracked-tip-source", type=str, default=DEFAULT_POST_TRACKED_TIP_SOURCE,
+                    choices=["auto", "coarse", "selected", "cnn"],
+                    help="Tracked tip source passed to calib_point_process.py.")
+    ap.add_argument("--post-red-tip-sat-min", type=int, default=DEFAULT_POST_RED_TIP_SAT_MIN)
+    ap.add_argument("--post-red-tip-val-min", type=int, default=DEFAULT_POST_RED_TIP_VAL_MIN)
+    ap.add_argument("--post-red-tip-min-area-px", type=int, default=DEFAULT_POST_RED_TIP_MIN_AREA_PX)
+    ap.add_argument("--post-red-tip-morph-kernel", type=int, default=DEFAULT_POST_RED_TIP_MORPH_KERNEL)
+    ap.add_argument("--post-red-tip-hue1-min", type=int, default=DEFAULT_POST_RED_TIP_HUE1_MIN)
+    ap.add_argument("--post-red-tip-hue1-max", type=int, default=DEFAULT_POST_RED_TIP_HUE1_MAX)
+    ap.add_argument("--post-red-tip-hue2-min", type=int, default=DEFAULT_POST_RED_TIP_HUE2_MIN)
+    ap.add_argument("--post-red-tip-hue2-max", type=int, default=DEFAULT_POST_RED_TIP_HUE2_MAX)
+    ap.add_argument("--post-red-tip-search-radius-px", type=float, default=DEFAULT_POST_RED_TIP_SEARCH_RADIUS_PX)
+    ap.add_argument("--post-red-tip-local-min-area-px", type=int, default=DEFAULT_POST_RED_TIP_LOCAL_MIN_AREA_PX)
+    ap.add_argument("--post-red-tip-distance-weight", type=float, default=DEFAULT_POST_RED_TIP_DISTANCE_WEIGHT)
+    ap.add_argument("--post-red-tip-min-circularity", type=float, default=DEFAULT_POST_RED_TIP_MIN_CIRCULARITY)
+    ap.add_argument("--post-red-tip-component-selection", type=str, default=DEFAULT_POST_RED_TIP_COMPONENT_SELECTION,
+                    choices=["largest", "nearest", "nearest_largest"])
+    ap.add_argument("--post-red-tip-use-rgb-excess", dest="post_red_tip_use_rgb_excess",
+                    action="store_true", default=DEFAULT_POST_RED_TIP_USE_RGB_EXCESS)
+    ap.add_argument("--no-post-red-tip-use-rgb-excess", dest="post_red_tip_use_rgb_excess",
+                    action="store_false")
+    ap.add_argument("--post-red-tip-rgb-excess-min", type=int, default=DEFAULT_POST_RED_TIP_RGB_EXCESS_MIN)
+    ap.add_argument("--post-red-tip-debug-save-mask", dest="post_red_tip_debug_save_mask",
+                    action="store_true", default=DEFAULT_POST_RED_TIP_DEBUG_SAVE_MASK)
+    ap.add_argument("--no-post-red-tip-debug-save-mask", dest="post_red_tip_debug_save_mask",
+                    action="store_false")
+    ap.add_argument("--post-save-plots", dest="post_save_plots", action="store_true", default=True,
+                    help="Pass --save_plots to calib_point_process.py.")
+    ap.add_argument("--no-post-save-plots", dest="post_save_plots", action="store_false",
+                    help="Do not pass --save_plots to calib_point_process.py.")
+    ap.add_argument("--post-save-analysis-config", dest="post_save_analysis_config",
+                    action="store_true", default=True,
+                    help="Pass --save_analysis_config to calib_point_process.py.")
+    ap.add_argument("--no-post-save-analysis-config", dest="post_save_analysis_config",
+                    action="store_false",
+                    help="Do not pass --save_analysis_config to calib_point_process.py.")
 
     # Startup / end poses
     ap.add_argument("--safe-approach-z", type=float, default=DEFAULT_SAFE_APPROACH_Z)

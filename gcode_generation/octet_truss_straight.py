@@ -36,9 +36,9 @@ from scipy.interpolate import PchipInterpolator
 DEFAULT_OUT = "gcode_generation/octet_truss_cartesian_topdown.gcode"
 
 # Placement in tip space (world coordinates): lower/min cube corner
-DEFAULT_ORIGIN_X = 40.0
+DEFAULT_ORIGIN_X = 70.0
 DEFAULT_ORIGIN_Y = 52.0
-DEFAULT_ORIGIN_Z = -200.0
+DEFAULT_ORIGIN_Z = -148.0
 
 # Geometry
 DEFAULT_ORDER = 3
@@ -48,9 +48,9 @@ DEFAULT_INCLUDE_CUBE_FRAME = True
 
 # Motion
 DEFAULT_TRAVEL_FEED = 2000.0      # mm/min
-DEFAULT_PRINT_FEED = 150.0        # mm/min
-DEFAULT_FINE_PRINT_FEED = 50.0    # mm/min when very close to node
-DEFAULT_FINE_RAMP_DISTANCE_MM = 5.0
+DEFAULT_PRINT_FEED = 300.0        # mm/min 150
+DEFAULT_FINE_PRINT_FEED = 150.0    # mm/min when very close to node 50
+DEFAULT_FINE_RAMP_DISTANCE_MM = 2.0
 
 # Strut overprint into node
 DEFAULT_NODE_EXTENSION_MM = 1.5   # mm beyond the end node along the strut direction
@@ -60,13 +60,13 @@ DEFAULT_NODE_REVISIT_LIFT_MM = 2.0
 DEFAULT_NODE_DWELL_EXTRUSION_MM = 0.15   # additional U extrusion while dwelling on node
 
 # User-defined pre/post print poses (stage axes)
-DEFAULT_START_X = 40.0
+DEFAULT_START_X = 70.0
 DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -20.0
-DEFAULT_END_X = 40.0
+DEFAULT_START_Z = -10.0
+DEFAULT_END_X = 70.0
 DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -20.0
-DEFAULT_SAFE_APPROACH_Z = -100.0
+DEFAULT_END_Z = -10.0
+DEFAULT_SAFE_APPROACH_Z = -10.0
 
 # Virtual XYZ bounding box (enforced during print/travel)
 DEFAULT_BBOX_X_MIN = 10.0
@@ -84,8 +84,8 @@ DEFAULT_PRIME_MM = 1.0
 DEFAULT_PRESSURE_OFFSET_MM = 4.0
 DEFAULT_PRESSURE_ADVANCE_FEED = 1000.0
 DEFAULT_PRESSURE_RETRACT_FEED = 1000.0
-DEFAULT_PREFLOW_DWELL_MS = 1000
-DEFAULT_NODE_DWELL_MS = 1500
+DEFAULT_PREFLOW_DWELL_MS = 300
+DEFAULT_NODE_DWELL_MS = 300
 
 # Fixed B/C for this simplified version
 DEFAULT_FIXED_B = 0.0
@@ -663,11 +663,7 @@ def write_gcode_octet_truss_cartesian_bottom_up(
         edge_samples = 2
 
     bbox_warnings: List[str] = []
-    u_material_abs = 0.0
-    pressure_charged = False
-
-    def u_cmd_actual() -> float:
-        return u_material_abs + (float(pressure_offset_mm) if pressure_charged else 0.0)
+    extrusion_enabled = False
 
     tip_offset = tip_offset_xyz_physical(cal, float(fixed_b), float(fixed_c), phase='pull')
 
@@ -698,16 +694,15 @@ def write_gcode_octet_truss_cartesian_bottom_up(
         f.write(f"; node_extension_mm = {float(node_extension_mm):.3f} mm\n")
         f.write(f"; node_revisit_lift_mm = {float(node_revisit_lift_mm):.3f} mm\n")
         f.write(f"; node_dwell_extrusion_mm = {float(node_dwell_extrusion_mm):.3f} mm\n")
+        f.write("; extrusion actuation: pressure solenoid valve via M42 P0 S1 / M42 P0 S0\n")
+        f.write("; prime-mm / pressure-offset-mm / pressure feed settings are retained for CLI compatibility and ignored here\n")
+        f.write("; node_dwell_extrusion_mm is retained for CLI compatibility; node dwell is time-based with the solenoid valve open\n")
         for k, v in header_meta.items():
             f.write(f"; {k}: {v}\n")
         f.write("G90\n")
 
         if emit_extrusion:
-            f.write("M82\n")
-            f.write(f"G92 {cal.u_axis}0\n")
-            if abs(float(prime_mm)) > 0.0:
-                u_material_abs += float(prime_mm)
-                f.write(f"G1 {cal.u_axis}{u_cmd_actual():.3f} F{max(60.0, float(pressure_advance_feed)):.0f}\n")
+            f.write("M42 P0 S0\n")
 
         sx, sy, sz, _, _ = [float(v) for v in start_pose]
         ex, ey, ez, _, _ = [float(v) for v in end_pose]
@@ -742,20 +737,22 @@ def write_gcode_octet_truss_cartesian_bottom_up(
                 f.write(f"G1 {cal.z_axis}{tz:.3f} {cal.b_axis}{fixed_b:.3f} {cal.c_axis}{fixed_c:.3f} F{travel_feed:.1f}\n")
             current_stage = np.array([tx, ty, tz], dtype=float)
 
-        def retract_pressure_if_needed():
-            nonlocal pressure_charged
-            if emit_extrusion and float(pressure_offset_mm) > 0.0 and pressure_charged:
-                pressure_charged = False
-                f.write(f"G1 {cal.u_axis}{u_cmd_actual():.3f} F{float(pressure_retract_feed):.1f}\n")
+        def stop_extrusion_if_needed():
+            nonlocal extrusion_enabled
+            if emit_extrusion and extrusion_enabled:
+                extrusion_enabled = False
+                f.write("M42 P0 S0\n")
 
-        def advance_pressure_if_needed():
-            nonlocal pressure_charged
-            if emit_extrusion and float(pressure_offset_mm) > 0.0 and not pressure_charged:
-                pressure_charged = True
-                f.write(f"G1 {cal.u_axis}{u_cmd_actual():.3f} F{float(pressure_advance_feed):.1f}\n")
+        def start_extrusion_if_needed():
+            nonlocal extrusion_enabled
+            if emit_extrusion and not extrusion_enabled:
+                extrusion_enabled = True
+                f.write("M42 P0 S1\n")
+                if int(preflow_dwell_ms) > 0:
+                    f.write(f"G4 P{int(preflow_dwell_ms)}\n")
 
         def emit_node_revisit(true_node_tip: np.ndarray, comment: str):
-            nonlocal current_stage, current_tip, u_material_abs
+            nonlocal current_stage, current_tip
 
             true_node_stage = clamp_xyz(true_node_tip - tip_offset, f"{comment} true node")
             cx, cy, cz = [float(v) for v in current_stage]
@@ -782,21 +779,10 @@ def write_gcode_octet_truss_cartesian_bottom_up(
             current_tip = true_node_tip.copy()
 
             if emit_extrusion:
-                advance_pressure_if_needed()
-
-                if float(node_dwell_extrusion_mm) > 0.0:
-                    u_material_abs += float(node_dwell_extrusion_mm)
-                    f.write(f"; node dwell extrusion for {comment}\n")
-                    f.write(
-                        f"G1 {cal.x_axis}{tx:.3f} {cal.y_axis}{ty:.3f} {cal.z_axis}{tz:.3f} "
-                        f"{cal.b_axis}{fixed_b:.3f} {cal.c_axis}{fixed_c:.3f} "
-                        f"{cal.u_axis}{u_cmd_actual():.3f} F{max(60.0, float(pressure_advance_feed)):.1f}\n"
-                    )
-
+                start_extrusion_if_needed()
                 if int(node_dwell_ms) > 0:
                     f.write(f"G4 P{int(node_dwell_ms)}\n")
-
-                retract_pressure_if_needed()
+                stop_extrusion_if_needed()
 
         for ei, plan in enumerate(plans, start=1):
             p0_tip = plan.p0_tip.copy()
@@ -829,11 +815,7 @@ def write_gcode_octet_truss_cartesian_bottom_up(
             else:
                 current_stage = p0_stage.copy()
 
-            if emit_extrusion and float(pressure_offset_mm) > 0.0 and not pressure_charged:
-                pressure_charged = True
-                f.write(f"G1 {cal.u_axis}{u_cmd_actual():.3f} F{float(pressure_advance_feed):.1f}\n")
-                if int(preflow_dwell_ms) > 0:
-                    f.write(f"G4 P{int(preflow_dwell_ms)}\n")
+            start_extrusion_if_needed()
 
             prev_tip = p0_tip.copy()
 
@@ -860,11 +842,6 @@ def write_gcode_octet_truss_cartesian_bottom_up(
                     f"{cal.c_axis}{fixed_c:.3f}"
                 )
 
-                if emit_extrusion:
-                    seg_len = float(np.linalg.norm(p_tip - prev_tip))
-                    u_material_abs += float(extrusion_per_mm) * seg_len
-                    line += f" {cal.u_axis}{u_cmd_actual():.3f}"
-
                 line += f" F{seg_feed:.1f}\n"
                 f.write(line)
 
@@ -879,12 +856,13 @@ def write_gcode_octet_truss_cartesian_bottom_up(
             # 2) lift + move back to actual node
             # 3) lower onto node
             # 4) repressurize and dwell/extrude at true node
-            retract_pressure_if_needed()
+            stop_extrusion_if_needed()
             emit_node_revisit(p1_tip_nominal, f"edge {ei} node")
 
             emitted_edges += 1
 
         f.write("; end\n")
+        stop_extrusion_if_needed()
         end_stage = clamp_xyz(np.array([ex, ey, ez], dtype=float), "end pose")
         emit_travel_move(end_stage, "end pose")
         f.write(f"; emitted edges = {emitted_edges}\n")

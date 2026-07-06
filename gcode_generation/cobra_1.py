@@ -129,6 +129,7 @@ DEFAULT_TONGUE_BASE_DIAM_Y      = 2.5    # lateral (Y) diameter at tongue base (
 DEFAULT_TONGUE_BASE_DIAM_Z      = 0.6    # height (thin dimension) at tongue base (mm)
 DEFAULT_TONGUE_FORK_FRAC        = 0.50   # fraction of tongue length at which prongs split
 DEFAULT_TONGUE_FORK_ANGLE_DEG   = 22.0   # half-angle of fork spread (degrees)
+DEFAULT_TONGUE_DROP_ANGLE_DEG   = 28.0   # downward pitch away from the neck tangent
 DEFAULT_TONGUE_TAPER_START_FRAC = 0.65   # fraction along prong where taper to tip begins
 DEFAULT_TONGUE_TIP_DIAM         = 0.25   # prong tip diameter (mm)
 DEFAULT_TONGUE_LAYER_HEIGHT     = 0.25   # helical layer height for tongue winding
@@ -167,6 +168,18 @@ class Calibration:
     selected_offplane_fit_model: Optional[str] = None
     active_phase: str = "pull"
     offplane_y_sign: float = 1.0
+    phase_model_sets: Optional[Dict[str, "PhaseModelSet"]] = None
+    motion_phase_map: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class PhaseModelSet:
+    phase_name: str
+    r_model: Optional[Dict[str, Any]] = None
+    z_model: Optional[Dict[str, Any]] = None
+    y_off_model: Optional[Dict[str, Any]] = None
+    y_off_extrap_model: Optional[Dict[str, Any]] = None
+    tip_angle_model: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -270,6 +283,38 @@ def _select_named_model(
     return None
 
 
+def _build_phase_model_set(
+    models: Dict[str, Any],
+    phase_name: str,
+    selected_fit_model: Optional[str],
+    selected_offplane_fit_model: Optional[str],
+    force_y_offset_selection: bool = False,
+) -> PhaseModelSet:
+    sel = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
+    sel_op = (None if selected_offplane_fit_model is None
+              else str(selected_offplane_fit_model).strip().lower())
+    y_off_sel = sel_op or sel
+    r_model = _select_named_model(models, "r", sel)
+    z_model = _select_named_model(models, "z", sel)
+    if force_y_offset_selection:
+        y_off_model = _select_named_model(models, "offplane_y", y_off_sel)
+    else:
+        y_off_model = (_normalize_model_spec(models.get("offplane_y_avg_cubic")) or
+                       _select_named_model(models, "offplane_y", y_off_sel))
+    y_off_extrap_model = (_normalize_model_spec(models.get("offplane_y_avg_linear")) or
+                          _normalize_model_spec(models.get("offplane_y_linear")) or
+                          _normalize_model_spec(models.get("offplane_y")))
+    tip_angle_model = _select_named_model(models, "tip_angle", sel)
+    return PhaseModelSet(
+        phase_name=str(phase_name).strip().lower(),
+        r_model=r_model,
+        z_model=z_model,
+        y_off_model=y_off_model,
+        y_off_extrap_model=y_off_extrap_model,
+        tip_angle_model=tip_angle_model,
+    )
+
+
 def _pchip_endpoint_slope(h0: float, h1: float, delta0: float, delta1: float) -> float:
     d = ((2.0 * h0 + h1) * delta0 - h0 * delta1) / max(h0 + h1, 1e-12)
     if np.sign(d) != np.sign(delta0):
@@ -349,7 +394,12 @@ def eval_pchip_with_linear_extrap(
     return out
 
 
-def load_calibration(json_path: str, offplane_y_sign: float = 1.0) -> Calibration:
+def load_calibration(
+    json_path: str,
+    offplane_y_sign: float = 1.0,
+    fit_model_override: Optional[str] = None,
+    y_offset_fit_model_override: Optional[str] = None,
+) -> Calibration:
     p = Path(json_path)
     if not p.exists():
         raise FileNotFoundError(f"Calibration JSON not found: {json_path}")
@@ -386,6 +436,10 @@ def load_calibration(json_path: str, offplane_y_sign: float = 1.0) -> Calibratio
     sel    = None if sel    is None else str(sel).strip().lower()
     sel_op = data.get("selected_offplane_fit_model")
     sel_op = None if sel_op is None else str(sel_op).strip().lower()
+    if fit_model_override is not None:
+        sel = str(fit_model_override).strip().lower()
+    if y_offset_fit_model_override is not None:
+        sel_op = str(y_offset_fit_model_override).strip().lower()
     active_phase = str(data.get("default_phase_for_legacy_access") or "pull").strip().lower()
 
     phase_models = data.get("fit_models_by_phase", {}) or {}
@@ -393,15 +447,25 @@ def load_calibration(json_path: str, offplane_y_sign: float = 1.0) -> Calibratio
     if not isinstance(apm, dict):
         apm = fit_models
 
-    y_off_sel = sel_op or sel
-    r_model   = _select_named_model(apm, "r",          sel)
-    z_model   = _select_named_model(apm, "z",          sel)
-    yo_model  = (_normalize_model_spec(apm.get("offplane_y_avg_cubic")) or
-                 _select_named_model(apm, "offplane_y", y_off_sel))
-    yoe_model = (_normalize_model_spec(apm.get("offplane_y_avg_linear")) or
-                 _normalize_model_spec(apm.get("offplane_y_linear")) or
-                 _normalize_model_spec(apm.get("offplane_y")))
-    ta_model  = _select_named_model(apm, "tip_angle",  sel)
+    active_models = _build_phase_model_set(
+        apm,
+        active_phase,
+        selected_fit_model=sel,
+        selected_offplane_fit_model=sel_op,
+        force_y_offset_selection=(y_offset_fit_model_override is not None),
+    )
+    phase_model_sets: Dict[str, PhaseModelSet] = {}
+    if isinstance(phase_models, dict):
+        for phase_name, model_map in phase_models.items():
+            if not isinstance(model_map, dict):
+                continue
+            phase_model_sets[str(phase_name).strip().lower()] = _build_phase_model_set(
+                model_map,
+                str(phase_name),
+                selected_fit_model=sel,
+                selected_offplane_fit_model=sel_op,
+                force_y_offset_selection=(y_offset_fit_model_override is not None),
+            )
 
     motor   = data.get("motor_setup", {})
     duet    = data.get("duet_axis_mapping", {})
@@ -410,8 +474,10 @@ def load_calibration(json_path: str, offplane_y_sign: float = 1.0) -> Calibratio
 
     return Calibration(
         pr=pr, pz=pz, py_off=py_off, pa=pa,
-        r_model=r_model, z_model=z_model,
-        y_off_model=yo_model, y_off_extrap_model=yoe_model, tip_angle_model=ta_model,
+        r_model=active_models.r_model, z_model=active_models.z_model,
+        y_off_model=active_models.y_off_model,
+        y_off_extrap_model=active_models.y_off_extrap_model,
+        tip_angle_model=active_models.tip_angle_model,
         selected_fit_model=sel, selected_offplane_fit_model=sel_op,
         active_phase=active_phase,
         b_min=b_min, b_max=b_max,
@@ -423,6 +489,9 @@ def load_calibration(json_path: str, offplane_y_sign: float = 1.0) -> Calibratio
         u_axis=str(duet.get("extruder_axis")     or "U"),
         c_180_deg=float(motor.get("rotation_axis_180_deg", 180.0)),
         offplane_y_sign=float(offplane_y_sign),
+        phase_model_sets=phase_model_sets or None,
+        motion_phase_map={str(k): str(v).strip().lower()
+                          for k, v in (data.get("motion_phase_map", {}) or {}).items()},
     )
 
 
@@ -437,31 +506,43 @@ def make_cartesian_calibration() -> Calibration:
     )
 
 
-def eval_r(cal: Calibration, b: Any) -> np.ndarray:
-    return eval_model_spec(cal.r_model, b) if cal.r_model is not None else poly_eval(cal.pr, b)
+def eval_r(cal: Any, b: Any) -> np.ndarray:
+    model = getattr(cal, "r_model", None)
+    if model is not None:
+        return eval_model_spec(model, b)
+    return poly_eval(getattr(cal, "pr", None), b)
 
 
-def eval_z(cal: Calibration, b: Any) -> np.ndarray:
-    return eval_model_spec(cal.z_model, b) if cal.z_model is not None else poly_eval(cal.pz, b)
+def eval_z(cal: Any, b: Any) -> np.ndarray:
+    model = getattr(cal, "z_model", None)
+    if model is not None:
+        return eval_model_spec(model, b)
+    return poly_eval(getattr(cal, "pz", None), b)
 
 
-def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.y_off_model is not None:
-        if str(cal.y_off_model.get("model_type","")).lower() == "pchip":
-            vals = eval_pchip_with_linear_extrap(cal.y_off_model, cal.y_off_extrap_model, b)
+def eval_offplane_y(cal: Any, b: Any) -> np.ndarray:
+    y_off_model = getattr(cal, "y_off_model", None)
+    if y_off_model is not None:
+        if str(y_off_model.get("model_type", "")).lower() == "pchip":
+            vals = eval_pchip_with_linear_extrap(
+                y_off_model,
+                getattr(cal, "y_off_extrap_model", None),
+                b,
+            )
         else:
-            vals = eval_model_spec(cal.y_off_model, b, default_if_none=0.0)
+            vals = eval_model_spec(y_off_model, b, default_if_none=0.0)
     else:
-        vals = poly_eval(cal.py_off, b, default_if_none=0.0)
-    return float(cal.offplane_y_sign) * np.asarray(vals, dtype=float)
+        vals = poly_eval(getattr(cal, "py_off", None), b, default_if_none=0.0)
+    return float(getattr(cal, "offplane_y_sign", 1.0)) * np.asarray(vals, dtype=float)
 
 
-def eval_tip_angle_deg(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.tip_angle_model is not None:
-        return eval_model_spec(cal.tip_angle_model, b)
-    if cal.pa is None:
+def eval_tip_angle_deg(cal: Any, b: Any) -> np.ndarray:
+    tip_angle_model = getattr(cal, "tip_angle_model", None)
+    if tip_angle_model is not None:
+        return eval_model_spec(tip_angle_model, b)
+    if getattr(cal, "pa", None) is None:
         raise ValueError("Calibration missing tip_angle_coeffs / tip_angle model.")
-    return poly_eval(cal.pa, b)
+    return poly_eval(getattr(cal, "pa", None), b)
 
 
 def predict_tip_offset_xyz(cal: Calibration, b_machine: float, c_deg: float) -> np.ndarray:
@@ -478,6 +559,13 @@ def stage_xyz_for_tip(
     cal: Calibration, tip_xyz: np.ndarray, b_machine: float, c_deg: float
 ) -> np.ndarray:
     return np.asarray(tip_xyz, dtype=float) - predict_tip_offset_xyz(cal, b_machine, c_deg)
+
+
+def get_phase_model_set(cal: Calibration, phase_name: Optional[str]) -> Optional[PhaseModelSet]:
+    if phase_name is None:
+        return None
+    phase_sets = cal.phase_model_sets or {}
+    return phase_sets.get(str(phase_name).strip().lower())
 
 
 def solve_b_for_target_tip_angle(
@@ -529,26 +617,25 @@ def describe_model(model: Optional[Dict[str, Any]], fallback_name: str) -> str:
 # Cobra centerline builder
 # ============================================================================
 
-def _neck_boost_array(
-    cycle_nums: np.ndarray,
-    start_cycle: float,
-    peak_cycle: float,
-    max_mult: float,
-) -> np.ndarray:
+def _last_rising_segment_start_s(
+    omega: float,
+    phase: float,
+    end_s: float,
+) -> float:
     """
-    Per-sample neck-boost amplitude multiplier.
+    Return the wave-parameter ``s`` where the final monotonic upstroke begins.
 
-    Below start_cycle  → 1.0 (no boost)
-    start→peak cycle   → smooth ramp 1.0 → max_mult
-    Above peak_cycle   → max_mult (holds; the sine curls back naturally)
+    This is the last local minimum of the underlying sine within the sampled
+    wave domain. The caller can then replace only that tail with a straight,
+    continuous neck segment.
     """
-    t = np.clip(
-        (cycle_nums - float(start_cycle)) / max(float(peak_cycle) - float(start_cycle), 1e-12),
-        0.0, 1.0,
-    )
-    ramp = smootherstep(t)
-    # Any sample below start_cycle has t=0, ramp=0, giving mult=1
-    return 1.0 + (float(max_mult) - 1.0) * ramp
+    if abs(omega) <= 1e-12:
+        return 0.0
+    theta_end = omega * float(end_s) + float(phase)
+    k = math.floor((theta_end - 1.5 * math.pi) / (2.0 * math.pi))
+    theta_min = 1.5 * math.pi + 2.0 * math.pi * k
+    s_min = (theta_min - float(phase)) / omega
+    return float(np.clip(s_min, 0.0, float(end_s)))
 
 
 def build_cobra_centerline(
@@ -600,18 +687,31 @@ def build_cobra_centerline(
     xs     = np.linspace(x0, x1, n)
     s_glob = (xs - x0) / total_span          # 0 → 1 over full span
 
-    # --- Z: boosted sine wave ---
+    # --- Z: base sine wave with a straight neck extension on the final upstroke ---
     in_wave = (xs >= wave_x0) & (xs <= wave_x1)
     s_wave  = np.where(in_wave,
                        np.clip((xs - wave_x0) / max(wave_span, 1e-12), 0.0, 1.0),
                        0.0)
-    cycle_nums = float(cycles) * s_wave
-    boost = _neck_boost_array(cycle_nums, neck_boost_start_cycle, neck_boost_peak_cycle, neck_boost_mult)
 
     omega = 2.0 * math.pi * float(cycles)
     phase = math.radians(float(phase_deg))
 
-    z_wave = float(z_baseline) + float(z_amplitude) * boost * np.sin(omega * s_wave + phase)
+    z_wave = float(z_baseline) + float(z_amplitude) * np.sin(omega * s_wave + phase)
+
+    tail_start_s = _last_rising_segment_start_s(omega, phase, 1.0)
+    tail_start_s = max(tail_start_s, float(neck_boost_start_cycle) / max(float(cycles), 1e-12))
+    tail_start_s = min(tail_start_s, 1.0)
+
+    tail_mask = in_wave & (s_wave >= tail_start_s)
+    if np.any(tail_mask):
+        first_tail_idx = int(np.flatnonzero(tail_mask)[0])
+        x_tail_start = float(xs[first_tail_idx])
+        z_tail_start = float(z_wave[first_tail_idx])
+        z_tail_end = float(z_baseline) + float(z_amplitude) * float(neck_boost_mult)
+        tail_dx = max(float(wave_x1) - x_tail_start, 1e-12)
+        tail_t = np.clip((xs[tail_mask] - x_tail_start) / tail_dx, 0.0, 1.0)
+        z_wave[tail_mask] = z_tail_start + (z_tail_end - z_tail_start) * tail_t
+
     zs     = np.where(in_wave, z_wave, float(z_baseline))
 
     # --- Y: gentle lateral oscillation that fades to zero as neck begins ---
@@ -874,6 +974,7 @@ def build_tongue(
     base_diam_z: float,
     fork_frac: float,
     fork_angle_deg: float,
+    drop_angle_deg: float,
     taper_start_frac: float,
     tip_diam: float,
     layer_height: float,
@@ -895,19 +996,26 @@ def build_tongue(
     head    = np.asarray(cobra_head_pt,      dtype=float)
     tang    = normalize(np.asarray(cobra_head_tangent, dtype=float))
     lat_dir = np.array([0.0, 1.0, 0.0], dtype=float)  # lateral = Y axis
+    down_dir = np.array([0.0, 0.0, -1.0], dtype=float)
+    tang_xy = np.array([tang[0], tang[1], 0.0], dtype=float)
+    if float(np.linalg.norm(tang_xy)) < 1e-12:
+        tang_xy = np.array([1.0, 0.0, 0.0], dtype=float)
+    forward_xy = normalize(tang_xy)
+    drop_rad = math.radians(float(drop_angle_deg))
+    tongue_dir = normalize(math.cos(drop_rad) * forward_xy + math.sin(drop_rad) * down_dir)
 
     body_len  = float(tongue_length) * float(fork_frac)
     prong_len = float(tongue_length) * (1.0 - float(fork_frac))
-    fork_pt   = head + body_len * tang
+    fork_pt   = head + body_len * tongue_dir
 
     fa = math.radians(float(fork_angle_deg))
-    # Fork directions diverge in ±Y from the cobra tangent
-    dir_right = normalize(tang + math.tan(fa) * lat_dir)
-    dir_left  = normalize(tang - math.tan(fa) * lat_dir)
+    # Fork directions diverge in ±Y from the pitched tongue direction.
+    dir_right = normalize(tongue_dir + math.tan(fa) * lat_dir)
+    dir_left  = normalize(tongue_dir - math.tan(fa) * lat_dir)
 
     body_plan = _build_prong_helix(
         start_pt=head,
-        direction=tang,
+        direction=tongue_dir,
         length=body_len,
         base_diam_z=base_diam_z,
         base_diam_y=base_diam_y,
@@ -1024,6 +1132,14 @@ class CobraGCodeWriter:
         self.total_travel_mm   = 0.0
         self.warnings: List[str] = []
         self._b_cache: Dict[float, float] = {}
+        self.phase_models = self._init_directional_phase_models()
+        self.current_phase_name = str(self.cal.active_phase).strip().lower()
+        self.current_phase_models: Optional[PhaseModelSet] = get_phase_model_set(
+            self.cal, self.current_phase_name
+        )
+        self.phase_stage_offset = np.zeros(3, dtype=float)
+        self.phase_tip_angle_bias_deg = 0.0
+        self.last_b_motion_sign = 0
 
     # axis shortcuts
     @property
@@ -1039,12 +1155,113 @@ class CobraGCodeWriter:
     @property
     def u_axis(self): return self.cal.u_axis
 
+    def _init_directional_phase_models(self) -> Dict[str, PhaseModelSet]:
+        if not self.calibrated:
+            return {}
+        phase_sets = self.cal.phase_model_sets or {}
+        pull_name = str((self.cal.motion_phase_map or {}).get("0") or "pull").strip().lower()
+        release_name = str((self.cal.motion_phase_map or {}).get("1") or "release").strip().lower()
+        out: Dict[str, PhaseModelSet] = {}
+        if pull_name in phase_sets:
+            out["pull"] = phase_sets[pull_name]
+        if release_name in phase_sets:
+            out["release"] = phase_sets[release_name]
+        return out
+
+    def _phase_holder(self) -> Any:
+        return self.current_phase_models if self.current_phase_models is not None else self.cal
+
+    def _solve_b_for_target_with_holder(self, holder: Any, target_angle_deg: float) -> float:
+        bb = np.linspace(float(self.cal.b_min), float(self.cal.b_max),
+                         int(max(101, self.bc_solve_samples)))
+        aa = eval_tip_angle_deg(holder, bb) - float(target_angle_deg)
+        i_best = int(np.argmin(np.abs(aa)))
+        b_best = float(bb[i_best])
+        sign_changes: List[Tuple[float, float, float]] = []
+        for i in range(len(bb) - 1):
+            a0, a1 = float(aa[i]), float(aa[i + 1])
+            if a0 == 0.0:
+                return float(bb[i])
+            if a0 * a1 < 0.0:
+                sign_changes.append((min(abs(a0), abs(a1)), float(bb[i]), float(bb[i + 1])))
+        if sign_changes:
+            sign_changes.sort(key=lambda t: t[0])
+            _, lo, hi = sign_changes[0]
+            flo = float(eval_tip_angle_deg(holder, lo) - float(target_angle_deg))
+            for _ in range(80):
+                mid = 0.5 * (lo + hi)
+                fmid = float(eval_tip_angle_deg(holder, mid) - float(target_angle_deg))
+                if abs(fmid) < 1e-10:
+                    return float(mid)
+                if flo * fmid <= 0.0:
+                    hi = mid
+                else:
+                    lo, flo = mid, fmid
+            return float(0.5 * (lo + hi))
+        return b_best
+
+    def _predict_tip_offset_xyz_current(self, b_machine: float, c_deg: float) -> np.ndarray:
+        holder = self._phase_holder()
+        r = float(eval_r(holder, b_machine))
+        z = float(eval_z(holder, b_machine))
+        y_off = float(eval_offplane_y(holder, b_machine))
+        c = math.radians(float(c_deg))
+        return np.array([r*math.cos(c) - y_off*math.sin(c),
+                         r*math.sin(c) + y_off*math.cos(c),
+                         z], dtype=float)
+
+    def _stage_xyz_for_tip_current(self, tip_xyz: np.ndarray, b_machine: float, c_deg: float) -> np.ndarray:
+        raw_stage = np.asarray(tip_xyz, dtype=float) - self._predict_tip_offset_xyz_current(
+            b_machine, c_deg
+        )
+        return raw_stage + self.phase_stage_offset
+
+    def _phase_for_motion_sign(self, motion_sign: int) -> Optional[str]:
+        if motion_sign < 0 and "pull" in self.phase_models:
+            return "pull"
+        if motion_sign > 0 and "release" in self.phase_models:
+            return "release"
+        return None
+
+    def _switch_phase_if_needed(self, desired_phase: Optional[str]) -> None:
+        if desired_phase is None or desired_phase == self.current_phase_name:
+            return
+        next_models = self.phase_models.get(desired_phase)
+        if next_models is None:
+            return
+        if self.cur_tip is not None and self.cur_stage is not None:
+            current_tip = np.asarray(self.cur_tip, dtype=float)
+            current_stage = np.asarray(self.cur_stage, dtype=float)
+            b_machine = float(self.cur_b_machine)
+            c_deg = float(self.cur_c)
+            c_rad = math.radians(c_deg)
+            r = float(eval_r(next_models, b_machine))
+            z = float(eval_z(next_models, b_machine))
+            y_off = float(eval_offplane_y(next_models, b_machine))
+            raw_stage = current_tip - np.array([
+                r * math.cos(c_rad) - y_off * math.sin(c_rad),
+                r * math.sin(c_rad) + y_off * math.cos(c_rad),
+                z,
+            ], dtype=float)
+            self.phase_stage_offset = current_stage - raw_stage
+            self.phase_tip_angle_bias_deg = (
+                float(self.cur_b_target_deg) - float(eval_tip_angle_deg(next_models, b_machine))
+            )
+            self.fh.write(
+                f"; phase switch {self.current_phase_name} -> {desired_phase} "
+                f"anchored_at_B={b_machine:.6f} target={self.cur_b_target_deg:.6f}\n"
+            )
+        self.current_phase_name = desired_phase
+        self.current_phase_models = next_models
+        self._b_cache.clear()
+
     def b_machine_for_target(self, b_target_deg: float) -> float:
         b_target = float(np.clip(b_target_deg + self.b_angle_bias_deg, 0.0, 180.0))
-        key = round(b_target, 8)
+        effective_target = b_target - float(self.phase_tip_angle_bias_deg)
+        key = round(effective_target, 8)
         if key not in self._b_cache:
             self._b_cache[key] = (
-                solve_b_for_target_tip_angle(self.cal, key, self.bc_solve_samples)
+                self._solve_b_for_target_with_holder(self._phase_holder(), effective_target)
                 if self.calibrated else key
             )
         return self._b_cache[key]
@@ -1063,9 +1280,16 @@ class CobraGCodeWriter:
         self, tip_xyz: np.ndarray, b_target_deg: float, c_deg: float
     ) -> Tuple[np.ndarray, float]:
         b_machine = self.b_machine_for_target(b_target_deg)
-        stage = (stage_xyz_for_tip(self.cal, tip_xyz, b_machine, c_deg)
+        stage = (self._stage_xyz_for_tip_current(tip_xyz, b_machine, c_deg)
                  if self.calibrated else np.asarray(tip_xyz, dtype=float))
         return self.clamp_stage(stage, "tip_to_stage"), b_machine
+
+    def tip_to_stage_with_machine_b(
+        self, tip_xyz: np.ndarray, b_machine: float, c_deg: float
+    ) -> np.ndarray:
+        stage = (self._stage_xyz_for_tip_current(tip_xyz, b_machine, c_deg)
+                 if self.calibrated else np.asarray(tip_xyz, dtype=float))
+        return self.clamp_stage(stage, "tip_to_stage_fixed_b")
 
     def write_move(
         self,
@@ -1106,10 +1330,18 @@ class CobraGCodeWriter:
         comment: Optional[str] = None,
         extrude: bool = False,
         extrusion_scale: float = 1.0,
+        fixed_b_machine: Optional[float] = None,
+        fixed_b_target_deg: Optional[float] = None,
     ) -> None:
         tip  = np.asarray(tip_xyz, dtype=float)
         prev = None if self.cur_tip is None else self.cur_tip.copy()
-        stage, b_machine = self.tip_to_stage(tip, b_target_deg, c_deg)
+        if fixed_b_machine is None:
+            stage, b_machine = self.tip_to_stage(tip, b_target_deg, c_deg)
+        else:
+            b_machine = float(fixed_b_machine)
+            stage = self.tip_to_stage_with_machine_b(tip, b_machine, c_deg)
+            if fixed_b_target_deg is not None:
+                b_target_deg = float(fixed_b_target_deg)
         if extrude and self.emit_extrusion:
             seg = 0.0 if prev is None else float(np.linalg.norm(tip - prev))
             self.total_print_mm += seg
@@ -1181,6 +1413,24 @@ class CobraGCodeWriter:
         )
         self.cur_tip = start_tip.copy()
 
+    def move_to_tip_same_b(
+        self,
+        tip_xyz: np.ndarray,
+        c_deg: float,
+        feed: float,
+        comment: Optional[str] = None,
+    ) -> None:
+        self.move_to_tip(
+            tip_xyz=np.asarray(tip_xyz, dtype=float),
+            b_target_deg=float(self.cur_b_target_deg),
+            c_deg=c_deg,
+            feed=feed,
+            comment=comment,
+            extrude=False,
+            fixed_b_machine=float(self.cur_b_machine),
+            fixed_b_target_deg=float(self.cur_b_target_deg),
+        )
+
     def exit_to_safe_z(self, safe_approach_z: float) -> None:
         if self.cur_stage is None:
             return
@@ -1191,7 +1441,13 @@ class CobraGCodeWriter:
             self.approach_feed, comment=f"exit to safe Z{safe_approach_z:.3f}",
         )
 
-    def print_tube(self, plan: TubePlan, extrusion_scale: float = 1.0, label: str = "tube") -> None:
+    def print_tube(
+        self,
+        plan: TubePlan,
+        extrusion_scale: float = 1.0,
+        label: str = "tube",
+        hold_current_b: bool = False,
+    ) -> None:
         """Follow `plan.tube_points`, extruding at each step."""
         pts   = plan.tube_points
         tans  = plan.centerline_tangents
@@ -1206,11 +1462,24 @@ class CobraGCodeWriter:
             f"samples={len(pts)} arc={plan.total_arc_length:.4f} "
             f"turns={plan.minor_turns:.4f}\n"
         )
+        held_b_machine = float(self.cur_b_machine) if hold_current_b else None
+        held_b_target = float(self.cur_b_target_deg) if hold_current_b else None
         self.pressure_preload()
         for i in range(1, len(pts)):
+            b_target = float(b_targets[i])
+            if self.calibrated and not hold_current_b and self.phase_models:
+                candidate_current = self.b_machine_for_target(b_target)
+                motion_sign = int(np.sign(candidate_current - float(self.cur_b_machine)))
+                if motion_sign != 0:
+                    desired_phase = self._phase_for_motion_sign(motion_sign)
+                    if desired_phase is not None and motion_sign != self.last_b_motion_sign:
+                        self._switch_phase_if_needed(desired_phase)
+                    self.last_b_motion_sign = motion_sign
             self.move_to_tip(
-                pts[i], float(b_targets[i]), float(self.c_deg),
+                pts[i], b_target, float(self.c_deg),
                 self.print_feed, extrude=True, extrusion_scale=extrusion_scale,
+                fixed_b_machine=held_b_machine,
+                fixed_b_target_deg=held_b_target,
             )
         self.pressure_release()
         if self.end_dwell_ms > 0:
@@ -1228,7 +1497,12 @@ def write_cobra_gcode(args: argparse.Namespace) -> Dict[str, Any]:
     if write_mode == "calibrated" and not args.calibration:
         raise ValueError("--calibration required when --write-mode calibrated")
 
-    cal = (load_calibration(args.calibration, offplane_y_sign=args.y_offplane_sign)
+    cal = (load_calibration(
+               args.calibration,
+               offplane_y_sign=args.y_offplane_sign,
+               fit_model_override=args.fit_model,
+               y_offset_fit_model_override=args.y_offset_fit_model,
+           )
            if write_mode == "calibrated" else make_cartesian_calibration())
     cal.offplane_y_sign = float(args.y_offplane_sign)
 
@@ -1301,6 +1575,7 @@ def write_cobra_gcode(args: argparse.Namespace) -> Dict[str, Any]:
             base_diam_z=args.tongue_base_diam_z,
             fork_frac=args.tongue_fork_frac,
             fork_angle_deg=args.tongue_fork_angle_deg,
+            drop_angle_deg=args.tongue_drop_angle_deg,
             taper_start_frac=args.tongue_taper_start_frac,
             tip_diam=args.tongue_tip_diam,
             layer_height=args.tongue_layer_height,
@@ -1366,6 +1641,7 @@ def write_cobra_gcode(args: argparse.Namespace) -> Dict[str, Any]:
                 f"; tongue length={args.tongue_length:.3f} "
                 f"fork_frac={args.tongue_fork_frac:.3f} "
                 f"fork_angle_deg={args.tongue_fork_angle_deg:.3f} "
+                f"drop_angle_deg={args.tongue_drop_angle_deg:.3f} "
                 f"diam_y={args.tongue_base_diam_y:.3f} "
                 f"diam_z={args.tongue_base_diam_z:.3f}\n"
             )
@@ -1433,35 +1709,42 @@ def write_cobra_gcode(args: argparse.Namespace) -> Dict[str, Any]:
                 safe_approach_z=args.safe_approach_z,
                 travel_lift_z=args.travel_lift_z,
             )
-            writer.print_tube(tongue_body_plan, extrusion_scale=esc, label="tongue_body")
-            writer.exit_to_safe_z(args.safe_approach_z)
+            writer.print_tube(
+                tongue_body_plan,
+                extrusion_scale=esc,
+                label="tongue_body",
+                hold_current_b=True,
+            )
 
             # -- right prong --
             fh.write("\n; ===== TONGUE PRONG RIGHT =====\n")
-            writer.approach_start(
-                start_tip=prong_r_plan.tube_points[0],
-                start_b_target_deg=desired_physical_b_angle_from_tangent(
-                    prong_r_plan.centerline_tangents[0]
-                ),
+            writer.move_to_tip_same_b(
+                tip_xyz=prong_r_plan.tube_points[0],
                 c_deg=args.c_deg,
-                safe_approach_z=args.safe_approach_z,
-                travel_lift_z=args.travel_lift_z,
+                feed=args.travel_feed,
+                comment="move to tongue right-prong start without Z lift",
             )
-            writer.print_tube(prong_r_plan, extrusion_scale=esc, label="tongue_prong_right")
-            writer.exit_to_safe_z(args.safe_approach_z)
+            writer.print_tube(
+                prong_r_plan,
+                extrusion_scale=esc,
+                label="tongue_prong_right",
+                hold_current_b=True,
+            )
 
             # -- left prong --
             fh.write("\n; ===== TONGUE PRONG LEFT =====\n")
-            writer.approach_start(
-                start_tip=prong_l_plan.tube_points[0],
-                start_b_target_deg=desired_physical_b_angle_from_tangent(
-                    prong_l_plan.centerline_tangents[0]
-                ),
+            writer.move_to_tip_same_b(
+                tip_xyz=prong_l_plan.tube_points[0],
                 c_deg=args.c_deg,
-                safe_approach_z=args.safe_approach_z,
-                travel_lift_z=args.travel_lift_z,
+                feed=args.travel_feed,
+                comment="move to tongue left-prong start without Z lift",
             )
-            writer.print_tube(prong_l_plan, extrusion_scale=esc, label="tongue_prong_left")
+            writer.print_tube(
+                prong_l_plan,
+                extrusion_scale=esc,
+                label="tongue_prong_left",
+                hold_current_b=True,
+            )
             writer.exit_to_safe_z(args.safe_approach_z)
 
         # ── Summary ───────────────────────────────────────────────────────────
@@ -1524,10 +1807,7 @@ def write_cobra_gcode(args: argparse.Namespace) -> Dict[str, Any]:
             "body_arc_mm":        float(tb_plan.total_arc_length),
             "prong_right_arc_mm": float(pr_plan.total_arc_length),
             "prong_left_arc_mm":  float(pl_plan.total_arc_length),
-            "fork_point_xyz":     (centerline_pts[-1] +
-                                   float(args.tongue_length) *
-                                   float(args.tongue_fork_frac) *
-                                   normalize(centerline_tans[-1])).tolist(),
+            "fork_point_xyz":     tb_plan.centerline_points[-1].tolist(),
         }
     return summary
 
@@ -1544,6 +1824,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Calibration JSON. Required for --write-mode calibrated.")
     ap.add_argument("--write-mode",  choices=["calibrated", "cartesian"],
                     default=DEFAULT_WRITE_MODE)
+    ap.add_argument("--fit-model", default=None,
+                    help="Override calibration fit model, e.g. pchip, cubic, avg_cubic, linear.")
+    ap.add_argument("--y-offset-fit-model", default=None,
+                    help="Override off-plane Y fit model independently, e.g. pchip, cubic, avg_cubic, linear.")
     ap.add_argument("--y-offplane-sign", type=float, default=DEFAULT_Y_OFFPLANE_SIGN)
 
     # Centerline geometry
@@ -1650,6 +1934,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Fraction of tongue length before the fork (0–1).")
     ap.add_argument("--tongue-fork-angle-deg",   type=float, default=DEFAULT_TONGUE_FORK_ANGLE_DEG,
                     help="Half-angle of prong divergence from the tongue axis (degrees).")
+    ap.add_argument("--tongue-drop-angle-deg",   type=float, default=DEFAULT_TONGUE_DROP_ANGLE_DEG,
+                    help="Downward pitch of the tongue relative to the cobra head tangent (degrees).")
     ap.add_argument("--tongue-taper-start-frac", type=float, default=DEFAULT_TONGUE_TAPER_START_FRAC,
                     help="Normalised position along each prong where tapering begins.")
     ap.add_argument("--tongue-tip-diam",         type=float, default=DEFAULT_TONGUE_TIP_DIAM,

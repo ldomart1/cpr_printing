@@ -1445,6 +1445,10 @@ RE_B_VAL = re.compile(rf"_B({_NUM})")
 RE_C_VAL = re.compile(rf"_C({_NUM})")
 RE_TIP_VAL = re.compile(rf"_TIP({_NUM})")
 RE_BPH_VAL = re.compile(rf"_BPH({_NUM})")
+RE_CPH_VAL = re.compile(rf"_CPH({_NUM})")
+RE_SEQ_NAME = re.compile(r"_SEQ([^_]+)")
+RE_DIR_NAME = re.compile(r"_DIR([^_]+)")
+RE_CYCLE = re.compile(r"_CY(\d+)OF(\d+)")
 RE_SAMPLE_IDX = re.compile(r"^(\d+)_")
 RE_PHASE = re.compile(r"^\d+_([^_]+)")
 RE_BLOCK_NAME = re.compile(r"_(C0|C180)(?:_|$)")
@@ -1509,7 +1513,20 @@ def parse_fixed_tip_filename_metadata(image_name: str) -> Dict[str, Any]:
     c_val = _safe_float_from_match(RE_C_VAL, stem)
     tip_angle_deg = _safe_float_from_match(RE_TIP_VAL, stem)
     block_phase_01 = _safe_float_from_match(RE_BPH_VAL, stem)
+    cycle_phase_01 = _safe_float_from_match(RE_CPH_VAL, stem)
+    sequence_name = _safe_str_from_match(RE_SEQ_NAME, stem)
+    motion_phase_name = _safe_str_from_match(RE_DIR_NAME, stem)
     block_name = _safe_str_from_match(RE_BLOCK_NAME, stem)
+    cycle_match = RE_CYCLE.search(stem)
+    cycle_index = None
+    cycle_count = None
+    if cycle_match:
+        try:
+            cycle_index = max(0, int(cycle_match.group(1)) - 1)
+            cycle_count = int(cycle_match.group(2))
+        except Exception:
+            cycle_index = None
+            cycle_count = None
 
     c_orientation_deg = canonicalize_c_orientation(c_val)
     if block_name is None:
@@ -1526,7 +1543,12 @@ def parse_fixed_tip_filename_metadata(image_name: str) -> Dict[str, Any]:
         "c_orientation_deg": c_orientation_deg,
         "tip_angle_deg_from_name": tip_angle_deg,
         "block_phase_01": block_phase_01,
+        "cycle_index": cycle_index,
+        "cycle_count": cycle_count,
+        "cycle_phase_01": cycle_phase_01,
         "block_name": block_name,
+        "sequence_name": sequence_name,
+        "motion_phase_name": motion_phase_name,
     }
 
 
@@ -1691,14 +1713,53 @@ def compute_tracked_tip_positions_mm(
     }
 
 
+def filter_tip_data_by_orientation(
+    tip_data: Dict[str, Any],
+    orientation_mode: str,
+) -> Dict[str, Any]:
+    mode = str(orientation_mode).strip().lower()
+    if mode == "both":
+        return tip_data
+    if mode == "c0":
+        target_c = 0.0
+    elif mode == "c180":
+        target_c = 180.0
+    else:
+        raise ValueError(f"Unsupported orientation_mode: {orientation_mode}")
+
+    records = list(tip_data["records"])
+    selected_valid_indices: List[int] = []
+    selected_mm_points: List[np.ndarray] = []
+    valid_set = set(int(v) for v in tip_data["valid_indices"])
+    for idx, rec in enumerate(records):
+        if idx not in valid_set:
+            continue
+        c_val = rec.get("c_orientation_deg")
+        if c_val is None or not np.isfinite(c_val):
+            continue
+        if math.isclose(float(c_val), float(target_c), abs_tol=1e-6):
+            selected_valid_indices.append(int(idx))
+            selected_mm_points.append(np.asarray([float(rec["u_mm"]), float(rec["z_mm"])], dtype=float))
+
+    mm_points = (
+        np.asarray(selected_mm_points, dtype=float).reshape(-1, 2)
+        if selected_mm_points else np.empty((0, 2), dtype=float)
+    )
+    return {
+        "records": records,
+        "valid_indices": selected_valid_indices,
+        "mm_points": mm_points,
+    }
+
+
 def build_reference_points_mm(
     records: List[Dict[str, Any]],
     valid_indices: List[int],
     mm_points: np.ndarray,
 ) -> Dict[str, Any]:
     """
-    Use the centroid of each sample's C-orientation group as that sample's
-    reference point.
+    Use the centroid of all valid points within each curl cycle and orientation
+    as the reference point for samples from that cycle.
     """
     mm_points = np.asarray(mm_points, dtype=float).reshape(-1, 2)
     if mm_points.shape[0] == 0:
@@ -1707,12 +1768,21 @@ def build_reference_points_mm(
     if len(valid_indices) != mm_points.shape[0]:
         raise RuntimeError("valid_indices must match mm_points rows.")
 
-    grouped_points: Dict[str, List[np.ndarray]] = {}
-    local_keys: List[str] = []
+    grouped_points: Dict[Tuple[Any, ...], List[np.ndarray]] = {}
+    local_keys: List[Tuple[Any, ...]] = []
+
+    def _reference_group_key(rec: Dict[str, Any]) -> Tuple[Any, ...]:
+        c_orientation_deg = rec.get("c_orientation_deg", None)
+        c_key = "unknown" if c_orientation_deg is None else f"{float(c_orientation_deg):.3f}"
+        cycle_count = rec.get("cycle_count")
+        cycle_index = rec.get("cycle_index")
+        if cycle_index is not None and cycle_count is not None and int(cycle_count) > 1:
+            return ("per_cycle_centroid", c_key, int(cycle_index))
+        return ("per_orientation_centroid", c_key)
+
     for global_idx, pt_mm in zip(valid_indices, mm_points):
         rec = records[global_idx] if 0 <= global_idx < len(records) else {}
-        c_orientation_deg = rec.get("c_orientation_deg", None)
-        key = "unknown" if c_orientation_deg is None else f"{float(c_orientation_deg):.3f}"
+        key = _reference_group_key(rec)
         grouped_points.setdefault(key, []).append(np.asarray(pt_mm, dtype=float))
         local_keys.append(key)
 
@@ -1722,6 +1792,7 @@ def build_reference_points_mm(
     }
     reference_points = np.asarray([group_centroids[key] for key in local_keys], dtype=float).reshape(-1, 2)
     ref_mean = np.mean(reference_points, axis=0)
+    uses_cycle_groups = any(key and key[0] == "per_cycle_centroid" for key in grouped_points.keys())
     return {
         "reference_points_mm": reference_points,
         "reference_point_mm": {
@@ -1729,10 +1800,11 @@ def build_reference_points_mm(
             "z_mean_mm": float(ref_mean[1]),
         },
         "reference_points_raw_mm": None,
-        "reference_mode": "per_c_centroid",
+        "reference_mode": "per_cycle_centroid" if uses_cycle_groups else "per_orientation_centroid",
         "reference_description": (
-            "Each measured point is compared to the centroid of its own valid "
-            "C-orientation group in checkerboard-referenced coordinates."
+            "Each measured point is compared to the centroid of all valid points from its "
+            "own curl cycle and orientation when cycle metadata is available; otherwise it "
+            "falls back to the centroid of its valid C-orientation group."
         ),
         "alignment_shift_mm": {
             "u_mm": 0.0,
@@ -1832,22 +1904,22 @@ def attach_errors_to_records(
     return records
 
 
-def compute_per_orientation_metrics(
+def compute_per_cycle_metrics(
     records: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    Compute metrics grouped by C orientation using the same per-sample reference
-    definition already attached to each record.
+    Compute metrics for each curl cycle within each C orientation using the
+    cycle-centroid reference already attached to each record.
     """
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for rec in records:
         if not rec.get("valid", False) or rec.get("error_distance_mm") is None:
             continue
         c_orientation_deg = rec.get("c_orientation_deg", None)
-        if c_orientation_deg is None or not np.isfinite(c_orientation_deg):
-            key = "unknown"
-        else:
-            key = f"{float(c_orientation_deg):.3f}"
+        cycle_index = rec.get("cycle_index")
+        c_key = "unknown" if c_orientation_deg is None or not np.isfinite(c_orientation_deg) else f"{float(c_orientation_deg):.3f}"
+        cycle_key = "none" if cycle_index is None else str(int(cycle_index))
+        key = f"{c_key}|cycle={cycle_key}"
         grouped.setdefault(key, []).append(rec)
 
     out = {}
@@ -1864,9 +1936,11 @@ def compute_per_orientation_metrics(
         errs = np.asarray([float(r["error_distance_mm"]) for r in recs], dtype=float)
         c_vals = [r.get("c_orientation_deg") for r in recs if r.get("c_orientation_deg") is not None]
         tip_vals = [r.get("tip_angle_deg_from_name") for r in recs if r.get("tip_angle_deg_from_name") is not None]
+        cycle_vals = [int(r["cycle_index"]) for r in recs if r.get("cycle_index") is not None]
 
         out[key] = {
             "c_orientation_deg": None if not c_vals else float(np.median(np.asarray(c_vals, dtype=float))),
+            "cycle_index": None if not cycle_vals else int(np.median(np.asarray(cycle_vals, dtype=float))),
             "num_samples": int(len(recs)),
             "rmse_mm": float(np.sqrt(np.mean(errs ** 2))),
             "mean_error_mm": float(np.mean(errs)),
@@ -1887,6 +1961,40 @@ def compute_per_orientation_metrics(
     return out
 
 
+def compute_per_orientation_cycle_metric_means(
+    per_cycle_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for _, metrics in sorted(per_cycle_metrics.items()):
+        c_orientation_deg = metrics.get("c_orientation_deg", None)
+        key = "unknown" if c_orientation_deg is None or not np.isfinite(c_orientation_deg) else f"{float(c_orientation_deg):.3f}"
+        grouped.setdefault(key, []).append(metrics)
+
+    out: Dict[str, Any] = {}
+    for key, items in sorted(grouped.items(), key=lambda kv: kv[0]):
+        c_vals = [item.get("c_orientation_deg") for item in items if item.get("c_orientation_deg") is not None]
+        rmse_vals = np.asarray([float(item["rmse_mm"]) for item in items], dtype=float)
+        mean_vals = np.asarray([float(item["mean_error_mm"]) for item in items], dtype=float)
+        std_vals = np.asarray([float(item["std_error_mm"]) for item in items], dtype=float)
+        median_vals = np.asarray([float(item["median_error_mm"]) for item in items], dtype=float)
+        min_vals = np.asarray([float(item["min_error_mm"]) for item in items], dtype=float)
+        max_vals = np.asarray([float(item["max_error_mm"]) for item in items], dtype=float)
+        sample_counts = np.asarray([int(item["num_samples"]) for item in items], dtype=int)
+        out[key] = {
+            "c_orientation_deg": None if not c_vals else float(np.median(np.asarray(c_vals, dtype=float))),
+            "num_cycles": int(len(items)),
+            "cycle_indices": [item.get("cycle_index") for item in items],
+            "mean_cycle_rmse_mm": float(np.mean(rmse_vals)),
+            "mean_cycle_mean_error_mm": float(np.mean(mean_vals)),
+            "mean_cycle_std_error_mm": float(np.mean(std_vals)),
+            "mean_cycle_median_error_mm": float(np.mean(median_vals)),
+            "mean_cycle_min_error_mm": float(np.mean(min_vals)),
+            "mean_cycle_max_error_mm": float(np.mean(max_vals)),
+            "mean_cycle_sample_count": float(np.mean(sample_counts)),
+        }
+    return out
+
+
 def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
     fieldnames = [
         "sample_index",
@@ -1894,7 +2002,12 @@ def save_tracked_tip_csv(csv_path: Path, records: List[Dict[str, Any]]):
         "image_name",
         "phase_name",
         "block_name",
+        "sequence_name",
+        "motion_phase_name",
         "block_phase_01",
+        "cycle_index",
+        "cycle_count",
+        "cycle_phase_01",
         "stage_x_cmd",
         "stage_y_cmd",
         "stage_z_cmd",
@@ -2213,7 +2326,11 @@ def save_error_histogram_and_dual_orientation_heatmaps(
 
         rmse_txt = ""
         if group_key in per_orientation_metrics:
-            rmse_txt = f"  |  RMSE = {float(per_orientation_metrics[group_key]['rmse_mm']):.4f} mm"
+            group_metrics = per_orientation_metrics[group_key]
+            if "rmse_mm" in group_metrics:
+                rmse_txt = f"  |  RMSE = {float(group_metrics['rmse_mm']):.4f} mm"
+            elif "mean_cycle_rmse_mm" in group_metrics:
+                rmse_txt = f"  |  Mean cycle RMSE = {float(group_metrics['mean_cycle_rmse_mm']):.4f} mm"
 
         ax.scatter(
             pts[:, 0],
@@ -2332,6 +2449,8 @@ def annotate_analysis_output_images(analysis_output_dir: Path, records: List[Dic
         err = rec.get("error_distance_mm")
         c_txt = rec.get("c_orientation_deg")
         tip_txt = rec.get("tip_angle_deg_from_name")
+        cycle_idx = rec.get("cycle_index")
+        cycle_count = rec.get("cycle_count")
 
         if err is None:
             err_str = "Error: n/a"
@@ -2340,6 +2459,11 @@ def annotate_analysis_output_images(analysis_output_dir: Path, records: List[Dic
 
         c_str = "C: n/a" if c_txt is None else f"C: {float(c_txt):.3f} deg"
         tip_str = "TIP: n/a" if tip_txt is None else f"TIP: {float(tip_txt):.3f} deg"
+        cycle_str = (
+            "Cycle: n/a"
+            if cycle_idx is None or cycle_count is None
+            else f"Cycle: {int(cycle_idx) + 1}/{int(cycle_count)}"
+        )
 
         h, w = image.shape[:2]
         banner_h = max(62, int(round(0.09 * h)))
@@ -2350,7 +2474,7 @@ def annotate_analysis_output_images(analysis_output_dir: Path, records: List[Dic
             cv2.FONT_HERSHEY_SIMPLEX, 0.84, (20, 20, 20), 2, lineType=cv2.LINE_AA
         )
         cv2.putText(
-            banner, f"{c_str}   |   {tip_str}", (18, int(round(banner_h * 0.80))),
+            banner, f"{c_str}   |   {tip_str}   |   {cycle_str}", (18, int(round(banner_h * 0.80))),
             cv2.FONT_HERSHEY_SIMPLEX, 0.72, (40, 40, 40), 2, lineType=cv2.LINE_AA
         )
 
@@ -2361,7 +2485,8 @@ def annotate_analysis_output_images(analysis_output_dir: Path, records: List[Dic
 def save_metrics_json(
     json_path: Path,
     global_metrics: Dict[str, Any],
-    per_orientation_metrics: Dict[str, Any],
+    per_cycle_metrics: Dict[str, Any],
+    per_orientation_cycle_metric_means: Dict[str, Any],
     cal: CTR_Shadow_Calibration,
     args,
 ):
@@ -2381,7 +2506,8 @@ def save_metrics_json(
             "max_error_mm": global_metrics["max_error_mm"],
             "num_samples": global_metrics["num_samples"],
         },
-        "per_c_orientation_metrics": per_orientation_metrics,
+        "per_cycle_metrics": per_cycle_metrics,
+        "per_c_orientation_cycle_metric_means": per_orientation_cycle_metric_means,
         "analysis_crop": getattr(cal, "analysis_crop", None),
         "board_reference": collect_board_reference_info(cal),
         "settings": {
@@ -2426,6 +2552,14 @@ def main():
                     help="raw_image_data_folder or any folder of images (will be wrapped into a project)")
     ap.add_argument("--threshold", type=int, default=200)
     ap.add_argument("--save_plots", action="store_true")
+    ap.add_argument("--crop_width_min", type=int, default=None,
+                    help="Optional preselected crop min X in image coordinates.")
+    ap.add_argument("--crop_width_max", type=int, default=None,
+                    help="Optional preselected crop max X in image coordinates.")
+    ap.add_argument("--crop_height_min", type=int, default=None,
+                    help="Optional preselected crop min height-from-bottom.")
+    ap.add_argument("--crop_height_max", type=int, default=None,
+                    help="Optional preselected crop max height-from-bottom.")
 
     ap.add_argument("--camera_calibration_file", type=str, required=True,
                     help="Path to camera calibration .npz for checkerboard-reference analysis.")
@@ -2471,11 +2605,13 @@ def main():
                     help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
     ap.add_argument("--tip_refiner_compare_only", action="store_true",
                     help="Save CNN tips but keep non-CNN tips as the default tracked source.")
-    ap.add_argument("--tip_detection_mode", type=str, default="classical",
+    ap.add_argument("--tip_detection_mode", type=str, default="red_dot",
                     choices=["classical", "red_dot", "auto_red_dot"],
                     help="Tip detection mode from CTR shadow calibration. red_dot uses the red marker centroid as the selected tip.")
     ap.add_argument("--tracked_tip_source", type=str, default="auto", choices=["auto", "coarse", "selected", "cnn"],
                     help="Which tip rows to convert to mm. auto uses selected rows when red-dot or CNN-selected tips are active, otherwise coarse.")
+    ap.add_argument("--orientation-mode", type=str, default="both", choices=["both", "c0", "c180"],
+                    help="Analyze both C orientations, or only C=0 / only C=180.")
 
     ap.add_argument("--hist_bins", type=int, default=24,
                     help="Number of histogram bins.")
@@ -2590,10 +2726,22 @@ def main():
 
     print(f"[INFO] Checkerboard reference estimated from: {board_ref_path}")
 
-    analysis_crop = interactive_crop_from_image(
-        img_bgr,
-        default_crop=cal.default_analysis_crop,
-    )
+    if all(
+        getattr(args, key) is not None
+        for key in ("crop_width_min", "crop_width_max", "crop_height_min", "crop_height_max")
+    ):
+        analysis_crop = {
+            "crop_width_min": int(args.crop_width_min),
+            "crop_width_max": int(args.crop_width_max),
+            "crop_height_min": int(args.crop_height_min),
+            "crop_height_max": int(args.crop_height_max),
+        }
+        print(f"[INFO] Using preselected analysis_crop: {analysis_crop}")
+    else:
+        analysis_crop = interactive_crop_from_image(
+            img_bgr,
+            default_crop=cal.default_analysis_crop,
+        )
     cal.analysis_crop = dict(analysis_crop)
 
     if args.save_analysis_config:
@@ -2616,6 +2764,11 @@ def main():
 
     print("[INFO] Converting tracked tips to checkerboard-referenced mm...")
     tip_data = compute_tracked_tip_positions_mm(cal, tracked_rows, imgs)
+    tip_data = filter_tip_data_by_orientation(tip_data, args.orientation_mode)
+    print(f"[INFO] Orientation mode for metrics: {args.orientation_mode}")
+
+    if tip_data["mm_points"].shape[0] == 0:
+        raise RuntimeError(f"No valid mm points remained after orientation filter: {args.orientation_mode}")
 
     print("[INFO] Building per-sample reference points and error metrics...")
     reference_meta = build_reference_points_mm(
@@ -2638,8 +2791,11 @@ def main():
         errors_mm=global_metrics["errors_mm"],
     )
 
-    print("[INFO] Computing per-C orientation metrics...")
-    per_orientation_metrics = compute_per_orientation_metrics(records=records)
+    print("[INFO] Computing per-cycle metrics and per-orientation averages over cycles...")
+    per_cycle_metrics = compute_per_cycle_metrics(records=records)
+    per_orientation_cycle_metric_means = compute_per_orientation_cycle_metric_means(
+        per_cycle_metrics=per_cycle_metrics,
+    )
 
     csv_path = processed_dir / "tracked_tip_positions_mm.csv"
     metrics_json_path = processed_dir / "tracked_tip_error_metrics.json"
@@ -2648,7 +2804,14 @@ def main():
     hist_hexbin_path = processed_dir / "tracked_tip_error_histogram_dual_c_heatmaps.png"
 
     save_tracked_tip_csv(csv_path, records)
-    save_metrics_json(metrics_json_path, global_metrics, per_orientation_metrics, cal, args)
+    save_metrics_json(
+        metrics_json_path,
+        global_metrics,
+        per_cycle_metrics,
+        per_orientation_cycle_metric_means,
+        cal,
+        args,
+    )
 
     save_error_plot(
         error_plot_path,
@@ -2664,7 +2827,7 @@ def main():
         hist_hexbin_path,
         records=records,
         global_metrics=global_metrics,
-        per_orientation_metrics=per_orientation_metrics,
+        per_orientation_metrics=per_orientation_cycle_metric_means,
         title_prefix="Checkerboard-referenced ",
         bins=int(args.hist_bins),
     )
@@ -2706,20 +2869,39 @@ def main():
     print(f"Min error:     {global_metrics['min_error_mm']:.6f} mm")
     print(f"Max error:     {global_metrics['max_error_mm']:.6f} mm")
 
-    print("\nPer-C RMSE (to the corresponding per-sample reference points):")
-    if not per_orientation_metrics:
-        print("  No valid per-orientation groups found.")
+    print("\nPer-cycle metrics (reference = mean of all points in that curl cycle):")
+    if not per_cycle_metrics:
+        print("  No valid per-cycle groups found.")
     else:
         for _, pm in sorted(
-            per_orientation_metrics.items(),
+            per_cycle_metrics.items(),
+            key=lambda kv: (
+                999999.0 if kv[1]["c_orientation_deg"] is None else kv[1]["c_orientation_deg"],
+                999999 if kv[1]["cycle_index"] is None else kv[1]["cycle_index"],
+            )
+        ):
+            c_val = pm["c_orientation_deg"]
+            c_label = "unknown" if c_val is None else f"{float(c_val):.3f} deg"
+            cycle_label = "n/a" if pm["cycle_index"] is None else str(int(pm["cycle_index"]) + 1)
+            print(
+                f"  C = {c_label:<12} cycle = {cycle_label:<4} "
+                f"RMSE = {pm['rmse_mm']:.6f} mm   "
+                f"N = {pm['num_samples']}"
+            )
+    print("\nPer-C mean of cycle metrics:")
+    if not per_orientation_cycle_metric_means:
+        print("  No valid per-orientation cycle-mean groups found.")
+    else:
+        for _, pm in sorted(
+            per_orientation_cycle_metric_means.items(),
             key=lambda kv: (999999.0 if kv[1]["c_orientation_deg"] is None else kv[1]["c_orientation_deg"])
         ):
             c_val = pm["c_orientation_deg"]
             c_label = "unknown" if c_val is None else f"{float(c_val):.3f} deg"
             print(
                 f"  C = {c_label:<12} "
-                f"RMSE = {pm['rmse_mm']:.6f} mm   "
-                f"N = {pm['num_samples']}"
+                f"mean cycle RMSE = {pm['mean_cycle_rmse_mm']:.6f} mm   "
+                f"cycles = {pm['num_cycles']}"
             )
     print("=============================\n")
 

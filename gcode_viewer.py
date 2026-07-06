@@ -37,12 +37,13 @@ DEFAULT_MAX_B = -0.0
 DEFAULT_C0_DEG = 0.0
 DEFAULT_FIGSIZE = (11.8, 8.4)
 DEFAULT_OFFPLANE_SIGN = -1.0
-DEFAULT_Y_OFFPLANE_FIT_MODEL = "avg_cubic"
+DEFAULT_Y_OFFPLANE_FIT_MODEL = "auto"
 
 DEFAULT_ROBOT_DIAMETER_MM = 3.0
 DEFAULT_ROBOT_LINKS = 6
 DEFAULT_PRESSURE_TOGGLE_U_MM = 2.0
 DEFAULT_COLLISION_TIP_EXCLUSION_MM = 2.0
+DEFAULT_COLLISION_HIGHLIGHT_RADIUS_MM = 3.0
 
 # UI tuning
 UI_DEBOUNCE_MS_INDEX = 18
@@ -91,6 +92,8 @@ class Calibration:
     z_axis: str
     c_180_deg: float
     b_home: float
+    selected_fit_model: Optional[str]
+    selected_offplane_fit_model: Optional[str]
     requested_offplane_fit_model: Optional[str]
 
 
@@ -238,6 +241,93 @@ def _select_named_model(models: Dict[str, dict], base_name: str, selected_fit_mo
     return None
 
 
+def _select_offplane_model(
+    phase_models: Dict[str, dict],
+    global_models: Dict[str, dict],
+    selected_offplane_fit_model: Optional[str],
+    selected_fit_model: Optional[str],
+    requested_offplane_fit_model: Optional[str],
+) -> Tuple[Optional[dict], Optional[dict]]:
+    requested_mode = None if requested_offplane_fit_model is None else str(requested_offplane_fit_model).strip().lower()
+    selected_offplane = None if selected_offplane_fit_model is None else str(selected_offplane_fit_model).strip().lower()
+    selected_generic = None if selected_fit_model is None else str(selected_fit_model).strip().lower()
+
+    def pick(models: Dict[str, dict], names: List[str]) -> Optional[dict]:
+        for key in names:
+            spec = _normalize_model_spec(models.get(key))
+            if spec is not None:
+                return spec
+        return None
+
+    if requested_mode and requested_mode != "auto":
+        explicit_specs = {
+            "pull_pchip": (
+                phase_models,
+                ["offplane_y_pchip", "offplane_y"],
+                ["offplane_y_linear", "offplane_y"],
+            ),
+            "pull_cubic": (
+                phase_models,
+                ["offplane_y_cubic"],
+                ["offplane_y_linear", "offplane_y"],
+            ),
+            "avg_pchip": (
+                global_models,
+                ["offplane_y_avg_pchip"],
+                ["offplane_y_avg_linear", "offplane_y_linear", "offplane_y_avg_pchip"],
+            ),
+            "avg_cubic": (
+                global_models,
+                ["offplane_y_avg_cubic"],
+                ["offplane_y_avg_linear", "offplane_y_linear", "offplane_y_avg_cubic"],
+            ),
+        }
+        payload = explicit_specs.get(requested_mode)
+        if payload is None:
+            raise ValueError(
+                f"Unsupported requested offplane fit mode: {requested_offplane_fit_model}. "
+                "Expected one of: auto, pull_pchip, pull_cubic, avg_pchip, avg_cubic."
+            )
+        primary_models, primary_names, extrap_names = payload
+        model = pick(primary_models, primary_names)
+        extrap = pick(primary_models, extrap_names)
+        if model is None:
+            raise ValueError(
+                f"Requested offplane fit mode '{requested_mode}' could not be resolved from the calibration JSON."
+            )
+        return model, extrap
+
+    primary_names: List[str] = []
+    extrap_names: List[str] = []
+    if selected_offplane:
+        primary_names.append(f"offplane_y_avg_{selected_offplane}")
+        primary_names.append(f"offplane_y_{selected_offplane}")
+        if selected_offplane == "pchip":
+            extrap_names.append("offplane_y_avg_linear")
+            extrap_names.append("offplane_y_linear")
+    if selected_generic:
+        primary_names.append(f"offplane_y_avg_{selected_generic}")
+        primary_names.append(f"offplane_y_{selected_generic}")
+        if selected_generic == "pchip":
+            extrap_names.append("offplane_y_avg_linear")
+            extrap_names.append("offplane_y_linear")
+    primary_names.extend([
+        "offplane_y_avg_pchip",
+        "offplane_y_avg_cubic",
+        "offplane_y_avg_linear",
+        "offplane_y",
+    ])
+    extrap_names.extend(["offplane_y_avg_linear", "offplane_y_linear", "offplane_y"])
+
+    model = pick(global_models, primary_names)
+    if model is None:
+        model = pick(phase_models, primary_names)
+    extrap = pick(global_models, extrap_names)
+    if extrap is None:
+        extrap = pick(phase_models, extrap_names)
+    return model, extrap
+
+
 def load_calibration_json(json_path: str) -> dict:
     p = Path(json_path)
     if not p.exists():
@@ -321,7 +411,9 @@ def load_calibration(json_path: str, requested_offplane_fit_model: Optional[str]
         x_axis=x_axis, z_axis=z_axis,
         c_180_deg=c_180,
         b_home=b_home,
-        requested_offplane_fit_model=requested_offplane_fit_model or selected_offplane_fit_model or selected_fit_model,
+        selected_fit_model=selected_fit_model,
+        selected_offplane_fit_model=selected_offplane_fit_model,
+        requested_offplane_fit_model=requested_offplane_fit_model,
     )
 
 
@@ -764,11 +856,13 @@ def evaluate_calibration_phase_models(
         r_model = _select_named_model(models, "r", "pchip")
         z_model = _select_named_model(models, "z", "pchip")
         tip_model = _select_named_model(models, "tip_angle", "pchip")
-        y_selector = cal.requested_offplane_fit_model or "pchip"
-        y_model = _select_named_model(models, "offplane_y", y_selector)
-        y_extrap_model = _normalize_model_spec(models.get("offplane_y_linear"))
-        if y_extrap_model is None:
-            y_extrap_model = _normalize_model_spec(models.get("offplane_y"))
+        y_model, y_extrap_model = _select_offplane_model(
+            phase_models=models,
+            global_models=models,
+            selected_offplane_fit_model=cal.selected_offplane_fit_model,
+            selected_fit_model=cal.selected_fit_model,
+            requested_offplane_fit_model=cal.requested_offplane_fit_model,
+        )
 
         if r_model is None or z_model is None or tip_model is None:
             raise ValueError(f"Calibration phase '{phase}' is missing required PCHIP models")
@@ -1164,18 +1258,68 @@ def update_tube_artist(
     return smooth_points
 
 
+def _view_direction_from_axes(ax) -> np.ndarray:
+    elev_deg = float(getattr(ax, "elev", 25.0))
+    azim_deg = float(getattr(ax, "azim", -60.0))
+    elev = np.deg2rad(elev_deg)
+    azim = np.deg2rad(azim_deg)
+    view_dir = np.array([
+        np.cos(elev) * np.cos(azim),
+        np.cos(elev) * np.sin(azim),
+        np.sin(elev),
+    ], dtype=float)
+    return _safe_unit_vector(view_dir, np.array([1.0, 0.0, 0.0], dtype=float))
+
+
+def _split_segments_relative_to_body(
+    segments_xyz: np.ndarray,
+    body_points_xyz: Optional[np.ndarray],
+    body_radius_mm: float,
+    ax,
+) -> Tuple[np.ndarray, np.ndarray]:
+    segs = np.asarray(segments_xyz, dtype=float)
+    body_pts = None if body_points_xyz is None else np.asarray(body_points_xyz, dtype=float)
+    if (
+        segs.ndim != 3 or segs.shape[0] == 0 or segs.shape[1:] != (2, 3)
+        or body_pts is None or body_pts.ndim != 2 or body_pts.shape[0] < 2 or body_pts.shape[1] != 3
+        or body_radius_mm <= 0.0
+    ):
+        return segs, np.empty((0, 2, 3), dtype=float)
+
+    seg_mid = 0.5 * (segs[:, 0, :] + segs[:, 1, :])
+    delta = seg_mid[:, None, :] - body_pts[None, :, :]
+    dist_sq = np.sum(delta * delta, axis=2)
+    nearest_idx = np.argmin(dist_sq, axis=1)
+    nearest_dist = np.sqrt(np.maximum(dist_sq[np.arange(dist_sq.shape[0]), nearest_idx], 0.0))
+
+    # Only re-layer segments whose projected overlap is likely to be ambiguous.
+    overlap_thresh_mm = max(float(body_radius_mm) * 1.35, float(body_radius_mm) + 0.75)
+    near_body_mask = nearest_dist <= overlap_thresh_mm
+    if not np.any(near_body_mask):
+        return segs, np.empty((0, 2, 3), dtype=float)
+
+    view_dir = _view_direction_from_axes(ax)
+    body_depth = body_pts @ view_dir
+    seg_depth = seg_mid @ view_dir
+    front_mask = np.zeros(segs.shape[0], dtype=bool)
+    front_mask[near_body_mask] = seg_depth[near_body_mask] > (body_depth[nearest_idx[near_body_mask]] + 1e-6)
+
+    return segs[~front_mask], segs[front_mask]
+
+
 def _compute_collision_highlight_segments(
     body_points_xyz: np.ndarray,
     candidate_segments_xyz: np.ndarray,
     collision_radius_mm: float,
+    highlight_radius_mm: float = DEFAULT_COLLISION_HIGHLIGHT_RADIUS_MM,
     tip_exclusion_mm: float = DEFAULT_COLLISION_TIP_EXCLUSION_MM,
-) -> Tuple[np.ndarray, np.ndarray, bool, float]:
+) -> Tuple[np.ndarray, np.ndarray, bool, float, Optional[np.ndarray]]:
     body_pts = np.asarray(body_points_xyz, dtype=float)
     candidate_segs = np.asarray(candidate_segments_xyz, dtype=float)
     if body_pts.ndim != 2 or body_pts.shape[0] < 2 or body_pts.shape[1] != 3:
-        return np.empty((0, 2, 3), dtype=float), np.zeros((0,), dtype=bool), False, float("inf")
+        return np.empty((0, 2, 3), dtype=float), np.zeros((0,), dtype=bool), False, float("inf"), None
     if candidate_segs.ndim != 3 or candidate_segs.shape[0] == 0 or candidate_segs.shape[1:] != (2, 3):
-        return np.empty((0, 2, 3), dtype=float), np.zeros((0,), dtype=bool), False, float("inf")
+        return np.empty((0, 2, 3), dtype=float), np.zeros((0,), dtype=bool), False, float("inf"), None
 
     body_arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(body_pts, axis=0), axis=1))])
     body_dist_to_tip = body_arc[-1] - body_arc
@@ -1184,22 +1328,22 @@ def _compute_collision_highlight_segments(
         body_mask[:-1] = True
     candidate_body_pts = body_pts[body_mask]
     if candidate_body_pts.shape[0] == 0:
-        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, float("inf")
+        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, float("inf"), None
 
     min_dist = float("inf")
+    best_collision_point = None
     seg_start = candidate_segs[:, 0, :]
     seg_end = candidate_segs[:, 1, :]
     seg_vec = seg_end - seg_start
     seg_len_sq = np.sum(seg_vec * seg_vec, axis=1)
     valid_seg_mask = seg_len_sq > 1e-12
     if not np.any(valid_seg_mask):
-        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, float("inf")
+        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, float("inf"), None
 
     seg_start_valid = seg_start[valid_seg_mask]
     seg_vec_valid = seg_vec[valid_seg_mask]
     seg_len_sq_valid = seg_len_sq[valid_seg_mask]
-    candidate_segs_valid = candidate_segs[valid_seg_mask]
-    hit_mask_any = np.zeros(candidate_segs_valid.shape[0], dtype=bool)
+    hit_mask_any = np.zeros(seg_start_valid.shape[0], dtype=bool)
 
     for body_pt in candidate_body_pts:
         rel = body_pt[None, :] - seg_start_valid
@@ -1208,14 +1352,29 @@ def _compute_collision_highlight_segments(
         proj = seg_start_valid + t[:, None] * seg_vec_valid
         dists = np.linalg.norm(proj - body_pt[None, :], axis=1)
         if dists.size:
-            min_dist = min(min_dist, float(np.min(dists)))
+            local_idx = int(np.argmin(dists))
+            local_min_dist = float(dists[local_idx])
+            if local_min_dist < min_dist:
+                min_dist = local_min_dist
+                best_collision_point = proj[local_idx].astype(float)
         hit_mask_any |= (dists <= collision_radius_mm)
 
+    if not np.any(hit_mask_any) or best_collision_point is None:
+        return np.empty((0, 2, 3), dtype=float), np.zeros(candidate_segs.shape[0], dtype=bool), False, min_dist, best_collision_point
+
+    highlight_radius_mm = max(0.0, float(highlight_radius_mm))
+    rel_best = best_collision_point[None, :] - seg_start_valid
+    t_best = np.sum(rel_best * seg_vec_valid, axis=1) / seg_len_sq_valid
+    t_best = np.clip(t_best, 0.0, 1.0)
+    proj_best = seg_start_valid + t_best[:, None] * seg_vec_valid
+    highlight_dists = np.linalg.norm(proj_best - best_collision_point[None, :], axis=1)
+    highlight_mask_valid = highlight_dists <= highlight_radius_mm
+
     collision_mask = np.zeros(candidate_segs.shape[0], dtype=bool)
-    collision_mask[valid_seg_mask] = hit_mask_any
+    collision_mask[valid_seg_mask] = highlight_mask_valid
     if not np.any(collision_mask):
-        return np.empty((0, 2, 3), dtype=float), collision_mask, False, min_dist
-    return np.asarray(candidate_segs[collision_mask], dtype=float), collision_mask, True, min_dist
+        return np.empty((0, 2, 3), dtype=float), collision_mask, True, min_dist, best_collision_point
+    return np.asarray(candidate_segs[collision_mask], dtype=float), collision_mask, True, min_dist, best_collision_point
 
 
 def compute_equal_box_center_radius(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, pad_frac: float = 0.04):
@@ -1243,7 +1402,7 @@ def apply_equal_axes_with_zoom(ax, center: Tuple[float, float, float], base_radi
     elev, azim = getattr(ax, "elev", None), getattr(ax, "azim", None)
 
     ax.set_xlim(cx - r, cx + r)
-    ax.set_ylim(cy - r, cy + r)
+    ax.set_ylim(cy + r, cy - r)
     ax.set_zlim(cz - r, cz + r)
 
     try:
@@ -1256,6 +1415,56 @@ def apply_equal_axes_with_zoom(ax, center: Tuple[float, float, float], base_radi
             ax.view_init(elev=elev, azim=azim)
         except Exception:
             pass
+
+
+def apply_plane_axes_with_zoom(
+    ax,
+    view_name: str,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    zoom: float,
+    pad_frac: float = 0.02,
+):
+    center, base_radius = compute_equal_box_center_radius(xs, ys, zs, pad_frac=pad_frac)
+    zoom = max(float(zoom), 1e-6)
+    cx, cy, cz = center
+    radius = base_radius / zoom
+
+    if view_name == "XY":
+        px_min, px_max = float(np.min(xs)), float(np.max(xs))
+        py_min, py_max = float(np.min(ys)), float(np.max(ys))
+        pcx = 0.5 * (px_min + px_max)
+        pcy = 0.5 * (py_min + py_max)
+        pr = 0.5 * max(px_max - px_min, py_max - py_min, 1e-9) * (1.0 + pad_frac) / zoom
+        ax.set_xlim(pcx - pr, pcx + pr)
+        ax.set_ylim(pcy + pr, pcy - pr)
+        ax.set_zlim(cz - radius, cz + radius)
+    elif view_name == "YZ":
+        py_min, py_max = float(np.min(ys)), float(np.max(ys))
+        pz_min, pz_max = float(np.min(zs)), float(np.max(zs))
+        pcy = 0.5 * (py_min + py_max)
+        pcz = 0.5 * (pz_min + pz_max)
+        pr = 0.5 * max(py_max - py_min, pz_max - pz_min, 1e-9) * (1.0 + pad_frac) / zoom
+        ax.set_xlim(cx - radius, cx + radius)
+        ax.set_ylim(pcy + pr, pcy - pr)
+        ax.set_zlim(pcz - pr, pcz + pr)
+    elif view_name == "XZ":
+        px_min, px_max = float(np.min(xs)), float(np.max(xs))
+        pz_min, pz_max = float(np.min(zs)), float(np.max(zs))
+        pcx = 0.5 * (px_min + px_max)
+        pcz = 0.5 * (pz_min + pz_max)
+        pr = 0.5 * max(px_max - px_min, pz_max - pz_min, 1e-9) * (1.0 + pad_frac) / zoom
+        ax.set_xlim(pcx - pr, pcx + pr)
+        ax.set_ylim(cy + radius, cy - radius)
+        ax.set_zlim(pcz - pr, pcz + pr)
+    else:
+        raise ValueError(f"Unknown plane view '{view_name}'")
+
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass
 
 
 def capture_view_state(ax) -> dict:
@@ -1292,13 +1501,13 @@ def restore_view_state(ax, state: dict):
 def set_major_view(ax, view_name: str):
     name = view_name.upper()
     if name == "XY":
-        ax.view_init(elev=90, azim=-90)
+        ax.view_init(elev=90, azim=90)
     elif name == "XZ":
-        ax.view_init(elev=0, azim=-90)
+        ax.view_init(elev=0, azim=90)
     elif name == "YZ":
-        ax.view_init(elev=0, azim=0)
+        ax.view_init(elev=0, azim=180)
     elif name == "ISO":
-        ax.view_init(elev=25, azim=-60)
+        ax.view_init(elev=22, azim=58)
     else:
         raise ValueError(f"Unknown view '{view_name}'")
 
@@ -1336,6 +1545,17 @@ def style_dark_3d_axes(fig, ax):
             axis._axinfo["axisline"]["color"] = (1, 1, 1, 1)
         except Exception:
             pass
+
+
+def _add_path_collection(ax, segs: np.ndarray, colors, linewidth: float, alpha: float) -> Line3DCollection:
+    coll = Line3DCollection(
+        segs,
+        colors=colors,
+        linewidths=linewidth,
+        alpha=alpha,
+    )
+    ax.add_collection3d(coll)
+    return coll
 
 
 def _decimate_xyz(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, max_points: int):
@@ -1406,6 +1626,16 @@ def print_gantry_ranges_used(traj: TipTrajectory, axis_names: Dict[str, str]) ->
     print(f"  {axis_names['c']}: {np.min(traj.c_cmd):.4f} to {np.max(traj.c_cmd):.4f}")
 
 
+def select_start_anchor_index(states: List[MotionState]) -> int:
+    if not states:
+        return 0
+
+    for i, state in enumerate(states):
+        if state.pressure_active and state.motion_code == "G1":
+            return i
+    return 0
+
+
 # =========================
 # Interactive UI
 # =========================
@@ -1429,14 +1659,16 @@ def launch_interactive_plot(
     remove_mpl_keymap_entries(("left", "right", "home", "h", "j", "k", "l"))
 
     n = len(states)
-    idx0 = 0
+    start_anchor_idx = select_start_anchor_index(states)
+    idx0 = start_anchor_idx
     robot_start_world = (
-        float(traj.x_stage[0]),
-        float(traj.y_stage[0]),
-        float(traj.z_stage[0]),
+        float(traj.x_stage[start_anchor_idx]),
+        float(traj.y_stage[start_anchor_idx]),
+        float(traj.z_stage[start_anchor_idx]),
     )
     elapsed_seconds, skipped_time_segments = estimate_print_time_seconds(states, traj)
     total_estimated_seconds = float(elapsed_seconds[-1]) if elapsed_seconds.size else 0.0
+    time0 = float(elapsed_seconds[idx0]) if elapsed_seconds.size else 0.0
     gantry_ranges = {
         "x": (float(np.min(traj.x_stage)), float(np.max(traj.x_stage))),
         "y": (float(np.min(traj.y_stage)), float(np.max(traj.y_stage))),
@@ -1444,14 +1676,34 @@ def launch_interactive_plot(
     }
 
     fig = plt.figure(figsize=DEFAULT_FIGSIZE)
-    ax = fig.add_subplot(111, projection="3d")
+    grid = fig.add_gridspec(
+        nrows=2, ncols=2,
+        left=0.035, right=0.985, bottom=0.285, top=0.975,
+        wspace=0.03, hspace=0.05,
+    )
+    ax = fig.add_subplot(grid[0, 0], projection="3d")
+    xy_ax = fig.add_subplot(grid[0, 1], projection="3d")
+    yz_ax = fig.add_subplot(grid[1, 0], projection="3d")
+    xz_ax = fig.add_subplot(grid[1, 1], projection="3d")
+    overview_axes = [xy_ax, yz_ax, xz_ax]
+    all_axes = [ax] + overview_axes
 
-    # Reserve less space for controls so the 3D axes stay larger.
-    plt.subplots_adjust(left=0.04, right=0.99, bottom=0.245, top=0.975)
-    style_dark_3d_axes(fig, ax)
+    for axis in all_axes:
+        style_dark_3d_axes(fig, axis)
+        try:
+            axis.set_proj_type("ortho")
+        except Exception:
+            pass
 
     xs, ys, zs = traj.x_tip, traj.y_tip, traj.z_tip
     segs = make_line_segments(xs, ys, zs)
+    visible_slice = slice(start_anchor_idx, None)
+    xs_visible = xs[visible_slice]
+    ys_visible = ys[visible_slice]
+    zs_visible = zs[visible_slice]
+    x_stage_visible = traj.x_stage[visible_slice]
+    y_stage_visible = traj.y_stage[visible_slice]
+    z_stage_visible = traj.z_stage[visible_slice]
     phase_colors = {
         PULL_PHASE: "#66d9ff",
         RELEASE_PHASE: "tomato",
@@ -1472,49 +1724,51 @@ def launch_interactive_plot(
     extrude_end_idx = (np.nonzero(extrude_seg_mask)[0] + 1).astype(int)  # segment ends at index i
 
     # Full reference tip path, tinted by active equation set.
-    bg_idx = _decimate_idx(len(xs), MAX_BACKGROUND_POINTS)
-    bg_segs = make_line_segments(xs[bg_idx], ys[bg_idx], zs[bg_idx])
-    bg_seg_phase = point_phase[bg_idx[1:]] if bg_idx.size > 1 else np.empty((0,), dtype=object)
+    bg_idx = _decimate_idx(len(xs_visible), MAX_BACKGROUND_POINTS)
+    bg_segs = make_line_segments(xs_visible[bg_idx], ys_visible[bg_idx], zs_visible[bg_idx])
+    bg_seg_phase = point_phase[start_anchor_idx + bg_idx[1:]] if bg_idx.size > 1 else np.empty((0,), dtype=object)
     if len(bg_segs) > 0:
         bg_colors = [phase_colors.get(str(phase), "deepskyblue") for phase in bg_seg_phase]
-        lc = Line3DCollection(
-            bg_segs,
-            colors=bg_colors,
-            linewidths=unprinted_line_width,
-            alpha=unprinted_line_alpha,
-        )
-        ax.add_collection3d(lc)
+        for draw_ax in all_axes:
+            _add_path_collection(draw_ax, bg_segs, bg_colors, unprinted_line_width, unprinted_line_alpha)
 
     # Start/end markers
-    ax.scatter([xs[0]], [ys[0]], [zs[0]], marker="o", s=46, color="lime", label="Start")
-    ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], marker="x", s=46, color="red", label="End")
+    for draw_ax in all_axes:
+        draw_ax.scatter([xs[start_anchor_idx]], [ys[start_anchor_idx]], [zs[start_anchor_idx]], marker="o", s=46, color="lime", label="Start")
+        draw_ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], marker="x", s=46, color="red", label="End")
 
     # Current markers
-    current_tip_marker, = ax.plot([xs[idx0]], [ys[idx0]], [zs[idx0]],
-                                  marker="o", markersize=8, linestyle="None", color="white")
-    current_stage_marker, = ax.plot([traj.x_stage[idx0]], [traj.y_stage[idx0]], [traj.z_stage[idx0]],
-                                    marker="^", markersize=6, linestyle="None", alpha=0.95, color="magenta")
+    current_tip_markers = []
+    current_stage_markers = []
+    for draw_ax in all_axes:
+        tip_marker, = draw_ax.plot(
+            [xs[idx0]], [ys[idx0]], [zs[idx0]],
+            marker="o", markersize=8, linestyle="None", color="white",
+        )
+        stage_marker, = draw_ax.plot(
+            [traj.x_stage[idx0]], [traj.y_stage[idx0]], [traj.z_stage[idx0]],
+            marker="^", markersize=6, linestyle="None", alpha=0.95, color="magenta",
+        )
+        current_tip_markers.append(tip_marker)
+        current_stage_markers.append(stage_marker)
 
     # Current extruding portion
     p0 = np.array([[xs[idx0], ys[idx0], zs[idx0]], [xs[idx0], ys[idx0], zs[idx0]]], dtype=float)
-    current_print_lc = Line3DCollection(
-        [p0],
-        colors=[printed_line_color],
-        linewidths=printed_line_width,
-        alpha=printed_line_alpha,
-    )
-    ax.add_collection3d(current_print_lc)
+    current_print_lc = _add_path_collection(ax, [p0], [printed_line_color], printed_line_width, printed_line_alpha)
+    current_print_front_lc = _add_path_collection(ax, [p0], [printed_line_color], printed_line_width, printed_line_alpha)
+    overview_print_lcs = [
+        _add_path_collection(draw_ax, [p0], [printed_line_color], max(1.2, printed_line_width - 0.5), printed_line_alpha)
+        for draw_ax in overview_axes
+    ]
     current_collision_seed = np.array(
         [[[xs[idx0], ys[idx0], zs[idx0]], [xs[idx0], ys[idx0], zs[idx0]]]],
         dtype=float,
     )
-    current_collision_lc = Line3DCollection(
-        current_collision_seed,
-        colors=["red"],
-        linewidths=printed_line_width + 1.0,
-        alpha=1.0,
-    )
-    ax.add_collection3d(current_collision_lc)
+    current_collision_lc = _add_path_collection(ax, current_collision_seed, ["red"], printed_line_width + 1.0, 1.0)
+    overview_collision_lcs = [
+        _add_path_collection(draw_ax, current_collision_seed, ["red"], printed_line_width, 1.0)
+        for draw_ax in overview_axes
+    ]
 
     # Robot overlays (optional)
     robot_lc = None
@@ -1537,16 +1791,23 @@ def launch_interactive_plot(
             offplane_sign=offplane_sign,
             start_world=robot_start_world,
         )
-        robot_lc, _ = create_tube_artist(
-            ax,
-            rp,
-            diameter_mm=robot_cfg.diameter_mm,
-            color=ROBOT_TUBE_COLOR,
-            alpha=0.94,
-        )
+        robot_lcs = []
+        for draw_ax in all_axes:
+            robot_artist, _ = create_tube_artist(
+                draw_ax,
+                rp,
+                diameter_mm=robot_cfg.diameter_mm,
+                color=ROBOT_TUBE_COLOR,
+                alpha=0.94,
+            )
+            robot_lcs.append(robot_artist)
+        robot_lc = robot_lcs[0]
         robot_visible["value"] = bool(robot_cfg.show_default)
-        robot_lc.set_visible(robot_visible["value"])
+        for artist in robot_lcs:
+            artist.set_visible(robot_visible["value"])
         active_body_radius_mm = 0.5 * float(robot_cfg.diameter_mm)
+    else:
+        robot_lcs = []
 
     skeleton_ref_lc = None
     if robot_skeleton_ref is not None:
@@ -1557,27 +1818,45 @@ def launch_interactive_plot(
             tip_world=(float(traj.x_tip[idx0]), float(traj.y_tip[idx0]), float(traj.z_tip[idx0])),
             equation_phase=str(traj.equation_phase[idx0]),
         )
-        skeleton_ref_lc, _ = create_tube_artist(
-            ax,
-            pts_ref,
-            diameter_mm=robot_skeleton_ref.diameter_mm,
-            color=ROBOT_TUBE_COLOR,
-            alpha=0.97,
-        )
+        skeleton_ref_lcs = []
+        for draw_ax in all_axes:
+            skeleton_artist, _ = create_tube_artist(
+                draw_ax,
+                pts_ref,
+                diameter_mm=robot_skeleton_ref.diameter_mm,
+                color=ROBOT_TUBE_COLOR,
+                alpha=0.97,
+            )
+            skeleton_ref_lcs.append(skeleton_artist)
+        skeleton_ref_lc = skeleton_ref_lcs[0]
         if robot_cfg is None:
             robot_visible["value"] = True
-        skeleton_ref_lc.set_visible(robot_visible["value"])
+        for artist in skeleton_ref_lcs:
+            artist.set_visible(robot_visible["value"])
         active_body_radius_mm = 0.5 * float(robot_skeleton_ref.diameter_mm)
+    else:
+        skeleton_ref_lcs = []
 
     # Title further up
     ax.set_title("Tip Trajectory from G-code and Calibration", pad=18)
     ax.set_xlabel("X (mm)")
     ax.set_ylabel("Y (mm)")
     ax.set_zlabel("Z (mm)")
+    side_titles = [("XY", xy_ax), ("YZ", yz_ax), ("XZ", xz_ax)]
+    for title, draw_ax in side_titles:
+        draw_ax.set_title(title, pad=6, fontsize=9)
+        draw_ax.set_xlabel("X (mm)" if title != "YZ" else "Y (mm)")
+        draw_ax.set_ylabel("Y (mm)" if title == "XY" else ("Z (mm)" if title == "YZ" else "Z (mm)"))
+        draw_ax.set_zlabel("")
+        try:
+            draw_ax.zaxis.label.set_visible(False)
+            draw_ax.set_zticks([])
+        except Exception:
+            pass
 
-    all_x = xs if not show_stage else np.concatenate([xs, traj.x_stage])
-    all_y = ys if not show_stage else np.concatenate([ys, traj.y_stage])
-    all_z = zs if not show_stage else np.concatenate([zs, traj.z_stage])
+    all_x = xs_visible if not show_stage else np.concatenate([xs_visible, x_stage_visible])
+    all_y = ys_visible if not show_stage else np.concatenate([ys_visible, y_stage_visible])
+    all_z = zs_visible if not show_stage else np.concatenate([zs_visible, z_stage_visible])
     if robot_skeleton_ref is not None and robot_skeleton_ref.points_xyz_mm.size:
         pts_ref = compute_tracked_skeleton_world(
             robot_skeleton_ref,
@@ -1591,22 +1870,42 @@ def launch_interactive_plot(
         all_z = np.concatenate([all_z, pts_ref[:, 2]])
 
     center, base_radius = compute_equal_box_center_radius(all_x, all_y, all_z, pad_frac=0.05)
+    if extrude_segs.shape[0] > 0:
+        overview_pts = extrude_segs.reshape(-1, 3)
+        overview_x = overview_pts[:, 0]
+        overview_y = overview_pts[:, 1]
+        overview_z = overview_pts[:, 2]
+    else:
+        overview_x = xs_visible
+        overview_y = ys_visible
+        overview_z = zs_visible
     overlay_radius = 0.0
     if robot_cfg is not None:
         overlay_radius = max(overlay_radius, 0.5 * float(robot_cfg.diameter_mm))
     if robot_skeleton_ref is not None:
         overlay_radius = max(overlay_radius, 0.5 * float(robot_skeleton_ref.diameter_mm))
     base_radius += overlay_radius
-    current_zoom = {"value": 1.0}
+    _, overview_base_radius = compute_equal_box_center_radius(overview_x, overview_y, overview_z, pad_frac=0.01)
+    startup_zoom = float(np.clip(base_radius / max(overview_base_radius, 1e-9), 0.25, 8.0))
+    current_zoom = {"value": startup_zoom}
 
     def apply_view_limits():
         apply_equal_axes_with_zoom(ax, center=center, base_radius=base_radius, zoom=current_zoom["value"])
+        apply_overview_view_limits()
+
+    def apply_overview_view_limits():
+        apply_plane_axes_with_zoom(xy_ax, "XY", overview_x, overview_y, overview_z, current_zoom["value"], pad_frac=0.01)
+        apply_plane_axes_with_zoom(yz_ax, "YZ", overview_x, overview_y, overview_z, current_zoom["value"], pad_frac=0.01)
+        apply_plane_axes_with_zoom(xz_ax, "XZ", overview_x, overview_y, overview_z, current_zoom["value"], pad_frac=0.01)
 
     apply_view_limits()
     set_major_view(ax, "ISO")
+    set_major_view(xy_ax, "XY")
+    set_major_view(yz_ax, "YZ")
+    set_major_view(xz_ax, "XZ")
 
     # ----- Info panel -----
-    text_ax = fig.add_axes([0.04, 0.025, 0.60, 0.165])
+    text_ax = fig.add_axes([0.04, 0.03, 0.54, 0.20])
     text_ax.set_facecolor("black")
     text_ax.axis("off")
     info_text = text_ax.text(
@@ -1614,15 +1913,14 @@ def launch_interactive_plot(
         va="top", ha="left", family="monospace", fontsize=8.3, color="white", clip_on=True
     )
 
-    # ----- Index slider -----
-    slider_ax = fig.add_axes([0.70, 0.080, 0.26, 0.026], facecolor="#111111")
+    # ----- Print-time slider -----
+    slider_ax = fig.add_axes([0.63, 0.105, 0.33, 0.028], facecolor="#111111")
     idx_slider = Slider(
         ax=slider_ax,
-        label="Index",
-        valmin=0,
-        valmax=n - 1,
-        valinit=idx0,
-        valstep=1,
+        label="Print Time",
+        valmin=0.0,
+        valmax=max(total_estimated_seconds, 1e-9),
+        valinit=time0,
     )
     try:
         idx_slider.label.set_color("white")
@@ -1631,13 +1929,13 @@ def launch_interactive_plot(
         pass
 
     # ----- Zoom slider -----
-    zoom_ax = fig.add_axes([0.70, 0.125, 0.26, 0.026], facecolor="#111111")
+    zoom_ax = fig.add_axes([0.63, 0.155, 0.33, 0.028], facecolor="#111111")
     zoom_slider = Slider(
         ax=zoom_ax,
         label="Zoom",
         valmin=0.25,
         valmax=8.0,
-        valinit=1.0,
+        valinit=startup_zoom,
         valstep=0.01,
     )
     try:
@@ -1647,12 +1945,12 @@ def launch_interactive_plot(
         pass
 
     def _apply_robot_visibility():
-        if robot_lc is not None:
-            robot_lc.set_visible(robot_visible["value"])
-        if skeleton_ref_lc is not None:
-            skeleton_ref_lc.set_visible(robot_visible["value"])
+        for artist in robot_lcs:
+            artist.set_visible(robot_visible["value"])
+        for artist in skeleton_ref_lcs:
+            artist.set_visible(robot_visible["value"])
 
-    help_ax = fig.add_axes([0.70, 0.025, 0.28, 0.035], facecolor="black")
+    help_ax = fig.add_axes([0.63, 0.03, 0.33, 0.05], facecolor="black")
     help_ax.axis("off")
     help_ax.text(
         0.0, 1.0,
@@ -1660,6 +1958,15 @@ def launch_interactive_plot(
         va="top", ha="left", fontsize=8, color="white"
     )
     collision_state = {"active": False, "min_dist_mm": float("inf")}
+
+    def _index_from_elapsed_time(seconds: float) -> int:
+        if elapsed_seconds.size == 0:
+            return 0
+        t = float(np.clip(seconds, 0.0, total_estimated_seconds))
+        return int(np.clip(np.searchsorted(elapsed_seconds, t, side="right") - 1, 0, n - 1))
+
+    def _set_slider_time(seconds: float):
+        idx_slider.set_val(float(np.clip(seconds, 0.0, total_estimated_seconds)))
 
     # ---------------------------
     # Fast redraw (precomputed extrude segments + debounced sliders)
@@ -1688,7 +1995,7 @@ def launch_interactive_plot(
             collision_line = (
                 f"body_path_collision={collision_state['active']}  "
                 f"threshold={active_body_radius_mm:.3f}mm  min_dist={min_dist_text}  "
-                f"highlight=full_print_move\n"
+                f"highlight_radius={DEFAULT_COLLISION_HIGHLIGHT_RADIUS_MM:.1f}mm\n"
             )
         return (
             f"idx={s.idx:6d}   gcode_line={s.gcode_line_no:6d}   motion={s.motion_code}   F={f_text}\n"
@@ -1713,34 +2020,44 @@ def launch_interactive_plot(
     def _update_print_segments(i: int):
         if i <= 0 or extrude_segs.shape[0] == 0:
             current_print_lc.set_segments([])
-            return np.empty((0, 2, 3), dtype=float)
+            current_print_front_lc.set_segments([])
+            for coll in overview_print_lcs:
+                coll.set_segments([])
+            for coll in overview_collision_lcs:
+                coll.set_segments([])
+            return np.empty((0, 2, 3), dtype=float), np.empty((0, 2, 3), dtype=float)
         # how many extrude segments end at/before i?
         k = int(np.searchsorted(extrude_end_idx, i, side="right"))
         visible_printed_segs = extrude_segs[:k]
-        current_print_lc.set_segments(visible_printed_segs)
         current_print_lc.set_color(printed_line_color)
-        return visible_printed_segs
+        current_print_front_lc.set_color(printed_line_color)
+        return visible_printed_segs, np.empty((0, 2, 3), dtype=float)
 
-    def _update_collision_overlay(visible_printed_segs: np.ndarray, body_points_xyz: Optional[np.ndarray]):
+    def _update_collision_overlay(visible_printed_segs: np.ndarray, body_points_xyz: Optional[np.ndarray]) -> np.ndarray:
         collision_state["active"] = False
         collision_state["min_dist_mm"] = float("inf")
         if robot_skeleton_ref is None or body_points_xyz is None or active_body_radius_mm <= 0.0:
             current_collision_lc.set_segments([])
-            return
-        hit_segments, collision_mask, is_collision, min_dist = _compute_collision_highlight_segments(
+            for coll in overview_collision_lcs:
+                coll.set_segments([])
+            return visible_printed_segs
+        hit_segments, collision_mask, is_collision, min_dist, _ = _compute_collision_highlight_segments(
             body_points_xyz=body_points_xyz,
             candidate_segments_xyz=visible_printed_segs,
             collision_radius_mm=active_body_radius_mm,
         )
         collision_state["active"] = bool(is_collision)
         collision_state["min_dist_mm"] = float(min_dist)
-        if visible_printed_segs.shape[0] > 0:
-            current_print_lc.set_segments(visible_printed_segs[~collision_mask])
         current_collision_lc.set_segments(hit_segments)
+        for coll in overview_collision_lcs:
+            coll.set_segments(hit_segments)
+        if visible_printed_segs.shape[0] == 0:
+            return visible_printed_segs
+        return visible_printed_segs[~collision_mask]
 
-    def _update_robot(i: int):
-        if robot_cfg is None or robot_lc is None:
-            return
+    def _update_robot(i: int) -> Optional[np.ndarray]:
+        if robot_cfg is None or not robot_lcs:
+            return None
         rp = compute_robot_polyline_world(
             cal, robot_cfg,
             x_stage=traj.x_stage[i],
@@ -1757,16 +2074,18 @@ def launch_interactive_plot(
             offplane_sign=offplane_sign,
             start_world=robot_start_world,
         )
-        update_tube_artist(
-            robot_lc,
-            rp,
-            diameter_mm=robot_cfg.diameter_mm,
-            color=ROBOT_TUBE_COLOR,
-            alpha=0.94,
-        )
+        for artist in robot_lcs:
+            update_tube_artist(
+                artist,
+                rp,
+                diameter_mm=robot_cfg.diameter_mm,
+                color=ROBOT_TUBE_COLOR,
+                alpha=0.94,
+            )
+        return rp
 
     def _update_skeleton(i: int) -> Optional[np.ndarray]:
-        if robot_skeleton_ref is None or skeleton_ref_lc is None:
+        if robot_skeleton_ref is None or not skeleton_ref_lcs:
             return None
         rp = compute_tracked_skeleton_world(
             robot_skeleton_ref,
@@ -1775,29 +2094,47 @@ def launch_interactive_plot(
             tip_world=(float(traj.x_tip[i]), float(traj.y_tip[i]), float(traj.z_tip[i])),
             equation_phase=str(traj.equation_phase[i]),
         )
-        return update_tube_artist(
-            skeleton_ref_lc,
-            rp,
-            diameter_mm=robot_skeleton_ref.diameter_mm,
-            color=ROBOT_TUBE_COLOR,
-            alpha=0.97,
-        )
+        for artist in skeleton_ref_lcs:
+            update_tube_artist(
+                artist,
+                rp,
+                diameter_mm=robot_skeleton_ref.diameter_mm,
+                color=ROBOT_TUBE_COLOR,
+                alpha=0.97,
+            )
+        return rp
 
     def redraw(i: int):
         i = int(np.clip(i, 0, n - 1))
         view_state = capture_view_state(ax)
-        current_tip_marker.set_data_3d([traj.x_tip[i]], [traj.y_tip[i]], [traj.z_tip[i]])
-        current_stage_marker.set_data_3d([traj.x_stage[i]], [traj.y_stage[i]], [traj.z_stage[i]])
-        visible_printed_segs = _update_print_segments(i)
-        _update_robot(i)
-        body_points_xyz = _update_skeleton(i)
-        _update_collision_overlay(visible_printed_segs, body_points_xyz)
+        apply_overview_view_limits()
+        for marker in current_tip_markers:
+            marker.set_data_3d([traj.x_tip[i]], [traj.y_tip[i]], [traj.z_tip[i]])
+        for marker in current_stage_markers:
+            marker.set_data_3d([traj.x_stage[i]], [traj.y_stage[i]], [traj.z_stage[i]])
+        visible_printed_segs, front_printed_segs = _update_print_segments(i)
+        robot_points_xyz = _update_robot(i)
+        skeleton_points_xyz = _update_skeleton(i)
+        body_points_xyz = skeleton_points_xyz if skeleton_points_xyz is not None else robot_points_xyz
+        visible_printed_segs = _update_collision_overlay(visible_printed_segs, body_points_xyz)
+        if visible_printed_segs.shape[0] > 0 and body_points_xyz is not None and active_body_radius_mm > 0.0:
+            visible_printed_segs, front_printed_segs = _split_segments_relative_to_body(
+                visible_printed_segs,
+                body_points_xyz=body_points_xyz,
+                body_radius_mm=active_body_radius_mm,
+                ax=ax,
+            )
+        current_print_lc.set_segments(visible_printed_segs)
+        current_print_front_lc.set_segments(front_printed_segs)
+        overview_segs = np.concatenate([visible_printed_segs, front_printed_segs], axis=0) if front_printed_segs.size else visible_printed_segs
+        for coll in overview_print_lcs:
+            coll.set_segments(overview_segs)
         info_text.set_text(fmt_state(i))
         restore_view_state(ax, view_state)
         fig.canvas.draw_idle()
 
     # Debounce helpers (so sliders feel fluid)
-    pending = {"idx": idx0, "zoom": 1.0, "idx_dirty": False, "zoom_dirty": False}
+    pending = {"idx": idx0, "time": time0, "zoom": 1.0, "idx_dirty": False, "zoom_dirty": False}
 
     idx_timer = fig.canvas.new_timer(interval=UI_DEBOUNCE_MS_INDEX)
     zoom_timer = fig.canvas.new_timer(interval=UI_DEBOUNCE_MS_ZOOM)
@@ -1813,19 +2150,24 @@ def launch_interactive_plot(
             pending["zoom_dirty"] = False
             current_zoom["value"] = float(pending["zoom"])
             apply_view_limits()
-            redraw(int(idx_slider.val))
+            redraw(int(pending["idx"]))
 
     idx_timer.add_callback(_idx_timer_cb)
     zoom_timer.add_callback(_zoom_timer_cb)
 
     def on_index_slider(val):
-        pending["idx"] = int(val)
+        pending["time"] = float(val)
+        pending["idx"] = _index_from_elapsed_time(float(val))
         pending["idx_dirty"] = True
         try:
             idx_timer.stop()
         except Exception:
             pass
         idx_timer.start()
+        try:
+            idx_slider.valtext.set_text(format_duration(float(val)))
+        except Exception:
+            pass
 
     def on_zoom_slider(val):
         pending["zoom"] = float(val)
@@ -1841,20 +2183,22 @@ def launch_interactive_plot(
 
     def on_key(event):
         key = event.key.lower() if isinstance(event.key, str) else event.key
-        i = int(idx_slider.val)
+        current_time = float(idx_slider.val)
+        small_step = max(total_estimated_seconds / 2000.0, 0.1)
+        large_step = max(total_estimated_seconds / 200.0, 2.0)
 
         if key in ("right", "k", "l"):
-            idx_slider.set_val(min(n - 1, i + 1))
+            _set_slider_time(current_time + small_step)
         elif key in ("left", "j", "h"):
-            idx_slider.set_val(max(0, i - 1))
+            _set_slider_time(current_time - small_step)
         elif key == "pagedown":
-            idx_slider.set_val(min(n - 1, i + 10))
+            _set_slider_time(current_time + large_step)
         elif key == "pageup":
-            idx_slider.set_val(max(0, i - 10))
+            _set_slider_time(current_time - large_step)
         elif key == "home":
-            idx_slider.set_val(0)
+            _set_slider_time(0.0)
         elif key == "end":
-            idx_slider.set_val(n - 1)
+            _set_slider_time(total_estimated_seconds)
         elif key == "1":
             set_major_view(ax, "XY"); apply_view_limits(); fig.canvas.draw_idle()
         elif key == "2":
@@ -1897,10 +2241,16 @@ def main():
     ap.add_argument("--print-summary", action="store_true", help="Print summary before plotting.")
     ap.add_argument("--offplane-sign", type=float, default=DEFAULT_OFFPLANE_SIGN,
                     help="Sign multiplier applied to offplane_y(B) when reconstructing tip/links (default -1).")
+    ap.add_argument(
+        "--offplane-fit-mode",
+        choices=["auto", "pull_pchip", "pull_cubic", "avg_pchip", "avg_cubic"],
+        default=DEFAULT_Y_OFFPLANE_FIT_MODEL,
+        help="Select the off-plane Y calibration model used to reconstruct the tip path.",
+    )
     args = ap.parse_args()
 
     cal_data = load_calibration_json(args.calibration)
-    cal = load_calibration(args.calibration)
+    cal = load_calibration(args.calibration, requested_offplane_fit_model=args.offplane_fit_mode)
     gcode_metadata = parse_gcode_metadata(args.gcode)
     write_mode = str(gcode_metadata.get("write_mode", "calibrated")).strip().lower()
 
@@ -1965,17 +2315,6 @@ def main():
         offplane_sign=float(args.offplane_sign),
         write_mode=write_mode,
     )
-    print_gantry_ranges_used(
-        traj,
-        axis_names={
-            "x": cal.x_axis,
-            "y": y_axis,
-            "z": cal.z_axis,
-            "b": cal.pull_axis,
-            "c": cal.rot_axis,
-        },
-    )
-
     if args.print_summary:
         c_unique = np.unique(np.round(traj.c_cmd, 6))
         print(f"Parsed {len(states)} motion states from {args.gcode}")
@@ -2005,6 +2344,17 @@ def main():
                 f"Y[{mins[1]:.4f}, {maxs[1]:.4f}] "
                 f"Z[{mins[2]:.4f}, {maxs[2]:.4f}]"
             )
+
+    print_gantry_ranges_used(
+        traj,
+        axis_names={
+            "x": cal.x_axis,
+            "y": y_axis,
+            "z": cal.z_axis,
+            "b": cal.pull_axis,
+            "c": cal.rot_axis,
+        },
+    )
 
     launch_interactive_plot(
         states=states,

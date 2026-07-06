@@ -16,11 +16,11 @@ from shadow_calibration import CTR_Shadow_Calibration
 import shadow_calibration
 
 
-DEFAULT_PROJECT_NAME = "Test_Calibration_2026-06-30_CTR_03"
+DEFAULT_PROJECT_NAME = "Test_Calibration_2026-06-30_02"
 DEFAULT_MANUAL_CROP_ADJUSTMENT = True
 DEFAULT_THRESHOLD = 220
 DEFAULT_PULL_B_START = 0.0
-DEFAULT_PULL_B_STEPS = 85
+DEFAULT_PULL_B_STEPS = 23
 DEFAULT_PULL_B_STEP_SIZE = -0.2
 DEFAULT_MAIN_MOTION_MODE = "stepped"
 DEFAULT_MAIN_CONTINUOUS_FEEDRATE = 60.0
@@ -35,7 +35,7 @@ DEFAULT_CURL_CONTINUOUS_FEEDRATE = 100.0
 DEFAULT_CURL_CONTINUOUS_ACCEL_MM_S2 = 200.0
 DEFAULT_CURL_CONTINUOUS_CAPTURE_PERIOD_S = None
 DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
-DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260627_161714.png")
+DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260630_174948.png")
 DEFAULT_BOARD_XZ_AXIS_SIGN = 1
 DEFAULT_PROBE_MODE = "middle"
 DEFAULT_FIT_MODEL = "pchip"
@@ -145,7 +145,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def probe_points_for_mode(probe_mode: str):
     if probe_mode == "middle":
-        return [(90.0, 40.0, -140.0)]
+        return [(100.0, 55.0, -170.0)]
     if probe_mode == "five":
         return [
             (30.0, 0.0, -70.0),

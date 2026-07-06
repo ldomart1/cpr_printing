@@ -13,6 +13,7 @@ import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 import numpy as np
 import pandas as pd
 
@@ -46,23 +47,25 @@ CAMERA_CALIBRATION_FILE = os.path.join(
     SCRIPT_DIR, "captures", "calibration_webcam_20260406_104136.npz"
 )
 BOARD_REFERENCE_IMAGE = os.path.join(
-    SCRIPT_DIR, "captures", "photo_20260406_104134.png"
+    SCRIPT_DIR, "captures", "photo_20260624_150531.png"
 )
 DEFAULT_TIP_REFINER_MODEL = os.path.join(
     SCRIPT_DIR,
-    "CNN_Calib",
+    "CNN_calib_2",
     "processed_image_data_folder",
     "tip_refinement_model",
     "best_tip_refiner.pt",
 )
 DEFAULT_TIP_REFINER_ANCHOR = None
 DEFAULT_TIP_REFINER_COMPARE_ONLY = False
+DEFAULT_TIP_REFINE_MODE = "coarse"
+DEFAULT_TIP_DETECTION_MODE = "classical"
 
 RUN_OUTPUT_SUBDIR = "per_run"
 RUN_RESULTS_CSV_NAME = "tip_tracking_results.csv"
 RUN_SUMMARY_CSV_NAME = "run_summary.csv"
 ALL_RESULTS_CSV_NAME = "all_tip_tracking_results.csv"
-SPEED_SUMMARY_CSV_NAME = "speed_summary_by_direction.csv"
+SPEED_SUMMARY_CSV_NAME = "speed_summary_by_dataset_and_run_type.csv"
 SUMMARY_PLOT_DIRNAME = "summary_plots"
 
 ANNOTATED_IMAGE_EXTENSION = ".jpg"
@@ -73,12 +76,19 @@ PHASE_COLORS = {
     "accel": "#4cc9f0",
     "ss": "#80ed99",
     "decel": "#f28482",
+    "pause": "#f9c74f",
     "post": "#f8fafc",
     "unknown": "#cbd5e1",
 }
-DIRECTION_COLORS = {
+DATASET_COLORS = {
     "forward": "#60a5fa",
     "backward": "#f59e0b",
+    "transverse": "#34d399",
+}
+FIXED_B_SERIES = {
+    "fixed_b_0": {"curl_angle_deg": 0.0, "label": "0 deg", "color": "#3d70b2"},
+    "fixed_b_m3p2": {"curl_angle_deg": 90.0, "label": "90 deg", "color": "#c83f3f"},
+    "fixed_b_m5p1": {"curl_angle_deg": 180.0, "label": "180 deg", "color": "#3aa97a"},
 }
 VALID_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 
@@ -93,6 +103,15 @@ class RunFolderInfo:
     capture_log_path: str
     speed_mm_min: float
     direction: str
+    dataset_label: str
+    orientation_name: str
+    orientation_deg: float
+    run_type: str
+    repeat_idx: int
+    repeat_count: int
+    daq_mode: str = "speed_series"
+    attack_angle_deg: float = float("nan")
+    b_command_mm: float = float("nan")
 
 
 # =========================
@@ -119,6 +138,79 @@ def _apply_dark_axes_style(ax, title: str, xlabel: str, ylabel: str) -> None:
     ax.set_facecolor("#0f1723")
 
 
+def set_science_light_style(font: str = "Arial") -> None:
+    mpl.rcParams.update(
+        {
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "svg.fonttype": "none",
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.03,
+            "savefig.facecolor": "white",
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "font.family": "sans-serif",
+            "font.sans-serif": [font, "Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"],
+            "font.size": 8.0,
+            "axes.titlesize": 8.8,
+            "axes.labelsize": 8.0,
+            "xtick.labelsize": 7.6,
+            "ytick.labelsize": 7.6,
+            "legend.fontsize": 7.1,
+            "axes.linewidth": 0.8,
+            "axes.edgecolor": "#222222",
+            "axes.labelcolor": "#222222",
+            "xtick.color": "#222222",
+            "ytick.color": "#222222",
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.major.width": 0.75,
+            "ytick.major.width": 0.75,
+            "xtick.minor.width": 0.5,
+            "ytick.minor.width": 0.5,
+        }
+    )
+
+
+def _apply_light_axes_style(ax, title: str, xlabel: str, ylabel: str) -> None:
+    ax.set_title(title, color="#222222", fontsize=9.0, pad=8, weight="semibold")
+    ax.set_xlabel(xlabel, color="#222222")
+    ax.set_ylabel(ylabel, color="#222222")
+    ax.tick_params(colors="#222222", labelsize=7.6)
+    for spine in ax.spines.values():
+        spine.set_color("#222222")
+        spine.set_linewidth(0.8)
+    ax.grid(True, color="#d8d8d8", linewidth=0.6, alpha=0.45)
+    ax.set_facecolor("white")
+
+
+def _style_axes(ax, theme: str, title: str, xlabel: str, ylabel: str) -> None:
+    if theme == "dark":
+        _apply_dark_axes_style(ax, title, xlabel, ylabel)
+    else:
+        _apply_light_axes_style(ax, title, xlabel, ylabel)
+
+
+def _style_legend(leg, theme: str) -> None:
+    if leg is None:
+        return
+    if theme == "dark":
+        leg.get_frame().set_facecolor("#121c28")
+        leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
+        for txt in leg.get_texts():
+            txt.set_color("#e8f0f8")
+    else:
+        leg.get_frame().set_facecolor("white")
+        leg.get_frame().set_edgecolor("#d8d8d8")
+
+
+def _save_plot_outputs(fig, out_base: str, theme: str) -> None:
+    fig.savefig(f"{out_base}.png", dpi=220, bbox_inches="tight", transparent=(theme == "dark"))
+    if theme == "light":
+        fig.savefig(f"{out_base}.pdf", bbox_inches="tight")
+        fig.savefig(f"{out_base}.svg", bbox_inches="tight")
+
+
 def parse_folder_speed_and_direction(folder_name: str) -> Tuple[Optional[float], Optional[str]]:
     direction = None
     if folder_name.endswith("_forward"):
@@ -136,6 +228,75 @@ def parse_folder_speed_and_direction(folder_name: str) -> Tuple[Optional[float],
             speed = None
 
     return speed, direction
+
+
+def parse_folder_metadata(folder_name: str) -> Dict[str, object]:
+    speed, direction = parse_folder_speed_and_direction(folder_name)
+
+    run_type = None
+    if "_two_stage_" in folder_name or folder_name.endswith("_two_stage"):
+        run_type = "two_stage"
+    elif "_direct_" in folder_name or folder_name.endswith("_direct"):
+        run_type = "direct"
+
+    dataset_label = None
+    for candidate in ("forward", "backward", "transverse"):
+        if f"_{candidate}_" in folder_name or folder_name.endswith(f"_{candidate}"):
+            dataset_label = candidate
+            break
+
+    orientation_name = None
+    orientation_deg = float("nan")
+    orientation_match = re.search(r"(c\d{3})", folder_name)
+    if orientation_match:
+        orientation_name = orientation_match.group(1).lower()
+        try:
+            orientation_deg = float(int(orientation_name[1:]))
+        except Exception:
+            orientation_deg = float("nan")
+
+    attack_angle_deg = float("nan")
+    attack_match = re.search(r"attack_([mp0-9]+(?:p[0-9]+)?)deg", folder_name)
+    if attack_match:
+        try:
+            attack_angle_deg = float(attack_match.group(1).replace("m", "-").replace("p", "."))
+        except Exception:
+            attack_angle_deg = float("nan")
+
+    b_command_mm = float("nan")
+    b_match = re.search(r"bcmd_([mp0-9]+(?:p[0-9]+)?)", folder_name)
+    if b_match:
+        try:
+            b_command_mm = float(b_match.group(1).replace("m", "-").replace("p", "."))
+        except Exception:
+            b_command_mm = float("nan")
+
+    daq_mode = "b_attack_sweep" if "_b_attack_" in folder_name else "speed_series"
+
+    repeat_idx = 1
+    repeat_count = 1
+    repeat_match = re.search(r"_pass_(\d+)_of_(\d+)", folder_name)
+    if repeat_match:
+        try:
+            repeat_idx = int(repeat_match.group(1))
+            repeat_count = int(repeat_match.group(2))
+        except Exception:
+            repeat_idx = 1
+            repeat_count = 1
+
+    return {
+        "speed_mm_min": speed,
+        "direction": direction,
+        "run_type": run_type,
+        "dataset_label": dataset_label,
+        "orientation_name": orientation_name,
+        "orientation_deg": orientation_deg,
+        "repeat_idx": repeat_idx,
+        "repeat_count": repeat_count,
+        "daq_mode": daq_mode,
+        "attack_angle_deg": attack_angle_deg,
+        "b_command_mm": b_command_mm,
+    }
 
 
 def save_json(path: str, payload: Dict[str, object]) -> None:
@@ -180,6 +341,12 @@ def infer_output_root(project_dir: Optional[str], raw_root: str, output_dir: Opt
     return ensure_dir(
         os.path.join(project_parent, "processed_image_data_folder", "tip_tracking_analysis")
     )
+
+
+def themed_summary_plot_dir(output_root: str, theme: str) -> str:
+    theme = str(theme).strip().lower()
+    folder = f"{SUMMARY_PLOT_DIRNAME}_{theme}" if theme in {"light", "dark"} else SUMMARY_PLOT_DIRNAME
+    return ensure_dir(os.path.join(output_root, folder))
 
 
 def roi_to_analysis_crop(roi_xywh: Tuple[int, int, int, int], image_shape: Tuple[int, ...]) -> Dict[str, int]:
@@ -276,7 +443,7 @@ def find_run_folders(raw_root: str) -> List[RunFolderInfo]:
         if not os.path.isfile(capture_log_path):
             continue
 
-        speed_from_name, direction_from_name = parse_folder_speed_and_direction(folder_name)
+        folder_meta = parse_folder_metadata(folder_name)
 
         try:
             log_df = pd.read_csv(capture_log_path)
@@ -288,8 +455,17 @@ def find_run_folders(raw_root: str) -> List[RunFolderInfo]:
             print(f"[WARN] Empty capture log: {capture_log_path}")
             continue
 
-        speed = speed_from_name
-        direction = direction_from_name
+        speed = folder_meta["speed_mm_min"]
+        direction = folder_meta["direction"]
+        dataset_label = folder_meta["dataset_label"]
+        orientation_name = folder_meta["orientation_name"]
+        orientation_deg = folder_meta["orientation_deg"]
+        run_type = folder_meta["run_type"]
+        repeat_idx = int(folder_meta.get("repeat_idx", 1))
+        repeat_count = int(folder_meta.get("repeat_count", 1))
+        daq_mode = str(folder_meta.get("daq_mode", "speed_series"))
+        attack_angle_deg = float(folder_meta.get("attack_angle_deg", float("nan")))
+        b_command_mm = float(folder_meta.get("b_command_mm", float("nan")))
 
         if "speed_mm_min" in log_df.columns and pd.notna(log_df["speed_mm_min"].iloc[0]):
             try:
@@ -300,8 +476,54 @@ def find_run_folders(raw_root: str) -> List[RunFolderInfo]:
         if "direction" in log_df.columns and pd.notna(log_df["direction"].iloc[0]):
             direction = str(log_df["direction"].iloc[0]).strip().lower()
 
-        if speed is None or direction not in {"forward", "backward"}:
-            print(f"[WARN] Skipping folder with unresolved speed/direction: {folder_path}")
+        if "dataset_label" in log_df.columns and pd.notna(log_df["dataset_label"].iloc[0]):
+            dataset_label = str(log_df["dataset_label"].iloc[0]).strip().lower()
+
+        if "orientation_name" in log_df.columns and pd.notna(log_df["orientation_name"].iloc[0]):
+            orientation_name = str(log_df["orientation_name"].iloc[0]).strip().lower()
+
+        if "orientation_deg" in log_df.columns and pd.notna(log_df["orientation_deg"].iloc[0]):
+            try:
+                orientation_deg = float(log_df["orientation_deg"].iloc[0])
+            except Exception:
+                pass
+
+        if "run_type" in log_df.columns and pd.notna(log_df["run_type"].iloc[0]):
+            run_type = str(log_df["run_type"].iloc[0]).strip().lower()
+        if "repeat_idx" in log_df.columns and pd.notna(log_df["repeat_idx"].iloc[0]):
+            try:
+                repeat_idx = int(log_df["repeat_idx"].iloc[0])
+            except Exception:
+                pass
+        if "repeat_count" in log_df.columns and pd.notna(log_df["repeat_count"].iloc[0]):
+            try:
+                repeat_count = int(log_df["repeat_count"].iloc[0])
+            except Exception:
+                pass
+        if "daq_mode" in log_df.columns and pd.notna(log_df["daq_mode"].iloc[0]):
+            daq_mode = str(log_df["daq_mode"].iloc[0]).strip().lower()
+        if "attack_angle_deg" in log_df.columns and pd.notna(log_df["attack_angle_deg"].iloc[0]):
+            try:
+                attack_angle_deg = float(log_df["attack_angle_deg"].iloc[0])
+            except Exception:
+                pass
+        if "b_command_mm" in log_df.columns and pd.notna(log_df["b_command_mm"].iloc[0]):
+            try:
+                b_command_mm = float(log_df["b_command_mm"].iloc[0])
+            except Exception:
+                pass
+
+        if dataset_label is None:
+            dataset_label = direction if direction is not None else "unknown"
+        if orientation_name is None:
+            orientation_name = "unknown"
+        if run_type is None:
+            run_type = "direct"
+        if direction is None:
+            direction = "unknown"
+
+        if speed is None:
+            print(f"[WARN] Skipping folder with unresolved speed: {folder_path}")
             continue
 
         run_infos.append(
@@ -311,10 +533,31 @@ def find_run_folders(raw_root: str) -> List[RunFolderInfo]:
                 capture_log_path=capture_log_path,
                 speed_mm_min=float(speed),
                 direction=direction,
+                dataset_label=dataset_label,
+                orientation_name=orientation_name,
+                orientation_deg=float(orientation_deg) if pd.notna(orientation_deg) else float("nan"),
+                run_type=run_type,
+                repeat_idx=int(repeat_idx),
+                repeat_count=int(repeat_count),
+                daq_mode=str(daq_mode),
+                attack_angle_deg=float(attack_angle_deg) if pd.notna(attack_angle_deg) else float("nan"),
+                b_command_mm=float(b_command_mm) if pd.notna(b_command_mm) else float("nan"),
             )
         )
 
-    run_infos.sort(key=lambda r: (r.speed_mm_min, 0 if r.direction == "forward" else 1, natural_key(r.folder_name)))
+    run_type_order = {"direct": 0, "two_stage": 1}
+    dataset_order = {"forward": 0, "backward": 1, "transverse": 2}
+    run_infos.sort(
+        key=lambda r: (
+            9999.0 if not np.isfinite(r.orientation_deg) else float(r.orientation_deg),
+            dataset_order.get(r.dataset_label, 99),
+            r.speed_mm_min,
+            run_type_order.get(r.run_type, 99),
+            9999.0 if not np.isfinite(r.attack_angle_deg) else float(r.attack_angle_deg),
+            r.repeat_idx,
+            natural_key(r.folder_name),
+        )
+    )
     return run_infos
 
 
@@ -335,6 +578,10 @@ def read_capture_log(capture_log_path: str) -> pd.DataFrame:
 
     if "elapsed_s_from_motion_start" not in df.columns:
         df["elapsed_s_from_motion_start"] = np.arange(len(df), dtype=float)
+    if "elapsed_s_from_run_start" not in df.columns:
+        df["elapsed_s_from_run_start"] = pd.to_numeric(df["elapsed_s_from_motion_start"], errors="coerce")
+    if "elapsed_s_from_segment_start" not in df.columns:
+        df["elapsed_s_from_segment_start"] = np.nan
 
     if "phase" not in df.columns:
         df["phase"] = "unknown"
@@ -349,9 +596,31 @@ def read_capture_log(capture_log_path: str) -> pd.DataFrame:
 
     if "direction" not in df.columns:
         df["direction"] = "unknown"
+    if "dataset_label" not in df.columns:
+        df["dataset_label"] = df["direction"]
+    if "orientation_name" not in df.columns:
+        df["orientation_name"] = "unknown"
+    if "orientation_deg" not in df.columns:
+        df["orientation_deg"] = np.nan
+    if "run_type" not in df.columns:
+        df["run_type"] = "direct"
+    if "repeat_idx" not in df.columns:
+        df["repeat_idx"] = 1
+    if "repeat_count" not in df.columns:
+        df["repeat_count"] = 1
+    if "segment_name" not in df.columns:
+        df["segment_name"] = "unknown"
+    if "segment_index" not in df.columns:
+        df["segment_index"] = np.nan
 
     if "speed_mm_min" not in df.columns:
         df["speed_mm_min"] = np.nan
+    if "daq_mode" not in df.columns:
+        df["daq_mode"] = "speed_series"
+    if "attack_angle_deg" not in df.columns:
+        df["attack_angle_deg"] = np.nan
+    if "b_command_mm" not in df.columns:
+        df["b_command_mm"] = np.nan
 
     return df.reset_index(drop=True)
 
@@ -400,6 +669,15 @@ def prepare_calibration_object(
     print("Calibration object created!")
 
     cal.analysis_crop = dict(analysis_crop)
+    cal.tip_refine_mode = DEFAULT_TIP_REFINE_MODE
+    cal.tip_detection_mode = DEFAULT_TIP_DETECTION_MODE
+    cal.tip_parallel_section_near_r = 0.75
+    cal.tip_parallel_section_far_r = 5.0
+    cal.tip_parallel_scan_half_r = 2.5
+    cal.tip_parallel_num_sections = 7
+    cal.tip_parallel_cross_step_px = 0.5
+    cal.tip_parallel_ray_step_px = 0.5
+    cal.tip_parallel_ray_max_len_r = 10.0
 
     if camera_calibration_file is not None and os.path.isfile(camera_calibration_file):
         cal.load_camera_calibration(camera_calibration_file)
@@ -718,7 +996,11 @@ def process_single_run_folder(
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
     print("\n" + "=" * 80)
     print(f"[RUN] Processing {run_info.folder_name}")
-    print(f"      speed={run_info.speed_mm_min:.3f} mm/min | direction={run_info.direction}")
+    print(
+        f"      speed={run_info.speed_mm_min:.3f} mm/min | "
+        f"dataset={run_info.dataset_label} | run_type={run_info.run_type} | "
+        f"orientation={run_info.orientation_name}"
+    )
     print("=" * 80)
 
     run_output_dir = ensure_dir(os.path.join(output_root, RUN_OUTPUT_SUBDIR, run_info.folder_name))
@@ -806,9 +1088,22 @@ def process_single_run_folder(
             "annotated_path": annotated_path,
             "frame_idx": frame_idx,
             "elapsed_s_from_motion_start": elapsed_s,
+            "elapsed_s_from_run_start": float(log_row.get("elapsed_s_from_run_start", elapsed_s)),
+            "elapsed_s_from_segment_start": float(log_row.get("elapsed_s_from_segment_start", np.nan)),
             "sample_type": sample_type,
             "phase": phase,
             "direction": run_info.direction,
+            "dataset_label": run_info.dataset_label,
+            "orientation_name": run_info.orientation_name,
+            "orientation_deg": run_info.orientation_deg,
+            "run_type": run_info.run_type,
+            "repeat_idx": int(run_info.repeat_idx),
+            "repeat_count": int(run_info.repeat_count),
+            "daq_mode": str(log_row.get("daq_mode", run_info.daq_mode)).strip().lower(),
+            "attack_angle_deg": float(pd.to_numeric(log_row.get("attack_angle_deg", run_info.attack_angle_deg), errors="coerce")),
+            "b_command_mm": float(pd.to_numeric(log_row.get("b_command_mm", run_info.b_command_mm), errors="coerce")),
+            "segment_name": str(log_row.get("segment_name", "unknown")).strip().lower(),
+            "segment_index": pd.to_numeric(log_row.get("segment_index", np.nan), errors="coerce"),
             "speed_mm_min": float(run_info.speed_mm_min),
             "tip_row_px": float(analysis["tip_row_px"]),
             "tip_col_px": float(analysis["tip_col_px"]),
@@ -844,27 +1139,36 @@ def process_single_run_folder(
 
     results_df = pd.DataFrame(rows).sort_values("frame_idx").reset_index(drop=True)
     units = choose_run_units(results_df)
+    if units == "mm":
+        results_df["current_x"] = pd.to_numeric(results_df["tip_u_mm"], errors="coerce")
+        results_df["current_y"] = pd.to_numeric(results_df["tip_z_mm"], errors="coerce")
+    else:
+        results_df["current_x"] = pd.to_numeric(results_df["tip_col_px"], errors="coerce")
+        results_df["current_y"] = pd.to_numeric(results_df["tip_row_px"], errors="coerce")
+
+    initial_x = float(results_df.iloc[0]["current_x"])
+    initial_y = float(results_df.iloc[0]["current_y"])
+    results_df["initial_ref_x"] = initial_x
+    results_df["initial_ref_y"] = initial_y
+    results_df["disp_x_from_initial"] = results_df["current_x"] - initial_x
+    results_df["disp_y_from_initial"] = results_df["current_y"] - initial_y
+    results_df["disp_mag_from_initial"] = np.sqrt(
+        results_df["disp_x_from_initial"] ** 2 + results_df["disp_y_from_initial"] ** 2
+    )
 
     motion_df = results_df[results_df["sample_type"] == "motion"].copy()
     if motion_df.empty:
         motion_ref_x = float("nan")
         motion_ref_y = float("nan")
     else:
-        motion_ref_x = float(motion_df.iloc[0]["ref_x"] + motion_df.iloc[0]["disp_x"])
-        motion_ref_y = float(motion_df.iloc[0]["ref_y"] + motion_df.iloc[0]["disp_y"])
+        motion_ref_x = float(motion_df.iloc[0]["current_x"])
+        motion_ref_y = float(motion_df.iloc[0]["current_y"])
 
-    results_df["idle_ref_x"] = float(results_df.iloc[0]["ref_x"])
-    results_df["idle_ref_y"] = float(results_df.iloc[0]["ref_y"])
     results_df["motion_start_ref_x"] = motion_ref_x
     results_df["motion_start_ref_y"] = motion_ref_y
-    results_df["disp_x_from_idle"] = pd.to_numeric(results_df["disp_x"], errors="coerce")
-    results_df["disp_y_from_idle"] = pd.to_numeric(results_df["disp_y"], errors="coerce")
-    results_df["disp_mag_from_idle"] = pd.to_numeric(results_df["disp_mag"], errors="coerce")
     if np.isfinite(motion_ref_x) and np.isfinite(motion_ref_y):
-        current_x = pd.to_numeric(results_df["ref_x"], errors="coerce") + pd.to_numeric(results_df["disp_x"], errors="coerce")
-        current_y = pd.to_numeric(results_df["ref_y"], errors="coerce") + pd.to_numeric(results_df["disp_y"], errors="coerce")
-        results_df["disp_x_from_motion_start"] = current_x - motion_ref_x
-        results_df["disp_y_from_motion_start"] = current_y - motion_ref_y
+        results_df["disp_x_from_motion_start"] = results_df["current_x"] - motion_ref_x
+        results_df["disp_y_from_motion_start"] = results_df["current_y"] - motion_ref_y
         results_df["disp_mag_from_motion_start"] = np.sqrt(
             results_df["disp_x_from_motion_start"] ** 2 + results_df["disp_y_from_motion_start"] ** 2
         )
@@ -872,6 +1176,31 @@ def process_single_run_folder(
         results_df["disp_x_from_motion_start"] = np.nan
         results_df["disp_y_from_motion_start"] = np.nan
         results_df["disp_mag_from_motion_start"] = np.nan
+
+    middle_pause_df = results_df[results_df["sample_type"] == "idle_mid_pause"].copy()
+    if middle_pause_df.empty:
+        middle_pause_x = float("nan")
+        middle_pause_y = float("nan")
+    else:
+        middle_pause_x = float(middle_pause_df.iloc[-1]["current_x"])
+        middle_pause_y = float(middle_pause_df.iloc[-1]["current_y"])
+
+    results_df["middle_pause_ref_x"] = middle_pause_x
+    results_df["middle_pause_ref_y"] = middle_pause_y
+    if np.isfinite(middle_pause_x) and np.isfinite(middle_pause_y):
+        results_df["disp_x_from_middle_pause"] = results_df["current_x"] - middle_pause_x
+        results_df["disp_y_from_middle_pause"] = results_df["current_y"] - middle_pause_y
+        results_df["disp_mag_from_middle_pause"] = np.sqrt(
+            results_df["disp_x_from_middle_pause"] ** 2 + results_df["disp_y_from_middle_pause"] ** 2
+        )
+    else:
+        results_df["disp_x_from_middle_pause"] = np.nan
+        results_df["disp_y_from_middle_pause"] = np.nan
+        results_df["disp_mag_from_middle_pause"] = np.nan
+
+    results_df["disp_x"] = results_df["disp_x_from_initial"]
+    results_df["disp_y"] = results_df["disp_y_from_initial"]
+    results_df["disp_mag"] = results_df["disp_mag_from_initial"]
 
     results_csv_path = os.path.join(run_output_dir, RUN_RESULTS_CSV_NAME)
     results_df.to_csv(results_csv_path, index=False)
@@ -890,39 +1219,78 @@ def process_single_run_folder(
         output_dir=run_output_dir,
         folder_name=run_info.folder_name,
         speed_mm_min=run_info.speed_mm_min,
-        direction=run_info.direction,
+        dataset_label=run_info.dataset_label,
+        run_type=run_info.run_type,
         dx_label=dx_label,
         dy_label=dy_label,
         mag_label=mag_label,
     )
 
     ss_df = results_df[results_df["phase"] == "ss"].copy()
-    if ss_df.empty:
-        mean_ss_disp_x = float("nan")
-        mean_ss_disp_y = float("nan")
-        mean_ss_disp_mag = float("nan")
-        std_ss_disp_mag = float("nan")
-        n_ss = 0
+    second_leg_ss_df = results_df[
+        (results_df["phase"] == "ss") & (results_df["segment_name"] == "mid_to_end")
+    ].copy()
+
+    def _mean_std(frame: pd.DataFrame, prefix: str) -> Tuple[float, float, float, float, int]:
+        if frame.empty:
+            return float("nan"), float("nan"), float("nan"), float("nan"), 0
+        mean_x = float(pd.to_numeric(frame[f"disp_x_from_{prefix}"], errors="coerce").mean())
+        mean_y = float(pd.to_numeric(frame[f"disp_y_from_{prefix}"], errors="coerce").mean())
+        mean_mag = float(pd.to_numeric(frame[f"disp_mag_from_{prefix}"], errors="coerce").mean())
+        std_mag = float(pd.to_numeric(frame[f"disp_mag_from_{prefix}"], errors="coerce").std())
+        return mean_x, mean_y, mean_mag, std_mag, int(len(frame))
+
+    mean_ss_disp_x_from_initial, mean_ss_disp_y_from_initial, mean_ss_disp_mag_from_initial, std_ss_disp_mag_from_initial, n_ss_all = _mean_std(
+        ss_df,
+        "initial",
+    )
+    mean_second_leg_ss_disp_x_from_middle, mean_second_leg_ss_disp_y_from_middle, mean_second_leg_ss_disp_mag_from_middle, std_second_leg_ss_disp_mag_from_middle, n_ss_second_leg = _mean_std(
+        second_leg_ss_df,
+        "middle_pause",
+    )
+
+    if run_info.run_type == "two_stage" and np.isfinite(middle_pause_x) and n_ss_second_leg > 0:
+        mean_ss_disp_x = mean_second_leg_ss_disp_x_from_middle
+        mean_ss_disp_y = mean_second_leg_ss_disp_y_from_middle
+        mean_ss_disp_mag = mean_second_leg_ss_disp_mag_from_middle
+        std_ss_disp_mag = std_second_leg_ss_disp_mag_from_middle
+        n_ss = n_ss_second_leg
+        ss_reference = "middle_pause"
+        ss_segment_name = "mid_to_end"
     else:
-        mean_ss_disp_x = float(pd.to_numeric(ss_df["disp_x"], errors="coerce").mean())
-        mean_ss_disp_y = float(pd.to_numeric(ss_df["disp_y"], errors="coerce").mean())
-        mean_ss_disp_mag = float(pd.to_numeric(ss_df["disp_mag"], errors="coerce").mean())
-        std_ss_disp_mag = float(pd.to_numeric(ss_df["disp_mag"], errors="coerce").std())
-        n_ss = int(len(ss_df))
+        mean_ss_disp_x = mean_ss_disp_x_from_initial
+        mean_ss_disp_y = mean_ss_disp_y_from_initial
+        mean_ss_disp_mag = mean_ss_disp_mag_from_initial
+        std_ss_disp_mag = std_ss_disp_mag_from_initial
+        n_ss = n_ss_all
+        ss_reference = "initial"
+        ss_segment_name = "all_ss"
 
     final_row = results_df.iloc[-1]
     first_motion_row = results_df[results_df["sample_type"] == "motion"].head(1)
     if first_motion_row.empty:
-        idle_to_first_motion_disp_x = float("nan")
-        idle_to_first_motion_disp_y = float("nan")
-        idle_to_first_motion_disp_mag = float("nan")
+        initial_to_first_motion_disp_x = float("nan")
+        initial_to_first_motion_disp_y = float("nan")
+        initial_to_first_motion_disp_mag = float("nan")
         first_motion_frame_idx = float("nan")
     else:
         first_motion = first_motion_row.iloc[0]
-        idle_to_first_motion_disp_x = float(first_motion["disp_x_from_idle"])
-        idle_to_first_motion_disp_y = float(first_motion["disp_y_from_idle"])
-        idle_to_first_motion_disp_mag = float(first_motion["disp_mag_from_idle"])
+        initial_to_first_motion_disp_x = float(first_motion["disp_x_from_initial"])
+        initial_to_first_motion_disp_y = float(first_motion["disp_y_from_initial"])
+        initial_to_first_motion_disp_mag = float(first_motion["disp_mag_from_initial"])
         first_motion_frame_idx = int(first_motion["frame_idx"])
+
+    if middle_pause_df.empty:
+        middle_pause_disp_x_from_initial = float("nan")
+        middle_pause_disp_y_from_initial = float("nan")
+        middle_pause_disp_mag_from_initial = float("nan")
+        middle_pause_frame_idx = float("nan")
+    else:
+        middle_pause_row = middle_pause_df.iloc[-1]
+        middle_pause_disp_x_from_initial = float(middle_pause_row["disp_x_from_initial"])
+        middle_pause_disp_y_from_initial = float(middle_pause_row["disp_y_from_initial"])
+        middle_pause_disp_mag_from_initial = float(middle_pause_row["disp_mag_from_initial"])
+        middle_pause_frame_idx = int(middle_pause_row["frame_idx"])
 
     summary_row: Dict[str, object] = {
         "folder_name": run_info.folder_name,
@@ -931,29 +1299,59 @@ def process_single_run_folder(
         "annotated_dir": annotated_dir,
         "speed_mm_min": float(run_info.speed_mm_min),
         "direction": run_info.direction,
+        "dataset_label": run_info.dataset_label,
+        "orientation_name": run_info.orientation_name,
+        "orientation_deg": float(run_info.orientation_deg),
+        "run_type": run_info.run_type,
+        "repeat_idx": int(run_info.repeat_idx),
+        "repeat_count": int(run_info.repeat_count),
+        "daq_mode": str(run_info.daq_mode),
+        "attack_angle_deg": float(run_info.attack_angle_deg),
+        "b_command_mm": float(run_info.b_command_mm),
         "analysis_units": units,
         "n_frames_analyzed": int(len(results_df)),
         "n_idle_before_frames": int((results_df["sample_type"] == "idle_before_motion").sum()),
+        "n_idle_middle_frames": int((results_df["sample_type"] == "idle_mid_pause").sum()),
         "n_idle_after_frames": int((results_df["sample_type"] == "idle_after_motion").sum()),
-        "n_idle_frames": int(results_df["sample_type"].isin(["idle_before_motion", "idle_after_motion"]).sum()),
+        "n_idle_frames": int(
+            results_df["sample_type"].isin(["idle_before_motion", "idle_mid_pause", "idle_after_motion"]).sum()
+        ),
         "n_missing_images": int(missing_images),
         "n_ss_frames": int(n_ss),
-        "ref_x": float(results_df.iloc[0]["ref_x"]),
-        "ref_y": float(results_df.iloc[0]["ref_y"]),
+        "n_ss_frames_all": int(n_ss_all),
+        "n_ss_frames_second_leg": int(n_ss_second_leg),
+        "initial_ref_x": initial_x,
+        "initial_ref_y": initial_y,
         "motion_start_ref_x": motion_ref_x,
         "motion_start_ref_y": motion_ref_y,
+        "middle_pause_ref_x": middle_pause_x,
+        "middle_pause_ref_y": middle_pause_y,
         "first_motion_frame_idx": first_motion_frame_idx,
-        "idle_to_first_motion_disp_x": idle_to_first_motion_disp_x,
-        "idle_to_first_motion_disp_y": idle_to_first_motion_disp_y,
-        "idle_to_first_motion_disp_mag": idle_to_first_motion_disp_mag,
+        "middle_pause_frame_idx": middle_pause_frame_idx,
+        "initial_to_first_motion_disp_x": initial_to_first_motion_disp_x,
+        "initial_to_first_motion_disp_y": initial_to_first_motion_disp_y,
+        "initial_to_first_motion_disp_mag": initial_to_first_motion_disp_mag,
+        "middle_pause_disp_x_from_initial": middle_pause_disp_x_from_initial,
+        "middle_pause_disp_y_from_initial": middle_pause_disp_y_from_initial,
+        "middle_pause_disp_mag_from_initial": middle_pause_disp_mag_from_initial,
+        "mean_ss_disp_x_from_initial": mean_ss_disp_x_from_initial,
+        "mean_ss_disp_y_from_initial": mean_ss_disp_y_from_initial,
+        "mean_ss_disp_mag_from_initial": mean_ss_disp_mag_from_initial,
+        "std_ss_disp_mag_from_initial": std_ss_disp_mag_from_initial,
+        "mean_second_leg_ss_disp_x_from_middle_pause": mean_second_leg_ss_disp_x_from_middle,
+        "mean_second_leg_ss_disp_y_from_middle_pause": mean_second_leg_ss_disp_y_from_middle,
+        "mean_second_leg_ss_disp_mag_from_middle_pause": mean_second_leg_ss_disp_mag_from_middle,
+        "std_second_leg_ss_disp_mag_from_middle_pause": std_second_leg_ss_disp_mag_from_middle,
+        "ss_reference": ss_reference,
+        "ss_segment_name": ss_segment_name,
         "mean_ss_disp_x": mean_ss_disp_x,
         "mean_ss_disp_y": mean_ss_disp_y,
         "mean_ss_disp_mag": mean_ss_disp_mag,
         "std_ss_disp_mag": std_ss_disp_mag,
-        "final_disp_x": float(final_row["disp_x"]),
-        "final_disp_y": float(final_row["disp_y"]),
-        "final_disp_mag": float(final_row["disp_mag"]),
-        "max_disp_mag": float(pd.to_numeric(results_df["disp_mag"], errors="coerce").max()),
+        "final_disp_x": float(final_row["disp_x_from_initial"]),
+        "final_disp_y": float(final_row["disp_y_from_initial"]),
+        "final_disp_mag": float(final_row["disp_mag_from_initial"]),
+        "max_disp_mag": float(pd.to_numeric(results_df["disp_mag_from_initial"], errors="coerce").max()),
         "min_elapsed_s": float(pd.to_numeric(results_df["elapsed_s_from_motion_start"], errors="coerce").min()),
         "max_elapsed_s": float(pd.to_numeric(results_df["elapsed_s_from_motion_start"], errors="coerce").max()),
     }
@@ -961,7 +1359,8 @@ def process_single_run_folder(
     if np.isfinite(summary_row["mean_ss_disp_mag"]):
         print(
             f"[INFO] {run_info.folder_name} | average steady-state displacement = "
-            f"{summary_row['mean_ss_disp_mag']:.6f} {units} | n_ss={n_ss}"
+            f"{summary_row['mean_ss_disp_mag']:.6f} {units} | "
+            f"ref={summary_row['ss_reference']} | n_ss={n_ss}"
         )
     else:
         print(
@@ -980,12 +1379,13 @@ def make_per_run_plots(
     output_dir: str,
     folder_name: str,
     speed_mm_min: float,
-    direction: str,
+    dataset_label: str,
+    run_type: str,
     dx_label: str,
     dy_label: str,
     mag_label: str,
 ) -> None:
-    title_base = f"{folder_name} | {direction} | {speed_mm_min:.3f} mm/min"
+    title_base = f"{folder_name} | {dataset_label} | {run_type} | {speed_mm_min:.3f} mm/min"
 
     # magnitude scatter vs time
     fig, ax = plt.subplots(figsize=(9.2, 6.2))
@@ -1105,226 +1505,418 @@ def make_per_run_plots(
     )
     plt.close(fig)
 
+    middle_pause_df = results_df[
+        results_df["sample_type"].astype(str).str.lower() == "idle_mid_pause"
+    ].copy()
+    second_leg_ss_df = results_df[
+        (results_df["phase"].astype(str).str.lower() == "ss")
+        & (results_df["segment_name"].astype(str).str.lower() == "mid_to_end")
+    ].copy()
+    if not middle_pause_df.empty or not second_leg_ss_df.empty:
+        fig, ax = plt.subplots(figsize=(9.2, 6.2))
+        fig.patch.set_facecolor("none")
+        fig.patch.set_alpha(0.0)
 
-def make_summary_plots(summary_df: pd.DataFrame, output_dir: str) -> None:
+        elapsed = pd.to_numeric(results_df["elapsed_s_from_run_start"], errors="coerce")
+        disp_mid = pd.to_numeric(results_df["disp_mag_from_middle_pause"], errors="coerce")
+        ax.scatter(
+            elapsed,
+            disp_mid,
+            s=42,
+            color="#8ecae6",
+            alpha=0.72,
+            edgecolors="#f8fafc",
+            linewidths=0.35,
+            label="all frames vs middle pause",
+        )
+        if not second_leg_ss_df.empty:
+            ax.scatter(
+                pd.to_numeric(second_leg_ss_df["elapsed_s_from_run_start"], errors="coerce"),
+                pd.to_numeric(second_leg_ss_df["disp_mag_from_middle_pause"], errors="coerce"),
+                s=58,
+                color=PHASE_COLORS["ss"],
+                alpha=0.92,
+                edgecolors="#f8fafc",
+                linewidths=0.4,
+                label="second-leg steady state",
+            )
+        if not middle_pause_df.empty:
+            ax.scatter(
+                pd.to_numeric(middle_pause_df["elapsed_s_from_run_start"], errors="coerce"),
+                pd.to_numeric(middle_pause_df["disp_mag_from_middle_pause"], errors="coerce"),
+                s=70,
+                color=PHASE_COLORS["pause"],
+                alpha=0.95,
+                edgecolors="#f8fafc",
+                linewidths=0.4,
+                label="middle pause",
+            )
+
+        _apply_dark_axes_style(
+            ax,
+            title=f"{title_base}\nDisplacement relative to middle pause",
+            xlabel="Elapsed time from run start (s)",
+            ylabel=mag_label,
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            leg = ax.legend(loc="best", frameon=True, fontsize=9)
+            leg.get_frame().set_facecolor("#121c28")
+            leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
+            for txt in leg.get_texts():
+                txt.set_color("#e8f0f8")
+        fig.tight_layout()
+        fig.savefig(
+            os.path.join(output_dir, "displacement_from_middle_pause_vs_time.png"),
+            dpi=220,
+            bbox_inches="tight",
+            transparent=True,
+        )
+        plt.close(fig)
+
+
+def make_summary_plots(summary_df: pd.DataFrame, output_dir: str, theme: str = "dark") -> None:
     if summary_df.empty:
         return
 
     output_dir = ensure_dir(output_dir)
+    averaged_df = build_speed_summary(summary_df)
 
     units_mode = summary_df["analysis_units"].mode()
     units = str(units_mode.iloc[0]) if not units_mode.empty else "px"
-    comp_x_label = "Δu" if units == "mm" else "Δx"
-    comp_y_label = "Δz" if units == "mm" else "Δy"
     mag_label = f"|Δtip| ({units})"
-
-    # mean steady-state displacement vs speed, separated
-    fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.8), squeeze=False)
-    fig.patch.set_facecolor("none")
-    fig.patch.set_alpha(0.0)
-
-    for ax, direction in zip(axes.flat, ["forward", "backward"]):
-        dfi = summary_df[summary_df["direction"] == direction].copy().sort_values("speed_mm_min")
-
-        if not dfi.empty:
-            ax.scatter(
-                dfi["speed_mm_min"],
-                dfi["mean_ss_disp_mag"],
-                s=70,
-                color=DIRECTION_COLORS[direction],
-                alpha=0.88,
-                edgecolors="#f8fafc",
-                linewidths=0.45,
-                label=f"{direction} runs",
-            )
-            grouped = dfi.groupby("speed_mm_min", as_index=False)["mean_ss_disp_mag"].mean()
-            ax.plot(
-                grouped["speed_mm_min"],
-                grouped["mean_ss_disp_mag"],
-                linewidth=2.0,
-                marker="o",
-                markersize=5.2,
-                alpha=0.95,
-                label=f"{direction} mean",
-            )
-
-        _apply_dark_axes_style(
-            ax,
-            title=f"Mean steady-state displacement vs speed ({direction})",
-            xlabel="Movement speed (mm/min)",
-            ylabel=mag_label,
-        )
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            leg = ax.legend(loc="best", frameon=True, fontsize=9)
-            leg.get_frame().set_facecolor("#121c28")
-            leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
-            for txt in leg.get_texts():
-                txt.set_color("#e8f0f8")
-
-    fig.tight_layout()
-    fig.savefig(
-        os.path.join(output_dir, "steady_state_mean_displacement_vs_speed_by_direction.png"),
-        dpi=220,
-        bbox_inches="tight",
-        transparent=True,
+    dataset_order = [
+        label for label in ["forward", "backward", "transverse"]
+        if label in set(summary_df["dataset_label"].astype(str).str.lower())
+    ]
+    for label in sorted(set(summary_df["dataset_label"].astype(str).str.lower())):
+        if label not in dataset_order:
+            dataset_order.append(label)
+    fig, axes = plt.subplots(
+        1,
+        max(1, len(dataset_order)),
+        figsize=(5.2 * max(1, len(dataset_order)), 4.8),
+        squeeze=False,
     )
-    plt.close(fig)
+    if theme == "dark":
+        fig.patch.set_facecolor("none")
+        fig.patch.set_alpha(0.0)
+    else:
+        fig.patch.set_facecolor("white")
+        fig.patch.set_alpha(1.0)
 
-    # final displacement vs speed
-    fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.8), squeeze=False)
-    fig.patch.set_facecolor("none")
-    fig.patch.set_alpha(0.0)
-
-    for ax, direction in zip(axes.flat, ["forward", "backward"]):
-        dfi = summary_df[summary_df["direction"] == direction].copy().sort_values("speed_mm_min")
-
-        if not dfi.empty:
-            ax.scatter(
-                dfi["speed_mm_min"],
-                dfi["final_disp_mag"],
-                s=70,
-                color=DIRECTION_COLORS[direction],
-                alpha=0.88,
-                edgecolors="#f8fafc",
-                linewidths=0.45,
-                label=f"{direction} runs",
-            )
-            grouped = dfi.groupby("speed_mm_min", as_index=False)["final_disp_mag"].mean()
-            ax.plot(
-                grouped["speed_mm_min"],
-                grouped["final_disp_mag"],
-                linewidth=2.0,
-                marker="o",
-                markersize=5.2,
-                alpha=0.95,
-                label=f"{direction} mean",
-            )
-
-        _apply_dark_axes_style(
-            ax,
-            title=f"Final displacement vs speed ({direction})",
-            xlabel="Movement speed (mm/min)",
-            ylabel=mag_label,
-        )
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            leg = ax.legend(loc="best", frameon=True, fontsize=9)
-            leg.get_frame().set_facecolor("#121c28")
-            leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
-            for txt in leg.get_texts():
-                txt.set_color("#e8f0f8")
-
-    fig.tight_layout()
-    fig.savefig(
-        os.path.join(output_dir, "final_displacement_vs_speed_by_direction.png"),
-        dpi=220,
-        bbox_inches="tight",
-        transparent=True,
-    )
-    plt.close(fig)
-
-    # max displacement vs speed
-    fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.8), squeeze=False)
-    fig.patch.set_facecolor("none")
-    fig.patch.set_alpha(0.0)
-
-    for ax, direction in zip(axes.flat, ["forward", "backward"]):
-        dfi = summary_df[summary_df["direction"] == direction].copy().sort_values("speed_mm_min")
-
-        if not dfi.empty:
-            ax.scatter(
-                dfi["speed_mm_min"],
-                dfi["max_disp_mag"],
-                s=70,
-                color=DIRECTION_COLORS[direction],
-                alpha=0.88,
-                edgecolors="#f8fafc",
-                linewidths=0.45,
-                label=f"{direction} runs",
-            )
-            grouped = dfi.groupby("speed_mm_min", as_index=False)["max_disp_mag"].mean()
-            ax.plot(
-                grouped["speed_mm_min"],
-                grouped["max_disp_mag"],
-                linewidth=2.0,
-                marker="o",
-                markersize=5.2,
-                alpha=0.95,
-                label=f"{direction} mean",
-            )
-
-        _apply_dark_axes_style(
-            ax,
-            title=f"Max displacement vs speed ({direction})",
-            xlabel="Movement speed (mm/min)",
-            ylabel=mag_label,
-        )
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            leg = ax.legend(loc="best", frameon=True, fontsize=9)
-            leg.get_frame().set_facecolor("#121c28")
-            leg.get_frame().set_edgecolor((0.75, 0.84, 0.93, 0.18))
-            for txt in leg.get_texts():
-                txt.set_color("#e8f0f8")
-
-    fig.tight_layout()
-    fig.savefig(
-        os.path.join(output_dir, "max_displacement_vs_speed_by_direction.png"),
-        dpi=220,
-        bbox_inches="tight",
-        transparent=True,
-    )
-    plt.close(fig)
-
-    # steady-state components vs speed
-    fig, axes = plt.subplots(2, 2, figsize=(13.8, 10.2), squeeze=False)
-    fig.patch.set_facecolor("none")
-    fig.patch.set_alpha(0.0)
-
-    component_specs = [
-        ("mean_ss_disp_x", f"Mean SS {comp_x_label} ({units})"),
-        ("mean_ss_disp_y", f"Mean SS {comp_y_label} ({units})"),
+    curve_specs = [
+        {
+            "label": "Plunge Reset",
+            "run_type": "direct",
+            "color": "#3d70b2",
+        },
+        {
+            "label": "Bath start-stop",
+            "run_type": "two_stage",
+            "color": "#c83f3f",
+        },
     ]
 
-    for row_idx, (col_name, ylabel) in enumerate(component_specs):
-        for col_idx, direction in enumerate(["forward", "backward"]):
-            ax = axes[row_idx, col_idx]
-            dfi = summary_df[summary_df["direction"] == direction].copy().sort_values("speed_mm_min")
+    for col_idx, dataset_label in enumerate(dataset_order):
+        ax = axes[0, col_idx]
+        for spec in curve_specs:
+            dfi = summary_df[
+                (summary_df["run_type"].astype(str).str.lower() == spec["run_type"])
+                & (summary_df["dataset_label"].astype(str).str.lower() == dataset_label)
+            ].copy().sort_values("speed_mm_min")
+            avgi = averaged_df[
+                (averaged_df["run_type"].astype(str).str.lower() == spec["run_type"])
+                & (averaged_df["dataset_label"].astype(str).str.lower() == dataset_label)
+            ].copy().sort_values("speed_mm_min")
             if not dfi.empty:
+                run_vals = pd.to_numeric(dfi["mean_ss_disp_mag"], errors="coerce")
+                run_speed = pd.to_numeric(dfi["speed_mm_min"], errors="coerce")
+                mask = run_speed.notna() & run_vals.notna()
+                if mask.any():
+                    ax.scatter(
+                        run_speed[mask],
+                        run_vals[mask],
+                        s=50,
+                        color=spec["color"],
+                        alpha=0.22,
+                        edgecolors="none",
+                        label=None,
+                    )
+            if not avgi.empty:
+                mean_vals = pd.to_numeric(avgi["mean_of_mean_ss_disp_mag"], errors="coerce")
+                std_vals = pd.to_numeric(avgi["std_of_mean_ss_disp_mag"], errors="coerce").fillna(0.0)
+                speed_vals = pd.to_numeric(avgi["speed_mm_min"], errors="coerce")
+                mask = speed_vals.notna() & mean_vals.notna()
+                if mask.any():
+                    ax.errorbar(
+                        speed_vals[mask],
+                        mean_vals[mask],
+                        yerr=std_vals[mask],
+                        linewidth=2.0,
+                        marker="o",
+                        markersize=5.2,
+                        alpha=0.95,
+                        color=spec["color"],
+                        capsize=3.5,
+                        label=spec["label"],
+                    )
+
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label}\nSteady-state displacement vs speed",
+            xlabel="Bath speed (mm/min)",
+            ylabel=f"{mag_label} | plunge reset / bath start-stop" if col_idx == 0 else "",
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            leg = ax.legend(loc="best", frameon=True, fontsize=9)
+            _style_legend(leg, theme)
+
+    fig.tight_layout()
+    _save_plot_outputs(
+        fig,
+        os.path.join(output_dir, "steady_state_displacement_vs_speed_by_dataset_and_run_type"),
+        theme,
+    )
+    plt.close(fig)
+
+    two_stage_df = summary_df[
+        summary_df["run_type"].astype(str).str.lower() == "two_stage"
+    ].copy()
+    if not two_stage_df.empty:
+        fig, axes = plt.subplots(1, max(1, len(dataset_order)), figsize=(5.2 * max(1, len(dataset_order)), 5.0), squeeze=False)
+        if theme == "dark":
+            fig.patch.set_facecolor("none")
+            fig.patch.set_alpha(0.0)
+        else:
+            fig.patch.set_facecolor("white")
+            fig.patch.set_alpha(1.0)
+        for col_idx, dataset_label in enumerate(dataset_order):
+            ax = axes[0, col_idx]
+            dfi = two_stage_df[
+                two_stage_df["dataset_label"].astype(str).str.lower() == dataset_label
+            ].copy().sort_values("speed_mm_min")
+            if not dfi.empty:
+                color = DATASET_COLORS.get(dataset_label, "#fca5a5")
                 ax.scatter(
                     dfi["speed_mm_min"],
-                    dfi[col_name],
-                    s=64,
-                    color=DIRECTION_COLORS[direction],
-                    alpha=0.88,
-                    edgecolors="#f8fafc",
-                    linewidths=0.45,
+                    dfi["middle_pause_disp_mag_from_initial"],
+                    s=72,
+                    color=color,
+                    alpha=0.36,
+                    edgecolors="none",
+                    label="runs",
                 )
-                grouped = dfi.groupby("speed_mm_min", as_index=False)[col_name].mean()
-                ax.plot(
-                    grouped["speed_mm_min"],
-                    grouped[col_name],
+                avg_dfi = averaged_df[
+                    (averaged_df["run_type"].astype(str).str.lower() == "two_stage")
+                    & (averaged_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                ].copy().sort_values("speed_mm_min")
+                yerr = pd.to_numeric(avg_dfi["mean_of_middle_pause_disp_mag_from_initial"], errors="coerce") * 0.0
+                ax.errorbar(
+                    avg_dfi["speed_mm_min"],
+                    avg_dfi["mean_of_middle_pause_disp_mag_from_initial"],
+                    yerr=yerr,
                     linewidth=2.0,
                     marker="o",
                     markersize=5.2,
                     alpha=0.95,
+                    color=color,
+                    capsize=3.5,
+                    label="repeat mean",
                 )
-
-            ax.axhline(0.0, color="#cbd5e1", linestyle="--", linewidth=1.0, alpha=0.65)
-            _apply_dark_axes_style(
+            _style_axes(
                 ax,
-                title=f"{ylabel} vs speed ({direction})",
-                xlabel="Movement speed (mm/min)",
-                ylabel=ylabel,
+                theme,
+                title=f"{dataset_label} | two_stage\nMiddle-pause displacement vs speed",
+                xlabel="Bath speed (mm/min)",
+                ylabel=f"{mag_label} from initial pose",
             )
+            handles, labels = ax.get_legend_handles_labels()
+            if handles:
+                leg = ax.legend(loc="best", frameon=True, fontsize=9)
+                _style_legend(leg, theme)
+        fig.tight_layout()
+        _save_plot_outputs(
+            fig,
+            os.path.join(output_dir, "middle_pause_displacement_vs_speed_by_dataset"),
+            theme,
+        )
+        plt.close(fig)
 
+
+    make_b_attack_summary_plots(summary_df, output_dir, theme=theme)
+
+
+def make_b_attack_summary_plots(summary_df: pd.DataFrame, output_dir: str, theme: str = "dark") -> None:
+    if summary_df.empty or "attack_angle_deg" not in summary_df.columns:
+        return
+
+    attack_df = summary_df[pd.to_numeric(summary_df["attack_angle_deg"], errors="coerce").notna()].copy()
+    if attack_df.empty:
+        return
+
+    attack_df["attack_angle_deg"] = pd.to_numeric(attack_df["attack_angle_deg"], errors="coerce")
+    attack_df["mean_ss_disp_mag"] = pd.to_numeric(attack_df["mean_ss_disp_mag"], errors="coerce")
+    attack_df["middle_pause_disp_mag_from_initial"] = pd.to_numeric(
+        attack_df["middle_pause_disp_mag_from_initial"], errors="coerce"
+    )
+
+    units_mode = attack_df["analysis_units"].mode()
+    units = str(units_mode.iloc[0]) if not units_mode.empty else "px"
+    mag_label = f"|Δtip| ({units})"
+
+    group_cols = [
+        "dataset_label",
+        "orientation_name",
+        "orientation_deg",
+        "speed_mm_min",
+        "attack_angle_deg",
+        "analysis_units",
+    ]
+    avg_df = (
+        attack_df.groupby(group_cols, as_index=False)
+        .agg(
+            n_runs=("folder_name", "count"),
+            mean_of_mean_ss_disp_mag=("mean_ss_disp_mag", "mean"),
+            std_of_mean_ss_disp_mag=("mean_ss_disp_mag", "std"),
+            mean_middle_pause_disp_mag_from_initial=("middle_pause_disp_mag_from_initial", "mean"),
+            std_middle_pause_disp_mag_from_initial=("middle_pause_disp_mag_from_initial", "std"),
+            mean_b_command_mm=("b_command_mm", "mean"),
+        )
+        .sort_values(["orientation_deg", "speed_mm_min", "attack_angle_deg"])
+        .reset_index(drop=True)
+    )
+    avg_csv = os.path.join(output_dir, "b_attack_summary_by_attack_angle.csv")
+    avg_df.to_csv(avg_csv, index=False)
+
+    dataset_order = []
+    for label in ["forward", "backward", "transverse"]:
+        if label in set(attack_df["dataset_label"].astype(str).str.lower()):
+            dataset_order.append(label)
+    for label in sorted(set(attack_df["dataset_label"].astype(str).str.lower())):
+        if label not in dataset_order:
+            dataset_order.append(label)
+
+    fig, axes = plt.subplots(
+        1,
+        max(1, len(dataset_order)),
+        figsize=(5.4 * max(1, len(dataset_order)), 5.1),
+        squeeze=False,
+    )
+    if theme == "dark":
+        fig.patch.set_facecolor("none")
+        fig.patch.set_alpha(0.0)
+    else:
+        fig.patch.set_facecolor("white")
+        fig.patch.set_alpha(1.0)
+
+    for col_idx, dataset_label in enumerate(dataset_order):
+        ax = axes[0, col_idx]
+        dfi = attack_df[attack_df["dataset_label"].astype(str).str.lower() == dataset_label].copy()
+        avgi = avg_df[avg_df["dataset_label"].astype(str).str.lower() == dataset_label].copy()
+        color = DATASET_COLORS.get(dataset_label, "#93c5fd")
+        if not dfi.empty:
+            ax.scatter(
+                dfi["attack_angle_deg"],
+                dfi["mean_ss_disp_mag"],
+                s=58,
+                color=color,
+                alpha=0.36,
+                edgecolors="none",
+                label="runs",
+            )
+        if not avgi.empty:
+            yerr = pd.to_numeric(avgi["std_of_mean_ss_disp_mag"], errors="coerce").fillna(0.0)
+            ax.errorbar(
+                avgi["attack_angle_deg"],
+                avgi["mean_of_mean_ss_disp_mag"],
+                yerr=yerr,
+                linewidth=2.2,
+                marker="o",
+                markersize=4.8,
+                alpha=0.95,
+                color=color,
+                capsize=3.5,
+                label="repeat mean",
+            )
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label} | B-attack sweep\nSteady-state displacement vs attack angle",
+            xlabel="B curl attack angle (deg)",
+            ylabel=f"{mag_label} | second leg from middle pose",
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            leg = ax.legend(loc="best", frameon=True, fontsize=9)
+            _style_legend(leg, theme)
     fig.tight_layout()
-    fig.savefig(
-        os.path.join(output_dir, "steady_state_components_vs_speed_by_direction.png"),
-        dpi=220,
-        bbox_inches="tight",
-        transparent=True,
+    _save_plot_outputs(
+        fig,
+        os.path.join(output_dir, "b_attack_steady_state_displacement_vs_attack_angle"),
+        theme,
+    )
+    plt.close(fig)
+
+    fig, axes = plt.subplots(
+        1,
+        max(1, len(dataset_order)),
+        figsize=(5.4 * max(1, len(dataset_order)), 5.1),
+        squeeze=False,
+    )
+    if theme == "dark":
+        fig.patch.set_facecolor("none")
+        fig.patch.set_alpha(0.0)
+    else:
+        fig.patch.set_facecolor("white")
+        fig.patch.set_alpha(1.0)
+    for col_idx, dataset_label in enumerate(dataset_order):
+        ax = axes[0, col_idx]
+        dfi = attack_df[attack_df["dataset_label"].astype(str).str.lower() == dataset_label].copy()
+        avgi = avg_df[avg_df["dataset_label"].astype(str).str.lower() == dataset_label].copy()
+        color = DATASET_COLORS.get(dataset_label, "#fca5a5")
+        if not dfi.empty:
+            ax.scatter(
+                dfi["attack_angle_deg"],
+                dfi["middle_pause_disp_mag_from_initial"],
+                s=58,
+                color=color,
+                alpha=0.36,
+                edgecolors="none",
+                label="runs",
+            )
+        if not avgi.empty:
+            yerr = pd.to_numeric(avgi["std_middle_pause_disp_mag_from_initial"], errors="coerce").fillna(0.0) if "std_middle_pause_disp_mag_from_initial" in avgi.columns else pd.Series(np.zeros(len(avgi)))
+            ax.errorbar(
+                avgi["attack_angle_deg"],
+                avgi["mean_middle_pause_disp_mag_from_initial"],
+                yerr=yerr,
+                linewidth=2.2,
+                marker="o",
+                markersize=4.8,
+                alpha=0.95,
+                color=color,
+                capsize=3.5,
+                label="repeat mean",
+            )
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label} | B-attack sweep\nMiddle-pause displacement vs attack angle",
+            xlabel="B curl attack angle (deg)",
+            ylabel=f"{mag_label} from initial pose",
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            leg = ax.legend(loc="best", frameon=True, fontsize=9)
+            _style_legend(leg, theme)
+    fig.tight_layout()
+    _save_plot_outputs(
+        fig,
+        os.path.join(output_dir, "b_attack_middle_pause_displacement_vs_attack_angle"),
+        theme,
     )
     plt.close(fig)
 
@@ -1334,20 +1926,413 @@ def build_speed_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     grouped = (
-        summary_df.groupby(["direction", "speed_mm_min", "analysis_units"], as_index=False)
+        summary_df.groupby(
+            [
+                "dataset_label",
+                "run_type",
+                "orientation_name",
+                "orientation_deg",
+                "speed_mm_min",
+                "analysis_units",
+                "repeat_count",
+            ],
+            as_index=False,
+        )
         .agg(
             n_runs=("folder_name", "count"),
             mean_of_mean_ss_disp_mag=("mean_ss_disp_mag", "mean"),
             std_of_mean_ss_disp_mag=("mean_ss_disp_mag", "std"),
-            mean_of_final_disp_mag=("final_disp_mag", "mean"),
-            mean_of_max_disp_mag=("max_disp_mag", "mean"),
             mean_of_mean_ss_disp_x=("mean_ss_disp_x", "mean"),
             mean_of_mean_ss_disp_y=("mean_ss_disp_y", "mean"),
+            mean_of_middle_pause_disp_mag_from_initial=("middle_pause_disp_mag_from_initial", "mean"),
+            mean_of_initial_to_first_motion_disp_mag=("initial_to_first_motion_disp_mag", "mean"),
+            std_of_initial_to_first_motion_disp_mag=("initial_to_first_motion_disp_mag", "std"),
+            mean_of_final_disp_mag=("final_disp_mag", "mean"),
+            std_of_final_disp_mag=("final_disp_mag", "std"),
+            mean_of_max_disp_mag=("max_disp_mag", "mean"),
         )
-        .sort_values(["direction", "speed_mm_min"])
+        .sort_values(["dataset_label", "run_type", "orientation_name", "speed_mm_min"])
         .reset_index(drop=True)
     )
     return grouped
+
+
+def infer_fixed_b_key_from_path(path_text: str) -> Optional[str]:
+    txt = str(path_text)
+    for key in FIXED_B_SERIES.keys():
+        if f"/{key}/" in txt or txt.endswith(f"/{key}") or f"\\{key}\\" in txt:
+            return key
+    return None
+
+
+def attach_fixed_b_metadata(df: pd.DataFrame, fixed_b_key: str) -> pd.DataFrame:
+    out = df.copy()
+    meta = FIXED_B_SERIES.get(fixed_b_key, {})
+    out["fixed_b_key"] = fixed_b_key
+    out["curl_angle_deg"] = float(meta.get("curl_angle_deg", np.nan))
+    out["curl_angle_label"] = str(meta.get("label", fixed_b_key))
+    out["series_color"] = str(meta.get("color", "#3d70b2"))
+    return out
+
+
+def load_existing_analysis_frames(project_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    analysis_root = os.path.join(
+        os.path.abspath(project_dir),
+        "processed_image_data_folder",
+        "tip_tracking_analysis",
+    )
+    if not os.path.isdir(analysis_root):
+        raise FileNotFoundError(f"tip_tracking_analysis not found: {analysis_root}")
+
+    per_run_frames: List[pd.DataFrame] = []
+    per_speed_frames: List[pd.DataFrame] = []
+
+    for fixed_b_key in FIXED_B_SERIES.keys():
+        subdir = os.path.join(analysis_root, fixed_b_key)
+        run_summary_path = os.path.join(subdir, RUN_SUMMARY_CSV_NAME)
+        if not os.path.isfile(run_summary_path):
+            continue
+        run_df = pd.read_csv(run_summary_path)
+        per_run_frames.append(attach_fixed_b_metadata(run_df, fixed_b_key))
+
+        speed_summary_path = os.path.join(subdir, SPEED_SUMMARY_CSV_NAME)
+        if os.path.isfile(speed_summary_path):
+            speed_df = pd.read_csv(speed_summary_path)
+        else:
+            speed_df = build_speed_summary(run_df)
+        per_speed_frames.append(attach_fixed_b_metadata(speed_df, fixed_b_key))
+
+    if not per_run_frames:
+        run_summary_path = os.path.join(analysis_root, RUN_SUMMARY_CSV_NAME)
+        if not os.path.isfile(run_summary_path):
+            raise FileNotFoundError(
+                f"No reusable run_summary.csv found under: {analysis_root}"
+            )
+        run_df = pd.read_csv(run_summary_path)
+        key = infer_fixed_b_key_from_path(run_summary_path) or "fixed_b_0"
+        per_run_frames.append(attach_fixed_b_metadata(run_df, key))
+        speed_summary_path = os.path.join(analysis_root, SPEED_SUMMARY_CSV_NAME)
+        if os.path.isfile(speed_summary_path):
+            speed_df = pd.read_csv(speed_summary_path)
+        else:
+            speed_df = build_speed_summary(run_df)
+        per_speed_frames.append(attach_fixed_b_metadata(speed_df, key))
+
+    per_run_df = pd.concat(per_run_frames, ignore_index=True)
+    per_speed_df = pd.concat(per_speed_frames, ignore_index=True)
+    return per_run_df, per_speed_df
+
+
+def make_fixed_b_overlay_summary_plot(
+    per_run_df: pd.DataFrame,
+    per_speed_df: pd.DataFrame,
+    output_dir: str,
+    theme: str = "light",
+) -> None:
+    if per_run_df.empty or per_speed_df.empty:
+        return
+
+    output_dir = ensure_dir(output_dir)
+    units_mode = per_run_df["analysis_units"].mode()
+    units = str(units_mode.iloc[0]) if not units_mode.empty else "px"
+    mag_label = f"|Δtip| ({units})"
+
+    dataset_order = [
+        label for label in ["forward", "backward", "transverse"]
+        if label in set(per_run_df["dataset_label"].astype(str).str.lower())
+    ]
+    for label in sorted(set(per_run_df["dataset_label"].astype(str).str.lower())):
+        if label not in dataset_order:
+            dataset_order.append(label)
+
+    fig, axes = plt.subplots(
+        1,
+        max(1, len(dataset_order)),
+        figsize=(4.8 * max(1, len(dataset_order)), 4.0),
+        squeeze=False,
+        sharey=False,
+    )
+    fig.patch.set_facecolor("white")
+    fig.patch.set_alpha(1.0)
+
+    for col_idx, dataset_label in enumerate(dataset_order):
+        ax = axes[0, col_idx]
+        for fixed_b_key in ["fixed_b_0", "fixed_b_m3p2", "fixed_b_m5p1"]:
+            meta = FIXED_B_SERIES[fixed_b_key]
+            dfi = per_run_df[
+                (per_run_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (per_run_df["fixed_b_key"].astype(str) == fixed_b_key)
+            ].copy().sort_values("speed_mm_min")
+            avgi = per_speed_df[
+                (per_speed_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (per_speed_df["fixed_b_key"].astype(str) == fixed_b_key)
+            ].copy().sort_values("speed_mm_min")
+            if not dfi.empty:
+                ax.scatter(
+                    dfi["speed_mm_min"],
+                    dfi["mean_ss_disp_mag"],
+                    s=34,
+                    color=meta["color"],
+                    alpha=0.28,
+                    edgecolors="none",
+                    label=None,
+                )
+            if not avgi.empty:
+                yerr = pd.to_numeric(avgi["std_of_mean_ss_disp_mag"], errors="coerce").fillna(0.0)
+                ax.errorbar(
+                    avgi["speed_mm_min"],
+                    avgi["mean_of_mean_ss_disp_mag"],
+                    yerr=yerr,
+                    color=meta["color"],
+                    linewidth=1.8,
+                    marker="o",
+                    markersize=4.2,
+                    capsize=3.2,
+                    alpha=0.97,
+                    label=f"{meta['label']} curl",
+                )
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label}",
+            xlabel="Bath speed (mm/min)",
+            ylabel=f"{mag_label} | steady state" if col_idx == 0 else "",
+        )
+        leg = ax.legend(loc="best", frameon=True, fontsize=7.0)
+        _style_legend(leg, theme)
+
+    fig.tight_layout()
+    _save_plot_outputs(
+        fig,
+        os.path.join(output_dir, "steady_state_displacement_vs_speed_overlay_by_fixed_b"),
+        theme,
+    )
+    plt.close(fig)
+
+    for dataset_label in dataset_order:
+        fig, ax = plt.subplots(figsize=(4.8, 4.0))
+        fig.patch.set_facecolor("white")
+        fig.patch.set_alpha(1.0)
+        for fixed_b_key in ["fixed_b_0", "fixed_b_m3p2", "fixed_b_m5p1"]:
+            meta = FIXED_B_SERIES[fixed_b_key]
+            dfi = per_run_df[
+                (per_run_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (per_run_df["fixed_b_key"].astype(str) == fixed_b_key)
+            ].copy().sort_values("speed_mm_min")
+            avgi = per_speed_df[
+                (per_speed_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (per_speed_df["fixed_b_key"].astype(str) == fixed_b_key)
+            ].copy().sort_values("speed_mm_min")
+            if not dfi.empty:
+                ax.scatter(
+                    dfi["speed_mm_min"],
+                    dfi["mean_ss_disp_mag"],
+                    s=34,
+                    color=meta["color"],
+                    alpha=0.28,
+                    edgecolors="none",
+                    label=None,
+                )
+            if not avgi.empty:
+                yerr = pd.to_numeric(avgi["std_of_mean_ss_disp_mag"], errors="coerce").fillna(0.0)
+                ax.errorbar(
+                    avgi["speed_mm_min"],
+                    avgi["mean_of_mean_ss_disp_mag"],
+                    yerr=yerr,
+                    color=meta["color"],
+                    linewidth=1.8,
+                    marker="o",
+                    markersize=4.2,
+                    capsize=3.2,
+                    alpha=0.97,
+                    label=f"{meta['label']} curl",
+                )
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label}",
+            xlabel="Bath speed (mm/min)",
+            ylabel=f"{mag_label} | steady state",
+        )
+        leg = ax.legend(loc="best", frameon=True, fontsize=7.0)
+        _style_legend(leg, theme)
+        fig.tight_layout()
+        _save_plot_outputs(
+            fig,
+            os.path.join(output_dir, f"steady_state_displacement_vs_speed_overlay_{dataset_label}"),
+            theme,
+        )
+        plt.close(fig)
+
+
+def make_plunge_and_bath_plots(
+    summary_df: pd.DataFrame,
+    output_dir: str,
+    theme: str = "light",
+) -> None:
+    if summary_df.empty:
+        return
+
+    output_dir = ensure_dir(output_dir)
+    averaged_df = build_speed_summary(summary_df)
+    units_mode = summary_df["analysis_units"].mode()
+    units = str(units_mode.iloc[0]) if not units_mode.empty else "px"
+    ylabel = f"|Δtip| ({units})"
+    dataset_order = [
+        label for label in ["forward", "backward", "transverse"]
+        if label in set(summary_df["dataset_label"].astype(str).str.lower())
+    ]
+    for label in sorted(set(summary_df["dataset_label"].astype(str).str.lower())):
+        if label not in dataset_order:
+            dataset_order.append(label)
+
+    curve_specs = [
+        {
+            "label": "Plunge Reset",
+            "run_type": "direct",
+            "run_col": "mean_ss_disp_mag",
+            "mean_col": "mean_of_mean_ss_disp_mag",
+            "std_col": "std_of_mean_ss_disp_mag",
+            "color": "#3d70b2",
+        },
+        {
+            "label": "Bath start-stop",
+            "run_type": "two_stage",
+            "run_col": "mean_ss_disp_mag",
+            "mean_col": "mean_of_mean_ss_disp_mag",
+            "std_col": "std_of_mean_ss_disp_mag",
+            "color": "#c83f3f",
+        },
+    ]
+
+    fig, axes = plt.subplots(
+        1,
+        max(1, len(dataset_order)),
+        figsize=(4.8 * max(1, len(dataset_order)), 4.0),
+        squeeze=False,
+        sharey=True,
+    )
+    fig.patch.set_facecolor("white" if theme == "light" else "none")
+    fig.patch.set_alpha(1.0 if theme == "light" else 0.0)
+
+    for col_idx, dataset_label in enumerate(dataset_order):
+        ax = axes[0, col_idx]
+        for spec in curve_specs:
+            dfi = summary_df[
+                (summary_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (summary_df["run_type"].astype(str).str.lower() == spec["run_type"])
+            ].copy().sort_values("speed_mm_min")
+            avgi = averaged_df[
+                (averaged_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (averaged_df["run_type"].astype(str).str.lower() == spec["run_type"])
+            ].copy().sort_values("speed_mm_min")
+            run_vals = pd.to_numeric(dfi[spec["run_col"]], errors="coerce")
+            run_speed = pd.to_numeric(dfi["speed_mm_min"], errors="coerce")
+            mask = run_speed.notna() & run_vals.notna()
+            if mask.any():
+                ax.scatter(
+                    run_speed[mask],
+                    run_vals[mask],
+                    s=32,
+                    color=spec["color"],
+                    alpha=0.22,
+                    edgecolors="none",
+                    label=None,
+                )
+            mean_vals = pd.to_numeric(avgi[spec["mean_col"]], errors="coerce")
+            std_vals = pd.to_numeric(avgi[spec["std_col"]], errors="coerce").fillna(0.0)
+            speed_vals = pd.to_numeric(avgi["speed_mm_min"], errors="coerce")
+            mask = speed_vals.notna() & mean_vals.notna()
+            if mask.any():
+                ax.errorbar(
+                    speed_vals[mask],
+                    mean_vals[mask],
+                    yerr=std_vals[mask],
+                    color=spec["color"],
+                    linewidth=1.8,
+                    marker="o",
+                    markersize=4.2,
+                    capsize=3.2,
+                    alpha=0.97,
+                    label=spec["label"],
+                )
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label}",
+            xlabel="Bath speed (mm/min)",
+            ylabel=f"{ylabel}" if col_idx == 0 else "",
+        )
+        leg = ax.legend(loc="best", frameon=True, fontsize=7.0)
+        _style_legend(leg, theme)
+
+    fig.tight_layout()
+    _save_plot_outputs(
+        fig,
+        os.path.join(output_dir, "plunge_reset_and_bath_start_stop_by_dataset"),
+        theme,
+    )
+    plt.close(fig)
+
+    for dataset_label in dataset_order:
+        fig, ax = plt.subplots(figsize=(4.8, 4.0))
+        fig.patch.set_facecolor("white" if theme == "light" else "none")
+        fig.patch.set_alpha(1.0 if theme == "light" else 0.0)
+        for spec in curve_specs:
+            dfi = summary_df[
+                (summary_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (summary_df["run_type"].astype(str).str.lower() == spec["run_type"])
+            ].copy().sort_values("speed_mm_min")
+            avgi = averaged_df[
+                (averaged_df["dataset_label"].astype(str).str.lower() == dataset_label)
+                & (averaged_df["run_type"].astype(str).str.lower() == spec["run_type"])
+            ].copy().sort_values("speed_mm_min")
+            run_vals = pd.to_numeric(dfi[spec["run_col"]], errors="coerce")
+            run_speed = pd.to_numeric(dfi["speed_mm_min"], errors="coerce")
+            mask = run_speed.notna() & run_vals.notna()
+            if mask.any():
+                ax.scatter(
+                    run_speed[mask],
+                    run_vals[mask],
+                    s=32,
+                    color=spec["color"],
+                    alpha=0.22,
+                    edgecolors="none",
+                    label=None,
+                )
+            mean_vals = pd.to_numeric(avgi[spec["mean_col"]], errors="coerce")
+            std_vals = pd.to_numeric(avgi[spec["std_col"]], errors="coerce").fillna(0.0)
+            speed_vals = pd.to_numeric(avgi["speed_mm_min"], errors="coerce")
+            mask = speed_vals.notna() & mean_vals.notna()
+            if mask.any():
+                ax.errorbar(
+                    speed_vals[mask],
+                    mean_vals[mask],
+                    yerr=std_vals[mask],
+                    color=spec["color"],
+                    linewidth=1.8,
+                    marker="o",
+                    markersize=4.2,
+                    capsize=3.2,
+                    alpha=0.97,
+                    label=spec["label"],
+                )
+        _style_axes(
+            ax,
+            theme,
+            title=f"{dataset_label}",
+            xlabel="Bath speed (mm/min)",
+            ylabel=ylabel,
+        )
+        leg = ax.legend(loc="best", frameon=True, fontsize=7.0)
+        _style_legend(leg, theme)
+        fig.tight_layout()
+        _save_plot_outputs(
+            fig,
+            os.path.join(output_dir, f"plunge_reset_and_bath_start_stop_{dataset_label}"),
+            theme,
+        )
+        plt.close(fig)
 
 
 # =========================
@@ -1357,9 +2342,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Process all run folders inside raw_image_data_folder, track tip displacement "
-            "relative to the first image in each folder using the CTR shadow calibration "
-            "pipeline, save annotated tip outputs, and generate summary plots. Forward and "
-            "backward runs remain separate."
+            "using the CTR shadow calibration pipeline plus the CNN tip refiner, save "
+            "annotated tip outputs, and generate steady-state displacement summaries for "
+            "direct and two-stage deflection runs across C0/C180/C90 orientations."
         )
     )
 
@@ -1454,16 +2439,55 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TIP_REFINER_COMPARE_ONLY,
         help="Run the CNN refiner for debug only and keep the classical selected tip.",
     )
+    parser.add_argument(
+        "--reuse-existing-analysis",
+        action="store_true",
+        help="Skip image analysis and rebuild plots from existing tip_tracking_analysis CSV summaries.",
+    )
+    parser.add_argument(
+        "--plot-theme",
+        choices=["dark", "light"],
+        default="light",
+        help="Summary plot theme. Default: light.",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.plot_theme == "light":
+        set_science_light_style()
 
     raw_root = resolve_raw_root(project_dir=args.project_dir, raw_root=args.raw_root)
     output_root = infer_output_root(args.project_dir, raw_root, args.output_dir)
-    summary_plot_dir = ensure_dir(os.path.join(output_root, SUMMARY_PLOT_DIRNAME))
+    summary_plot_dir = themed_summary_plot_dir(output_root, args.plot_theme)
+
+    if bool(args.reuse_existing_analysis):
+        if args.project_dir is None:
+            raise ValueError("--reuse-existing-analysis currently requires --project-dir.")
+        summary_df, speed_summary_df = load_existing_analysis_frames(args.project_dir)
+        analysis_root = os.path.join(
+            os.path.abspath(args.project_dir),
+            "processed_image_data_folder",
+            "tip_tracking_analysis",
+        )
+        has_fixed_b_subdirs = any(
+            os.path.isdir(os.path.join(analysis_root, key)) for key in FIXED_B_SERIES.keys()
+        )
+        if has_fixed_b_subdirs:
+            for fixed_b_key in sorted(summary_df["fixed_b_key"].astype(str).unique(), key=lambda x: FIXED_B_SERIES.get(x, {}).get("curl_angle_deg", 0.0)):
+                per_fixed_dir = ensure_dir(os.path.join(summary_plot_dir, fixed_b_key))
+                per_fixed_df = summary_df[summary_df["fixed_b_key"].astype(str) == fixed_b_key].copy()
+                make_summary_plots(per_fixed_df, per_fixed_dir, theme=str(args.plot_theme))
+            make_fixed_b_overlay_summary_plot(summary_df, speed_summary_df, summary_plot_dir, theme=str(args.plot_theme))
+        else:
+            make_summary_plots(summary_df, summary_plot_dir, theme=str(args.plot_theme))
+            make_plunge_and_bath_plots(summary_df, summary_plot_dir, theme=str(args.plot_theme))
+        print("\n[INFO] Reused existing analysis summaries only; images were not reprocessed.")
+        print(f"  - project_dir: {os.path.abspath(args.project_dir)}")
+        print(f"  - summary_plots_dir: {summary_plot_dir}")
+        return
 
     run_infos = find_run_folders(raw_root)
     if not run_infos:
@@ -1473,7 +2497,8 @@ def main() -> None:
     for run_info in run_infos:
         print(
             f"  - {run_info.folder_name} | speed={run_info.speed_mm_min:.3f} mm/min | "
-            f"direction={run_info.direction}"
+            f"dataset={run_info.dataset_label} | run_type={run_info.run_type} | "
+            f"orientation={run_info.orientation_name}"
         )
 
     analysis_crop = load_or_create_analysis_crop(
@@ -1510,7 +2535,7 @@ def main() -> None:
 
     summary_df = (
         pd.DataFrame(summary_rows)
-        .sort_values(["speed_mm_min", "direction", "folder_name"])
+        .sort_values(["orientation_deg", "dataset_label", "run_type", "speed_mm_min", "folder_name"])
         .reset_index(drop=True)
     )
     summary_csv_path = os.path.join(output_root, RUN_SUMMARY_CSV_NAME)
@@ -1526,7 +2551,7 @@ def main() -> None:
     if not speed_summary_df.empty:
         speed_summary_df.to_csv(speed_summary_csv_path, index=False)
 
-    make_summary_plots(summary_df, summary_plot_dir)
+    make_summary_plots(summary_df, summary_plot_dir, theme=str(args.plot_theme))
 
     print("\n" + "=" * 80)
     print("[INFO] Average tip displacement during steady state")
@@ -1541,17 +2566,20 @@ def main() -> None:
         print(
             f"{row['folder_name']}: "
             f"speed={float(row['speed_mm_min']):.3f} mm/min | "
-            f"direction={row['direction']} | "
+            f"dataset={row['dataset_label']} | "
+            f"run_type={row['run_type']} | "
+            f"ref={row['ss_reference']} | "
             f"avg_ss_disp={avg_ss_str}"
         )
 
     if not speed_summary_df.empty:
         print("\n" + "=" * 80)
-        print("[INFO] Mean steady-state displacement by speed and direction")
+        print("[INFO] Mean steady-state displacement by speed, dataset, and run type")
         print("=" * 80)
         for _, row in speed_summary_df.iterrows():
             print(
-                f"{row['direction']} | speed={float(row['speed_mm_min']):.3f} mm/min | "
+                f"{row['dataset_label']} | {row['run_type']} | "
+                f"speed={float(row['speed_mm_min']):.3f} mm/min | "
                 f"mean(mean_ss_disp_mag)={float(row['mean_of_mean_ss_disp_mag']):.6f} {row['analysis_units']} | "
                 f"n_runs={int(row['n_runs'])}"
             )

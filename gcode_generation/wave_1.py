@@ -43,11 +43,11 @@ import numpy as np
 DEFAULT_OUT = "gcode_generation/gaussian_wave_xz.gcode"
 
 # Path placement
-DEFAULT_X_START = 50.0
-DEFAULT_X_END = 110.0
+DEFAULT_X_START = 60.0
+DEFAULT_X_END = 115.0
 DEFAULT_Y = 52.0
 DEFAULT_Z_MIN = -155.0
-DEFAULT_Z_MAX = -115.0
+DEFAULT_Z_MAX = -125.0
 DEFAULT_Z_BASELINE = 0.5 * (DEFAULT_Z_MIN + DEFAULT_Z_MAX)
 
 # Wave shape
@@ -75,23 +75,19 @@ DEFAULT_C_DEG = 180.0
 DEFAULT_B_ANGLE_BIAS_DEG = 0.0
 DEFAULT_BC_SOLVE_SAMPLES = 5001
 DEFAULT_Y_OFFPLANE_SIGN = -1.0
-DEFAULT_Y_OFFPLANE_FIT_MODEL = "avg_cubic"
+DEFAULT_Y_OFFPLANE_FIT_MODEL = "avg_pchip"
 
 # Motion
 DEFAULT_TRAVEL_FEED = 1000.0
 DEFAULT_APPROACH_FEED = 400.0
-DEFAULT_FINE_APPROACH_FEED = 100.0
+DEFAULT_FINE_APPROACH_FEED = 200.0
 DEFAULT_PRINT_FEED = 300.0
 DEFAULT_TRAVEL_LIFT_Z = 8.0
 DEFAULT_APPROACH_SIDE_MM = 4.0
 DEFAULT_EDGE_SAMPLES = 1
 
-# Extrusion / pressure
+# Pressure actuation
 DEFAULT_EMIT_EXTRUSION = True
-DEFAULT_EXTRUSION_PER_MM = 0.0015
-DEFAULT_PRESSURE_OFFSET_MM = 4.0
-DEFAULT_PRESSURE_ADVANCE_FEED = 120.0
-DEFAULT_PRESSURE_RETRACT_FEED = 240.0
 DEFAULT_PREFLOW_DWELL_MS = 500
 
 # Stage limits
@@ -119,8 +115,6 @@ class Calibration:
     z_axis: str
     b_axis: str
     c_axis: str
-    u_axis: str
-
     c_180_deg: float
 
     r_model: Optional[Dict[str, Any]] = None
@@ -128,6 +122,7 @@ class Calibration:
     y_off_model: Optional[Dict[str, Any]] = None
     y_off_extrap_model: Optional[Dict[str, Any]] = None
     tip_angle_model: Optional[Dict[str, Any]] = None
+    phase_models: Optional[Dict[str, Dict[str, Any]]] = None
     selected_fit_model: Optional[str] = None
     selected_offplane_fit_model: Optional[str] = None
     requested_r_fit_model: Optional[str] = None
@@ -235,6 +230,26 @@ def desired_physical_b_angle_from_tangent(tangent: np.ndarray) -> float:
     return float(math.degrees(math.acos(tz)))
 
 
+def infer_motion_phase_for_b(
+    default_phase: str,
+    prev_b: Optional[float],
+    curr_b: float,
+    next_b: Optional[float],
+) -> str:
+    deltas: List[float] = []
+    if prev_b is not None:
+        deltas.append(float(curr_b) - float(prev_b))
+    if next_b is not None:
+        deltas.append(float(next_b) - float(curr_b))
+
+    for delta in deltas:
+        if abs(delta) <= 1e-9:
+            continue
+        return "pull" if delta < 0.0 else "release"
+
+    return str(default_phase)
+
+
 def unwrap_angle_deg_near(target_deg: float, reference_deg: float) -> float:
     target = float(target_deg)
     ref = float(reference_deg)
@@ -284,6 +299,13 @@ def _normalize_model_spec(model_spec: Any) -> Optional[Dict[str, Any]]:
     if out.get("model_type") is not None:
         out["model_type"] = str(out["model_type"]).strip().lower()
     return out
+
+
+def _normalize_motion_phase_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text or None
 
 
 def _select_named_model(models: Dict[str, Any], base_name: str, selected_fit_model: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -461,7 +483,14 @@ def load_calibration(
     requested_z_fit_model = None if requested_z_fit_model is None else str(requested_z_fit_model).strip().lower()
     active_phase = str(data.get("default_phase_for_legacy_access") or "pull").strip().lower()
 
-    phase_models = data.get("fit_models_by_phase", {}) or {}
+    phase_models_raw = data.get("fit_models_by_phase", {}) or {}
+    phase_models: Dict[str, Dict[str, Any]] = {}
+    if isinstance(phase_models_raw, dict):
+        for raw_phase_name, models in phase_models_raw.items():
+            phase_name = _normalize_motion_phase_name(raw_phase_name)
+            if phase_name is None or not isinstance(models, dict):
+                continue
+            phase_models[phase_name] = dict(models)
     active_phase_models = phase_models.get(active_phase) if isinstance(phase_models, dict) else None
     if not isinstance(active_phase_models, dict):
         active_phase_models = fit_models
@@ -506,6 +535,7 @@ def load_calibration(
         y_off_model=y_off_model,
         y_off_extrap_model=y_off_extrap_model,
         tip_angle_model=tip_angle_model,
+        phase_models=phase_models,
         selected_fit_model=selected_fit_model,
         selected_offplane_fit_model=selected_offplane_fit_model,
         requested_r_fit_model=requested_r_fit_model,
@@ -522,20 +552,31 @@ def load_calibration(
         z_axis=str(duet_map.get("vertical_axis") or motor_setup.get("vertical_axis") or "Z"),
         b_axis=str(duet_map.get("pull_axis") or motor_setup.get("b_motor_axis") or "B"),
         c_axis=str(duet_map.get("rotation_axis") or motor_setup.get("rotation_axis") or "C"),
-        u_axis=str(duet_map.get("extruder_axis") or "U"),
         c_180_deg=float(motor_setup.get("rotation_axis_180_deg", 180.0)),
     )
 
 
-def eval_r(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.r_model is not None:
-        return eval_model_spec(cal.r_model, b)
+def _select_phase_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    phase_name = _normalize_motion_phase_name(motion_phase)
+    if phase_name and cal.phase_models and phase_name in cal.phase_models:
+        spec = _normalize_model_spec(cal.phase_models[phase_name].get(model_name))
+        if spec is not None:
+            return spec
+    fallback = getattr(cal, f"{model_name}_model", None)
+    return None if fallback is None else _normalize_model_spec(fallback)
+
+
+def eval_r(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model = _select_phase_fit_model(cal, "r", motion_phase=motion_phase)
+    if model is not None:
+        return eval_model_spec(model, b)
     return poly_eval(cal.pr, b)
 
 
-def eval_z(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.z_model is not None:
-        return eval_model_spec(cal.z_model, b)
+def eval_z(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model = _select_phase_fit_model(cal, "z", motion_phase=motion_phase)
+    if model is not None:
+        return eval_model_spec(model, b)
     return poly_eval(cal.pz, b)
 
 
@@ -550,17 +591,18 @@ def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
     return float(cal.offplane_y_sign) * np.asarray(values, dtype=float)
 
 
-def eval_tip_angle_deg(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.tip_angle_model is not None:
-        return eval_model_spec(cal.tip_angle_model, b)
+def eval_tip_angle_deg(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model = _select_phase_fit_model(cal, "tip_angle", motion_phase=motion_phase)
+    if model is not None:
+        return eval_model_spec(model, b)
     if cal.pa is None:
         raise ValueError("Calibration is missing tip_angle_coeffs.")
     return poly_eval(cal.pa, b)
 
 
-def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float) -> np.ndarray:
-    r = float(eval_r(cal, b))
-    z = float(eval_z(cal, b))
+def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float, motion_phase: Optional[str] = None) -> np.ndarray:
+    r = float(eval_r(cal, b, motion_phase=motion_phase))
+    z = float(eval_z(cal, b, motion_phase=motion_phase))
     y_off = float(eval_offplane_y(cal, b))
     c = math.radians(float(c_deg))
     x = r * math.cos(c) - y_off * math.sin(c)
@@ -568,14 +610,19 @@ def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float) -> np.ndarr
     return np.array([x, y, z], dtype=float)
 
 
-def stage_xyz_for_tip(cal: Calibration, tip_xyz: np.ndarray, b: float, c_deg: float) -> np.ndarray:
-    return np.asarray(tip_xyz, dtype=float) - predict_tip_offset_xyz(cal, b, c_deg)
+def stage_xyz_for_tip(cal: Calibration, tip_xyz: np.ndarray, b: float, c_deg: float, motion_phase: Optional[str] = None) -> np.ndarray:
+    return np.asarray(tip_xyz, dtype=float) - predict_tip_offset_xyz(cal, b, c_deg, motion_phase=motion_phase)
 
 
-def solve_b_for_target_tip_angle(cal: Calibration, target_angle_deg: float, search_samples: int = DEFAULT_BC_SOLVE_SAMPLES) -> float:
+def solve_b_for_target_tip_angle(
+    cal: Calibration,
+    target_angle_deg: float,
+    search_samples: int = DEFAULT_BC_SOLVE_SAMPLES,
+    motion_phase: Optional[str] = None,
+) -> float:
     b_lo, b_hi = float(cal.b_min), float(cal.b_max)
     bb = np.linspace(b_lo, b_hi, int(max(101, search_samples)))
-    aa = eval_tip_angle_deg(cal, bb) - float(target_angle_deg)
+    aa = eval_tip_angle_deg(cal, bb, motion_phase=motion_phase) - float(target_angle_deg)
     i_best_abs = int(np.argmin(np.abs(aa)))
     b_best_abs = float(bb[i_best_abs])
 
@@ -594,7 +641,7 @@ def solve_b_for_target_tip_angle(cal: Calibration, target_angle_deg: float, sear
         _, lo, hi = sign_changes[0]
 
         def f(x: float) -> float:
-            return float(eval_tip_angle_deg(cal, x) - float(target_angle_deg))
+            return float(eval_tip_angle_deg(cal, x, motion_phase=motion_phase) - float(target_angle_deg))
 
         flo = f(lo)
         for _ in range(80):
@@ -716,10 +763,6 @@ class GCodeWriter:
         print_feed: float,
         edge_samples: int,
         emit_extrusion: bool,
-        extrusion_per_mm: float,
-        pressure_offset_mm: float,
-        pressure_advance_feed: float,
-        pressure_retract_feed: float,
         preflow_dwell_ms: int,
     ) -> None:
         self.f = fh
@@ -738,13 +781,8 @@ class GCodeWriter:
         self.print_feed = float(print_feed)
         self.edge_samples = max(1, int(edge_samples))
         self.emit_extrusion = bool(emit_extrusion)
-        self.extrusion_per_mm = float(extrusion_per_mm)
-        self.pressure_offset_mm = float(pressure_offset_mm)
-        self.pressure_advance_feed = float(pressure_advance_feed)
-        self.pressure_retract_feed = float(pressure_retract_feed)
         self.preflow_dwell_ms = int(preflow_dwell_ms)
 
-        self.u_material_abs = 0.0
         self.pressure_charged = False
         self.cur_stage_xyz: Optional[np.ndarray] = None
         self.cur_tip_xyz: Optional[np.ndarray] = None
@@ -786,10 +824,6 @@ class GCodeWriter:
     def c_axis(self) -> str:
         return self.cal.c_axis if self.cal is not None else "C"
 
-    @property
-    def u_axis(self) -> str:
-        return self.cal.u_axis if self.cal is not None else "U"
-
     def clamp_stage(self, p_stage: np.ndarray, context: str) -> np.ndarray:
         x = float(np.clip(p_stage[0], self.bbox["x_min"], self.bbox["x_max"]))
         y = float(np.clip(p_stage[1], self.bbox["y_min"], self.bbox["y_max"]))
@@ -798,10 +832,7 @@ class GCodeWriter:
             self.warnings.append(f"WARNING: {context} stage point clamped to bbox.")
         return np.array([x, y, z], dtype=float)
 
-    def u_cmd_actual(self) -> float:
-        return self.u_material_abs + (self.pressure_offset_mm if self.pressure_charged else 0.0)
-
-    def bc_for_tangent(self, tangent: np.ndarray) -> Tuple[float, float]:
+    def bc_for_tangent(self, tangent: np.ndarray, motion_phase: Optional[str] = None) -> Tuple[float, float]:
         if self.orientation_mode == "fixed":
             return float(self.fixed_b), float(self.fixed_c)
 
@@ -810,24 +841,40 @@ class GCodeWriter:
 
         if self.write_mode == "calibrated":
             assert self.cal is not None
-            b = solve_b_for_target_tip_angle(self.cal, target_b, search_samples=self.bc_solve_samples)
+            b = solve_b_for_target_tip_angle(
+                self.cal,
+                target_b,
+                search_samples=self.bc_solve_samples,
+                motion_phase=motion_phase,
+            )
         else:
             b = target_b
 
         return float(b), float(self.c_deg)
 
-    def tip_to_stage_with_bc(self, p_tip: np.ndarray, b: float, c: float) -> np.ndarray:
+    def tip_to_stage_with_bc(self, p_tip: np.ndarray, b: float, c: float, motion_phase: Optional[str] = None) -> np.ndarray:
         if self.write_mode == "calibrated":
             assert self.cal is not None
-            p_stage = stage_xyz_for_tip(self.cal, np.asarray(p_tip, dtype=float), float(b), float(c))
+            p_stage = stage_xyz_for_tip(
+                self.cal,
+                np.asarray(p_tip, dtype=float),
+                float(b),
+                float(c),
+                motion_phase=motion_phase,
+            )
         else:
             p_stage = np.asarray(p_tip, dtype=float)
         return self.clamp_stage(np.asarray(p_stage, dtype=float), "tip_to_stage_with_bc")
 
-    def tip_to_stage(self, p_tip: np.ndarray, tangent: Optional[np.ndarray]) -> Tuple[np.ndarray, float, float]:
+    def tip_to_stage(
+        self,
+        p_tip: np.ndarray,
+        tangent: Optional[np.ndarray],
+        motion_phase: Optional[str] = None,
+    ) -> Tuple[np.ndarray, float, float]:
         tangent_arr = np.array([1.0, 0.0, 0.0], dtype=float) if tangent is None else normalize(np.asarray(tangent, dtype=float))
-        b, c = self.bc_for_tangent(tangent_arr)
-        return self.tip_to_stage_with_bc(np.asarray(p_tip, dtype=float), b, c), float(b), float(c)
+        b, c = self.bc_for_tangent(tangent_arr, motion_phase=motion_phase)
+        return self.tip_to_stage_with_bc(np.asarray(p_tip, dtype=float), b, c, motion_phase=motion_phase), float(b), float(c)
 
     def write_move(
         self,
@@ -836,7 +883,6 @@ class GCodeWriter:
         c: float,
         feed: float,
         comment: Optional[str] = None,
-        u_value: Optional[float] = None,
     ) -> None:
         if comment:
             self.f.write(f"; {comment}\n")
@@ -847,8 +893,6 @@ class GCodeWriter:
             (self.b_axis, float(b)),
             (self.c_axis, float(c)),
         ]
-        if u_value is not None:
-            axes.append((self.u_axis, float(u_value)))
         self.f.write(f"G1 {_fmt_axes_move(axes)} F{float(feed):.0f}\n")
 
         p_stage_arr = np.asarray(p_stage, dtype=float).copy()
@@ -862,8 +906,15 @@ class GCodeWriter:
         self.c_min_used = min(self.c_min_used, float(c))
         self.c_max_used = max(self.c_max_used, float(c))
 
-    def move_to_tip(self, p_tip: np.ndarray, tangent: Optional[np.ndarray], feed: float, comment: Optional[str] = None) -> None:
-        p_stage, b, c = self.tip_to_stage(np.asarray(p_tip, dtype=float), tangent=tangent)
+    def move_to_tip(
+        self,
+        p_tip: np.ndarray,
+        tangent: Optional[np.ndarray],
+        feed: float,
+        comment: Optional[str] = None,
+        motion_phase: Optional[str] = None,
+    ) -> None:
+        p_stage, b, c = self.tip_to_stage(np.asarray(p_tip, dtype=float), tangent=tangent, motion_phase=motion_phase)
         self.write_move(p_stage, b, c, feed, comment=comment)
         self.cur_tip_xyz = np.asarray(p_tip, dtype=float).copy()
         self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
@@ -876,8 +927,9 @@ class GCodeWriter:
         feed: float,
         tangent: Optional[np.ndarray],
         comment: Optional[str] = None,
+        motion_phase: Optional[str] = None,
     ) -> None:
-        p_stage = self.tip_to_stage_with_bc(np.asarray(p_tip, dtype=float), float(b), float(c))
+        p_stage = self.tip_to_stage_with_bc(np.asarray(p_tip, dtype=float), float(b), float(c), motion_phase=motion_phase)
         self.write_move(p_stage, float(b), float(c), feed, comment=comment)
         self.cur_tip_xyz = np.asarray(p_tip, dtype=float).copy()
         self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
@@ -896,11 +948,20 @@ class GCodeWriter:
             self.f.write("; close pressure solenoid after print pass\n")
             self.f.write("M42 P0 S0\n")
 
-    def segment_bc(self, tangents: np.ndarray, i0: int, i1: int) -> Tuple[float, float]:
+    def segment_bc(self, tangents: np.ndarray, i0: int, i1: int, motion_phase: Optional[str] = None) -> Tuple[float, float]:
         mid = max(int(i0), min(int(i1), (int(i0) + int(i1)) // 2))
-        return self.bc_for_tangent(np.asarray(tangents[mid], dtype=float))
+        return self.bc_for_tangent(np.asarray(tangents[mid], dtype=float), motion_phase=motion_phase)
 
-    def print_segment_fixed_bc(self, points: np.ndarray, tangents: np.ndarray, i0: int, i1: int, b: float, c: float) -> None:
+    def print_segment_fixed_bc(
+        self,
+        points: np.ndarray,
+        tangents: np.ndarray,
+        i0: int,
+        i1: int,
+        b: float,
+        c: float,
+        motion_phase: Optional[str] = None,
+    ) -> None:
         if i1 <= i0:
             return
 
@@ -914,8 +975,8 @@ class GCodeWriter:
                 u = s / float(self.edge_samples)
                 p_tip = p0 + u * (p1 - p0)
                 tangent = normalize((1.0 - u) * t0 + u * t1)
-                p_stage = self.tip_to_stage_with_bc(p_tip, b, c)
-                self.write_move(p_stage, b, c, self.print_feed, comment=None, u_value=None)
+                p_stage = self.tip_to_stage_with_bc(p_tip, b, c, motion_phase=motion_phase)
+                self.write_move(p_stage, b, c, self.print_feed, comment=None)
                 self.cur_tip_xyz = p_tip.copy()
                 self.last_tip_tangent = tangent.copy()
 
@@ -928,6 +989,7 @@ class GCodeWriter:
         tangent: Optional[np.ndarray],
         feed: float,
         comment: Optional[str] = None,
+        motion_phase: Optional[str] = None,
     ) -> None:
         p_tip_arr = np.asarray(p_tip, dtype=float)
         tangent_arr = None if tangent is None else np.asarray(tangent, dtype=float).copy()
@@ -942,8 +1004,8 @@ class GCodeWriter:
             # Smooth endpoint velocity to mimic the sampled tracked style used in calib_plane_daq.py.
             s = u * u * (3.0 - 2.0 * u)
             b = (1.0 - s) * float(b_start) + s * float(b_end)
-            p_stage = self.tip_to_stage_with_bc(p_tip_arr, b, c)
-            self.write_move(p_stage, b, c, feed, comment=None, u_value=None)
+            p_stage = self.tip_to_stage_with_bc(p_tip_arr, b, c, motion_phase=motion_phase)
+            self.write_move(p_stage, b, c, feed, comment=None)
             self.cur_tip_xyz = p_tip_arr.copy()
             self.last_tip_tangent = None if tangent_arr is None else tangent_arr.copy()
 
@@ -991,7 +1053,26 @@ class GCodeWriter:
 
         if self.orientation_mode == "extrema-step":
             features = find_extrema_feature_indices(points)
-            segment_bcs = [self.segment_bc(tangents, i0, i1) for i0, i1 in zip(features[:-1], features[1:])]
+            target_segment_bs = [
+                desired_physical_b_angle_from_tangent(
+                    tangents[max(i0, min(i1, (i0 + i1) // 2))]
+                ) + float(self.b_angle_bias_deg)
+                for i0, i1 in zip(features[:-1], features[1:])
+            ]
+            default_phase = self.cal.active_phase if self.cal is not None else "pull"
+            segment_phases = [
+                infer_motion_phase_for_b(
+                    default_phase=default_phase,
+                    prev_b=(None if idx == 0 else target_segment_bs[idx - 1]),
+                    curr_b=target_segment_bs[idx],
+                    next_b=(None if idx + 1 >= len(target_segment_bs) else target_segment_bs[idx + 1]),
+                )
+                for idx in range(len(target_segment_bs))
+            ]
+            segment_bcs = [
+                self.segment_bc(tangents, i0, i1, motion_phase=segment_phases[idx])
+                for idx, (i0, i1) in enumerate(zip(features[:-1], features[1:]))
+            ]
 
             if segment_bcs:
                 first_b, first_c = segment_bcs[0]
@@ -1003,6 +1084,7 @@ class GCodeWriter:
                     tangent=tangents[0],
                     feed=self.fine_approach_feed,
                     comment="compensated initial B/C reposition before stepped wave write",
+                    motion_phase=segment_phases[0],
                 )
                 self.move_to_tip_with_bc(
                     points[0],
@@ -1011,18 +1093,33 @@ class GCodeWriter:
                     feed=self.fine_approach_feed,
                     tangent=tangents[0],
                     comment=None,
+                    motion_phase=segment_phases[0],
                 )
 
             for seg_idx, (i0, i1) in enumerate(zip(features[:-1], features[1:])):
                 b_seg, c_seg = segment_bcs[seg_idx]
                 self.pressure_preload_before_print()
-                self.print_segment_fixed_bc(points, tangents, i0, i1, b=b_seg, c=c_seg)
+                self.print_segment_fixed_bc(
+                    points,
+                    tangents,
+                    i0,
+                    i1,
+                    b=b_seg,
+                    c=c_seg,
+                    motion_phase=segment_phases[seg_idx],
+                )
 
                 if seg_idx + 1 < len(segment_bcs):
                     self.pressure_release_after_print()
                     b_next, c_next = segment_bcs[seg_idx + 1]
                     if abs(float(b_next) - float(b_seg)) > 1e-9 or abs(float(c_next) - float(c_seg)) > 1e-9:
                         feature_idx = i1
+                        transition_phase = infer_motion_phase_for_b(
+                            default_phase=default_phase,
+                            prev_b=b_seg,
+                            curr_b=b_next,
+                            next_b=None,
+                        )
                         self.tracked_tip_hold_bc_transition(
                             points[feature_idx],
                             b_start=b_seg,
@@ -1031,6 +1128,7 @@ class GCodeWriter:
                             tangent=tangents[feature_idx],
                             feed=self.approach_feed,
                             comment="compensated B/C reposition at wave extremum with extrusion disabled",
+                            motion_phase=transition_phase,
                         )
                         self.move_to_tip_with_bc(
                             points[feature_idx],
@@ -1039,6 +1137,7 @@ class GCodeWriter:
                             feed=self.approach_feed,
                             tangent=tangents[feature_idx],
                             comment=None,
+                            motion_phase=transition_phase,
                         )
 
             self.pressure_release_after_print()
@@ -1059,7 +1158,7 @@ class GCodeWriter:
                 tangent = normalize((1.0 - u) * t0 + u * t1)
                 p_stage, b, c = self.tip_to_stage(p_tip, tangent=tangent)
 
-                self.write_move(p_stage, b, c, self.print_feed, comment=None, u_value=None)
+                self.write_move(p_stage, b, c, self.print_feed, comment=None)
                 self.cur_tip_xyz = p_tip.copy()
                 self.last_tip_tangent = tangent.copy()
 
@@ -1115,10 +1214,6 @@ def write_gaussian_wave_gcode(
     approach_side_mm: float,
     edge_samples: int,
     emit_extrusion: bool,
-    extrusion_per_mm: float,
-    pressure_offset_mm: float,
-    pressure_advance_feed: float,
-    pressure_retract_feed: float,
     preflow_dwell_ms: int,
     bbox_x_min: float,
     bbox_x_max: float,
@@ -1212,10 +1307,6 @@ def write_gaussian_wave_gcode(
         print_feed=print_feed,
         edge_samples=edge_samples,
         emit_extrusion=emit_extrusion,
-        extrusion_per_mm=extrusion_per_mm,
-        pressure_offset_mm=pressure_offset_mm,
-        pressure_advance_feed=pressure_advance_feed,
-        pressure_retract_feed=pressure_retract_feed,
         preflow_dwell_ms=preflow_dwell_ms,
     )
 
@@ -1246,6 +1337,7 @@ def write_gaussian_wave_gcode(
         )
         fh.write("G21\n")
         fh.write("G90\n")
+        fh.write("; pressure actuation: open with M42 P0 S1, close with M42 P0 S0\n")
         fh.write(f"; B-angle convention: 0=up, 90=horizontal, 180=down\n")
         fh.write(f"; C held constant at {float(c_deg):.3f} deg by default\n")
         if cal is not None:
@@ -1280,12 +1372,31 @@ def write_gaussian_wave_gcode(
     elif orientation_mode == "extrema-step":
         feature_indices = find_extrema_feature_indices(pts)
         b_used = np.zeros_like(tip_b, dtype=float)
-        for i0, i1 in zip(feature_indices[:-1], feature_indices[1:]):
+        segment_target_bs = [
+            float(np.clip(desired_physical_b_angle_from_tangent(tangents[max(i0, min(i1, (i0 + i1) // 2))]) + b_angle_bias_deg, 0.0, 180.0))
+            for i0, i1 in zip(feature_indices[:-1], feature_indices[1:])
+        ]
+        default_phase = cal.active_phase if cal is not None else "pull"
+        segment_phases = [
+            infer_motion_phase_for_b(
+                default_phase=default_phase,
+                prev_b=(None if idx == 0 else segment_target_bs[idx - 1]),
+                curr_b=segment_target_bs[idx],
+                next_b=(None if idx + 1 >= len(segment_target_bs) else segment_target_bs[idx + 1]),
+            )
+            for idx in range(len(segment_target_bs))
+        ]
+        for idx, (i0, i1) in enumerate(zip(feature_indices[:-1], feature_indices[1:])):
             t_mid = tangents[max(i0, min(i1, (i0 + i1) // 2))]
             if write_mode == "calibrated":
                 assert cal is not None
                 target_b = float(np.clip(desired_physical_b_angle_from_tangent(t_mid) + b_angle_bias_deg, 0.0, 180.0))
-                b_seg = solve_b_for_target_tip_angle(cal, target_b, search_samples=bc_solve_samples)
+                b_seg = solve_b_for_target_tip_angle(
+                    cal,
+                    target_b,
+                    search_samples=bc_solve_samples,
+                    motion_phase=segment_phases[idx],
+                )
             else:
                 b_seg = float(np.clip(desired_physical_b_angle_from_tangent(t_mid) + b_angle_bias_deg, 0.0, 180.0))
             b_used[i0 : i1 + 1] = float(b_seg)
@@ -1375,11 +1486,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     ap.add_argument("--emit-extrusion", dest="emit_extrusion", action="store_true", default=DEFAULT_EMIT_EXTRUSION)
     ap.add_argument("--no-emit-extrusion", dest="emit_extrusion", action="store_false")
-    ap.add_argument("--extrusion-per-mm", type=float, default=DEFAULT_EXTRUSION_PER_MM)
-    ap.add_argument("--pressure-offset-mm", type=float, default=DEFAULT_PRESSURE_OFFSET_MM)
-    ap.add_argument("--pressure-advance-feed", type=float, default=DEFAULT_PRESSURE_ADVANCE_FEED)
-    ap.add_argument("--pressure-retract-feed", type=float, default=DEFAULT_PRESSURE_RETRACT_FEED)
-    ap.add_argument("--preflow-dwell-ms", type=int, default=DEFAULT_PREFLOW_DWELL_MS)
+    ap.add_argument("--preflow-dwell-ms", type=int, default=DEFAULT_PREFLOW_DWELL_MS, help="Dwell after opening the pressure valve and before starting the print pass.")
 
     ap.add_argument("--bbox-x-min", type=float, default=DEFAULT_BBOX_X_MIN)
     ap.add_argument("--bbox-x-max", type=float, default=DEFAULT_BBOX_X_MAX)

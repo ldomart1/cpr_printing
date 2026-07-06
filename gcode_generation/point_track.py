@@ -51,8 +51,11 @@ DEFAULT_C_AMP_DEG = 360.0
 DEFAULT_C_CYCLES = 5
 DEFAULT_C_WAVEFORM = "sine"           # restored true sine by default
 DEFAULT_OSC_SAMPLES_PER_CYCLE = 120
+DEFAULT_MOTION_MODE = "custom"        # custom or fast_routine
+DEFAULT_ROUTINE_REPEATS = 1
 
 DEFAULT_B_PROFILE = "sine"
+DEFAULT_B_CYCLES = 1.0
 
 DEFAULT_START_X = 60.0
 DEFAULT_START_Y = 40.0
@@ -75,6 +78,7 @@ DEFAULT_BBOX_Y_MIN = 10.0
 DEFAULT_BBOX_Y_MAX = 110.0
 DEFAULT_BBOX_Z_MIN = -120.0
 DEFAULT_BBOX_Z_MAX = -20.0
+DEFAULT_MOTION_ACCEL_MM_S2 = 0.0
 
 OFFPLANE_SIGN = -1.0
 
@@ -227,6 +231,22 @@ def b_profile_sine(t: float, b_start: float, b_peak: float) -> float:
     return float(b_start + (b_peak - b_start) * s)
 
 
+def b_profile_triangle_cycles(t: float, b_start: float, b_peak: float, cycles: float) -> float:
+    cycles = max(float(cycles), 1e-9)
+    phase = (float(t) * cycles) % 1.0
+    if phase <= 0.5:
+        u = 2.0 * phase
+    else:
+        u = 2.0 * (1.0 - phase)
+    return float((1.0 - u) * b_start + u * b_peak)
+
+
+def b_profile_sine_cycles(t: float, b_start: float, b_peak: float, cycles: float) -> float:
+    cycles = max(float(cycles), 1e-9)
+    u = 0.5 * (1.0 - math.cos(2.0 * math.pi * cycles * float(t)))
+    return float((1.0 - u) * b_start + u * b_peak)
+
+
 def c_wave_sweep(t: float, c_start_deg: float, c_sweep_deg: float) -> float:
     return float(c_start_deg + c_sweep_deg * t)
 
@@ -270,6 +290,7 @@ def c_wave_oscillate(
 def generate_motion_trajectory(
     cal: Calibration,
     p_tip_fixed: np.ndarray,
+    motion_mode: str,
     c_profile: str,
     c_start_deg: float,
     c_sweep_deg: float,
@@ -282,13 +303,29 @@ def generate_motion_trajectory(
     b_start: float,
     b_peak: float,
     b_profile_name: str,
+    b_cycles: float,
+    routine_repeats: int,
     unwrap_c_continuous: bool = True,
 ) -> List[Tuple[float, float, np.ndarray]]:
+    motion_mode = str(motion_mode).lower()
+    if motion_mode == "fast_routine":
+        c_profile = "oscillate"
+        c_center_deg = 0.0
+        c_amp_deg = 360.0
+        c_cycles = 5
+        c_waveform = "sine"
+        b_profile_name = "sine"
+        b_cycles = 3.0
+    elif motion_mode != "custom":
+        raise ValueError("--motion-mode must be 'custom' or 'fast_routine'")
+
     c_profile = c_profile.lower()
     if c_profile not in ("sweep", "oscillate"):
         raise ValueError("--c-profile must be 'sweep' or 'oscillate'")
     if b_profile_name.lower() not in ("triangle", "sine"):
         raise ValueError("--b-profile must be 'triangle' or 'sine'")
+    routine_repeats = max(1, int(routine_repeats))
+    b_cycles = max(float(b_cycles), 1e-9)
 
     if c_profile == "sweep":
         n_segments = max(2, int(steps))
@@ -298,30 +335,38 @@ def generate_motion_trajectory(
     pts: List[Tuple[float, float, np.ndarray]] = []
     prev_c: Optional[float] = None
 
-    for i in range(n_segments + 1):
-        t = i / float(n_segments)
+    for rep in range(routine_repeats):
+        i_start = 0 if rep == 0 else 1
+        for i in range(i_start, n_segments + 1):
+            t = i / float(n_segments)
 
-        if c_profile == "sweep":
-            c_nom = c_wave_sweep(t, c_start_deg=float(c_start_deg), c_sweep_deg=float(c_sweep_deg))
-        else:
-            c_nom = c_wave_oscillate(
-                t,
-                c_center_deg=float(c_center_deg),
-                c_amp_deg=float(c_amp_deg),
-                c_cycles=float(c_cycles),
-                waveform=str(c_waveform),
-            )
+            if c_profile == "sweep":
+                c_nom = c_wave_sweep(t, c_start_deg=float(c_start_deg), c_sweep_deg=float(c_sweep_deg))
+            else:
+                c_nom = c_wave_oscillate(
+                    t,
+                    c_center_deg=float(c_center_deg),
+                    c_amp_deg=float(c_amp_deg),
+                    c_cycles=float(c_cycles),
+                    waveform=str(c_waveform),
+                )
 
-        c_cmd = unwrap_deg_near(c_nom, prev_c) if unwrap_c_continuous else float(c_nom % 360.0)
+            c_cmd = unwrap_deg_near(c_nom, prev_c) if unwrap_c_continuous else float(c_nom % 360.0)
 
-        if b_profile_name.lower() == "triangle":
-            b_cmd = b_profile_triangle(t, b_start=float(b_start), b_peak=float(b_peak))
-        else:
-            b_cmd = b_profile_sine(t, b_start=float(b_start), b_peak=float(b_peak))
+            if b_profile_name.lower() == "triangle":
+                if b_cycles <= 1.0 + 1e-9:
+                    b_cmd = b_profile_triangle(t, b_start=float(b_start), b_peak=float(b_peak))
+                else:
+                    b_cmd = b_profile_triangle_cycles(t, b_start=float(b_start), b_peak=float(b_peak), cycles=b_cycles)
+            else:
+                if b_cycles <= 1.0 + 1e-9:
+                    b_cmd = b_profile_sine(t, b_start=float(b_start), b_peak=float(b_peak))
+                else:
+                    b_cmd = b_profile_sine_cycles(t, b_start=float(b_start), b_peak=float(b_peak), cycles=b_cycles)
 
-        p_stage = stage_xyz_for_fixed_tip(cal, p_tip_fixed, float(b_cmd), float(c_cmd))
-        pts.append((float(b_cmd), float(c_cmd), p_stage))
-        prev_c = float(c_cmd)
+            p_stage = stage_xyz_for_fixed_tip(cal, p_tip_fixed, float(b_cmd), float(c_cmd))
+            pts.append((float(b_cmd), float(c_cmd), p_stage))
+            prev_c = float(c_cmd)
 
     return pts
 
@@ -392,10 +437,15 @@ def _smoothstep01(x: float) -> float:
     return x * x * (3.0 - 2.0 * x)
 
 
+def _cosine_ease01(x: float) -> float:
+    x = max(0.0, min(1.0, float(x)))
+    return 0.5 - 0.5 * math.cos(math.pi * x)
+
+
 def _c_speed_envelope_factor(t01: float, accel_s: float, decel_s: float, total_s: float, floor_frac: float = 0.05) -> float:
     """
     Returns factor in [floor_frac, 1] for C max speed cap.
-    Smooth ramp up over accel_s, hold, then smooth ramp down over decel_s.
+    Cosine-eased ramp up over accel_s, hold, then cosine-eased ramp down over decel_s.
     """
     if total_s <= 1e-9:
         return 1.0
@@ -406,12 +456,27 @@ def _c_speed_envelope_factor(t01: float, accel_s: float, decel_s: float, total_s
     up = 1.0
     dn = 1.0
     if ta > 1e-9:
-        up = _smoothstep01(t / ta)
+        up = _cosine_ease01(t / ta)
     if td > 1e-9:
-        dn = _smoothstep01((total_s - t) / td)
+        dn = _cosine_ease01((total_s - t) / td)
 
     f = min(up, dn)
     return float(floor_frac + (1.0 - floor_frac) * f)
+
+
+def accel_limited_move_time_seconds(distance_mm: float, feedrate_mm_min: float, accel_mm_s2: float) -> float:
+    distance = abs(float(distance_mm))
+    v = abs(float(feedrate_mm_min)) / 60.0
+    accel = max(0.0, float(accel_mm_s2))
+    if distance <= 1e-12 or v <= 1e-12:
+        return 0.0
+    if accel <= 1e-12:
+        return distance / v
+    accel_distance = (v ** 2) / (2.0 * accel)
+    if distance <= accel_distance:
+        return math.sqrt((2.0 * distance) / accel)
+    t_accel = v / accel
+    return t_accel + ((distance - accel_distance) / v)
 
 
 def plan_segment_feeds_with_c_envelope(
@@ -421,6 +486,7 @@ def plan_segment_feeds_with_c_envelope(
     c_accel_time_s: float,
     c_decel_time_s: float,
     min_seg_time_s: float = 0.005,
+    motion_accel_mm_s2: float = 0.0,
 ) -> Tuple[List[float], dict]:
     """
     Compute a per-segment G-code feedrate (F) using a practical segment-time method.
@@ -502,10 +568,22 @@ def plan_segment_feeds_with_c_envelope(
         dts.append(float(dt))
         t_cum += dt
 
+    total_xyz_distance = float(np.sum(xyzlens)) if len(xyzlens) else 0.0
+    total_accel_est = accel_limited_move_time_seconds(
+        distance_mm=total_xyz_distance,
+        feedrate_mm_min=probe_feed,
+        accel_mm_s2=motion_accel_mm_s2,
+    )
     return feeds, {
         "est_total_time_s": float(sum(dts)),
+        "est_total_time_with_accel_s": float(total_accel_est),
         "max_est_c_speed_deg_min": float(max_est_c_speed),
         "mean_seg_time_ms": float(1000.0 * np.mean(dts)) if dts else 0.0,
+        "mean_seg_time_with_accel_ms": (
+            float(1000.0 * total_accel_est / len(dts))
+            if dts and total_accel_est > 0.0
+            else 0.0
+        ),
     }
 
 
@@ -552,11 +630,18 @@ def write_gcode_fixed_tip_motion(
     dwell_after_ms: int = 0,
     preposition_c_only: bool = True,
     use_segment_feed_scheduler: bool = True,
+    motion_accel_mm_s2: float = 0.0,
 ):
     bbox_warnings: List[str] = []
 
     seg_feeds: List[float] = []
-    sched_meta = {"est_total_time_s": 0.0, "max_est_c_speed_deg_min": 0.0, "mean_seg_time_ms": 0.0}
+    sched_meta = {
+        "est_total_time_s": 0.0,
+        "est_total_time_with_accel_s": 0.0,
+        "max_est_c_speed_deg_min": 0.0,
+        "mean_seg_time_ms": 0.0,
+        "mean_seg_time_with_accel_ms": 0.0,
+    }
     if use_segment_feed_scheduler and len(traj) > 1:
         seg_feeds, sched_meta = plan_segment_feeds_with_c_envelope(
             traj=traj,
@@ -564,6 +649,7 @@ def write_gcode_fixed_tip_motion(
             c_max_feed_deg_min=float(c_max_feed),
             c_accel_time_s=float(c_accel_time_s),
             c_decel_time_s=float(c_decel_time_s),
+            motion_accel_mm_s2=float(motion_accel_mm_s2),
         )
 
     with open(out_path, "w") as f:
@@ -578,8 +664,10 @@ def write_gcode_fixed_tip_motion(
         f.write(f"; feeds: travel F{float(travel_feed):.1f}, probe baseline F{float(probe_feed):.1f}, C-only F{float(c_feed):.1f}\n")
         f.write(f"; C tracked cap: {float(c_max_feed):.1f} deg/min, accel={float(c_accel_time_s):.3f}s, decel={float(c_decel_time_s):.3f}s\n")
         f.write(f"; feed scheduler est total tracked time: {sched_meta['est_total_time_s']:.3f}s\n")
+        f.write(f"; feed scheduler est total tracked time with accel model: {sched_meta['est_total_time_with_accel_s']:.3f}s\n")
         f.write(f"; feed scheduler est max C speed: {sched_meta['max_est_c_speed_deg_min']:.1f} deg/min\n")
         f.write(f"; feed scheduler mean segment time: {sched_meta['mean_seg_time_ms']:.2f} ms\n")
+        f.write(f"; feed scheduler mean segment time with accel model: {sched_meta['mean_seg_time_with_accel_ms']:.2f} ms\n")
         f.write("G90\n")
 
         # Safe startup
@@ -669,6 +757,7 @@ def main(args):
     traj = generate_motion_trajectory(
         cal=cal,
         p_tip_fixed=p_tip_fixed,
+        motion_mode=str(args.motion_mode),
         c_profile=str(args.c_profile),
         c_start_deg=float(args.c_start_deg),
         c_sweep_deg=float(args.c_sweep_deg),
@@ -681,19 +770,38 @@ def main(args):
         b_start=float(b_start),
         b_peak=float(b_peak),
         b_profile_name=str(args.b_profile),
+        b_cycles=float(args.b_cycles),
+        routine_repeats=int(args.routine_repeats),
         unwrap_c_continuous=(not bool(args.wrap_c)),
     )
 
     meta = compute_traj_meta(traj)
-    c_profile = str(args.c_profile).lower()
-    if c_profile == "sweep":
-        mode_desc = f"sweep: C from {float(args.c_start_deg):.3f} by {float(args.c_sweep_deg):.3f} deg"
+    motion_mode = str(args.motion_mode).lower()
+    c_profile = ("oscillate" if motion_mode == "fast_routine" else str(args.c_profile).lower())
+    if motion_mode == "fast_routine":
+        mode_desc = (
+            f"fast_routine: C = 0.000 ± 360.000 deg, 5 oscillations per routine; "
+            f"B curls {3.0:.1f} times per routine; repeats={int(args.routine_repeats)}"
+        )
+    elif c_profile == "sweep":
+        mode_desc = (
+            f"sweep: C from {float(args.c_start_deg):.3f} by {float(args.c_sweep_deg):.3f} deg; "
+            f"repeats={int(args.routine_repeats)}"
+        )
     else:
         mode_desc = (
             f"oscillate: C = {float(args.c_center_deg):.3f} ± {float(args.c_amp_deg):.3f} deg, "
-            f"{int(args.c_cycles)} cycles, waveform={str(args.c_waveform)}"
+            f"{int(args.c_cycles)} cycles, waveform={str(args.c_waveform)}, "
+            f"B cycles={float(args.b_cycles):.3f}, repeats={int(args.routine_repeats)}"
         )
-    meta.update({"mode_desc": mode_desc, "b_start": float(b_start), "b_peak": float(b_peak)})
+    meta.update({
+        "mode_desc": mode_desc,
+        "motion_mode": motion_mode,
+        "b_start": float(b_start),
+        "b_peak": float(b_peak),
+        "b_cycles": 3.0 if motion_mode == "fast_routine" else float(args.b_cycles),
+        "routine_repeats": int(args.routine_repeats),
+    })
 
     start_pose = (
         float(args.start_x), float(args.start_y), float(args.start_z),
@@ -736,6 +844,7 @@ def main(args):
         dwell_after_ms=int(args.dwell_after_ms),
         preposition_c_only=(not bool(args.no_c_preposition)),
         use_segment_feed_scheduler=(not bool(args.disable_segment_feed_scheduler)),
+        motion_accel_mm_s2=float(args.motion_accel_mm_s2),
     )
 
     ranges = sampled_ranges(cal, b_lo, b_hi)
@@ -745,15 +854,23 @@ def main(args):
     print(f"Fixed tip point (Cartesian): [{p_tip_fixed[0]:.3f}, {p_tip_fixed[1]:.3f}, {p_tip_fixed[2]:.3f}]")
     print(f"Calibration B range: [{cal.b_min:.3f}, {cal.b_max:.3f}]")
     print(f"Commanded B bounds: [{b_lo:.3f}, {b_hi:.3f}]")
-    print(f"Planned B start/peak/start: {b_start:.3f} -> {b_peak:.3f} -> {b_start:.3f}   profile={args.b_profile}")
+    print(
+        f"Planned B start/peak/start: {b_start:.3f} -> {b_peak:.3f} -> {b_start:.3f}   "
+        f"profile={args.b_profile}, b_cycles={meta['b_cycles']:.3f}, repeats={meta['routine_repeats']}"
+    )
     print(f"C mode: {meta['mode_desc']}")
     print(f"Samples: {meta['n_samples']} (segments={meta['n_segments']})")
     print(f"Feeds: travel={float(args.travel_feed):.1f} mm/min, probe baseline={float(args.probe_feed):.1f}, "
           f"C-only={float(args.c_feed):.1f}, C-tracked-cap={float(args.c_max_feed):.1f} deg/min")
     print(f"C accel/decel envelope: accel={float(args.c_accel_time):.3f}s decel={float(args.c_decel_time):.3f}s")
     print(f"Estimated tracked time: {sched_meta.get('est_total_time_s', 0.0):.3f}s")
+    print(
+        f"Estimated tracked time with accel model ({float(args.motion_accel_mm_s2):.3f} mm/s^2): "
+        f"{sched_meta.get('est_total_time_with_accel_s', 0.0):.3f}s"
+    )
     print(f"Estimated max C speed (scheduled): {sched_meta.get('max_est_c_speed_deg_min', 0.0):.1f} deg/min")
     print(f"Mean segment time: {sched_meta.get('mean_seg_time_ms', 0.0):.2f} ms")
+    print(f"Mean segment time with accel model: {sched_meta.get('mean_seg_time_with_accel_ms', 0.0):.2f} ms")
 
     print(f"Sampled r(B): [{ranges['r_min']:.3f}, {ranges['r_max']:.3f}] mm   |r| max={ranges['abs_r_max']:.3f}")
     print(f"Sampled y_off(B): [{ranges['yoff_min']:.3f}, {ranges['yoff_max']:.3f}] mm")
@@ -774,6 +891,7 @@ def main(args):
     print("  - --probe-feed is the baseline coordinated path feed.")
     print("  - --c-feed applies only to optional C-only preposition.")
     print("  - --c-max-feed + accel/decel are enforced via per-segment feed scheduling (best practical approximation with G1).")
+    print("  - --motion-accel-mm-s2 uses the same acceleration-limited move-time estimate as the continuous acquisition path.")
     print("  - If you need exact time-law execution, the next step is inverse-time feed (G93) or firmware-side motion control.")
 
 
@@ -793,6 +911,8 @@ if __name__ == "__main__":
     ap.add_argument("--point-z", type=float, default=DEFAULT_POINT_Z, help="Fixed tip Z (Cartesian/world).")
 
     # C motion mode
+    ap.add_argument("--motion-mode", choices=["custom", "fast_routine"], default=DEFAULT_MOTION_MODE,
+                    help="Use explicit C/B settings ('custom') or the requested fast routine preset.")
     ap.add_argument("--c-profile", choices=["sweep", "oscillate"], default=DEFAULT_C_PROFILE,
                     help="C motion mode: single sweep or oscillation.")
     ap.add_argument("--c-start-deg", type=float, default=DEFAULT_C_START_DEG, help="Sweep mode start C angle (deg).")
@@ -811,10 +931,14 @@ if __name__ == "__main__":
     # B profile
     ap.add_argument("--b-profile", choices=["triangle", "sine"], default=DEFAULT_B_PROFILE,
                     help="B motion profile over full motion.")
+    ap.add_argument("--b-cycles", type=float, default=DEFAULT_B_CYCLES,
+                    help="Number of B curl up/down cycles per routine.")
     ap.add_argument("--b-start", type=float, default=None, help="B at motion start/end. Default: --start-b (clamped).")
     ap.add_argument("--b-peak", type=float, default=None, help="B at motion midpoint. Default: farther B boundary.")
     ap.add_argument("--min-b", type=float, default=None, help="Lower commanded B bound.")
     ap.add_argument("--max-b", type=float, default=None, help="Upper commanded B bound.")
+    ap.add_argument("--routine-repeats", type=int, default=DEFAULT_ROUTINE_REPEATS,
+                    help="Repeat the whole routine this many times.")
 
     # Feedrates
     ap.add_argument("--travel-feed", type=float, default=DEFAULT_TRAVEL_FEED, help="Feedrate for non-tracked travel moves.")
@@ -832,6 +956,8 @@ if __name__ == "__main__":
                     help="Seconds for C speed envelope deceleration at end of tracked motion.")
     ap.add_argument("--disable-segment-feed-scheduler", action="store_true",
                     help="Disable per-segment feed scheduling (tracked motion uses constant --probe-feed).")
+    ap.add_argument("--motion-accel-mm-s2", type=float, default=DEFAULT_MOTION_ACCEL_MM_S2,
+                    help="Acceleration used only for move-time estimation, matching the continuous acquisition timing model.")
 
     ap.add_argument("--no-c-preposition", action="store_true",
                     help="Disable optional C-only pre-position move to first trajectory C.")

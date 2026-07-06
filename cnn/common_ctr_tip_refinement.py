@@ -122,6 +122,7 @@ class CTRSourceAdapter:
         os.chdir(str(self.workspace_dir))
 
         self.normalize_angle = getattr(self.module, "_normalize_tip_angle_deg")
+        self.normalize_tip_detection_mode = getattr(self.module, "_normalize_tip_detection_mode", lambda mode: str(mode).strip().lower())
         self.refine_tip_parallel_centerline = getattr(self.module, "refine_tip_parallel_centerline")
         self.select_tip_candidate = getattr(self.module, "_select_tip_candidate")
 
@@ -248,6 +249,28 @@ class CTRSourceAdapter:
             tip_dbg=tip_refine_dbg,
             mode=getattr(self.processor, "tip_refine_mode", "coarse"),
         )
+
+        tip_detection_mode = self.normalize_tip_detection_mode(
+            getattr(self.processor, "tip_detection_mode", "classical")
+        )
+        if tip_detection_mode in ("red_dot", "auto_red_dot"):
+            red_tip_dbg = self.processor.detect_red_tip_marker(
+                cropped,
+                crop_origin_xy=(crop_x_min_img, crop_y_min_img),
+                anchor_yx_local=(yy_selected, xx_selected),
+            )
+            if red_tip_dbg.get("found"):
+                yy_selected = float(red_tip_dbg["y_local"])
+                xx_selected = float(red_tip_dbg["x_local"])
+                tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                tip_select_dbg["tip_xy"] = [float(xx_selected), float(yy_selected)]
+                tip_select_dbg["selected_tip_xy"] = [float(xx_selected), float(yy_selected)]
+                tip_select_dbg["selected_tip_source"] = "red_dot"
+                tip_select_dbg["selected_tip_reason"] = "red_dot_centroid"
+                tip_select_dbg["mode"] = "red_dot"
+            else:
+                tip_select_dbg = dict(tip_select_dbg) if isinstance(tip_select_dbg, dict) else {}
+                tip_select_dbg["red_dot_fallback_reason"] = red_tip_dbg.get("reason", "red_dot_not_found")
 
         coarse_x_abs = float(tip_col + crop_x_min_img)
         coarse_y_abs = float(tip_row + crop_y_min_img)

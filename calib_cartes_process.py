@@ -20,11 +20,10 @@ What it does:
   7) Reconstructs desired grid coordinates from unique commanded X/Z values
      using user-specified step sizes (default: 5 mm in X and Z)
   8) For each used tip-angle pass:
-       - aligns desired grid to measured points by CENTERING the two point sets
-         using the mean of sampled points
+       - compares each measured point directly to its sampled grid point
        - computes per-point errors
        - computes per-angle RMSE
-  9) Computes global RMSE across all valid aligned points
+  9) Computes a global score as the average of the per-angle RMSE values
  10) Saves:
        - CSV of desired / aligned desired / measured / errors
        - JSON metrics summary
@@ -1812,6 +1811,41 @@ def compute_tracked_tip_positions_mm_with_targets(
     }
 
 
+def load_existing_tracked_rows(processed_dir: Path) -> np.ndarray:
+    coarse_npy = processed_dir / "tip_locations_coarse.npy"
+    coarse_csv = processed_dir / "tip_locations_coarse.csv"
+
+    if coarse_npy.exists():
+        arr = np.asarray(np.load(coarse_npy), dtype=float)
+        print(f"[INFO] Loaded existing tracked tips from: {coarse_npy}")
+        return arr
+
+    if coarse_csv.exists():
+        rows = []
+        with open(coarse_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for rec in reader:
+                rows.append([
+                    float(rec.get("tip_row", np.nan)),
+                    float(rec.get("tip_column", np.nan)),
+                    float(rec.get("orientation", np.nan)),
+                    float(rec.get("ss_pos", np.nan)),
+                    float(rec.get("ntnl_pos", np.nan)),
+                    float(rec.get("tip_angle_deg", np.nan)),
+                    float(rec.get("motion_phase_code", np.nan)),
+                    float(rec.get("pass_idx", np.nan)),
+                    float(rec.get("stage_y_cmd", np.nan)),
+                ])
+        arr = np.asarray(rows, dtype=float)
+        print(f"[INFO] Loaded existing tracked tips from: {coarse_csv}")
+        return arr
+
+    raise FileNotFoundError(
+        "Could not find existing tracked tip outputs. Expected "
+        f"{coarse_npy} or {coarse_csv}."
+    )
+
+
 # -----------------------------------------
 # Desired grid reconstruction + alignment
 # -----------------------------------------
@@ -1914,18 +1948,8 @@ def align_desired_to_measured_per_angle(
     records: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[float, Dict[str, Any]]]:
     """
-    For each used tip-angle pass:
-      aligned_desired_u_mm = desired_grid_u_mm + offset_u
-      aligned_desired_z_mm = desired_grid_z_mm + offset_z
-
-    Alignment is center-based using means of sampled points:
-      measured_center_u = mean(measured_u)
-      measured_center_z = mean(measured_z)
-      desired_center_u  = mean(desired_u)
-      desired_center_z  = mean(desired_z)
-
-      offset_u = measured_center_u - desired_center_u
-      offset_z = measured_center_z - desired_center_z
+    Align the sampled grid references to the measured points using centroids,
+    independently for each used tip-angle group.
     """
     grouped = defaultdict(list)
     for rec in records:
@@ -1956,6 +1980,7 @@ def align_desired_to_measured_per_angle(
                 "measured_center_z_mm": None,
                 "desired_center_u_mm": None,
                 "desired_center_z_mm": None,
+                "alignment_mode": "centroid_centering",
             }
             for rec in grecs:
                 rec["aligned_desired_u_mm"] = None
@@ -1984,6 +2009,7 @@ def align_desired_to_measured_per_angle(
             "measured_center_z_mm": measured_center_z,
             "desired_center_u_mm": desired_center_u,
             "desired_center_z_mm": desired_center_z,
+            "alignment_mode": "centroid_centering",
         }
 
         for rec in grecs:
@@ -2047,7 +2073,7 @@ def compute_errors_against_aligned_desired(
     if all_err.size == 0:
         raise RuntimeError("No valid aligned points available for RMSE calculation.")
 
-    global_rmse_mm = float(np.sqrt(np.mean(all_err ** 2)))
+    global_pointwise_rmse_mm = float(np.sqrt(np.mean(all_err ** 2)))
     global_mean_err_mm = float(np.mean(all_err))
     global_std_err_mm = float(np.std(all_err))
     global_median_err_mm = float(np.median(all_err))
@@ -2084,9 +2110,21 @@ def compute_errors_against_aligned_desired(
             "max_error_mm": float(np.max(errs)),
         }
 
+    per_angle_rmse_values = [
+        float(item["rmse_mm"])
+        for item in per_angle.values()
+        if item.get("rmse_mm") is not None
+    ]
+    if not per_angle_rmse_values:
+        raise RuntimeError("No valid per-angle RMSE values available for global score calculation.")
+
+    global_rmse_mm = float(np.mean(np.asarray(per_angle_rmse_values, dtype=float)))
+
     metrics = {
         "global_num_samples": int(all_err.size),
         "global_rmse_mm": global_rmse_mm,
+        "global_rmse_definition": "mean_of_per_angle_rmse",
+        "global_pointwise_rmse_mm": global_pointwise_rmse_mm,
         "global_mean_error_mm": global_mean_err_mm,
         "global_std_error_mm": global_std_err_mm,
         "global_median_error_mm": global_median_err_mm,
@@ -2156,6 +2194,8 @@ def save_metrics_json(
         "global_metrics": {
             "num_samples": metrics["global_num_samples"],
             "rmse_mm": metrics["global_rmse_mm"],
+            "rmse_definition": metrics["global_rmse_definition"],
+            "pointwise_rmse_mm": metrics["global_pointwise_rmse_mm"],
             "mean_error_mm": metrics["global_mean_error_mm"],
             "std_error_mm": metrics["global_std_error_mm"],
             "median_error_mm": metrics["global_median_error_mm"],
@@ -2251,7 +2291,7 @@ def save_desired_vs_actual_plot(
             facecolors="none",
             edgecolors="#8ae1ff",
             linewidths=1.5,
-            label="Reference (aligned centers)",
+            label="Reference grid point",
         )
 
         # Measured points smaller and as points, not circles
@@ -2261,29 +2301,6 @@ def save_desired_vs_actual_plot(
             marker=".",
             color="#ffd166",
             label="Measured",
-        )
-
-        # Draw centers explicitly
-        desired_center = np.array([np.mean(desired_u), np.mean(desired_z)], dtype=float)
-        measured_center = np.array([np.mean(measured_u), np.mean(measured_z)], dtype=float)
-
-        ax.scatter(
-            [desired_center[0]], [desired_center[1]],
-            s=60, marker="s", facecolors="none", edgecolors="#00e5ff", linewidths=2.0,
-            label="Reference center",
-        )
-        ax.scatter(
-            [measured_center[0]], [measured_center[1]],
-            s=36, marker="+", color="#ff5ea8", linewidths=1.8,
-            label="Measured center",
-        )
-        ax.plot(
-            [desired_center[0], measured_center[0]],
-            [desired_center[1], measured_center[1]],
-            linestyle="--",
-            linewidth=1.0,
-            alpha=0.7,
-            color="#ff5ea8",
         )
 
         per_angle = metrics["per_angle_metrics"].get(ang, {})
@@ -2347,7 +2364,7 @@ def save_desired_vs_actual_plot(
     global_rmse = float(metrics["global_rmse_mm"])
     fig.suptitle(
         f"{title_prefix}Desired vs measured tracked tip points by used tip angle\n"
-        f"Global RMSE = {global_rmse:.4f} mm",
+        f"Global score (mean per-angle RMSE) = {global_rmse:.4f} mm",
         fontsize=14,
         y=0.995,
         color="#f8fbff",
@@ -2367,6 +2384,8 @@ def main():
     ap.add_argument("--raw_dir", type=str, default=None,
                     help="raw_image_data_folder or any folder of images (will be wrapped into a project)")
     ap.add_argument("--threshold", type=int, default=200)
+    ap.add_argument("--skip_image_analysis", action="store_true",
+                    help="Reuse existing processed_image_data_folder tip locations instead of rerunning analyze_data_batch.")
 
     ap.add_argument("--camera_calibration_file", type=str, required=True,
                     help="Path to camera calibration .npz for checkerboard-reference analysis.")
@@ -2517,11 +2536,15 @@ def main():
 
     print(f"[INFO] Checkerboard reference estimated from: {board_ref_path}")
 
-    analysis_crop = interactive_crop_from_image(
-        img_bgr,
-        default_crop=cal.default_analysis_crop,
-    )
-    cal.analysis_crop = dict(analysis_crop)
+    if bool(args.skip_image_analysis):
+        cal.analysis_crop = getattr(cal, "default_analysis_crop", None)
+        print("[INFO] skip_image_analysis=True, reusing existing tracked tip outputs.")
+    else:
+        analysis_crop = interactive_crop_from_image(
+            img_bgr,
+            default_crop=cal.default_analysis_crop,
+        )
+        cal.analysis_crop = dict(analysis_crop)
 
     if args.save_analysis_config:
         cfg = {}
@@ -2535,12 +2558,14 @@ def main():
 
     patch_filename_parser()
 
-    print("\n[INFO] Running analyze_data_batch (offline)...")
-    cal.analyze_data_batch(threshold=int(args.threshold))
-
-    tracked_rows = np.asarray(cal.tip_locations_array_coarse, dtype=float)
-    if tracked_rows.size == 0:
-        raise RuntimeError("No tracked tip data found in cal.tip_locations_array_coarse after analyze_data_batch.")
+    if bool(args.skip_image_analysis):
+        tracked_rows = load_existing_tracked_rows(processed_dir)
+    else:
+        print("\n[INFO] Running analyze_data_batch (offline)...")
+        cal.analyze_data_batch(threshold=int(args.threshold))
+        tracked_rows = np.asarray(cal.tip_locations_array_coarse, dtype=float)
+        if tracked_rows.size == 0:
+            raise RuntimeError("No tracked tip data found in cal.tip_locations_array_coarse after analyze_data_batch.")
 
     print("[INFO] Converting tracked tips to checkerboard-referenced mm and parsing filename targets...")
     tip_data = compute_tracked_tip_positions_mm_with_targets(cal, tracked_rows, imgs)
@@ -2552,10 +2577,10 @@ def main():
         z_step_mm=float(args.desired_z_step_mm),
     )
 
-    print("[INFO] Aligning reference and measured point sets by the mean center of sampled points...")
+    print("[INFO] Using sampled grid points directly as the reference targets...")
     records, alignments = align_desired_to_measured_per_angle(records)
 
-    print("[INFO] Computing global and per-angle RMSE...")
+    print("[INFO] Computing per-angle RMSE and global score...")
     records, metrics = compute_errors_against_aligned_desired(records)
 
     csv_path = processed_dir / "tracked_tip_positions_desired_vs_measured_mm.csv"
@@ -2592,6 +2617,7 @@ def main():
     print("\n========== RESULTS ==========")
     print(f"Valid samples: {metrics['global_num_samples']}")
     print(f"Global RMSE:   {metrics['global_rmse_mm']:.6f} mm")
+    print(f"Pointwise RMSE:{metrics['global_pointwise_rmse_mm']:.6f} mm")
     print(f"Mean error:    {metrics['global_mean_error_mm']:.6f} mm")
     print(f"Std error:     {metrics['global_std_error_mm']:.6f} mm")
     print(f"Median error:  {metrics['global_median_error_mm']:.6f} mm")

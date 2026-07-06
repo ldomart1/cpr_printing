@@ -30,7 +30,7 @@ Assumptions / conventions
    - cubic_coefficients.offplane_y_coeffs (optional)
    - cubic_coefficients.tip_angle_coeffs (optional)
    - optional fit_models / fit_models_by_phase PCHIP or polynomial models
-   - motor_setup.b_motor_position_range
+   - motor_setup.b_motor_position_range 
    - duet_axis_mapping / motor_setup axis names
 
 3) B-angle convention used here for tangential writing:
@@ -63,6 +63,8 @@ import argparse
 import json
 import math
 import re
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -85,8 +87,8 @@ DEFAULT_MACHINE_END_Z = -10.0
 DEFAULT_MACHINE_END_B = 0.0
 DEFAULT_MACHINE_END_C = 0.0
 
-DEFAULT_TRAVEL_FEED = 2000.0            # mm/min
-DEFAULT_APPROACH_FEED = 1000.0           # mm/min
+DEFAULT_TRAVEL_FEED = 2500.0            # mm/min
+DEFAULT_APPROACH_FEED = 500.0           # mm/min
 DEFAULT_FINE_APPROACH_FEED = 150.0      # mm/min
 DEFAULT_PRINT_FEED = 500.0              # mm/min
 DEFAULT_C_FEED = 5000.0                 # deg/min
@@ -96,34 +98,37 @@ DEFAULT_PRIME_MM = 0.2
 
 DEFAULT_PRESSURE_OFFSET_MM = 5.0
 DEFAULT_PRESSURE_ADVANCE_FEED = 1000.0
-DEFAULT_PRESSURE_RETRACT_FEED = 2000.0
-DEFAULT_PREFLOW_DWELL_MS = 200
-DEFAULT_NODE_DWELL_MS = 200
+DEFAULT_PRESSURE_RETRACT_FEED = 1000.0
+DEFAULT_PREFLOW_DWELL_MS = 500
+DEFAULT_START_NODE_DWELL_MS = 500
+DEFAULT_NODE_DWELL_MS = 500
 
 DEFAULT_EDGE_SAMPLES = 1
 DEFAULT_NODE_ATTACH_THRESHOLD = 0.30    # mm
 DEFAULT_ROOT_RADIUS_FACTOR = 1.0
-DEFAULT_SIDE_APPROACH_FAR = 1.0         # mm in tip-space
+DEFAULT_SIDE_APPROACH_FAR = 4.0         # mm in tip-space
 DEFAULT_SIDE_APPROACH_NEAR = 0.25       # mm in tip-space
-DEFAULT_SIDE_RETREAT = 5            # mm in tip-space
+DEFAULT_SIDE_RETREAT = 10            # mm in tip-space
 DEFAULT_SIDE_LIFT_Z = 5               # mm in tip-space
 DEFAULT_TRAVEL_CLEARANCE_ABOVE_PRINTED_Z = 10.0
 DEFAULT_TRAVEL_BBOX_MARGIN = 0.0
-DEFAULT_TRAVEL_EDGE_CLEARANCE = 5.0
-DEFAULT_FINE_APPROACH_DISTANCE = 5.0
-DEFAULT_TANGENT_SMOOTH_WINDOW = 6
-DEFAULT_CENTERLINE_SMOOTH_WINDOW = 0
+DEFAULT_TRAVEL_EDGE_CLEARANCE = 8.0
+DEFAULT_TRAVEL_EASE_DISTANCE_MM = 5.0
+DEFAULT_TRAVEL_CORNER_MIN_FEED_SCALE = 0.15
+DEFAULT_FINE_APPROACH_DISTANCE = 3.0
+DEFAULT_TANGENT_SMOOTH_WINDOW = 40
+DEFAULT_CENTERLINE_SMOOTH_WINDOW = 12
 DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW = 0
-DEFAULT_PATH_RESAMPLE_SPACING = 0.0
-DEFAULT_SKELETON_COLLISION_CLEARANCE = 0.25
+DEFAULT_PATH_RESAMPLE_SPACING = 0.5
+DEFAULT_SKELETON_COLLISION_CLEARANCE = 2.0
 DEFAULT_SKELETON_COLLISION_SAMPLE_STEP_MM = 1.0
-DEFAULT_B_MAX_STEP_DEG = 10.0
-DEFAULT_B_SMOOTHING_ALPHA = 1.0
-DEFAULT_C_SMOOTHING_ALPHA = 1.0
+DEFAULT_B_MAX_STEP_DEG = 3.0
+DEFAULT_B_SMOOTHING_ALPHA = 0.15
+DEFAULT_C_SMOOTHING_ALPHA = 0.08
 DEFAULT_POINT_MERGE_TOL = 1e-6
-DEFAULT_MIN_TANGENT_XY = 0.05
+DEFAULT_MIN_TANGENT_XY = 0.30
 DEFAULT_MIN_PATH_POINTS = 2
-DEFAULT_C_MAX_STEP_DEG = 15.0
+DEFAULT_C_MAX_STEP_DEG = 1.5
 DEFAULT_MIN_GROUP_LENGTH_MM = 0.0
 DEFAULT_BRANCH_OVERLAP_TANGENT_WINDOW_MM = 5.0
 DEFAULT_END_OVEREXTENSION_MM = 0.0
@@ -132,6 +137,32 @@ DEFAULT_END_OVEREXTENSION_FEED = 5000.0
 DEFAULT_OFFPLANE_SIGN = -1.0
 DEFAULT_TRAVEL_ACCEL_MM_S2 = 0.0
 DEFAULT_POST_PRINT_TRAVEL_ACCEL_SCALE = 0.85
+
+# Aorta-centered 90-degree travel defaults
+DEFAULT_AORTA_CYLINDER_CLEARANCE_MM = 2.0
+DEFAULT_AORTA_CYLINDER_MIN_RADIUS_MM = 10
+DEFAULT_AORTA_CYLINDER_SAMPLES = 24
+DEFAULT_AORTA_CYLINDER_SAMPLE_SPACING_MM = 0.25
+DEFAULT_TRAVEL_STRATEGY = "cylinder-surface"
+
+# Radius-weighted print-feed defaults
+DEFAULT_EXTRUSION_FEED_MODE = "weighted"
+DEFAULT_RADIUS_FEED_MAP = "0.15:500,0.20:400,0.25:350,0.30:325,0.40:130,0.60:80,1.00:20,1.30:10"
+
+DEFAULT_WRITE_MODE = "calibrated"
+DEFAULT_ORIENTATION_MODE = "tangent"
+DEFAULT_OFFPLANE_FIT_MODE = "avg_cubic"
+DEFAULT_FORCE_BOTTOM_TO_TOP = True
+DEFAULT_ENABLE_TRAVEL_BBOX_CLEARANCE = False
+DEFAULT_LAUNCH_VIEWER = True
+DEFAULT_ALIGN_LOWEST_CENTROID = (100.0, 80.0, -130.0)
+DEFAULT_TRAVEL_C_MAX_STEP_DEG = 4.0
+DEFAULT_TRAVEL_C_SMOOTHING_ALPHA = 0.25
+
+# Physical C-axis command limits. Equivalent azimuths are chosen inside this
+# range so C can use the full robot travel without drifting past hard limits.
+DEFAULT_C_MIN_DEG = -360.0
+DEFAULT_C_MAX_DEG = 360.0
 
 DEFAULT_BBOX_X_MIN = -1e9
 DEFAULT_BBOX_X_MAX =  1e9
@@ -167,10 +198,13 @@ class Calibration:
     y_off_model: Optional[Dict[str, Any]] = None
     y_off_extrap_model: Optional[Dict[str, Any]] = None
     tip_angle_model: Optional[Dict[str, Any]] = None
+    fit_models_global: Dict[str, Any] = field(default_factory=dict)
+    fit_models_by_phase: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     selected_fit_model: Optional[str] = None
     selected_offplane_fit_model: Optional[str] = None
     requested_offplane_fit_mode: Optional[str] = None
     active_phase: str = "pull"
+    default_motion_phase: str = "pull"
 
 
 @dataclass
@@ -222,6 +256,7 @@ class PrintPath:
     path_id: str
     source_vessel_ids: List[int]
     points: np.ndarray
+    radius_profile: np.ndarray
     root_vessel_id: int
     parent_vessel_id: Optional[int]
     depth: int
@@ -244,6 +279,7 @@ class PlannedTipMove:
     feed: float
     comment: str
     allow_tip_segment_contact: bool = False
+    travel_mode: bool = True
 
 
 @dataclass
@@ -488,7 +524,12 @@ def load_calibration(json_path: str, requested_offplane_fit_mode: Optional[str] 
     active_phase = str(data.get("default_phase_for_legacy_access") or "pull").strip().lower()
 
     fit_models = data.get("fit_models", {}) or {}
-    phase_models = data.get("fit_models_by_phase", {}) or {}
+    phase_models_raw = data.get("fit_models_by_phase", {}) or {}
+    phase_models = {
+        _normalize_phase_key(k): v
+        for k, v in phase_models_raw.items()
+        if isinstance(v, dict)
+    } if isinstance(phase_models_raw, dict) else {}
     active_phase_models = phase_models.get(active_phase) if isinstance(phase_models, dict) else None
     if not isinstance(active_phase_models, dict):
         active_phase_models = fit_models
@@ -530,12 +571,15 @@ def load_calibration(json_path: str, requested_offplane_fit_mode: Optional[str] 
         y_off_model=y_off_model,
         y_off_extrap_model=y_off_extrap_model,
         tip_angle_model=tip_angle_model,
+        fit_models_global=dict(fit_models) if isinstance(fit_models, dict) else {},
+        fit_models_by_phase=phase_models,
         selected_fit_model=selected_fit_model,
         selected_offplane_fit_model=selected_offplane_fit_model,
         requested_offplane_fit_mode=(
             None if requested_offplane_fit_mode is None else str(requested_offplane_fit_mode).strip().lower()
         ),
         active_phase=active_phase,
+        default_motion_phase=active_phase,
         b_min=b_min,
         b_max=b_max,
         x_axis=x_axis,
@@ -553,6 +597,69 @@ def _normalize_phase_key(name: Optional[str]) -> str:
     if raw.startswith("release"):
         return "release"
     return "pull"
+
+
+def _phase_models_for(cal: Calibration, motion_phase: Optional[str]) -> Dict[str, Any]:
+    phase_key = _normalize_phase_key(motion_phase or cal.default_motion_phase)
+    payload = cal.fit_models_by_phase.get(phase_key)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _select_fit_model_for_phase(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    phase_models = _phase_models_for(cal, motion_phase)
+    phase_model = _select_named_model(phase_models, model_name, cal.selected_fit_model)
+    if phase_model is not None:
+        return phase_model
+    return {
+        "r": cal.r_model,
+        "z": cal.z_model,
+        "tip_angle": cal.tip_angle_model,
+    }.get(model_name)
+
+
+def _select_offplane_model_for_phase(
+    cal: Calibration,
+    motion_phase: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    requested_mode = None if cal.requested_offplane_fit_mode is None else str(cal.requested_offplane_fit_mode).strip().lower()
+    phase_models = _phase_models_for(cal, motion_phase)
+
+    if requested_mode and requested_mode != "auto":
+        return _select_offplane_model(
+            phase_models,
+            cal.fit_models_global,
+            cal.selected_offplane_fit_model,
+            cal.selected_fit_model,
+            requested_offplane_fit_mode=requested_mode,
+        )
+
+    primary_names: List[str] = []
+    extrap_names: List[str] = []
+    selected_offplane = None if cal.selected_offplane_fit_model is None else str(cal.selected_offplane_fit_model).strip().lower()
+    selected_generic = None if cal.selected_fit_model is None else str(cal.selected_fit_model).strip().lower()
+    if selected_offplane:
+        primary_names.append(f"offplane_y_{selected_offplane}")
+        if selected_offplane == "pchip":
+            extrap_names.append("offplane_y_linear")
+    if selected_generic:
+        primary_names.append(f"offplane_y_{selected_generic}")
+        if selected_generic == "pchip":
+            extrap_names.append("offplane_y_linear")
+    primary_names.extend(["offplane_y_pchip", "offplane_y_cubic", "offplane_y_linear", "offplane_y"])
+    extrap_names.extend(["offplane_y_linear", "offplane_y"])
+
+    for key in primary_names:
+        spec = _normalize_model_spec(phase_models.get(key))
+        if spec is None:
+            continue
+        extrap = None
+        for extrap_key in extrap_names:
+            extrap = _normalize_model_spec(phase_models.get(extrap_key))
+            if extrap is not None:
+                break
+        return spec, extrap
+
+    return cal.y_off_model, cal.y_off_extrap_model
 
 
 def _evaluate_skeleton_descriptor(model_descriptor: Optional[dict], b_val: float) -> float:
@@ -613,15 +720,37 @@ def resolve_robot_skeleton_from_calibration(calibration_path: str) -> Optional[P
     return candidate if candidate.exists() else None
 
 
-def eval_r(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.r_model is not None:
-        return eval_model_spec(cal.r_model, b)
+def default_groups_out_path(out_path: str) -> str:
+    p = Path(out_path)
+    suffix = p.suffix if p.suffix else ".gcode"
+    if p.name.endswith(suffix):
+        stem_name = p.name[: -len(suffix)]
+    else:
+        stem_name = p.stem
+    return str(p.with_name(f"{stem_name}_groups.txt"))
+
+
+def default_group_displacements_path(out_path: str) -> str:
+    p = Path(out_path)
+    suffix = p.suffix if p.suffix else ".gcode"
+    if p.name.endswith(suffix):
+        stem_name = p.name[: -len(suffix)]
+    else:
+        stem_name = p.stem
+    return str(p.with_name(f"{stem_name}_group_displacements.txt"))
+
+
+def eval_r(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model = _select_fit_model_for_phase(cal, "r", motion_phase=motion_phase)
+    if model is not None:
+        return eval_model_spec(model, b)
     return poly_eval(cal.pr, b)
 
 
-def eval_z(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.z_model is not None:
-        return eval_model_spec(cal.z_model, b)
+def eval_z(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model = _select_fit_model_for_phase(cal, "z", motion_phase=motion_phase)
+    if model is not None:
+        return eval_model_spec(model, b)
     return poly_eval(cal.pz, b)
 
 
@@ -643,17 +772,19 @@ def eval_pchip_with_linear_extrap(model_spec: Dict[str, Any], extrap_model_spec:
     return out
 
 
-def eval_offplane_y(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.y_off_model is not None:
-        if str(cal.y_off_model.get("model_type", "")).lower() == "pchip":
-            return eval_pchip_with_linear_extrap(cal.y_off_model, cal.y_off_extrap_model, b)
-        return eval_model_spec(cal.y_off_model, b, default_if_none=0.0)
+def eval_offplane_y(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model, extrap_model = _select_offplane_model_for_phase(cal, motion_phase=motion_phase)
+    if model is not None:
+        if str(model.get("model_type", "")).lower() == "pchip":
+            return eval_pchip_with_linear_extrap(model, extrap_model, b)
+        return eval_model_spec(model, b, default_if_none=0.0)
     return poly_eval(cal.py_off, b, default_if_none=0.0)
 
 
-def eval_tip_angle_deg(cal: Calibration, b: Any) -> np.ndarray:
-    if cal.tip_angle_model is not None:
-        return eval_model_spec(cal.tip_angle_model, b)
+def eval_tip_angle_deg(cal: Calibration, b: Any, motion_phase: Optional[str] = None) -> np.ndarray:
+    model = _select_fit_model_for_phase(cal, "tip_angle", motion_phase=motion_phase)
+    if model is not None:
+        return eval_model_spec(model, b)
     if cal.pa is None:
         raise ValueError("Calibration is missing tip_angle_coeffs.")
     return poly_eval(cal.pa, b)
@@ -688,11 +819,82 @@ def calibration_model_range_warnings(cal: Calibration) -> List[str]:
     return warnings
 
 
+def tip_angle_deg_to_b_continuous(
+    requested_tip_angle_deg: float,
+    b_samples: np.ndarray,
+    angle_samples_deg: np.ndarray,
+    prev_b: Optional[float] = None,
+) -> Tuple[float, float]:
+    angle_arr = np.asarray(angle_samples_deg, dtype=float).reshape(-1)
+    b_arr = np.asarray(b_samples, dtype=float).reshape(-1)
+    if angle_arr.size != b_arr.size or angle_arr.size < 2:
+        raise ValueError("Continuous tip-angle inversion requires matched dense B/angle samples.")
+
+    amin = float(np.nanmin(angle_arr))
+    amax = float(np.nanmax(angle_arr))
+    used_angle = float(np.clip(float(requested_tip_angle_deg), amin, amax))
+
+    candidates: List[float] = []
+    tol = 1e-9
+    for i in range(len(angle_arr) - 1):
+        a0 = float(angle_arr[i])
+        a1 = float(angle_arr[i + 1])
+        b0 = float(b_arr[i])
+        b1 = float(b_arr[i + 1])
+        if not (np.isfinite(a0) and np.isfinite(a1) and np.isfinite(b0) and np.isfinite(b1)):
+            continue
+        lo = min(a0, a1) - tol
+        hi = max(a0, a1) + tol
+        if used_angle < lo or used_angle > hi:
+            continue
+        if abs(a1 - a0) <= tol:
+            candidates.append(0.5 * (b0 + b1))
+            continue
+        t = (used_angle - a0) / (a1 - a0)
+        if -tol <= t <= 1.0 + tol:
+            t = float(np.clip(t, 0.0, 1.0))
+            candidates.append((1.0 - t) * b0 + t * b1)
+
+    if not candidates:
+        nearest_idx = int(np.nanargmin(np.abs(angle_arr - used_angle)))
+        return float(b_arr[nearest_idx]), used_angle
+
+    cand_arr = np.unique(np.round(np.asarray(candidates, dtype=float), decimals=9))
+    if prev_b is not None and np.isfinite(prev_b):
+        pick_idx = int(np.argmin(np.abs(cand_arr - float(prev_b))))
+        return float(cand_arr[pick_idx]), used_angle
+
+    nearest_idx = int(np.nanargmin(np.abs(angle_arr - used_angle)))
+    seed_b = float(b_arr[nearest_idx])
+    pick_idx = int(np.argmin(np.abs(cand_arr - seed_b)))
+    return float(cand_arr[pick_idx]), used_angle
+
+
+def solve_b_for_target_tip_angle_continuous(
+    cal: Calibration,
+    target_angle_deg: float,
+    prev_b: Optional[float] = None,
+    motion_phase: Optional[str] = None,
+    search_samples: int = DEFAULT_BC_SOLVE_SAMPLES,
+) -> Tuple[float, float]:
+    ns = max(1000, int(search_samples))
+    b_samples = np.linspace(float(cal.b_min), float(cal.b_max), ns, dtype=float)
+    angle_samples = np.asarray(eval_tip_angle_deg(cal, b_samples, motion_phase=motion_phase), dtype=float)
+    return tip_angle_deg_to_b_continuous(
+        requested_tip_angle_deg=float(target_angle_deg),
+        b_samples=b_samples,
+        angle_samples_deg=angle_samples,
+        prev_b=prev_b,
+    )
+
+
 def parse_group_displacements_file(path: str) -> Dict[int, GroupDisplacement]:
     out: Dict[int, GroupDisplacement] = {}
     p = Path(path)
     if not p.exists():
-        raise FileNotFoundError(f"Group displacement file not found: {path}")
+        write_default_group_displacements_file(str(p), paths=None)
+        print(f"Group displacement file not found; created default zero-offset file: {p}")
+        return out
 
     with p.open("r") as f:
         for line_no, raw_line in enumerate(f, start=1):
@@ -722,6 +924,8 @@ def parse_group_displacements_file(path: str) -> Dict[int, GroupDisplacement]:
             db = float(parts[4]) if len(parts) >= 5 else 0.0
             dc = float(parts[5]) if len(parts) >= 6 else 0.0
             feed = float(parts[6]) if len(parts) >= 7 else None
+            if feed is not None and feed <= 0.0:
+                feed = None
             enabled = True
             if len(parts) >= 8:
                 enabled = str(parts[7]).strip().lower() not in {"0", "false", "no", "off", "disable", "disabled"}
@@ -744,6 +948,42 @@ def parse_group_displacements_file(path: str) -> Dict[int, GroupDisplacement]:
                 note=note,
             )
     return out
+
+
+
+def group_displacements_file_has_data_rows(path: str) -> bool:
+    p = Path(path)
+    if not p.exists():
+        return False
+    with p.open("r") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if line and not line.startswith("#"):
+                return True
+    return False
+
+
+def write_default_group_displacements_file(path: str, paths: Optional[List[PrintPath]] = None) -> None:
+    """
+    Create a manual displacement template where every generated group defaults
+    to zero displacement/zero rotary offset and enabled=1.
+
+    Row format:
+      group_number dx dy dz db_deg dc_deg feed_mm_min enabled node_dx node_dy node_dz node_db node_dc
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w") as f:
+        f.write("# Manual post-group displacement file. All generated defaults are zero.\n")
+        f.write("# Edit rows after the first preview run if a group needs manual correction.\n")
+        f.write("# group_number dx dy dz db_deg dc_deg feed_mm_min enabled node_dx node_dy node_dz node_db node_dc # path_id vessel_ids\n")
+        if paths is not None:
+            for i, path in enumerate(paths, start=1):
+                vessel_ids = ",".join(str(vessel_id) for vessel_id in path.source_vessel_ids)
+                f.write(
+                    f"{i} 0 0 0 0 0 0 1 0 0 0 0 0 # "
+                    f"{path.path_id} vessels={vessel_ids}\n"
+                )
 
 
 def prepend_group_node_gantry_offset(
@@ -770,14 +1010,19 @@ def prepend_group_node_gantry_offset(
     return pts_shifted
 
 
-def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float) -> np.ndarray:
+def predict_tip_offset_xyz(
+    cal: Calibration,
+    b: float,
+    c_deg: float,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
     """
     Physical tip offset from stage origin:
       local transverse [r(B), y_off(B)] rotated by C into XY, z=z(B)
     """
-    r = float(eval_r(cal, b))
-    z = float(eval_z(cal, b))
-    y_off = float(DEFAULT_OFFPLANE_SIGN) * float(eval_offplane_y(cal, b))
+    r = float(eval_r(cal, b, motion_phase=motion_phase))
+    z = float(eval_z(cal, b, motion_phase=motion_phase))
+    y_off = float(DEFAULT_OFFPLANE_SIGN) * float(eval_offplane_y(cal, b, motion_phase=motion_phase))
 
     c = math.radians(float(c_deg))
     x = r * math.cos(c) - y_off * math.sin(c)
@@ -785,12 +1030,24 @@ def predict_tip_offset_xyz(cal: Calibration, b: float, c_deg: float) -> np.ndarr
     return np.array([x, y, z], dtype=float)
 
 
-def stage_xyz_for_tip(cal: Calibration, tip_xyz: np.ndarray, b: float, c_deg: float) -> np.ndarray:
-    return np.asarray(tip_xyz, dtype=float) - predict_tip_offset_xyz(cal, b, c_deg)
+def stage_xyz_for_tip(
+    cal: Calibration,
+    tip_xyz: np.ndarray,
+    b: float,
+    c_deg: float,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
+    return np.asarray(tip_xyz, dtype=float) - predict_tip_offset_xyz(cal, b, c_deg, motion_phase=motion_phase)
 
 
-def tip_xyz_for_stage(cal: Calibration, stage_xyz: np.ndarray, b: float, c_deg: float) -> np.ndarray:
-    return np.asarray(stage_xyz, dtype=float) + predict_tip_offset_xyz(cal, b, c_deg)
+def tip_xyz_for_stage(
+    cal: Calibration,
+    stage_xyz: np.ndarray,
+    b: float,
+    c_deg: float,
+    motion_phase: Optional[str] = None,
+) -> np.ndarray:
+    return np.asarray(stage_xyz, dtype=float) + predict_tip_offset_xyz(cal, b, c_deg, motion_phase=motion_phase)
 
 
 def compute_tracked_skeleton_world(
@@ -832,14 +1089,19 @@ def compute_tracked_skeleton_world(
     return pts_world
 
 
-def solve_b_for_target_tip_angle(cal: Calibration, target_angle_deg: float, search_samples: int = DEFAULT_BC_SOLVE_SAMPLES) -> float:
+def solve_b_for_target_tip_angle(
+    cal: Calibration,
+    target_angle_deg: float,
+    search_samples: int = DEFAULT_BC_SOLVE_SAMPLES,
+    motion_phase: Optional[str] = None,
+) -> float:
     """
     Solve B such that tip_angle(B) ~= target_angle_deg, constrained to [b_min, b_max].
     Returns the closest feasible B if there is no sign change.
     """
     b_lo, b_hi = float(cal.b_min), float(cal.b_max)
     bb = np.linspace(b_lo, b_hi, int(max(101, search_samples)))
-    aa = eval_tip_angle_deg(cal, bb) - float(target_angle_deg)
+    aa = eval_tip_angle_deg(cal, bb, motion_phase=motion_phase) - float(target_angle_deg)
 
     i_best_abs = int(np.argmin(np.abs(aa)))
     b_best_abs = float(bb[i_best_abs])
@@ -859,7 +1121,7 @@ def solve_b_for_target_tip_angle(cal: Calibration, target_angle_deg: float, sear
         _, lo, hi = sign_changes[0]
 
         def f(x: float) -> float:
-            return float(eval_tip_angle_deg(cal, x) - float(target_angle_deg))
+            return float(eval_tip_angle_deg(cal, x, motion_phase=motion_phase) - float(target_angle_deg))
 
         flo = f(lo)
         for _ in range(80):
@@ -890,35 +1152,93 @@ VESSEL_BLOCK_RE = re.compile(
 
 
 def parse_vessel_file(path: str) -> List[Vessel]:
-    text = Path(path).read_text()
-    matches = VESSEL_BLOCK_RE.findall(text)
-    if not matches:
-        raise ValueError(f"No vessel blocks found in {path}")
+    """
+    Parse vessel centerline files in either supported format.
+
+    Supported headers:
+      1) Legacy/raw table format:
+           Vessel: 12, Number of Points: 345
+
+      2) SimVascular bspline export format:
+           Vessel 12
+
+    Data rows are comma-separated numeric rows. The first four columns are
+    interpreted as x, y, z, radius_like. Any additional columns are preserved
+    in raw_rows but otherwise ignored by the planner.
+    """
+    p = Path(path)
+    text = p.read_text()
+
+    header_re = re.compile(
+        r"^\s*Vessel(?:\s*:\s*|\s+)(\d+)"
+        r"(?:\s*,\s*Number\s+of\s+Points\s*:\s*(\d+))?\s*$",
+        re.IGNORECASE,
+    )
 
     vessels: List[Vessel] = []
-    for vessel_id_s, n_points_s, body in matches:
-        rows: List[List[float]] = []
-        for line in body.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            vals = [float(x.strip()) for x in line.split(",")]
-            if len(vals) < 4:
-                raise ValueError(f"Expected >= 4 columns in vessel point row, got {len(vals)}: {line}")
-            rows.append(vals)
+    current_id: Optional[int] = None
+    declared_points: Optional[int] = None
+    rows: List[List[float]] = []
 
-        raw = np.array(rows, dtype=float)
-        if raw.shape[0] < DEFAULT_MIN_PATH_POINTS:
+    def flush_current() -> None:
+        nonlocal current_id, declared_points, rows, vessels
+        if current_id is None:
+            rows = []
+            return
+        if len(rows) >= DEFAULT_MIN_PATH_POINTS:
+            raw = np.asarray(rows, dtype=float)
+            if raw.ndim != 2 or raw.shape[1] < 4:
+                raise ValueError(
+                    f"Vessel {current_id} in {path} has invalid row shape {raw.shape}; expected at least 4 numeric columns."
+                )
+            vessels.append(
+                Vessel(
+                    vessel_id=int(current_id),
+                    declared_points=int(declared_points) if declared_points is not None else int(raw.shape[0]),
+                    points=raw[:, :3].copy(),
+                    raw_rows=raw,
+                    radius_like=float(np.median(raw[:, 3])),
+                )
+            )
+        current_id = None
+        declared_points = None
+        rows = []
+
+    saw_header = False
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
             continue
 
-        vessel = Vessel(
-            vessel_id=int(vessel_id_s),
-            declared_points=int(n_points_s),
-            points=raw[:, :3].copy(),
-            raw_rows=raw,
-            radius_like=float(np.median(raw[:, 3])),
+        header_match = header_re.match(line)
+        if header_match is not None:
+            flush_current()
+            saw_header = True
+            current_id = int(header_match.group(1))
+            declared_points = int(header_match.group(2)) if header_match.group(2) is not None else None
+            rows = []
+            continue
+
+        if current_id is None:
+            # Ignore non-data preamble until the first Vessel header.
+            continue
+
+        try:
+            vals = [float(x.strip()) for x in line.split(",") if x.strip()]
+        except ValueError as exc:
+            raise ValueError(f"Could not parse numeric vessel row at {path}:{line_no}: {raw_line!r}") from exc
+
+        if len(vals) < 4:
+            raise ValueError(f"Expected >= 4 columns in vessel point row at {path}:{line_no}, got {len(vals)}: {raw_line}")
+        rows.append(vals)
+
+    flush_current()
+
+    if not saw_header or not vessels:
+        raise ValueError(
+            f"No vessel blocks found in {path}. Expected headers like 'Vessel 0' or "
+            f"'Vessel: 0, Number of Points: N'."
         )
-        vessels.append(vessel)
 
     vessels.sort(key=lambda v: v.vessel_id)
     return vessels
@@ -944,6 +1264,109 @@ def parse_vessel_id_selection(raw_selection: Sequence[str]) -> Optional[List[int
             vessel_ids.append(vessel_id)
             seen.add(vessel_id)
     return vessel_ids
+
+
+def parse_radius_feed_map_text(raw: Optional[str]) -> List[Tuple[float, float]]:
+    """
+    Parse a radius-to-feed map. Accepted forms:
+      "0.10:900,0.30:650,0.60:350"
+      "0.10=900 0.30=650 0.60=350"
+      JSON list: [[0.10, 900], [0.30, 650], [0.60, 350]]
+      JSON dict: {"0.10": 900, "0.30": 650, "0.60": 350}
+    Radius is in the same units as the input radius column after geometry scale;
+    feed is in mm/min. Values between map entries are linearly interpolated and
+    values outside the map are clamped to the nearest endpoint.
+    """
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+
+    pairs: List[Tuple[float, float]] = []
+    if text[0] in "[{":
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            pairs = [(float(k), float(v)) for k, v in payload.items()]
+        elif isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    raise ValueError("Each JSON radius-feed map item must contain exactly [radius, feed].")
+                pairs.append((float(item[0]), float(item[1])))
+        else:
+            raise ValueError("JSON radius-feed map must be a dict or a list of [radius, feed] pairs.")
+    else:
+        for token in re.split(r"[\s,;]+", text):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" in token:
+                a, b = token.split(":", 1)
+            elif "=" in token:
+                a, b = token.split("=", 1)
+            else:
+                raise ValueError(f"Invalid radius-feed map token {token!r}; expected radius:feed or radius=feed.")
+            pairs.append((float(a), float(b)))
+
+    if not pairs:
+        return []
+    pairs.sort(key=lambda item: item[0])
+    deduped: List[Tuple[float, float]] = []
+    for radius, feed in pairs:
+        if radius < 0.0:
+            raise ValueError("Radius-feed map radii must be non-negative.")
+        if feed <= 0.0:
+            raise ValueError("Radius-feed map feeds must be positive mm/min values.")
+        if deduped and abs(radius - deduped[-1][0]) <= 1e-12:
+            deduped[-1] = (float(radius), float(feed))
+        else:
+            deduped.append((float(radius), float(feed)))
+    return deduped
+
+
+def parse_radius_feed_map(raw: Optional[str], file_path: Optional[str] = None) -> List[Tuple[float, float]]:
+    items: List[Tuple[float, float]] = []
+    if file_path:
+        items.extend(parse_radius_feed_map_text(Path(file_path).read_text()))
+    if raw:
+        items.extend(parse_radius_feed_map_text(raw))
+    if not items:
+        return []
+    # Re-parse through text-independent sorting/deduping logic.
+    items.sort(key=lambda item: item[0])
+    out: List[Tuple[float, float]] = []
+    for radius, feed in items:
+        if out and abs(radius - out[-1][0]) <= 1e-12:
+            out[-1] = (float(radius), float(feed))
+        else:
+            out.append((float(radius), float(feed)))
+    return out
+
+
+def feed_from_radius_map(radius_mm: float, radius_feed_map: Sequence[Tuple[float, float]], default_feed: float) -> float:
+    if not radius_feed_map:
+        return float(default_feed)
+    r = float(radius_mm)
+    pairs = sorted((float(a), float(b)) for a, b in radius_feed_map)
+    if r <= pairs[0][0]:
+        return float(pairs[0][1])
+    if r >= pairs[-1][0]:
+        return float(pairs[-1][1])
+    for (r0, f0), (r1, f1) in zip(pairs[:-1], pairs[1:]):
+        if r0 <= r <= r1:
+            if abs(r1 - r0) <= 1e-12:
+                return float(f1)
+            t = (r - r0) / (r1 - r0)
+            return float(f0 + t * (f1 - f0))
+    return float(default_feed)
+
+
+def vessel_ordered_radius_profile(vessel: Vessel) -> np.ndarray:
+    radii = np.asarray(vessel.raw_rows[:, 3], dtype=float).reshape(-1)
+    if vessel.ordered_points is not None and len(vessel.ordered_points) == len(vessel.points):
+        is_same_orientation = bool(np.allclose(vessel.ordered_points, vessel.points))
+        return radii.copy() if is_same_orientation else radii[::-1].copy()
+    return radii.copy()
 
 
 def filter_vessels_by_id(vessels: List[Vessel], selected_ids: Optional[List[int]]) -> List[Vessel]:
@@ -989,18 +1412,56 @@ def rotate_points_y(points: np.ndarray, angle_deg: float, origin: np.ndarray) ->
     return out + np.asarray(origin, dtype=float)
 
 
+def rotate_points_z(points: np.ndarray, angle_deg: float, origin: np.ndarray) -> np.ndarray:
+    theta = math.radians(float(angle_deg))
+    c = math.cos(theta)
+    s = math.sin(theta)
+    shifted = np.asarray(points, dtype=float) - np.asarray(origin, dtype=float)
+    out = shifted.copy()
+    out[:, 0] = c * shifted[:, 0] - s * shifted[:, 1]
+    out[:, 1] = s * shifted[:, 0] + c * shifted[:, 1]
+    return out + np.asarray(origin, dtype=float)
+
+
 def transform_vessel_geometry(
     vessels: List[Vessel],
     rotate_y_deg: float = 0.0,
     rotate_origin: Sequence[float] = (0.0, 0.0, 0.0),
-) -> None:
-    if abs(float(rotate_y_deg)) <= 1e-12:
-        return
+) -> Dict[str, np.ndarray]:
     origin = np.asarray(rotate_origin, dtype=float).reshape(3)
-    for vessel in vessels:
-        vessel.points = rotate_points_y(vessel.points, float(rotate_y_deg), origin)
-        vessel.raw_rows[:, :3] = rotate_points_y(vessel.raw_rows[:, :3], float(rotate_y_deg), origin)
-        _refresh_vessel_geometry(vessel)
+    rotate_z_origin = vessel_lowest_centroid_anchor(vessels)
+    if abs(float(rotate_y_deg)) > 1e-12:
+        for vessel in vessels:
+            vessel.points = rotate_points_y(vessel.points, float(rotate_y_deg), origin)
+            vessel.raw_rows[:, :3] = rotate_points_y(vessel.raw_rows[:, :3], float(rotate_y_deg), origin)
+            _refresh_vessel_geometry(vessel)
+        rotate_z_origin = vessel_lowest_centroid_anchor(vessels)
+    return {
+        "rotate_y_origin": origin.copy(),
+        "rotate_z_origin": rotate_z_origin.copy(),
+    }
+
+
+def transform_vessel_geometry_with_z(
+    vessels: List[Vessel],
+    rotate_y_deg: float = 0.0,
+    rotate_z_deg: float = 0.0,
+    rotate_origin: Sequence[float] = (0.0, 0.0, 0.0),
+) -> Dict[str, np.ndarray]:
+    info = transform_vessel_geometry(
+        vessels,
+        rotate_y_deg=rotate_y_deg,
+        rotate_origin=rotate_origin,
+    )
+    rotate_z_origin = np.asarray(info["rotate_z_origin"], dtype=float).reshape(3)
+    if abs(float(rotate_z_deg)) > 1e-12:
+        for vessel in vessels:
+            vessel.points = rotate_points_z(vessel.points, float(rotate_z_deg), rotate_z_origin)
+            vessel.raw_rows[:, :3] = rotate_points_z(vessel.raw_rows[:, :3], float(rotate_z_deg), rotate_z_origin)
+            _refresh_vessel_geometry(vessel)
+        rotate_z_origin = vessel_lowest_centroid_anchor(vessels)
+    info["rotate_z_origin"] = rotate_z_origin.copy()
+    return info
 
 
 def vessel_lowest_centroid_anchor(vessels: List[Vessel]) -> np.ndarray:
@@ -1129,6 +1590,14 @@ def orient_vessels(vessels: List[Vessel]) -> None:
 
 def vessel_print_order(vessels: List[Vessel], order_mode: str = "ascending_id") -> List[Vessel]:
     mode = str(order_mode).strip().lower()
+    if mode == "aorta_first_lowest_branch":
+        # Raw vessel pre-order before final PrintPath reordering. Choose likely
+        # aorta/root vessels first, then branch vessels by their start/attach Z.
+        roots = [v for v in vessels if v.parent_id is None]
+        children = [v for v in vessels if v.parent_id is not None]
+        roots.sort(key=lambda v: (-v.path_len, -v.radius_like, v.min_z, v.vessel_id))
+        children.sort(key=lambda v: (v.start_node_z if v.start_node_z is not None else v.min_z, v.vessel_id))
+        return roots + children
     if mode == "ascending_id":
         return sorted(vessels, key=lambda v: v.vessel_id)
     if mode == "ascending_start_z":
@@ -1205,6 +1674,24 @@ def _concat_polyline_segments(segments: List[np.ndarray], merge_threshold: float
     return out
 
 
+def _concat_scalar_segments(segments: List[np.ndarray], merge_threshold: float, point_segments: List[np.ndarray]) -> np.ndarray:
+    if not segments:
+        return np.zeros(0, dtype=float)
+    out = np.asarray(segments[0], dtype=float).reshape(-1).copy()
+    out_pts = np.asarray(point_segments[0], dtype=float)
+    for seg_vals, seg_pts in zip(segments[1:], point_segments[1:]):
+        vals = np.asarray(seg_vals, dtype=float).reshape(-1)
+        pts = np.asarray(seg_pts, dtype=float)
+        if len(vals) != len(pts):
+            raise ValueError("Point/radius segment length mismatch during path concatenation.")
+        if len(out) > 0 and len(vals) > 0 and float(np.linalg.norm(out_pts[-1] - pts[0])) <= float(merge_threshold):
+            out = np.concatenate([out, vals[1:]])
+        else:
+            out = np.concatenate([out, vals])
+        out_pts = _concat_polyline_segments([out_pts, pts], merge_threshold=float(merge_threshold))
+    return out
+
+
 def simplify_vessel_paths(
     vessels: List[Vessel],
     merge_threshold: float,
@@ -1270,6 +1757,16 @@ def simplify_vessel_paths(
             return vessel.points[::-1].copy()
         # degenerate case: same snapped node on both ends, keep original order
         return vessel.points.copy()
+
+    def edge_radii_from_node(edge_id: int, from_node: int) -> np.ndarray:
+        vessel = by_id[edge_id]
+        rr = np.asarray(vessel.raw_rows[:, 3], dtype=float).reshape(-1)
+        n0, n1 = edge_nodes[edge_id]
+        if from_node == n0 and from_node != n1:
+            return rr.copy()
+        if from_node == n1 and from_node != n0:
+            return rr[::-1].copy()
+        return rr.copy()
 
     def other_node(edge_id: int, node_id: int) -> int:
         n0, n1 = edge_nodes[edge_id]
@@ -1374,7 +1871,9 @@ def simplify_vessel_paths(
             used_edge_ids = [eid for eid, _ in chain_edges]
             local_counter += 1
             segs = [edge_points_from_node(eid, from_node) for eid, from_node in chain_edges]
+            radius_segs = [edge_radii_from_node(eid, from_node) for eid, from_node in chain_edges]
             merged_points = _concat_polyline_segments(segs, merge_threshold=float(merge_threshold))
+            merged_radii = _concat_scalar_segments(radius_segs, merge_threshold=float(merge_threshold), point_segments=segs)
             source_ids = [eid for eid, _ in chain_edges]
             source_vessels = [by_id[eid] for eid in source_ids]
             external_parent_ids = [v.parent_id for v in source_vessels if v.parent_id is not None and v.parent_id not in source_ids]
@@ -1385,6 +1884,7 @@ def simplify_vessel_paths(
                 path_id=f"component{comp_index:03d}_path{local_counter:03d}",
                 source_vessel_ids=source_ids,
                 points=merged_points,
+                radius_profile=merged_radii,
                 root_vessel_id=source_ids[0],
                 parent_vessel_id=path_parent,
                 depth=max(depth, path_depth),
@@ -1436,7 +1936,9 @@ def simplify_vessel_paths(
 
             local_counter += 1
             segs = [edge_points_from_node(eid, from_node) for eid, from_node in chain_edges]
+            radius_segs = [edge_radii_from_node(eid, from_node) for eid, from_node in chain_edges]
             merged_points = _concat_polyline_segments(segs, merge_threshold=float(merge_threshold))
+            merged_radii = _concat_scalar_segments(radius_segs, merge_threshold=float(merge_threshold), point_segments=segs)
             source_ids = [eid for eid, _ in chain_edges]
             source_vessels = [by_id[eid] for eid in source_ids]
             path_radius = float(np.median([v.radius_like for v in source_vessels])) if source_vessels else 0.0
@@ -1444,6 +1946,7 @@ def simplify_vessel_paths(
                 path_id=f"component{comp_index:03d}_path{local_counter:03d}",
                 source_vessel_ids=source_ids,
                 points=merged_points,
+                radius_profile=merged_radii,
                 root_vessel_id=source_ids[0],
                 parent_vessel_id=None,
                 depth=0,
@@ -1480,7 +1983,7 @@ def simplify_vessel_paths(
 
     # Stable final order: main paths before branches, then hierarchy depth, then requested component key.
     def final_key(p: PrintPath) -> Tuple[int, int, float, int]:
-        if str(order_mode).strip().lower() == "lowest_longest_roots":
+        if str(order_mode).strip().lower() in {"lowest_longest_roots", "aorta_first_lowest_branch"}:
             pts = np.asarray(p.points, dtype=float)
             connection_z = p.connection_z if p.connection_z is not None else (float(pts[0, 2]) if len(pts) else 0.0)
             return (0 if p.is_main else 1, int(round(float(connection_z) * 1000000.0)), float(connection_z), int(min(p.source_vessel_ids)))
@@ -1529,6 +2032,27 @@ def deduplicate_polyline_points(points: np.ndarray, tol: float = DEFAULT_POINT_M
     return np.asarray(out, dtype=float)
 
 
+def deduplicate_polyline_points_and_radii(
+    points: np.ndarray,
+    radii: np.ndarray,
+    tol: float = DEFAULT_POINT_MERGE_TOL,
+) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=float)
+    rr = np.asarray(radii, dtype=float).reshape(-1)
+    if len(pts) != len(rr):
+        raise ValueError("Point/radius profile length mismatch.")
+    if len(pts) <= 1:
+        return pts.copy(), rr.copy()
+
+    out_pts = [pts[0].copy()]
+    out_r = [float(rr[0])]
+    for p, radius in zip(pts[1:], rr[1:]):
+        if float(np.linalg.norm(p - out_pts[-1])) > float(tol):
+            out_pts.append(np.asarray(p, dtype=float).copy())
+            out_r.append(float(radius))
+    return np.asarray(out_pts, dtype=float), np.asarray(out_r, dtype=float)
+
+
 def resample_polyline_by_spacing(points: np.ndarray, spacing: float) -> np.ndarray:
     pts = np.asarray(points, dtype=float)
     if len(pts) <= 1 or float(spacing) <= 0.0:
@@ -1558,22 +2082,68 @@ def resample_polyline_by_spacing(points: np.ndarray, spacing: float) -> np.ndarr
     return deduplicate_polyline_points(np.asarray(out, dtype=float), tol=1e-12)
 
 
-def prepare_print_path_points(
+def resample_polyline_radii_by_spacing(points: np.ndarray, radii: np.ndarray, spacing: float) -> Tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=float)
+    rr = np.asarray(radii, dtype=float).reshape(-1)
+    if len(pts) != len(rr):
+        raise ValueError("Point/radius profile length mismatch.")
+    if len(pts) <= 1 or float(spacing) <= 0.0:
+        return pts.copy(), rr.copy()
+
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    total = float(seg.sum())
+    if total <= 0.0:
+        if len(pts) > 1:
+            return pts[[0, -1]].copy(), np.asarray([float(rr[0]), float(rr[-1])], dtype=float)
+        return pts.copy(), rr.copy()
+
+    spacing = float(spacing)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    sample_s = list(np.arange(0.0, total, spacing))
+    if not sample_s or abs(sample_s[-1] - total) > 1e-12:
+        sample_s.append(total)
+
+    out_pts: List[np.ndarray] = []
+    out_r: List[float] = []
+    j = 0
+    for s in sample_s:
+        while j < len(seg) - 1 and cum[j + 1] < s:
+            j += 1
+        denom = seg[j] if seg[j] > 0 else 1.0
+        t = float((s - cum[j]) / denom)
+        t = min(1.0, max(0.0, t))
+        p = pts[j] + t * (pts[j + 1] - pts[j])
+        radius = float((1.0 - t) * rr[j] + t * rr[j + 1])
+        out_pts.append(np.asarray(p, dtype=float))
+        out_r.append(radius)
+    out_pts_arr, out_r_arr = deduplicate_polyline_points_and_radii(np.asarray(out_pts, dtype=float), np.asarray(out_r, dtype=float), tol=1e-12)
+    return out_pts_arr, out_r_arr
+
+
+def prepare_print_path_geometry(
     points: np.ndarray,
+    radii: np.ndarray,
     point_merge_tol: float = DEFAULT_POINT_MERGE_TOL,
     resample_spacing: float = DEFAULT_PATH_RESAMPLE_SPACING,
     geometry_smooth_window: int = DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW,
-) -> np.ndarray:
-    pts = deduplicate_polyline_points(points, tol=point_merge_tol)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Prepare the actual XYZ print path without changing the vessel geometry.
+
+    Important: --path-geometry-smooth-window is intentionally ignored for the
+    emitted XYZ points. Earlier versions applied a moving average here, which
+    could slightly reshape branches and interact badly with endpoint/connection
+    ordering. Smoothness should come from the tangent/B/C field, not from
+    moving the printed centerline itself. Use --centerline-smooth-window and
+    --tangent-smooth-window to smooth orientation while preserving geometry.
+    """
+    _ = geometry_smooth_window  # retained for CLI/backward compatibility
+    pts, rr = deduplicate_polyline_points_and_radii(points, radii, tol=point_merge_tol)
     if len(pts) <= 1:
-        return pts
+        return pts, rr
     if float(resample_spacing) > 0.0:
-        pts = resample_polyline_by_spacing(pts, spacing=float(resample_spacing))
-        pts = deduplicate_polyline_points(pts, tol=point_merge_tol)
-    if int(geometry_smooth_window) > 0 and len(pts) > 2:
-        pts = smooth_centerline_points(pts, window=int(geometry_smooth_window))
-        pts = deduplicate_polyline_points(pts, tol=point_merge_tol)
-    return pts
+        pts, rr = resample_polyline_radii_by_spacing(pts, rr, spacing=float(resample_spacing))
+        pts, rr = deduplicate_polyline_points_and_radii(pts, rr, tol=point_merge_tol)
+    return pts, rr
 
 
 def unwrap_angle_deg_near(target_deg: float, reference_deg: float) -> float:
@@ -1607,6 +2177,74 @@ def smooth_scalar_toward(target: float, reference: float, alpha: float) -> float
 def smooth_angle_deg_toward(target_deg: float, reference_deg: float, alpha: float) -> float:
     target = unwrap_angle_deg_near(target_deg, reference_deg)
     return smooth_scalar_toward(target, reference_deg, alpha)
+
+
+def clamp_angle_deg(angle_deg: float, c_min_deg: float = DEFAULT_C_MIN_DEG, c_max_deg: float = DEFAULT_C_MAX_DEG) -> float:
+    lo = float(min(c_min_deg, c_max_deg))
+    hi = float(max(c_min_deg, c_max_deg))
+    return float(np.clip(float(angle_deg), lo, hi))
+
+
+def choose_equivalent_angle_in_range(
+    target_deg: float,
+    reference_deg: float,
+    c_min_deg: float = DEFAULT_C_MIN_DEG,
+    c_max_deg: float = DEFAULT_C_MAX_DEG,
+) -> float:
+    """Choose target_deg + 360*k inside the physical C range and closest to reference_deg."""
+    lo = float(min(c_min_deg, c_max_deg))
+    hi = float(max(c_min_deg, c_max_deg))
+    target = float(target_deg)
+    ref = float(reference_deg)
+    candidates = []
+    for k in range(-8, 9):
+        candidate = target + 360.0 * k
+        if lo - 1e-9 <= candidate <= hi + 1e-9:
+            candidates.append(float(np.clip(candidate, lo, hi)))
+    if candidates:
+        return min(candidates, key=lambda a: abs(float(a) - ref))
+    return clamp_angle_deg(target, lo, hi)
+
+
+def bounded_unwrapped_angle_deg(
+    target_deg: float,
+    reference_deg: float,
+    c_min_deg: float = DEFAULT_C_MIN_DEG,
+    c_max_deg: float = DEFAULT_C_MAX_DEG,
+) -> float:
+    target_near_ref = unwrap_angle_deg_near(float(target_deg), float(reference_deg))
+    return choose_equivalent_angle_in_range(target_near_ref, reference_deg, c_min_deg, c_max_deg)
+
+
+def smooth_limited_scalar_toward(target: float, reference: float, alpha: float, max_step: float) -> float:
+    """
+    Damped catch-up filter. Unlike limit-then-alpha, this never turns
+    --c-max-step-deg 3 plus --c-smoothing-alpha 0.10 into only 0.3 deg/point
+    when the command is far from the desired azimuth.
+    """
+    ref = float(reference)
+    delta = float(target) - ref
+    a = float(np.clip(float(alpha), 0.0, 1.0))
+    if a <= 0.0:
+        return ref
+    requested = a * delta
+    step = float(max_step)
+    if step > 0.0 and abs(requested) > step:
+        requested = math.copysign(step, requested)
+    return float(ref + requested)
+
+
+def smooth_limited_angle_deg_toward(
+    target_deg: float,
+    reference_deg: float,
+    alpha: float,
+    max_step_deg: float,
+    c_min_deg: float = DEFAULT_C_MIN_DEG,
+    c_max_deg: float = DEFAULT_C_MAX_DEG,
+) -> float:
+    target = bounded_unwrapped_angle_deg(target_deg, reference_deg, c_min_deg, c_max_deg)
+    out = smooth_limited_scalar_toward(target, reference_deg, alpha, max_step_deg)
+    return choose_equivalent_angle_in_range(out, reference_deg, c_min_deg, c_max_deg)
 
 
 def tangent_for_index(points: np.ndarray, i: int, smooth_window: int = DEFAULT_TANGENT_SMOOTH_WINDOW) -> np.ndarray:
@@ -1654,12 +2292,14 @@ def c_angle_from_tangent(
     prev_c: float = 0.0,
     min_xy: float = DEFAULT_MIN_TANGENT_XY,
     azimuth_offset_deg: float = 0.0,
+    c_min_deg: float = DEFAULT_C_MIN_DEG,
+    c_max_deg: float = DEFAULT_C_MAX_DEG,
 ) -> float:
     xy = np.asarray(tangent[:2], dtype=float)
     if float(np.linalg.norm(xy)) < float(min_xy):
-        return float(prev_c)
+        return choose_equivalent_angle_in_range(float(prev_c), prev_c, c_min_deg, c_max_deg)
     raw = float(math.degrees(math.atan2(float(xy[1]), float(xy[0])))) + float(azimuth_offset_deg)
-    return unwrap_angle_deg_near(raw, prev_c)
+    return bounded_unwrapped_angle_deg(raw, prev_c, c_min_deg, c_max_deg)
 
 
 def side_vector_from_tangent(tangent: np.ndarray, fallback: Optional[np.ndarray] = None, min_xy: float = DEFAULT_MIN_TANGENT_XY) -> np.ndarray:
@@ -1827,6 +2467,7 @@ class GCodeWriter:
         pressure_advance_feed: float,
         pressure_retract_feed: float,
         preflow_dwell_ms: int,
+        start_node_dwell_ms: int,
         node_dwell_ms: int,
         edge_samples: int,
         emit_extrusion: bool,
@@ -1837,6 +2478,10 @@ class GCodeWriter:
         c_max_step_deg: float,
         b_smoothing_alpha: float,
         c_smoothing_alpha: float,
+        travel_c_max_step_deg: Optional[float],
+        travel_c_smoothing_alpha: Optional[float],
+        c_min_deg: float,
+        c_max_deg: float,
         min_tangent_xy_for_c: float,
         travel_clearance_above_printed_z: float,
         travel_bbox_margin: float,
@@ -1851,6 +2496,13 @@ class GCodeWriter:
         end_overextension_feed: float = DEFAULT_END_OVEREXTENSION_FEED,
         travel_accel_mm_s2: float = DEFAULT_TRAVEL_ACCEL_MM_S2,
         post_print_travel_accel_scale: float = DEFAULT_POST_PRINT_TRAVEL_ACCEL_SCALE,
+        enable_aorta_cylinder_travel: bool = True,
+        aorta_cylinder_clearance_mm: float = DEFAULT_AORTA_CYLINDER_CLEARANCE_MM,
+        aorta_cylinder_min_radius_mm: float = DEFAULT_AORTA_CYLINDER_MIN_RADIUS_MM,
+        aorta_cylinder_samples: int = DEFAULT_AORTA_CYLINDER_SAMPLES,
+        aorta_cylinder_sample_spacing_mm: float = DEFAULT_AORTA_CYLINDER_SAMPLE_SPACING_MM,
+        extrusion_feed_mode: str = DEFAULT_EXTRUSION_FEED_MODE,
+        radius_feed_map: Optional[Sequence[Tuple[float, float]]] = None,
     ) -> None:
         self.f = fh
         self.cal = cal
@@ -1865,6 +2517,7 @@ class GCodeWriter:
         self.pressure_advance_feed = float(pressure_advance_feed)
         self.pressure_retract_feed = float(pressure_retract_feed)
         self.preflow_dwell_ms = int(preflow_dwell_ms)
+        self.start_node_dwell_ms = int(start_node_dwell_ms)
         self.node_dwell_ms = int(node_dwell_ms)
         self.edge_samples = max(1, int(edge_samples))
         self.emit_extrusion = bool(emit_extrusion)
@@ -1875,10 +2528,16 @@ class GCodeWriter:
         self.c_max_step_deg = float(c_max_step_deg)
         self.b_smoothing_alpha = float(np.clip(float(b_smoothing_alpha), 0.0, 1.0))
         self.c_smoothing_alpha = float(np.clip(float(c_smoothing_alpha), 0.0, 1.0))
+        self.travel_c_max_step_deg = float(c_max_step_deg) if travel_c_max_step_deg is None else float(travel_c_max_step_deg)
+        self.travel_c_smoothing_alpha = float(np.clip(self.c_smoothing_alpha if travel_c_smoothing_alpha is None else float(travel_c_smoothing_alpha), 0.0, 1.0))
+        self.c_min_deg = float(min(c_min_deg, c_max_deg))
+        self.c_max_deg = float(max(c_min_deg, c_max_deg))
         self.min_tangent_xy_for_c = float(min_tangent_xy_for_c)
         self.travel_clearance_above_printed_z = float(travel_clearance_above_printed_z)
         self.travel_bbox_margin = float(travel_bbox_margin)
         self.travel_edge_clearance = float(travel_edge_clearance)
+        self.travel_ease_distance_mm = float(DEFAULT_TRAVEL_EASE_DISTANCE_MM)
+        self.travel_corner_min_feed_scale = float(np.clip(DEFAULT_TRAVEL_CORNER_MIN_FEED_SCALE, 0.05, 1.0))
         self.enable_travel_bbox_clearance = bool(enable_travel_bbox_clearance)
         self.fine_approach_distance = float(fine_approach_distance)
         self.robot_skeleton_ref = robot_skeleton_ref
@@ -1890,6 +2549,14 @@ class GCodeWriter:
         self.travel_accel_mm_s2 = max(0.0, float(travel_accel_mm_s2))
         self.post_print_travel_accel_scale = float(np.clip(float(post_print_travel_accel_scale), 0.0, 1.0))
         self.active_travel_accel_mm_s2: Optional[float] = None
+        self.enable_aorta_cylinder_travel = bool(enable_aorta_cylinder_travel)
+        self.aorta_cylinder_clearance_mm = max(0.0, float(aorta_cylinder_clearance_mm))
+        self.aorta_cylinder_min_radius_mm = max(0.0, float(aorta_cylinder_min_radius_mm))
+        self.aorta_cylinder_samples = max(1, int(aorta_cylinder_samples))
+        self.aorta_cylinder_sample_spacing_mm = max(0.0, float(aorta_cylinder_sample_spacing_mm))
+        self.extrusion_feed_mode = str(extrusion_feed_mode).strip().lower()
+        self.radius_feed_map = [] if radius_feed_map is None else [(float(r), float(f)) for r, f in radius_feed_map]
+        self.aorta_centerline_points: Optional[np.ndarray] = None
 
         self.pressure_charged = False
         self.cur_stage_xyz: Optional[np.ndarray] = None
@@ -1899,6 +2566,7 @@ class GCodeWriter:
         self.last_tip_tangent: Optional[np.ndarray] = None
         self.printed_tip_points: List[np.ndarray] = []
         self.printed_paths: List[PrintedVasculaturePath] = []
+        self.planned_paths: List[PrintedVasculaturePath] = []
         self.warnings: List[str] = []
         self.command_min = np.array([math.inf, math.inf, math.inf], dtype=float)
         self.command_max = np.array([-math.inf, -math.inf, -math.inf], dtype=float)
@@ -1907,7 +2575,20 @@ class GCodeWriter:
         self.c_min_used = math.inf
         self.c_max_used = -math.inf
 
-        self.fixed_b = solve_b_for_target_tip_angle(self.cal, 0.0, search_samples=self.bc_solve_samples) if self.write_mode == "calibrated" else 0.0
+        self.current_motion_phase = _normalize_phase_key(self.cal.default_motion_phase)
+        self.last_requested_tip_angle: Optional[float] = None
+        self.fixed_b = solve_b_for_target_tip_angle(
+            self.cal,
+            0.0,
+            search_samples=self.bc_solve_samples,
+            motion_phase=self.current_motion_phase,
+        ) if self.write_mode == "calibrated" else 0.0
+        self.b_90 = solve_b_for_target_tip_angle(
+            self.cal,
+            90.0,
+            search_samples=self.bc_solve_samples,
+            motion_phase=self.current_motion_phase,
+        ) if self.write_mode == "calibrated" else 0.0
         self.fixed_c = 0.0
 
     def set_travel_acceleration(self, accel_mm_s2: float, comment: Optional[str] = None) -> None:
@@ -1954,42 +2635,125 @@ class GCodeWriter:
             self.warnings.append(f"WARNING: {context} stage point clamped to bbox.")
         return np.array([x, y, z], dtype=float)
 
-    def bc_for_tangent(self, tangent: np.ndarray, prev_c: Optional[float] = None, prev_b: Optional[float] = None) -> Tuple[float, float]:
-        if self.orientation_mode == "fixed" or self.write_mode != "calibrated":
-            return float(self.fixed_b), float(self.fixed_c)
+    def phase_for_requested_tip_angle(self, requested_tip_angle: float) -> str:
+        prev = self.last_requested_tip_angle
+        if prev is not None:
+            delta = float(requested_tip_angle) - float(prev)
+            if abs(delta) > 1e-9:
+                return "pull" if delta > 0.0 else "release"
+        return _normalize_phase_key(self.current_motion_phase)
 
-        c_ref = self.cur_c if prev_c is None else float(prev_c)
+    def bc_for_tangent_with_phase(
+        self,
+        tangent: np.ndarray,
+        prev_c: Optional[float] = None,
+        prev_b: Optional[float] = None,
+        travel_mode: bool = False,
+    ) -> Tuple[float, float, str, Optional[float]]:
+        if self.orientation_mode == "fixed" or self.write_mode != "calibrated":
+            return float(self.fixed_b), float(self.fixed_c), _normalize_phase_key(self.current_motion_phase), None
+
+        c_ref = clamp_angle_deg(self.cur_c if prev_c is None else float(prev_c), self.c_min_deg, self.c_max_deg)
         b_ref = self.cur_b if prev_b is None else float(prev_b)
-        # For pull-aligned writing the rotary azimuth needs to point opposite
-        # the local XY tangent, not along it. The calibration provides the
-        # command-space delta corresponding to a physical 180 degree flip.
+        c_max_step_deg = self.travel_c_max_step_deg if travel_mode else self.c_max_step_deg
+        c_smoothing_alpha = self.travel_c_smoothing_alpha if travel_mode else self.c_smoothing_alpha
+
         c_raw = c_angle_from_tangent(
             tangent,
             prev_c=c_ref,
             min_xy=self.min_tangent_xy_for_c,
             azimuth_offset_deg=self.cal.c_180_deg,
+            c_min_deg=self.c_min_deg,
+            c_max_deg=self.c_max_deg,
         )
-        c_limited = limit_angle_step_deg(c_raw, c_ref, self.c_max_step_deg)
-        c_deg = smooth_angle_deg_toward(c_limited, c_ref, self.c_smoothing_alpha)
-        target_b = desired_physical_b_angle_from_tangent(tangent)
-        b_raw = solve_b_for_target_tip_angle(self.cal, target_b, search_samples=self.bc_solve_samples)
-        b_limited = limit_angle_step_deg(b_raw, b_ref, self.b_max_step_deg)
-        b = smooth_scalar_toward(b_limited, b_ref, self.b_smoothing_alpha)
-        return float(b), float(c_deg)
+        c_deg = smooth_limited_angle_deg_toward(
+            c_raw,
+            c_ref,
+            c_smoothing_alpha,
+            c_max_step_deg,
+            self.c_min_deg,
+            self.c_max_deg,
+        )
 
-    def tip_to_stage(self, p_tip: np.ndarray, tangent: Optional[np.ndarray] = None, prev_c: Optional[float] = None, prev_b: Optional[float] = None) -> Tuple[np.ndarray, float, float]:
+        target_tip_angle = 90.0 if self.orientation_mode in {"90mode", "90", "ninety"} else desired_physical_b_angle_from_tangent(tangent)
+        motion_phase = self.phase_for_requested_tip_angle(target_tip_angle)
+        if self.orientation_mode in {"90mode", "90", "ninety"}:
+            return float(self.b_90), float(c_deg), motion_phase, float(target_tip_angle)
+
+        b_raw, used_tip_angle = solve_b_for_target_tip_angle_continuous(
+            self.cal,
+            target_tip_angle,
+            prev_b=b_ref,
+            motion_phase=motion_phase,
+            search_samples=self.bc_solve_samples,
+        )
+        b = smooth_limited_scalar_toward(b_raw, b_ref, self.b_smoothing_alpha, self.b_max_step_deg)
+        return float(b), float(c_deg), motion_phase, float(used_tip_angle)
+
+    def bc_for_tangent(
+        self,
+        tangent: np.ndarray,
+        prev_c: Optional[float] = None,
+        prev_b: Optional[float] = None,
+        travel_mode: bool = False,
+    ) -> Tuple[float, float]:
+        b, c, _motion_phase, _used_tip_angle = self.bc_for_tangent_with_phase(
+            tangent,
+            prev_c=prev_c,
+            prev_b=prev_b,
+            travel_mode=travel_mode,
+        )
+        return float(b), float(c)
+
+    def tip_to_stage_with_phase(
+        self,
+        p_tip: np.ndarray,
+        tangent: Optional[np.ndarray] = None,
+        prev_c: Optional[float] = None,
+        prev_b: Optional[float] = None,
+        travel_mode: bool = False,
+    ) -> Tuple[np.ndarray, float, float, str, Optional[float]]:
         if self.write_mode == "cartesian":
             p_stage = self.clamp_stage(np.asarray(p_tip, dtype=float), "cartesian_tip_to_stage")
-            b, c = (0.0, 0.0) if tangent is None else self.bc_for_tangent(tangent, prev_c=prev_c, prev_b=prev_b)
-            return p_stage, float(b), float(c)
+            b, c = (0.0, 0.0) if tangent is None else self.bc_for_tangent(tangent, prev_c=prev_c, prev_b=prev_b, travel_mode=travel_mode)
+            return p_stage, float(b), float(c), _normalize_phase_key(self.current_motion_phase), None
 
         if tangent is None:
-            b = float(self.fixed_b)
-            c = float(self.fixed_c)
+            motion_phase = _normalize_phase_key(self.current_motion_phase)
+            used_tip_angle = 90.0 if self.orientation_mode in {"90mode", "90", "ninety"} else 0.0
+            b = float(self.b_90) if self.orientation_mode in {"90mode", "90", "ninety"} else float(self.fixed_b)
+            c = choose_equivalent_angle_in_range(
+                float(self.cur_c if self.orientation_mode in {"90mode", "90", "ninety"} else self.fixed_c),
+                float(self.cur_c),
+                self.c_min_deg,
+                self.c_max_deg,
+            )
         else:
-            b, c = self.bc_for_tangent(tangent, prev_c=prev_c, prev_b=prev_b)
-        p_stage = stage_xyz_for_tip(self.cal, np.asarray(p_tip, dtype=float), b, c)
-        return self.clamp_stage(p_stage, "tip_to_stage"), float(b), float(c)
+            b, c, motion_phase, used_tip_angle = self.bc_for_tangent_with_phase(
+                tangent,
+                prev_c=prev_c,
+                prev_b=prev_b,
+                travel_mode=travel_mode,
+            )
+        p_stage = stage_xyz_for_tip(self.cal, np.asarray(p_tip, dtype=float), b, c, motion_phase=motion_phase)
+        return self.clamp_stage(p_stage, "tip_to_stage"), float(b), float(c), motion_phase, used_tip_angle
+
+    def tip_to_stage(
+        self,
+        p_tip: np.ndarray,
+        tangent: Optional[np.ndarray] = None,
+        prev_c: Optional[float] = None,
+        prev_b: Optional[float] = None,
+        travel_mode: bool = False,
+    ) -> Tuple[np.ndarray, float, float]:
+        p_stage, b, c, _motion_phase, _used_tip_angle = self.tip_to_stage_with_phase(
+            p_tip,
+            tangent=tangent,
+            prev_c=prev_c,
+            prev_b=prev_b,
+            travel_mode=travel_mode,
+        )
+        return p_stage, float(b), float(c)
 
     def write_move(
         self,
@@ -2003,14 +2767,7 @@ class GCodeWriter:
         if comment:
             self.f.write(f"; {comment}\n")
         p_stage = np.asarray(p_stage, dtype=float)
-
-        # Let the rotary axis run at its own feed so short XYZ steps are not
-        # throttled by a larger required C reorientation.
-        if self.write_mode == "calibrated" and abs(float(c) - self.cur_c) > 1e-9:
-            self.f.write(f"G1 {self.cal.c_axis}{float(c):.3f} F{self.c_feed:.0f}\n")
-            self.cur_c = float(c)
-            self.c_min_used = min(self.c_min_used, self.cur_c)
-            self.c_max_used = max(self.c_max_used, self.cur_c)
+        c = choose_equivalent_angle_in_range(float(c), float(self.cur_c), self.c_min_deg, self.c_max_deg)
 
         axes: List[Tuple[str, float]] = [
             (self.cal.x_axis, float(p_stage[0])),
@@ -2019,15 +2776,113 @@ class GCodeWriter:
         ]
         if self.write_mode == "calibrated":
             axes.append((self.cal.b_axis, float(b)))
+            axes.append((self.cal.c_axis, float(c)))
         if u_value is not None:
             axes.append((self.cal.u_axis, float(u_value)))
         self.f.write(f"G1 {_fmt_axes_move(axes)} F{float(feed):.0f}\n")
         self.cur_stage_xyz = p_stage.copy()
         self.cur_b = float(b)
+        self.cur_c = float(c)
         self.command_min = np.minimum(self.command_min, self.cur_stage_xyz)
         self.command_max = np.maximum(self.command_max, self.cur_stage_xyz)
         self.b_min_used = min(self.b_min_used, self.cur_b)
         self.b_max_used = max(self.b_max_used, self.cur_b)
+        self.c_min_used = min(self.c_min_used, self.cur_c)
+        self.c_max_used = max(self.c_max_used, self.cur_c)
+
+    def write_tip_speed_move(
+        self,
+        p_stage: np.ndarray,
+        b: float,
+        c: float,
+        desired_tip_feed: float,
+        start_tip_xyz: np.ndarray,
+        end_tip_xyz: np.ndarray,
+        motion_phase: Optional[str] = None,
+        requested_tip_angle: Optional[float] = None,
+        comment: Optional[str] = None,
+    ) -> None:
+        if comment:
+            self.f.write(f"; {comment}\n")
+
+        p_stage = np.asarray(p_stage, dtype=float)
+        start_tip = np.asarray(start_tip_xyz, dtype=float)
+        end_tip = np.asarray(end_tip_xyz, dtype=float)
+        c_cmd = choose_equivalent_angle_in_range(float(c), float(self.cur_c), self.c_min_deg, self.c_max_deg)
+
+        tip_dist = float(np.linalg.norm(end_tip - start_tip))
+        stage_dist = float(np.linalg.norm(p_stage - np.asarray(self.cur_stage_xyz, dtype=float)))
+        b_dist = abs(float(b) - float(self.cur_b))
+        c_dist = abs(float(c_cmd) - float(self.cur_c))
+        axis_dist = float(np.linalg.norm(np.array([stage_dist, b_dist, c_dist], dtype=float)))
+
+        if tip_dist <= 1e-12 or axis_dist <= 1e-12:
+            command_feed = float(max(desired_tip_feed, 1.0))
+        else:
+            desired_time_min = tip_dist / float(max(desired_tip_feed, 1e-9))
+            command_feed = float(max(axis_dist / max(desired_time_min, 1e-12), 1.0))
+
+        axes: List[Tuple[str, float]] = [
+            (self.cal.x_axis, float(p_stage[0])),
+            (self.cal.y_axis, float(p_stage[1])),
+            (self.cal.z_axis, float(p_stage[2])),
+        ]
+        if self.write_mode == "calibrated":
+            axes.append((self.cal.b_axis, float(b)))
+            axes.append((self.cal.c_axis, float(c_cmd)))
+        self.f.write(f"G1 {_fmt_axes_move(axes)} F{command_feed:.0f}\n")
+        self.cur_stage_xyz = p_stage.copy()
+        self.cur_tip_xyz = end_tip.copy()
+        self.cur_b = float(b)
+        self.cur_c = float(c_cmd)
+        self.current_motion_phase = _normalize_phase_key(motion_phase or self.current_motion_phase)
+        if requested_tip_angle is not None:
+            self.last_requested_tip_angle = float(requested_tip_angle)
+        self.command_min = np.minimum(self.command_min, self.cur_stage_xyz)
+        self.command_max = np.maximum(self.command_max, self.cur_stage_xyz)
+        self.b_min_used = min(self.b_min_used, self.cur_b)
+        self.b_max_used = max(self.b_max_used, self.cur_b)
+        self.c_min_used = min(self.c_min_used, self.cur_c)
+        self.c_max_used = max(self.c_max_used, self.cur_c)
+
+    def write_synced_pose_move(
+        self,
+        p_stage: np.ndarray,
+        b: float,
+        c: float,
+        feed: float,
+        tip_xyz: Optional[np.ndarray] = None,
+        motion_phase: Optional[str] = None,
+        requested_tip_angle: Optional[float] = None,
+        comment: Optional[str] = None,
+    ) -> None:
+        if comment:
+            self.f.write(f"; {comment}\n")
+        p_stage = np.asarray(p_stage, dtype=float)
+        c_cmd = choose_equivalent_angle_in_range(float(c), float(self.cur_c), self.c_min_deg, self.c_max_deg)
+        axes: List[Tuple[str, float]] = [
+            (self.cal.x_axis, float(p_stage[0])),
+            (self.cal.y_axis, float(p_stage[1])),
+            (self.cal.z_axis, float(p_stage[2])),
+        ]
+        if self.write_mode == "calibrated":
+            axes.append((self.cal.b_axis, float(b)))
+            axes.append((self.cal.c_axis, float(c_cmd)))
+        self.f.write(f"G1 {_fmt_axes_move(axes)} F{float(feed):.0f}\n")
+        self.cur_stage_xyz = p_stage.copy()
+        self.cur_b = float(b)
+        self.cur_c = float(c_cmd)
+        if tip_xyz is not None:
+            self.cur_tip_xyz = np.asarray(tip_xyz, dtype=float).copy()
+        self.current_motion_phase = _normalize_phase_key(motion_phase or self.current_motion_phase)
+        if requested_tip_angle is not None:
+            self.last_requested_tip_angle = float(requested_tip_angle)
+        self.command_min = np.minimum(self.command_min, self.cur_stage_xyz)
+        self.command_max = np.maximum(self.command_max, self.cur_stage_xyz)
+        self.b_min_used = min(self.b_min_used, self.cur_b)
+        self.b_max_used = max(self.b_max_used, self.cur_b)
+        self.c_min_used = min(self.c_min_used, self.cur_c)
+        self.c_max_used = max(self.c_max_used, self.cur_c)
 
     def write_tip_tracking_pose_move(
         self,
@@ -2039,6 +2894,8 @@ class GCodeWriter:
         max_tip_step_mm: Optional[float] = None,
         max_b_step_deg: Optional[float] = None,
         max_c_step_deg: Optional[float] = None,
+        motion_phase: Optional[str] = None,
+        requested_tip_angle: Optional[float] = None,
     ) -> None:
         if self.cur_stage_xyz is None:
             raise RuntimeError("Cannot emit tip-tracking pose move before a machine pose has been established.")
@@ -2053,13 +2910,19 @@ class GCodeWriter:
         start_tip = (
             np.asarray(self.cur_tip_xyz, dtype=float).copy()
             if self.cur_tip_xyz is not None
-            else tip_xyz_for_stage(self.cal, np.asarray(self.cur_stage_xyz, dtype=float), self.cur_b, self.cur_c)
+            else tip_xyz_for_stage(
+                self.cal,
+                np.asarray(self.cur_stage_xyz, dtype=float),
+                self.cur_b,
+                self.cur_c,
+                motion_phase=self.current_motion_phase,
+            )
         )
         target_tip = np.asarray(target_tip, dtype=float).copy()
         start_b = float(self.cur_b)
         start_c = float(self.cur_c)
         end_b = float(target_b)
-        end_c = float(unwrap_angle_deg_near(float(target_c), start_c))
+        end_c = float(bounded_unwrapped_angle_deg(float(target_c), start_c, self.c_min_deg, self.c_max_deg))
 
         tip_span = float(np.linalg.norm(target_tip - start_tip))
         b_span = abs(end_b - start_b)
@@ -2082,7 +2945,10 @@ class GCodeWriter:
             tip_i = start_tip + t * (target_tip - start_tip)
             b_i = start_b + t * (end_b - start_b)
             c_i = start_c + t * (end_c - start_c)
-            p_stage_i = self.clamp_stage(stage_xyz_for_tip(self.cal, tip_i, b_i, c_i), "tip_tracking_pose_move")
+            p_stage_i = self.clamp_stage(
+                stage_xyz_for_tip(self.cal, tip_i, b_i, c_i, motion_phase=motion_phase),
+                "tip_tracking_pose_move",
+            )
             axes: List[Tuple[str, float]] = [
                 (self.cal.x_axis, float(p_stage_i[0])),
                 (self.cal.y_axis, float(p_stage_i[1])),
@@ -2095,6 +2961,9 @@ class GCodeWriter:
             self.cur_tip_xyz = tip_i.copy()
             self.cur_b = float(b_i)
             self.cur_c = float(c_i)
+            self.current_motion_phase = _normalize_phase_key(motion_phase or self.current_motion_phase)
+            if requested_tip_angle is not None:
+                self.last_requested_tip_angle = float(requested_tip_angle)
             self.last_tip_tangent = None
             self.command_min = np.minimum(self.command_min, self.cur_stage_xyz)
             self.command_max = np.maximum(self.command_max, self.cur_stage_xyz)
@@ -2112,13 +2981,38 @@ class GCodeWriter:
             "c": (float(self.c_min_used), float(self.c_max_used)),
         }
 
-    def move_to_tip(self, p_tip: np.ndarray, tangent: Optional[np.ndarray], feed: float, comment: Optional[str] = None) -> None:
-        p_stage, b, c = self.tip_to_stage(np.asarray(p_tip, dtype=float), tangent=tangent, prev_c=self.cur_c, prev_b=self.cur_b)
+    def move_to_tip(
+        self,
+        p_tip: np.ndarray,
+        tangent: Optional[np.ndarray],
+        feed: float,
+        comment: Optional[str] = None,
+        travel_mode: bool = False,
+    ) -> None:
+        p_stage, b, c, motion_phase, used_tip_angle = self.tip_to_stage_with_phase(
+            np.asarray(p_tip, dtype=float),
+            tangent=tangent,
+            prev_c=self.cur_c,
+            prev_b=self.cur_b,
+            travel_mode=travel_mode,
+        )
         self.write_move(p_stage, b, c, feed, comment=comment)
         self.cur_tip_xyz = np.asarray(p_tip, dtype=float).copy()
+        self.current_motion_phase = _normalize_phase_key(motion_phase)
+        if used_tip_angle is not None:
+            self.last_requested_tip_angle = float(used_tip_angle)
         self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
 
-    def move_to_tip_with_explicit_bc(self, p_tip: np.ndarray, b: float, c: float, feed: float, comment: Optional[str] = None) -> None:
+    def move_to_tip_with_explicit_bc(
+        self,
+        p_tip: np.ndarray,
+        b: float,
+        c: float,
+        feed: float,
+        comment: Optional[str] = None,
+        motion_phase: Optional[str] = None,
+        requested_tip_angle: Optional[float] = None,
+    ) -> None:
         p_tip = np.asarray(p_tip, dtype=float).copy()
         if self.write_mode == "cartesian":
             p_stage = self.clamp_stage(p_tip, "cartesian_tip_to_stage_explicit_bc")
@@ -2127,10 +3021,52 @@ class GCodeWriter:
             self.last_tip_tangent = None
             return
 
-        c_cmd = float(unwrap_angle_deg_near(float(c), float(self.cur_c)))
-        p_stage = self.clamp_stage(stage_xyz_for_tip(self.cal, p_tip, float(b), c_cmd), "tip_to_stage_explicit_bc")
+        c_cmd = float(bounded_unwrapped_angle_deg(float(c), float(self.cur_c), self.c_min_deg, self.c_max_deg))
+        phase_key = _normalize_phase_key(motion_phase or self.current_motion_phase)
+        p_stage = self.clamp_stage(
+            stage_xyz_for_tip(self.cal, p_tip, float(b), c_cmd, motion_phase=phase_key),
+            "tip_to_stage_explicit_bc",
+        )
         self.write_move(p_stage, float(b), c_cmd, feed, comment=comment)
         self.cur_tip_xyz = p_tip.copy()
+        self.current_motion_phase = phase_key
+        if requested_tip_angle is not None:
+            self.last_requested_tip_angle = float(requested_tip_angle)
+        self.last_tip_tangent = None
+
+    def move_to_tip_with_explicit_bc_synced(
+        self,
+        p_tip: np.ndarray,
+        b: float,
+        c: float,
+        feed: float,
+        comment: Optional[str] = None,
+        motion_phase: Optional[str] = None,
+        requested_tip_angle: Optional[float] = None,
+    ) -> None:
+        p_tip = np.asarray(p_tip, dtype=float).copy()
+        if self.write_mode == "cartesian":
+            p_stage = self.clamp_stage(p_tip, "cartesian_tip_to_stage_explicit_bc_synced")
+            self.write_synced_pose_move(p_stage, float(b), float(c), feed, tip_xyz=p_tip, comment=comment)
+            self.last_tip_tangent = None
+            return
+
+        c_cmd = float(bounded_unwrapped_angle_deg(float(c), float(self.cur_c), self.c_min_deg, self.c_max_deg))
+        phase_key = _normalize_phase_key(motion_phase or self.current_motion_phase)
+        p_stage = self.clamp_stage(
+            stage_xyz_for_tip(self.cal, p_tip, float(b), c_cmd, motion_phase=phase_key),
+            "tip_to_stage_explicit_bc_synced",
+        )
+        self.write_synced_pose_move(
+            p_stage,
+            float(b),
+            c_cmd,
+            feed,
+            tip_xyz=p_tip,
+            motion_phase=phase_key,
+            requested_tip_angle=requested_tip_angle,
+            comment=comment,
+        )
         self.last_tip_tangent = None
 
     def sync_tip_state_from_stage(self, tangent: Optional[np.ndarray] = None) -> None:
@@ -2141,7 +3077,13 @@ class GCodeWriter:
         if self.write_mode == "cartesian":
             self.cur_tip_xyz = np.asarray(self.cur_stage_xyz, dtype=float).copy()
         else:
-            self.cur_tip_xyz = tip_xyz_for_stage(self.cal, self.cur_stage_xyz, self.cur_b, self.cur_c)
+            self.cur_tip_xyz = tip_xyz_for_stage(
+                self.cal,
+                self.cur_stage_xyz,
+                self.cur_b,
+                self.cur_c,
+                motion_phase=self.current_motion_phase,
+            )
         self.last_tip_tangent = None if tangent is None else np.asarray(tangent, dtype=float).copy()
 
     def apply_group_displacement(self, displacement: GroupDisplacement, default_feed: float, label: str) -> None:
@@ -2160,7 +3102,7 @@ class GCodeWriter:
         target_b = float(self.cur_b) + float(displacement.delta_b_deg)
         target_c = float(self.cur_c) + float(displacement.delta_c_deg)
         target_stage = np.asarray(self.cur_stage_xyz, dtype=float).copy() + delta_stage
-        feed = float(default_feed if displacement.feed is None else displacement.feed)
+        feed = float(default_feed if displacement.feed is None or float(displacement.feed) <= 0.0 else displacement.feed)
         note_suffix = f" ({displacement.note})" if displacement.note else ""
         self.write_move(
             p_stage=target_stage,
@@ -2177,18 +3119,24 @@ class GCodeWriter:
         self.sync_tip_state_from_stage()
 
     def current_equation_phase(self) -> str:
-        return _normalize_phase_key(self.cal.active_phase)
+        return _normalize_phase_key(self.current_motion_phase)
 
     def skeleton_points_for_pose(self, p_tip: np.ndarray, tangent: Optional[np.ndarray], prev_c: float, prev_b: float) -> Tuple[np.ndarray, float, float]:
         if self.robot_skeleton_ref is None:
             return np.zeros((0, 3), dtype=float), float(prev_b), float(prev_c)
-        _, b_cmd, c_cmd = self.tip_to_stage(np.asarray(p_tip, dtype=float), tangent=tangent, prev_c=prev_c, prev_b=prev_b)
+        _, b_cmd, c_cmd, motion_phase, _used_tip_angle = self.tip_to_stage_with_phase(
+            np.asarray(p_tip, dtype=float),
+            tangent=tangent,
+            prev_c=prev_c,
+            prev_b=prev_b,
+            travel_mode=True,
+        )
         pts_world = compute_tracked_skeleton_world(
             self.robot_skeleton_ref,
             b_cmd=b_cmd,
             c_cmd_deg=c_cmd,
             tip_world=np.asarray(p_tip, dtype=float),
-            equation_phase=self.current_equation_phase(),
+            equation_phase=motion_phase,
         )
         return pts_world, float(b_cmd), float(c_cmd)
 
@@ -2419,14 +3367,475 @@ class GCodeWriter:
         return moves
 
     def execute_planned_tip_moves(self, moves: Sequence[PlannedTipMove]) -> None:
-        for move in moves:
-            self.move_to_tip(move.tip_xyz, tangent=move.tangent, feed=move.feed, comment=move.comment)
+        def _corner_scale(v_in: Optional[np.ndarray], v_out: Optional[np.ndarray]) -> float:
+            if v_in is None or v_out is None:
+                return 1.0
+            a = normalize(np.asarray(v_in, dtype=float).reshape(3))
+            b = normalize(np.asarray(v_out, dtype=float).reshape(3))
+            if float(np.linalg.norm(a)) <= 1e-12 or float(np.linalg.norm(b)) <= 1e-12:
+                return 1.0
+            dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+            severity = 0.5 * (1.0 - dot)
+            return float(1.0 - severity * (1.0 - self.travel_corner_min_feed_scale))
+
+        def _emit_smoothed_travel(move: PlannedTipMove, move_idx: int) -> None:
+            if self.cur_tip_xyz is None:
+                self.move_to_tip(move.tip_xyz, tangent=move.tangent, feed=move.feed, comment=move.comment, travel_mode=move.travel_mode)
+                return
+            start_tip = np.asarray(self.cur_tip_xyz, dtype=float).copy()
+            target_tip = np.asarray(move.tip_xyz, dtype=float).copy()
+            delta = target_tip - start_tip
+            dist = float(np.linalg.norm(delta))
+            if dist <= 1e-9:
+                self.move_to_tip(target_tip, tangent=move.tangent, feed=move.feed, comment=move.comment, travel_mode=move.travel_mode)
+                return
+
+            prev_tip = None if move_idx == 0 else np.asarray(moves[move_idx - 1].tip_xyz, dtype=float).copy()
+            next_tip = None if move_idx + 1 >= len(moves) else np.asarray(moves[move_idx + 1].tip_xyz, dtype=float).copy()
+            v_in = None if prev_tip is None else start_tip - prev_tip
+            v_out = delta
+            v_next = None if next_tip is None else next_tip - target_tip
+            start_scale = _corner_scale(v_in, v_out)
+            end_scale = _corner_scale(v_out, v_next)
+
+            ease = min(float(self.travel_ease_distance_mm), 0.33 * dist)
+            if ease <= 1e-6 or dist <= 2.0 * ease + 1e-6:
+                corner_feed = float(move.feed * min(start_scale, end_scale))
+                self.move_to_tip(target_tip, tangent=move.tangent, feed=corner_feed, comment=move.comment, travel_mode=move.travel_mode)
+                return
+
+            t0 = ease / dist
+            t1 = 1.0 - t0
+            p0 = start_tip + t0 * delta
+            p1 = start_tip + t1 * delta
+            travel_tangent = normalize(delta if move.tangent is None else np.asarray(move.tangent, dtype=float))
+            self.move_to_tip(
+                p0,
+                tangent=travel_tangent,
+                feed=float(move.feed * start_scale),
+                comment=move.comment,
+                travel_mode=move.travel_mode,
+            )
+            self.move_to_tip(
+                p1,
+                tangent=travel_tangent,
+                feed=float(move.feed),
+                comment=None,
+                travel_mode=move.travel_mode,
+            )
+            self.move_to_tip(
+                target_tip,
+                tangent=move.tangent,
+                feed=float(move.feed * end_scale),
+                comment=None,
+                travel_mode=move.travel_mode,
+            )
+
+        for move_idx, move in enumerate(moves):
+            if move.travel_mode:
+                _emit_smoothed_travel(move, move_idx)
+            else:
+                self.move_to_tip(move.tip_xyz, tangent=move.tangent, feed=move.feed, comment=move.comment, travel_mode=move.travel_mode)
 
     def record_printed_path(self, points: np.ndarray, radius_mm: float = 0.0) -> None:
         pts = np.asarray(points, dtype=float)
         if len(pts) > 0:
             self.printed_tip_points.append(pts.copy())
             self.printed_paths.append(PrintedVasculaturePath(points_xyz_mm=pts.copy(), radius_mm=max(0.0, float(radius_mm))))
+
+    def set_planned_vasculature_paths(self, paths: Sequence[PrintedVasculaturePath]) -> None:
+        self.planned_paths = []
+        for path in paths:
+            pts = np.asarray(path.points_xyz_mm, dtype=float)
+            if len(pts) == 0:
+                continue
+            self.planned_paths.append(
+                PrintedVasculaturePath(
+                    points_xyz_mm=pts.copy(),
+                    radius_mm=max(0.0, float(path.radius_mm)),
+                )
+            )
+
+    def set_aorta_reference(self, points: np.ndarray) -> None:
+        pts, _ = prepare_print_path_geometry(
+            np.asarray(points, dtype=float),
+            np.ones(len(points), dtype=float),
+            point_merge_tol=1e-9,
+        )
+        if len(pts) >= 2:
+            self.aorta_centerline_points = pts.copy()
+            self.f.write(f"; aorta reference set from first/main path with {len(pts)} points\n")
+
+    def aorta_projection(self, point: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray, float]:
+        if self.aorta_centerline_points is None or len(self.aorta_centerline_points) < 2:
+            p = np.asarray(point, dtype=float).reshape(3)
+            return p.copy(), 0.0, np.array([0.0, 0.0, 1.0], dtype=float), 0.0
+        q, s, tangent, dist = projected_point_and_arclength_on_polyline(
+            np.asarray(point, dtype=float).reshape(3),
+            self.aorta_centerline_points,
+        )
+        return q, s, normalize(tangent), float(dist)
+
+    def aorta_point_at_s(self, s_query: float) -> Tuple[np.ndarray, np.ndarray]:
+        if self.aorta_centerline_points is None or len(self.aorta_centerline_points) < 2:
+            return np.zeros(3, dtype=float), np.array([0.0, 0.0, 1.0], dtype=float)
+        q = point_on_polyline_at_arclength(self.aorta_centerline_points, float(s_query))
+        arc = polyline_arc_lengths(self.aorta_centerline_points)
+        idx = int(np.searchsorted(arc, float(np.clip(s_query, 0.0, float(arc[-1]))), side="right") - 1)
+        idx = min(max(idx, 0), len(self.aorta_centerline_points) - 2)
+        tangent = normalize(self.aorta_centerline_points[idx + 1] - self.aorta_centerline_points[idx])
+        if float(np.linalg.norm(tangent)) <= 1e-12:
+            tangent = np.array([0.0, 0.0, 1.0], dtype=float)
+        return q, tangent
+
+    def aorta_radial_unit(self, point: np.ndarray, fallback: Optional[np.ndarray] = None) -> np.ndarray:
+        q, _, axis_tangent, _ = self.aorta_projection(point)
+        radial = np.asarray(point, dtype=float).reshape(3) - q
+        radial = radial - float(np.dot(radial, axis_tangent)) * axis_tangent
+        if float(np.linalg.norm(radial)) <= 1e-9 and fallback is not None:
+            radial = np.asarray(fallback, dtype=float).reshape(3)
+            radial = radial - float(np.dot(radial, axis_tangent)) * axis_tangent
+        if float(np.linalg.norm(radial)) <= 1e-9:
+            # Choose a deterministic normal to the local aorta tangent.
+            ref = np.array([1.0, 0.0, 0.0], dtype=float)
+            if abs(float(np.dot(ref, axis_tangent))) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0], dtype=float)
+            radial = ref - float(np.dot(ref, axis_tangent)) * axis_tangent
+        return normalize(radial)
+
+    def aorta_cylinder_tangent_from_radial(self, axis_tangent: np.ndarray, radial_unit: np.ndarray) -> np.ndarray:
+        # Tangent to the cylinder surface and perpendicular to the cylinder radius.
+        t = np.cross(normalize(axis_tangent), normalize(radial_unit))
+        if float(np.linalg.norm(t)) <= 1e-9:
+            t = np.array([-radial_unit[1], radial_unit[0], 0.0], dtype=float)
+        return normalize(t)
+
+    def move_to_tip_aorta_cylinder_azimuth_plane(
+        self,
+        p_tip: np.ndarray,
+        axis_tangent: np.ndarray,
+        radial_unit: np.ndarray,
+        feed: float,
+        comment: Optional[str] = None,
+    ) -> None:
+        radial = normalize(np.asarray(radial_unit, dtype=float).reshape(3))
+        axis_tan = normalize(np.asarray(axis_tangent, dtype=float).reshape(3))
+        if self.write_mode != "calibrated":
+            self.move_to_tip(p_tip, tangent=axis_tan, feed=feed, comment=comment, travel_mode=True)
+            return
+
+        # Keep travel C on the cylinder azimuth plane by orienting the XY
+        # projection from the aorta axis toward the current cylinder radial.
+        c = c_angle_from_tangent(
+            radial,
+            prev_c=self.cur_c,
+            min_xy=self.min_tangent_xy_for_c,
+            azimuth_offset_deg=self.cal.c_180_deg,
+            c_min_deg=self.c_min_deg,
+            c_max_deg=self.c_max_deg,
+        )
+        c = smooth_limited_angle_deg_toward(
+            c, self.cur_c, self.travel_c_smoothing_alpha, self.travel_c_max_step_deg, self.c_min_deg, self.c_max_deg
+        )
+
+        # Keep B consistent with tangent-mode travel inclination by using the
+        # local aorta-axis tangent instead of the circumferential travel tangent.
+        if self.orientation_mode in {"90mode", "90", "ninety"}:
+            b = float(self.b_90)
+            motion_phase = self.phase_for_requested_tip_angle(90.0)
+            used_tip_angle = 90.0
+        else:
+            target_b = desired_physical_b_angle_from_tangent(axis_tan)
+            motion_phase = self.phase_for_requested_tip_angle(target_b)
+            b_raw, used_tip_angle = solve_b_for_target_tip_angle_continuous(
+                self.cal,
+                target_b,
+                prev_b=self.cur_b,
+                motion_phase=motion_phase,
+                search_samples=self.bc_solve_samples,
+            )
+            b = smooth_limited_scalar_toward(b_raw, self.cur_b, self.b_smoothing_alpha, self.b_max_step_deg)
+        # Keep the tip on the intended cylinder-surface path while reorienting.
+        self.write_tip_tracking_pose_move(
+            target_tip=np.asarray(p_tip, dtype=float),
+            target_b=b,
+            target_c=c,
+            feed=feed,
+            comment=comment,
+            max_b_step_deg=self.b_max_step_deg,
+            max_c_step_deg=self.travel_c_max_step_deg,
+            motion_phase=motion_phase,
+            requested_tip_angle=used_tip_angle,
+        )
+
+    def current_aorta_cylinder_radius(self) -> float:
+        radius = float(self.aorta_cylinder_min_radius_mm)
+        if self.aorta_centerline_points is None or len(self.aorta_centerline_points) < 2:
+            return radius
+        support_paths = self.planned_paths if self.planned_paths else self.printed_paths
+        for printed in support_paths:
+            pts = np.asarray(printed.points_xyz_mm, dtype=float)
+            for pt in pts:
+                _, _, _, dist = self.aorta_projection(pt)
+                radius = max(radius, float(dist) + float(printed.radius_mm))
+        return max(0.0, radius + float(self.aorta_cylinder_clearance_mm))
+
+    def aorta_cylinder_step_count(self, distance_mm: float, legacy_min_steps: int = 1) -> int:
+        dist = max(0.0, float(distance_mm))
+        if dist <= 1e-9:
+            return 1
+        spacing = float(self.aorta_cylinder_sample_spacing_mm)
+        if spacing <= 1e-9:
+            return max(1, int(legacy_min_steps))
+        adaptive_steps = int(math.ceil(dist / spacing))
+        return max(1, int(legacy_min_steps), adaptive_steps)
+
+    def move_to_tip_aorta_cylinder_tangent(
+        self,
+        p_tip: np.ndarray,
+        axis_tangent: np.ndarray,
+        radial_unit: np.ndarray,
+        feed: float,
+        comment: Optional[str] = None,
+    ) -> None:
+        tangent = self.aorta_cylinder_tangent_from_radial(axis_tangent, radial_unit)
+        if self.write_mode == "calibrated" and self.orientation_mode in {"90mode", "90", "ninety"}:
+            c = c_angle_from_tangent(
+                tangent,
+                prev_c=self.cur_c,
+                min_xy=self.min_tangent_xy_for_c,
+                azimuth_offset_deg=self.cal.c_180_deg,
+                c_min_deg=self.c_min_deg,
+                c_max_deg=self.c_max_deg,
+            )
+            c = smooth_limited_angle_deg_toward(
+                c, self.cur_c, self.travel_c_smoothing_alpha, self.travel_c_max_step_deg, self.c_min_deg, self.c_max_deg
+            )
+            self.move_to_tip_with_explicit_bc(
+                p_tip,
+                b=self.b_90,
+                c=c,
+                feed=feed,
+                comment=comment,
+                motion_phase=self.phase_for_requested_tip_angle(90.0),
+                requested_tip_angle=90.0,
+            )
+        else:
+            # In tangent mode this computes both B and C from the tangent of the
+            # aorta-centered cylinder surface. In cartesian/fixed modes it falls
+            # back to the normal move planner.
+            self.move_to_tip(p_tip, tangent=tangent, feed=feed, comment=comment)
+
+    def reorient_on_aorta_cylinder_surface(
+        self,
+        axis_point: np.ndarray,
+        axis_tangent: np.ndarray,
+        radial_unit: np.ndarray,
+        target_b: float,
+        target_c: float,
+        feed: float,
+        motion_phase: Optional[str] = None,
+        requested_tip_angle: Optional[float] = None,
+        comment: Optional[str] = None,
+    ) -> None:
+        if self.cur_tip_xyz is None:
+            return
+        axis_pt = np.asarray(axis_point, dtype=float).reshape(3)
+        axis_tan = normalize(np.asarray(axis_tangent, dtype=float).reshape(3))
+        radial0 = normalize(np.asarray(radial_unit, dtype=float).reshape(3))
+        radius = float(np.linalg.norm(np.asarray(self.cur_tip_xyz, dtype=float).reshape(3) - axis_pt))
+        if radius <= 1e-9:
+            self.move_to_tip_with_explicit_bc_synced(
+                np.asarray(self.cur_tip_xyz, dtype=float),
+                b=target_b,
+                c=target_c,
+                feed=feed,
+                motion_phase=motion_phase,
+                requested_tip_angle=requested_tip_angle,
+                comment=comment,
+            )
+            return
+
+        start_b = float(self.cur_b)
+        start_c = float(self.cur_c)
+        end_c = float(bounded_unwrapped_angle_deg(float(target_c), start_c, self.c_min_deg, self.c_max_deg))
+        delta_c_deg = float(end_c - start_c)
+        delta_c_rad = math.radians(delta_c_deg)
+        b_span = abs(float(target_b) - start_b)
+        arc_distance = abs(delta_c_rad) * radius
+        n_steps = max(
+            1,
+            self.aorta_cylinder_step_count(arc_distance),
+            int(math.ceil(b_span / max(0.25, float(self.b_max_step_deg)))) if b_span > 1e-12 else 1,
+        )
+
+        for step_idx in range(1, n_steps + 1):
+            t = step_idx / float(n_steps)
+            angle = delta_c_rad * t
+            r_i = radial0 * math.cos(angle) + np.cross(axis_tan, radial0) * math.sin(angle) + axis_tan * float(np.dot(axis_tan, radial0)) * (1.0 - math.cos(angle))
+            r_i = normalize(r_i)
+            tip_i = axis_pt + radius * r_i
+            b_i = start_b + t * (float(target_b) - start_b)
+            c_i = start_c + t * delta_c_deg
+            self.move_to_tip_with_explicit_bc_synced(
+                tip_i,
+                b=b_i,
+                c=c_i,
+                feed=feed,
+                motion_phase=motion_phase,
+                requested_tip_angle=requested_tip_angle,
+                comment=comment if step_idx == n_steps else None,
+            )
+
+    def approach_start_from_aorta_cylinder(
+        self,
+        start_tip: np.ndarray,
+        start_tangent: np.ndarray,
+        label: str,
+        final_approach_feed: Optional[float] = None,
+    ) -> None:
+        start_tip = np.asarray(start_tip, dtype=float).reshape(3)
+        start_tangent = normalize(np.asarray(start_tangent, dtype=float).reshape(3))
+        final_feed = float(self.print_feed if final_approach_feed is None else final_approach_feed)
+        if (
+            not self.enable_aorta_cylinder_travel
+            or self.aorta_centerline_points is None
+        ):
+            self.approach_start_direct(start_tip=start_tip, start_tangent=start_tangent, label=label, final_approach_feed=final_feed)
+            return
+
+        reduced_accel_active = self.begin_post_print_travel(label)
+        try:
+            if self.cur_tip_xyz is None and self.cur_stage_xyz is not None:
+                self.sync_tip_state_from_stage(tangent=self.last_tip_tangent)
+            if self.cur_tip_xyz is None:
+                self.approach_start_direct(start_tip=start_tip, start_tangent=start_tangent, label=label, final_approach_feed=final_feed)
+                return
+
+            radius = self.current_aorta_cylinder_radius()
+            if radius <= 1e-9:
+                self.approach_start_direct(start_tip=start_tip, start_tangent=start_tangent, label=label, final_approach_feed=final_feed)
+                return
+
+            cur_tip = np.asarray(self.cur_tip_xyz, dtype=float).copy()
+            cur_axis, cur_s, cur_axis_tan, _ = self.aorta_projection(cur_tip)
+            target_axis, target_s, target_axis_tan, _ = self.aorta_projection(start_tip)
+            target_radial = self.aorta_radial_unit(start_tip, fallback=start_tangent)
+            cur_radial = self.aorta_radial_unit(cur_tip, fallback=target_radial)
+
+            self.f.write(
+                f"; {label}: {self.orientation_mode} aorta-cylinder travel radius={radius:.6f} "
+                f"from_s={cur_s:.6f} to_s={target_s:.6f}\n"
+            )
+
+            cur_surface = cur_axis + radius * cur_radial
+            if float(np.linalg.norm(cur_tip - cur_surface)) > 1e-6:
+                radial_xy_tip = np.array([float(cur_surface[0]), float(cur_surface[1]), float(cur_tip[2])], dtype=float)
+                if float(np.linalg.norm(radial_xy_tip - cur_tip)) > 1e-6:
+                    self.move_to_tip_with_explicit_bc(
+                        radial_xy_tip,
+                        b=self.cur_b,
+                        c=self.cur_c,
+                        feed=self.travel_feed,
+                        comment=f"{label}: XY-radial move outward before cylinder-surface tracking",
+                    )
+                if float(np.linalg.norm(np.asarray(self.cur_tip_xyz, dtype=float) - cur_surface)) > 1e-6:
+                    self.move_to_tip_aorta_cylinder_azimuth_plane(
+                        cur_surface,
+                        axis_tangent=cur_axis_tan,
+                        radial_unit=cur_radial,
+                        feed=self.travel_feed,
+                        comment=f"{label}: tip-tracked move onto current aorta-cylinder surface",
+                    )
+
+            axis_distance = abs(float(target_s) - float(cur_s))
+            n_axis = self.aorta_cylinder_step_count(axis_distance, legacy_min_steps=self.aorta_cylinder_samples)
+            for step in range(1, n_axis + 1):
+                t = step / float(n_axis)
+                s_i = (1.0 - t) * float(cur_s) + t * float(target_s)
+                axis_i, axis_tan_i = self.aorta_point_at_s(s_i)
+                surface_i = axis_i + radius * cur_radial
+                self.move_to_tip_aorta_cylinder_azimuth_plane(
+                    surface_i,
+                    axis_tangent=axis_tan_i,
+                    radial_unit=cur_radial,
+                    feed=self.travel_feed,
+                    comment=None if step < n_axis else f"{label}: follow aorta-cylinder surface to target node station",
+                )
+
+            # Rotate around the cylinder at the target station if the next branch
+            # wants a different radial approach direction.
+            dot_rt = float(np.clip(np.dot(cur_radial, target_radial), -1.0, 1.0))
+            if dot_rt < 0.999:
+                axis_tan = target_axis_tan
+                sin_rt = float(np.dot(np.cross(cur_radial, target_radial), axis_tan))
+                total_angle = math.atan2(sin_rt, dot_rt)
+                arc_distance = abs(total_angle) * radius
+                n_arc = self.aorta_cylinder_step_count(arc_distance)
+                for step in range(1, n_arc + 1):
+                    a = total_angle * step / float(n_arc)
+                    # Rodrigues rotation of current radial around local axis tangent.
+                    k = normalize(axis_tan)
+                    r = cur_radial * math.cos(a) + np.cross(k, cur_radial) * math.sin(a) + k * np.dot(k, cur_radial) * (1.0 - math.cos(a))
+                    r = normalize(r)
+                    surface_i = target_axis + radius * r
+                    self.move_to_tip_aorta_cylinder_azimuth_plane(
+                        surface_i,
+                        axis_tangent=axis_tan,
+                        radial_unit=r,
+                        feed=self.travel_feed,
+                        comment=None if step < n_arc else f"{label}: rotate on aorta-cylinder surface to branch radial",
+                    )
+
+            approach_start = target_axis + radius * target_radial
+            if float(np.linalg.norm(np.asarray(self.cur_tip_xyz, dtype=float) - approach_start)) > 1e-6:
+                self.move_to_tip_aorta_cylinder_azimuth_plane(
+                    approach_start,
+                    axis_tangent=target_axis_tan,
+                    radial_unit=target_radial,
+                    feed=self.travel_feed,
+                    comment=f"{label}: align on cylinder above node radial",
+                )
+
+            fine_dist = min(radius, max(0.0, float(self.fine_approach_distance)))
+            radial_tip = target_axis + max(fine_dist, 0.0) * target_radial
+            if fine_dist > 1e-9 and float(np.linalg.norm(radial_tip - start_tip)) > 1e-6:
+                self.move_to_tip_aorta_cylinder_azimuth_plane(
+                    radial_tip,
+                    axis_tangent=target_axis_tan,
+                    radial_unit=target_radial,
+                    feed=self.travel_feed,
+                    comment=f"{label}: radial approach to fine-approach start",
+                )
+            # Final contact uses the print tangent so C is the extrusion-line azimuth.
+            start_b, start_c, start_phase, start_tip_angle = self.bc_for_tangent_with_phase(
+                start_tangent,
+                prev_c=self.cur_c,
+                prev_b=self.cur_b,
+            )
+            prespin_tip = radial_tip if fine_dist > 1e-9 else start_tip
+            self.reorient_on_aorta_cylinder_surface(
+                axis_point=target_axis,
+                axis_tangent=target_axis_tan,
+                radial_unit=target_radial,
+                target_b=start_b,
+                target_c=start_c,
+                feed=final_feed,
+                motion_phase=start_phase,
+                requested_tip_angle=start_tip_angle,
+                comment=f"{label}: reorient on cylinder surface to print orientation",
+            )
+            self.move_to_tip_with_explicit_bc(
+                start_tip,
+                b=start_b,
+                c=start_c,
+                feed=final_feed,
+                comment=f"{label}: radial fine approach to node with print orientation",
+                motion_phase=start_phase,
+                requested_tip_angle=start_tip_angle,
+            )
+        finally:
+            self.end_post_print_travel(label, reduced_accel_active)
 
     def pressure_preload_before_print(self) -> None:
         if self.emit_extrusion and not self.pressure_charged:
@@ -2445,6 +3854,11 @@ class GCodeWriter:
             self.f.write("; disable pressure solenoid after print pass\n")
             self.f.write("M42 P0 S0\n")
 
+    def start_node_dwell_before_print(self) -> None:
+        if self.emit_extrusion and self.pressure_charged and self.start_node_dwell_ms > 0:
+            self.f.write("; start-of-pass dwell after pressure-on before first print move\n")
+            self.f.write(f"G4 P{self.start_node_dwell_ms}\n")
+
     def approach_start_from_side(
         self,
         start_tip: np.ndarray,
@@ -2454,10 +3868,12 @@ class GCodeWriter:
         retreat_clearance: float,
         side_lift_z: float,
         label: str,
+        final_approach_feed: Optional[float] = None,
     ) -> None:
         start_tip = np.asarray(start_tip, dtype=float)
         base_side = side_vector_from_tangent(start_tangent, fallback=self.last_tip_tangent)
         approach_distance = max(float(far_clearance), float(self.fine_approach_distance))
+        final_feed = float(self.print_feed if final_approach_feed is None else final_approach_feed)
         reduced_accel_active = self.begin_post_print_travel(label)
 
         direction_candidates: List[np.ndarray] = []
@@ -2520,13 +3936,13 @@ class GCodeWriter:
                     candidate_moves.append(PlannedTipMove(
                         tip_xyz=near_tip,
                         tangent=np.asarray(start_tangent, dtype=float).copy(),
-                        feed=self.fine_approach_feed,
+                        feed=final_feed,
                         comment=f"{label}: fine approach ramp near",
                     ))
                 candidate_moves.append(PlannedTipMove(
                     tip_xyz=start_tip,
                     tangent=np.asarray(start_tangent, dtype=float).copy(),
-                    feed=self.fine_approach_feed,
+                    feed=final_feed,
                     comment=f"{label}: fine approach ramp to node",
                     allow_tip_segment_contact=True,
                 ))
@@ -2557,6 +3973,17 @@ class GCodeWriter:
 
         try:
             self.execute_planned_tip_moves(chosen_moves)
+            # Travel smoothing can subdivide the final approach-to-node move.
+            # Re-issue one exact unsmoothed landing move so extrusion always
+            # starts from the intended node pose.
+            if len(chosen_moves) > 0:
+                self.move_to_tip(
+                    start_tip,
+                    tangent=np.asarray(start_tangent, dtype=float).copy(),
+                    feed=final_feed,
+                    comment=f"{label}: exact final node landing after smoothed side approach",
+                    travel_mode=False,
+                )
         finally:
             self.end_post_print_travel(label, reduced_accel_active)
 
@@ -2565,16 +3992,23 @@ class GCodeWriter:
         start_tip: np.ndarray,
         start_tangent: np.ndarray,
         label: str,
+        final_approach_feed: Optional[float] = None,
     ) -> None:
         start_tip = np.asarray(start_tip, dtype=float)
         start_tangent = normalize(np.asarray(start_tangent, dtype=float))
+        final_feed = float(self.print_feed if final_approach_feed is None else final_approach_feed)
         reduced_accel_active = self.begin_post_print_travel(label)
 
         try:
             if self.cur_tip_xyz is None and self.cur_stage_xyz is not None:
                 self.sync_tip_state_from_stage(tangent=self.last_tip_tangent)
 
-            start_b, start_c = self.bc_for_tangent(start_tangent, prev_c=self.cur_c, prev_b=self.cur_b)
+            start_b, start_c, start_phase, start_tip_angle = self.bc_for_tangent_with_phase(
+                start_tangent,
+                prev_c=self.cur_c,
+                prev_b=self.cur_b,
+                travel_mode=True,
+            )
 
             if self.cur_tip_xyz is None:
                 self.move_to_tip_with_explicit_bc(
@@ -2583,6 +4017,8 @@ class GCodeWriter:
                     c=start_c,
                     feed=self.travel_feed,
                     comment=f"{label}: direct travel to node start",
+                    motion_phase=start_phase,
+                    requested_tip_angle=start_tip_angle,
                 )
                 return
 
@@ -2596,6 +4032,8 @@ class GCodeWriter:
                     c=start_c,
                     feed=self.travel_feed,
                     comment=f"{label}: direct approach orientation sync at node start",
+                    motion_phase=start_phase,
+                    requested_tip_angle=start_tip_angle,
                 )
                 return
 
@@ -2607,6 +4045,8 @@ class GCodeWriter:
                     c=start_c,
                     feed=self.travel_feed,
                     comment=f"{label}: pre-spin at current Z before Z move to node",
+                    motion_phase=start_phase,
+                    requested_tip_angle=start_tip_angle,
                 )
                 cur_tip = np.asarray(self.cur_tip_xyz, dtype=float)
                 to_start = start_tip - cur_tip
@@ -2623,13 +4063,17 @@ class GCodeWriter:
                     c=start_c,
                     feed=self.travel_feed,
                     comment=f"{label}: direct travel to 5mm fine-approach start",
+                    motion_phase=start_phase,
+                    requested_tip_angle=start_tip_angle,
                 )
             self.move_to_tip_with_explicit_bc(
                 start_tip,
                 b=start_b,
                 c=start_c,
-                feed=self.fine_approach_feed,
+                feed=final_feed,
                 comment=f"{label}: direct fine approach within 5mm of node start",
+                motion_phase=start_phase,
+                requested_tip_angle=start_tip_angle,
             )
         finally:
             self.end_post_print_travel(label, reduced_accel_active)
@@ -2695,14 +4139,28 @@ class GCodeWriter:
             direction = normalize(tan[-1])
         return direction
 
-    def print_polyline(self, points: np.ndarray, tangents: np.ndarray, extrusion_multiplier: float, label: str, path_radius_mm: float = 0.0) -> None:
+    def print_polyline(
+        self,
+        points: np.ndarray,
+        tangents: np.ndarray,
+        extrusion_multiplier: float,
+        label: str,
+        path_radius_mm: float = 0.0,
+        print_feed_override: Optional[float] = None,
+        radius_profile_mm: Optional[np.ndarray] = None,
+    ) -> None:
         if len(points) < 2:
             return
 
         self.pressure_preload_before_print()
         mode_note = "Cartesian centerline" if self.write_mode == "cartesian" else "calibration-based exact tip tracking"
-        self.f.write(f"; print {label} ({mode_note})\n")
+        active_print_feed = float(self.print_feed if print_feed_override is None else print_feed_override)
+        rr = None if radius_profile_mm is None else np.asarray(radius_profile_mm, dtype=float).reshape(-1)
+        if rr is not None and len(rr) != len(points):
+            raise ValueError(f"Radius profile length mismatch for {label}: {len(rr)} radii for {len(points)} points.")
+        self.f.write(f"; print {label} ({mode_note}); desired_tip_feed={active_print_feed:.3f} mm/min; path_radius_mm={float(path_radius_mm):.6f}\n")
         self.emit_vasculature_write_start(label, points, tangents, extrusion_multiplier)
+        self.start_node_dwell_before_print()
 
         last_tip = np.asarray(points[0], dtype=float).copy()
         self.cur_tip_xyz = last_tip.copy()
@@ -2713,14 +4171,32 @@ class GCodeWriter:
             p1 = np.asarray(points[i], dtype=float)
             seg_t0 = np.asarray(tangents[i - 1], dtype=float)
             seg_t1 = np.asarray(tangents[i], dtype=float)
+            r0 = float(path_radius_mm if rr is None else rr[i - 1])
+            r1 = float(path_radius_mm if rr is None else rr[i])
             for s in range(1, self.edge_samples + 1):
                 t = s / float(self.edge_samples)
                 p_tip = p0 + t * (p1 - p0)
                 tangent = normalize((1.0 - t) * seg_t0 + t * seg_t1)
-                p_stage, b, c = self.tip_to_stage(p_tip, tangent=tangent, prev_c=self.cur_c)
-
-                self.write_move(p_stage, b, c, self.print_feed, comment=None, u_value=None)
-                self.cur_tip_xyz = p_tip.copy()
+                p_stage, b, c, motion_phase, used_tip_angle = self.tip_to_stage_with_phase(
+                    p_tip,
+                    tangent=tangent,
+                    prev_c=self.cur_c,
+                    prev_b=self.cur_b,
+                )
+                local_radius_mm = float((1.0 - t) * r0 + t * r1)
+                local_feed = active_print_feed
+                if self.extrusion_feed_mode == "weighted" and self.radius_feed_map:
+                    local_feed = feed_from_radius_map(local_radius_mm, self.radius_feed_map, active_print_feed)
+                self.write_tip_speed_move(
+                    p_stage=p_stage,
+                    b=b,
+                    c=c,
+                    desired_tip_feed=local_feed,
+                    start_tip_xyz=last_tip,
+                    end_tip_xyz=p_tip,
+                    motion_phase=motion_phase,
+                    requested_tip_angle=used_tip_angle,
+                )
                 self.last_tip_tangent = tangent.copy()
                 last_tip = p_tip.copy()
 
@@ -2779,6 +4255,7 @@ def build_print_paths(
                 path_id=f"vessel_{v.vessel_id:03d}",
                 source_vessel_ids=[v.vessel_id],
                 points=(v.ordered_points if v.ordered_points is not None else v.points).copy(),
+                radius_profile=vessel_ordered_radius_profile(v),
                 root_vessel_id=v.vessel_id,
                 parent_vessel_id=v.parent_id,
                 depth=v.depth,
@@ -2792,8 +4269,9 @@ def build_print_paths(
 
     prepared_paths: List[PrintPath] = []
     for path in raw_paths:
-        pts = prepare_print_path_points(
+        pts, rr = prepare_print_path_geometry(
             np.asarray(path.points, dtype=float),
+            np.asarray(path.radius_profile, dtype=float),
             point_merge_tol=point_merge_tol,
             resample_spacing=path_resample_spacing,
             geometry_smooth_window=path_geometry_smooth_window,
@@ -2801,13 +4279,11 @@ def build_print_paths(
         if len(pts) < 2:
             continue
         source_vessel_ids = list(path.source_vessel_ids)
-        if bool(force_bottom_to_top) and float(pts[0, 2]) > float(pts[-1, 2]):
-            pts = pts[::-1].copy()
-            source_vessel_ids = list(reversed(source_vessel_ids))
         prepared_paths.append(PrintPath(
             path_id=path.path_id,
             source_vessel_ids=source_vessel_ids,
             points=pts,
+            radius_profile=rr,
             root_vessel_id=path.root_vessel_id,
             parent_vessel_id=path.parent_vessel_id,
             depth=path.depth,
@@ -2816,10 +4292,17 @@ def build_print_paths(
             connection_xyz=None if path.connection_xyz is None else np.asarray(path.connection_xyz, dtype=float).copy(),
             connection_z=path.connection_z,
         ))
-    prepared_paths = order_paths_from_printed_tree(
-        prepared_paths,
-        connection_threshold=max(float(chain_merge_threshold) * 2.0, float(point_merge_tol) * 10.0),
-    )
+    if str(vessel_order_mode).strip().lower() == "aorta_first_lowest_branch":
+        prepared_paths = order_paths_aorta_first_lowest_branch(
+            prepared_paths,
+            preferred_main_vessel_ids=preferred_main_vessel_ids,
+            connection_threshold=max(float(chain_merge_threshold) * 2.0, float(point_merge_tol) * 10.0),
+        )
+    else:
+        prepared_paths = order_paths_from_printed_tree(
+            prepared_paths,
+            connection_threshold=max(float(chain_merge_threshold) * 2.0, float(point_merge_tol) * 10.0),
+        )
     final_paths = extend_branch_starts_into_printed_tree(
         prepared_paths,
         overlap_mm=float(branch_start_overlap_mm),
@@ -3005,17 +4488,21 @@ def extend_branch_starts_into_printed_tree(
         overlap_point = best_point - branch_tangent * overlap
 
         branch_pts = pts.copy()
+        branch_radii = np.asarray(path.radius_profile, dtype=float).copy()
         if float(np.linalg.norm(branch_pts[0] - best_point)) > float(point_merge_tol):
             branch_pts = np.vstack([best_point, branch_pts])
+            branch_radii = np.concatenate([[float(branch_radii[0])], branch_radii])
         else:
             branch_pts[0] = best_point
         if float(np.linalg.norm(branch_pts[0] - overlap_point)) > float(point_merge_tol):
             branch_pts = np.vstack([overlap_point, branch_pts])
+            branch_radii = np.concatenate([[float(branch_radii[0])], branch_radii])
 
         updated = PrintPath(
             path_id=path.path_id,
             source_vessel_ids=list(path.source_vessel_ids),
             points=branch_pts,
+            radius_profile=branch_radii,
             root_vessel_id=path.root_vessel_id,
             parent_vessel_id=path.parent_vessel_id,
             depth=path.depth,
@@ -3029,6 +4516,302 @@ def extend_branch_starts_into_printed_tree(
     return out
 
 
+def enforce_final_paths_bottom_to_top(paths: List[PrintPath]) -> List[PrintPath]:
+    """Reverse any final print path whose endpoints run high-to-low.
+
+    This is deliberately applied after aorta/branch hierarchy ordering and
+    after optional branch-start overlap. The hierarchy still controls WHEN a
+    branch prints; this function only controls the direction of extrusion within
+    each group. For branch paths with known connection metadata, the node/junction
+    endpoint is preserved as point[0] even when --force-bottom-to-top is enabled.
+    Connection metadata is preserved so cylinder-surface travel can still know
+    which parent/aorta node this branch belongs to.
+    """
+    out: List[PrintPath] = []
+    for path in paths:
+        pts = np.asarray(path.points, dtype=float).copy()
+        rr = np.asarray(path.radius_profile, dtype=float).copy()
+        source_ids = list(path.source_vessel_ids)
+        should_reverse = len(pts) >= 2 and float(pts[0, 2]) > float(pts[-1, 2])
+        if path.connection_xyz is not None and len(pts) >= 2:
+            conn = np.asarray(path.connection_xyz, dtype=float).reshape(3)
+            start_dist = float(np.linalg.norm(pts[0] - conn))
+            end_dist = float(np.linalg.norm(pts[-1] - conn))
+            # Branches must always start at the node/junction, not at the leaf.
+            should_reverse = end_dist + 1e-9 < start_dist
+        if should_reverse:
+            pts = pts[::-1].copy()
+            rr = rr[::-1].copy()
+            source_ids = list(reversed(source_ids))
+        out.append(PrintPath(
+            path_id=path.path_id,
+            source_vessel_ids=source_ids,
+            points=pts,
+            radius_profile=rr,
+            root_vessel_id=path.root_vessel_id,
+            parent_vessel_id=path.parent_vessel_id,
+            depth=path.depth,
+            is_main=path.is_main,
+            radius_like=path.radius_like,
+            connection_xyz=None if path.connection_xyz is None else np.asarray(path.connection_xyz, dtype=float).copy(),
+            connection_z=path.connection_z,
+        ))
+    return out
+
+
+def order_paths_aorta_first_lowest_branch(
+    paths: List[PrintPath],
+    preferred_main_vessel_ids: Optional[List[int]] = None,
+    connection_threshold: float = DEFAULT_NODE_ATTACH_THRESHOLD,
+) -> List[PrintPath]:
+    """
+    Print the aorta/main centerline first, bottom-to-top. Then print only
+    branches whose start is connected to already-written material.
+
+    Direct children of the aorta are sorted by their connection height on the
+    aorta from low to high. A branch that is not connected to the aorta is
+    treated as a child/subbranch of the closest parent branch, so the parent is
+    written first and its children are written recursively.
+
+    This prevents a subbranch from being printed as an "empty" branch before
+    the branch it physically attaches to has been deposited.
+    """
+    if len(paths) <= 1:
+        return paths
+
+    def _path_ids(path: PrintPath) -> Tuple[int, ...]:
+        return tuple(int(v) for v in path.source_vessel_ids)
+
+    main_candidates = [p for p in paths if p.is_main]
+    preferred = [int(v) for v in (preferred_main_vessel_ids or [])]
+    preferred_candidates: List[PrintPath] = []
+    if preferred:
+        preferred_set = set(preferred)
+        preferred_candidates = [p for p in paths if preferred_set.issubset(set(int(v) for v in p.source_vessel_ids))]
+        if not preferred_candidates:
+            preferred_candidates = [p for p in paths if int(p.source_vessel_ids[0]) == preferred[0]]
+
+    if preferred_candidates:
+        aorta = max(
+            preferred_candidates,
+            key=lambda p: (len(set(preferred).intersection(set(p.source_vessel_ids))), polyline_length(p.points)),
+        )
+    elif main_candidates:
+        aorta = max(
+            main_candidates,
+            key=lambda p: (
+                polyline_length(p.points),
+                float(p.radius_like),
+                -float(np.min(np.asarray(p.points, dtype=float)[:, 2])),
+                -int(min(p.source_vessel_ids)),
+            ),
+        )
+    else:
+        aorta = max(paths, key=lambda p: (polyline_length(p.points), float(p.radius_like)))
+
+    aorta_pts = np.asarray(aorta.points, dtype=float).copy()
+    aorta_radii = np.asarray(aorta.radius_profile, dtype=float).copy()
+    aorta_ids = list(aorta.source_vessel_ids)
+    if len(aorta_pts) >= 2 and float(aorta_pts[0, 2]) > float(aorta_pts[-1, 2]):
+        aorta_pts = aorta_pts[::-1].copy()
+        aorta_radii = aorta_radii[::-1].copy()
+        aorta_ids = list(reversed(aorta_ids))
+
+    aorta_path = PrintPath(
+        path_id=aorta.path_id,
+        source_vessel_ids=aorta_ids,
+        points=aorta_pts,
+        radius_profile=aorta_radii,
+        root_vessel_id=aorta.root_vessel_id,
+        parent_vessel_id=None,
+        depth=0,
+        is_main=True,
+        radius_like=aorta.radius_like,
+        connection_xyz=None,
+        connection_z=None,
+    )
+
+    # First orient every non-aorta path so point[0] is its connection endpoint.
+    # Parent selection is then done by comparing that endpoint to the aorta and
+    # all other branch centerlines.
+    candidate_records: List[Dict[str, Any]] = []
+    for idx, path in enumerate(paths):
+        if path is aorta:
+            continue
+        pts_original = np.asarray(path.points, dtype=float).copy()
+        if len(pts_original) < 2:
+            continue
+
+        refs: List[Tuple[str, int, np.ndarray]] = [("aorta", -1, aorta_pts)]
+        for other_idx, other in enumerate(paths):
+            if other is aorta or other is path:
+                continue
+            other_pts = np.asarray(other.points, dtype=float)
+            if len(other_pts) >= 2:
+                refs.append(("branch", other_idx, other_pts))
+
+        endpoint_options: List[Tuple[float, str, int, np.ndarray, float, np.ndarray, bool]] = []
+        for reverse in (False, True):
+            endpoint = pts_original[-1] if reverse else pts_original[0]
+            for ref_kind, ref_idx, ref_pts in refs:
+                q, s, _t, d = projected_point_and_arclength_on_polyline(endpoint, ref_pts)
+                endpoint_options.append((float(d), ref_kind, int(ref_idx), np.asarray(q, dtype=float), float(s), np.asarray(endpoint, dtype=float), bool(reverse)))
+
+        aorta_options = [item for item in endpoint_options if item[1] == "aorta"]
+        branch_options = [item for item in endpoint_options if item[1] == "branch"]
+        best_aorta = min(aorta_options, key=lambda item: (item[0], item[6])) if aorta_options else None
+        best_branch = min(branch_options, key=lambda item: (item[0], item[2], item[6])) if branch_options else None
+
+        # Do not promote a subbranch to an aorta child unless its endpoint is
+        # actually close to the aorta. If it is not close enough, use the closest
+        # branch as its parent so the parent branch is printed first.
+        preliminary_best = best_aorta
+        if best_aorta is None:
+            preliminary_best = best_branch
+        elif best_branch is not None and float(best_aorta[0]) > max(float(connection_threshold), 1e-9):
+            preliminary_best = best_branch
+        if preliminary_best is None:
+            continue
+
+        best_dist, best_kind, best_parent_idx, best_q, best_s, _endpoint, reverse = preliminary_best
+        pts = pts_original[::-1].copy() if reverse else pts_original.copy()
+        radii = np.asarray(path.radius_profile, dtype=float)[::-1].copy() if reverse else np.asarray(path.radius_profile, dtype=float).copy()
+        source_ids = list(reversed(path.source_vessel_ids)) if reverse else list(path.source_vessel_ids)
+
+        candidate_records.append({
+            "idx": int(idx),
+            "path": path,
+            "points": pts,
+            "radii": radii,
+            "source_ids": source_ids,
+            "nearest_dist": float(best_dist),
+            "nearest_kind": best_kind,
+            "nearest_parent_idx": int(best_parent_idx),
+            "nearest_q": np.asarray(best_q, dtype=float),
+            "nearest_s": float(best_s),
+            "best_aorta_dist": float(best_aorta[0]) if best_aorta is not None else float("inf"),
+            "best_branch_dist": float(best_branch[0]) if best_branch is not None else float("inf"),
+        })
+
+    if not candidate_records:
+        return [aorta_path]
+
+    record_by_idx: Dict[int, Dict[str, Any]] = {int(r["idx"]): r for r in candidate_records}
+    threshold = max(float(connection_threshold), 1e-9)
+
+    # Determine a support parent for each branch. Prefer aorta only when the
+    # branch endpoint is actually close enough to the aorta. Otherwise use the
+    # closest branch as parent, which enforces parent-before-subbranch order.
+    for rec in candidate_records:
+        if rec["nearest_kind"] == "aorta" and float(rec["nearest_dist"]) <= threshold:
+            rec["parent_key"] = "aorta"
+            rec["parent_idx"] = -1
+            rec["parent_points"] = aorta_pts
+        elif rec["nearest_kind"] == "branch" and int(rec["nearest_parent_idx"]) in record_by_idx:
+            parent_idx = int(rec["nearest_parent_idx"])
+            rec["parent_key"] = "branch"
+            rec["parent_idx"] = parent_idx
+            rec["parent_points"] = record_by_idx[parent_idx]["points"]
+        else:
+            # Fallback for imperfect data: attach to the closest already-known
+            # geometry. If this is far from everything, the branch is emitted
+            # after all supported branches instead of before its likely parent.
+            rec["parent_key"] = "aorta"
+            rec["parent_idx"] = -1
+            rec["parent_points"] = aorta_pts
+
+    # Recompute connection position and arc length on the selected parent using
+    # the oriented branch start. This keeps group metadata and branch-start
+    # overlap anchored on the printed parent, not always on the aorta.
+    for rec in candidate_records:
+        parent_pts = np.asarray(rec["parent_points"], dtype=float)
+        q, s, _t, d = projected_point_and_arclength_on_polyline(np.asarray(rec["points"], dtype=float)[0], parent_pts)
+        rec["connection_xyz"] = np.asarray(q, dtype=float)
+        rec["connection_z"] = float(q[2])
+        rec["connection_s"] = float(s)
+        rec["connection_dist"] = float(d)
+
+    children_by_parent: Dict[int, List[Dict[str, Any]]] = {-1: []}
+    for rec in candidate_records:
+        parent_idx = int(rec.get("parent_idx", -1))
+        children_by_parent.setdefault(parent_idx, []).append(rec)
+
+    def _record_sort_key(rec: Dict[str, Any]) -> Tuple[float, float, float, int]:
+        return (
+            float(rec.get("connection_z", 0.0)),
+            float(rec.get("connection_s", 0.0)),
+            float(rec.get("connection_dist", 0.0)),
+            int(min(int(v) for v in rec["source_ids"])),
+        )
+
+    for bucket in children_by_parent.values():
+        bucket.sort(key=_record_sort_key)
+
+    ordered: List[PrintPath] = [aorta_path]
+    emitted: set[int] = set()
+    visiting: set[int] = set()
+
+    def emit_branch_tree(parent_idx: int, depth: int) -> None:
+        for rec in children_by_parent.get(int(parent_idx), []):
+            idx = int(rec["idx"])
+            if idx in emitted:
+                continue
+            if idx in visiting:
+                # Cycle guard for noisy/ambiguous geometry. Emit once and break
+                # the cycle rather than recursing forever.
+                continue
+            visiting.add(idx)
+            path = rec["path"]
+            source_ids = [int(v) for v in rec["source_ids"]]
+            parent_vessel_id = None
+            if parent_idx >= 0 and parent_idx in record_by_idx:
+                parent_source_ids = [int(v) for v in record_by_idx[parent_idx]["source_ids"]]
+                if parent_source_ids:
+                    parent_vessel_id = int(parent_source_ids[-1])
+            branch = PrintPath(
+                path_id=path.path_id,
+                source_vessel_ids=source_ids,
+                points=np.asarray(rec["points"], dtype=float).copy(),
+                radius_profile=np.asarray(rec["radii"], dtype=float).copy(),
+                root_vessel_id=path.root_vessel_id,
+                parent_vessel_id=parent_vessel_id,
+                depth=max(int(depth), int(path.depth), 1),
+                is_main=False,
+                radius_like=path.radius_like,
+                connection_xyz=np.asarray(rec["connection_xyz"], dtype=float).copy(),
+                connection_z=float(rec["connection_z"]),
+            )
+            ordered.append(branch)
+            emitted.add(idx)
+            emit_branch_tree(idx, depth + 1)
+            visiting.discard(idx)
+
+    # Direct aorta branches first, low-to-high on the aorta, recursively emitting
+    # each parent branch before its subbranches.
+    emit_branch_tree(-1, 1)
+
+    # Any unresolved cycles or isolated remnants are appended after supported
+    # branches. They are still oriented from their nearest support, but they are
+    # not allowed to jump ahead of connected parent branches.
+    leftovers = [rec for rec in candidate_records if int(rec["idx"]) not in emitted]
+    leftovers.sort(key=_record_sort_key)
+    for rec in leftovers:
+        path = rec["path"]
+        ordered.append(PrintPath(
+            path_id=path.path_id,
+            source_vessel_ids=[int(v) for v in rec["source_ids"]],
+            points=np.asarray(rec["points"], dtype=float).copy(),
+            radius_profile=np.asarray(rec["radii"], dtype=float).copy(),
+            root_vessel_id=path.root_vessel_id,
+            parent_vessel_id=path.parent_vessel_id,
+            depth=max(int(path.depth), 1),
+            is_main=False,
+            radius_like=path.radius_like,
+            connection_xyz=np.asarray(rec["connection_xyz"], dtype=float).copy(),
+            connection_z=float(rec["connection_z"]),
+        ))
+
+    return ordered
 def order_paths_from_printed_tree(paths: List[PrintPath], connection_threshold: float) -> List[PrintPath]:
     if len(paths) <= 2:
         return paths
@@ -3108,13 +4891,24 @@ def machine_pose_for_tip(
     if write_mode == "cartesian":
         return (float(p_tip[0]), float(p_tip[1]), float(p_tip[2]), 0.0, 0.0)
 
-    if tangent is None or str(orientation_mode).strip().lower() == "fixed":
-        b = solve_b_for_target_tip_angle(cal, 0.0, search_samples=bc_solve_samples)
+    mode = str(orientation_mode).strip().lower()
+    motion_phase = _normalize_phase_key(cal.default_motion_phase)
+    if tangent is None or mode == "fixed":
+        b = solve_b_for_target_tip_angle(cal, 0.0, search_samples=bc_solve_samples, motion_phase=motion_phase)
         c = 0.0
+    elif mode in {"90mode", "90", "ninety"}:
+        c = c_angle_from_tangent(tangent, prev_c=0.0, azimuth_offset_deg=cal.c_180_deg)
+        b = solve_b_for_target_tip_angle(cal, 90.0, search_samples=bc_solve_samples, motion_phase=motion_phase)
     else:
         c = c_angle_from_tangent(tangent, prev_c=0.0, azimuth_offset_deg=cal.c_180_deg)
-        b = solve_b_for_target_tip_angle(cal, desired_physical_b_angle_from_tangent(tangent), search_samples=bc_solve_samples)
-    p_stage = stage_xyz_for_tip(cal, np.asarray(p_tip, dtype=float), float(b), float(c))
+        b, _used_tip_angle = solve_b_for_target_tip_angle_continuous(
+            cal,
+            desired_physical_b_angle_from_tangent(tangent),
+            prev_b=None,
+            motion_phase=motion_phase,
+            search_samples=bc_solve_samples,
+        )
+    p_stage = stage_xyz_for_tip(cal, np.asarray(p_tip, dtype=float), float(b), float(c), motion_phase=motion_phase)
     return (float(p_stage[0]), float(p_stage[1]), float(p_stage[2]), float(b), float(c))
 
 
@@ -3136,6 +4930,7 @@ def write_vessel_gcode(
     pressure_advance_feed: float,
     pressure_retract_feed: float,
     preflow_dwell_ms: int,
+    start_node_dwell_ms: int,
     node_dwell_ms: int,
     bbox: Dict[str, float],
     write_mode: str,
@@ -3153,9 +4948,15 @@ def write_vessel_gcode(
     c_max_step_deg: float,
     b_smoothing_alpha: float,
     c_smoothing_alpha: float,
+    travel_c_max_step_deg: Optional[float],
+    travel_c_smoothing_alpha: Optional[float],
+    c_min_deg: float,
+    c_max_deg: float,
     min_tangent_xy_for_c: float,
     rotate_y_deg: float,
+    rotate_z_deg: float,
     rotate_origin: Sequence[float],
+    rotate_z_origin: Sequence[float],
     geometry_scale: float,
     vessel_order_mode: str,
     simplify_paths: bool,
@@ -3179,10 +4980,24 @@ def write_vessel_gcode(
     skeleton_collision_sample_step_mm: float = DEFAULT_SKELETON_COLLISION_SAMPLE_STEP_MM,
     travel_accel_mm_s2: float = DEFAULT_TRAVEL_ACCEL_MM_S2,
     post_print_travel_accel_scale: float = DEFAULT_POST_PRINT_TRAVEL_ACCEL_SCALE,
+    travel_strategy: str = DEFAULT_TRAVEL_STRATEGY,
+    enable_aorta_cylinder_travel: bool = False,
+    aorta_cylinder_clearance_mm: float = DEFAULT_AORTA_CYLINDER_CLEARANCE_MM,
+    aorta_cylinder_min_radius_mm: float = DEFAULT_AORTA_CYLINDER_MIN_RADIUS_MM,
+    aorta_cylinder_samples: int = DEFAULT_AORTA_CYLINDER_SAMPLES,
+    aorta_cylinder_sample_spacing_mm: float = DEFAULT_AORTA_CYLINDER_SAMPLE_SPACING_MM,
+    extrusion_feed_mode: str = DEFAULT_EXTRUSION_FEED_MODE,
+    radius_feed_map: Optional[Sequence[Tuple[float, float]]] = None,
     group_displacements: Optional[Dict[int, GroupDisplacement]] = None,
 ) -> Dict[str, Tuple[float, float]]:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     emit_extrusion = float(extrusion_per_mm) != 0.0
+    feed_mode = str(extrusion_feed_mode).strip().lower()
+    if feed_mode not in {"traditional", "weighted"}:
+        raise ValueError("--extrusion-feed-mode must be 'traditional' or 'weighted'.")
+    radius_feed_map = [] if radius_feed_map is None else list(radius_feed_map)
+    if feed_mode == "weighted" and not radius_feed_map:
+        raise ValueError("--extrusion-feed-mode weighted requires --radius-feed-map or --radius-feed-map-file.")
 
     paths = build_print_paths(
         vessels=vessels,
@@ -3226,11 +5041,19 @@ def write_vessel_gcode(
         f.write(f"; radius_like range = [{vessel_summary['min_radius']:.6f}, {vessel_summary['max_radius']:.6f}]\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
         f.write("; extrusion actuation: pressure solenoid valve via M42 P0 S1 / M42 P0 S0\n")
+        f.write(f"; preflow_dwell_ms = {int(preflow_dwell_ms)}\n")
+        f.write(f"; start_node_dwell_ms = {int(start_node_dwell_ms)}\n")
+        f.write(f"; node_dwell_ms = {int(node_dwell_ms)}\n")
         f.write(f"; write_mode = {write_mode}\n")
         f.write(f"; orientation_mode = {orientation_mode}\n")
+        f.write(f"; extrusion_feed_mode = {feed_mode}\n")
+        if radius_feed_map:
+            f.write("; radius_feed_map = " + ",".join(f"{r:.6f}:{feed:.3f}" for r, feed in radius_feed_map) + "\n")
         f.write("; physical B convention = 0=>-Z, 90=>horizontal, 180=>+Z\n")
         f.write(f"; vessel_order_mode = {vessel_order_mode}\n")
         f.write(f"; force_bottom_to_top = {int(bool(force_bottom_to_top))}\n")
+        if bool(force_bottom_to_top):
+            f.write("; force_bottom_to_top affects branch ordering priority only; it does not reverse branch print direction.\n")
         if preferred_main_vessel_ids:
             f.write(f"; preferred_main_vessel_ids = {preferred_main_vessel_ids}\n")
         f.write(f"; tangent_smooth_window = {tangent_smooth_window}\n")
@@ -3240,9 +5063,15 @@ def write_vessel_gcode(
         f.write(f"; c_max_step_deg = {float(c_max_step_deg):.6f}\n")
         f.write(f"; b_smoothing_alpha = {float(b_smoothing_alpha):.6f}\n")
         f.write(f"; c_smoothing_alpha = {float(c_smoothing_alpha):.6f}\n")
+        f.write(f"; travel_c_max_step_deg = {float(c_max_step_deg if travel_c_max_step_deg is None else travel_c_max_step_deg):.6f}\n")
+        f.write(f"; travel_c_smoothing_alpha = {float(c_smoothing_alpha if travel_c_smoothing_alpha is None else travel_c_smoothing_alpha):.6f}\n")
+        f.write(f"; c_physical_limits_deg = [{float(min(c_min_deg, c_max_deg)):.6f}, {float(max(c_min_deg, c_max_deg)):.6f}]\n")
+        f.write("; c_filter_note = smoothing is applied before step limiting so large azimuth errors still catch up at --c-max-step-deg\n")
         f.write(f"; min_tangent_xy_for_c = {float(min_tangent_xy_for_c):.6f}\n")
         f.write(f"; geometry_rotate_y_deg = {float(rotate_y_deg):.6f}\n")
+        f.write(f"; geometry_rotate_z_deg = {float(rotate_z_deg):.6f}\n")
         f.write(f"; geometry_rotate_origin = [{float(rotate_origin[0]):.6f}, {float(rotate_origin[1]):.6f}, {float(rotate_origin[2]):.6f}]\n")
+        f.write(f"; geometry_rotate_z_origin = [{float(rotate_z_origin[0]):.6f}, {float(rotate_z_origin[1]):.6f}, {float(rotate_z_origin[2]):.6f}]\n")
         f.write(f"; geometry_scale = {float(geometry_scale):.6f}\n")
         f.write(f"; chain_merge_threshold = {chain_merge_threshold:.6f}\n")
         f.write(f"; min_group_length_mm = {float(min_group_length_mm):.6f}\n")
@@ -3253,6 +5082,12 @@ def write_vessel_gcode(
         f.write(f"; travel_edge_clearance = {float(travel_edge_clearance):.6f}\n")
         f.write(f"; enable_travel_bbox_clearance = {int(bool(enable_travel_bbox_clearance))}\n")
         f.write(f"; enable_side_approach = {int(bool(enable_side_approach))}\n")
+        f.write(f"; travel_strategy = {str(travel_strategy)}\n")
+        f.write(f"; enable_aorta_cylinder_travel = {int(bool(enable_aorta_cylinder_travel))}\n")
+        f.write(f"; aorta_cylinder_clearance_mm = {float(aorta_cylinder_clearance_mm):.6f}\n")
+        f.write(f"; aorta_cylinder_min_radius_mm = {float(aorta_cylinder_min_radius_mm):.6f}\n")
+        f.write(f"; aorta_cylinder_samples = {int(aorta_cylinder_samples)}\n")
+        f.write(f"; aorta_cylinder_sample_spacing_mm = {float(aorta_cylinder_sample_spacing_mm):.6f}\n")
         f.write(f"; fine_approach_distance = {float(fine_approach_distance):.6f}\n")
         f.write(f"; travel_accel_mm_s2 = {float(travel_accel_mm_s2):.6f}\n")
         f.write(f"; post_print_travel_accel_scale = {float(post_print_travel_accel_scale):.6f}\n")
@@ -3292,6 +5127,7 @@ def write_vessel_gcode(
             pressure_advance_feed=pressure_advance_feed,
             pressure_retract_feed=pressure_retract_feed,
             preflow_dwell_ms=preflow_dwell_ms,
+            start_node_dwell_ms=start_node_dwell_ms,
             node_dwell_ms=node_dwell_ms,
             edge_samples=edge_samples,
             emit_extrusion=emit_extrusion,
@@ -3302,6 +5138,10 @@ def write_vessel_gcode(
             c_max_step_deg=c_max_step_deg,
             b_smoothing_alpha=b_smoothing_alpha,
             c_smoothing_alpha=c_smoothing_alpha,
+            travel_c_max_step_deg=travel_c_max_step_deg,
+            travel_c_smoothing_alpha=travel_c_smoothing_alpha,
+            c_min_deg=c_min_deg,
+            c_max_deg=c_max_deg,
             min_tangent_xy_for_c=min_tangent_xy_for_c,
             travel_clearance_above_printed_z=travel_clearance_above_printed_z,
             travel_bbox_margin=travel_bbox_margin,
@@ -3313,6 +5153,13 @@ def write_vessel_gcode(
             skeleton_collision_sample_step_mm=skeleton_collision_sample_step_mm,
             travel_accel_mm_s2=travel_accel_mm_s2,
             post_print_travel_accel_scale=post_print_travel_accel_scale,
+            enable_aorta_cylinder_travel=enable_aorta_cylinder_travel,
+            aorta_cylinder_clearance_mm=aorta_cylinder_clearance_mm,
+            aorta_cylinder_min_radius_mm=aorta_cylinder_min_radius_mm,
+            aorta_cylinder_samples=aorta_cylinder_samples,
+            aorta_cylinder_sample_spacing_mm=aorta_cylinder_sample_spacing_mm,
+            extrusion_feed_mode=feed_mode,
+            radius_feed_map=radius_feed_map,
         )
 
         if float(travel_accel_mm_s2) > 0.0:
@@ -3321,18 +5168,34 @@ def write_vessel_gcode(
                 comment=f"startup: set nominal travel acceleration to {float(travel_accel_mm_s2):.1f} mm/s^2",
             )
 
+        group_parent_map = build_group_parent_map(paths)
+
+        planned_vasculature_paths: List[PrintedVasculaturePath] = []
+        for group_idx, path in enumerate(paths, start=1):
+            displacement = None if group_displacements is None else group_displacements.get(group_idx)
+            cumulative_offset = cumulative_group_node_offset_mm(group_idx, group_displacements, group_parent_map)
+            planned_points = prepend_group_node_gantry_offset(
+                points=np.asarray(path.points, dtype=float),
+                displacement=displacement,
+                point_merge_tol=point_merge_tol,
+                cumulative_offset=cumulative_offset,
+            )
+            if len(planned_points) < 2:
+                continue
+            path_radius_mm = max(0.0, float(path.radius_like) * float(geometry_scale))
+            planned_vasculature_paths.append(
+                PrintedVasculaturePath(
+                    points_xyz_mm=np.asarray(planned_points, dtype=float).copy(),
+                    radius_mm=path_radius_mm,
+                )
+            )
+        g.set_planned_vasculature_paths(planned_vasculature_paths)
+
         msx, msy, msz, msb, msc = [float(v) for v in machine_start_pose]
         shutdown_z = float(DEFAULT_MACHINE_END_Z if machine_end_pose is None else machine_end_pose[2])
 
-        if write_mode == "calibrated":
-            f.write(f"; startup: force C sync before lowering in Z\n")
-            f.write(f"G1 {cal.c_axis}{msc:.3f} F{c_feed:.0f}\n")
-            g.cur_c = float(msc)
-            g.c_min_used = min(g.c_min_used, g.cur_c)
-            g.c_max_used = max(g.c_max_used, g.cur_c)
         g.write_move(np.array([msx, msy, msz], dtype=float), msb, msc, travel_feed, comment="startup: move to anchored machine start pose")
 
-        group_parent_map = build_group_parent_map(paths)
         for group_idx, path in enumerate(paths, start=1):
             displacement = None if group_displacements is None else group_displacements.get(group_idx)
             cumulative_offset = cumulative_group_node_offset_mm(group_idx, group_displacements, group_parent_map)
@@ -3346,14 +5209,30 @@ def write_vessel_gcode(
                 continue
             tangents = build_tangents_for_points(points, smooth_window=tangent_smooth_window, centerline_smooth_window=centerline_smooth_window)
             mult = extrusion_multiplier_main if path.is_main else extrusion_multiplier_branch
+            path_radius_mm = max(0.0, float(path.radius_like) * float(geometry_scale))
+            active_path_print_feed = (
+                feed_from_radius_map(path_radius_mm, radius_feed_map, float(print_feed))
+                if feed_mode == "weighted"
+                else float(print_feed)
+            )
+            if group_idx == 1:
+                g.set_aorta_reference(points)
 
             f.write("; ------------------------------------------------------------\n")
             f.write(f"; group_number = {group_idx}\n")
             f.write(f"; {path.path_id}: source_vessels={path.source_vessel_ids}, depth={path.depth}, parent={path.parent_vessel_id}, is_main={path.is_main}\n")
             f.write(f"; centerline polyline points = {len(points)}\n")
+            f.write(f"; path_radius_mm = {path_radius_mm:.6f}; active_print_feed = {active_path_print_feed:.3f}\n")
             f.write("; this vessel/path is emitted as a single continuous print pass\n")
 
-            if enable_side_approach:
+            if str(orientation_mode).strip().lower() in {"90mode", "90", "ninety", "tangent"} and group_idx > 1 and bool(enable_aorta_cylinder_travel):
+                g.approach_start_from_aorta_cylinder(
+                    start_tip=points[0],
+                    start_tangent=tangents[0],
+                    label=path.path_id,
+                    final_approach_feed=active_path_print_feed,
+                )
+            elif enable_side_approach:
                 g.approach_start_from_side(
                     start_tip=points[0],
                     start_tangent=tangents[0],
@@ -3362,21 +5241,29 @@ def write_vessel_gcode(
                     retreat_clearance=side_retreat,
                     side_lift_z=side_lift_z,
                     label=path.path_id,
+                    final_approach_feed=active_path_print_feed,
                 )
             else:
                 g.approach_start_direct(
                     start_tip=points[0],
                     start_tangent=tangents[0],
                     label=path.path_id,
+                    final_approach_feed=active_path_print_feed,
                 )
             if displacement is not None and (
                 abs(float(displacement.node_delta_b_deg)) > 1e-12
                 or abs(float(displacement.node_delta_c_deg)) > 1e-12
             ):
+                _, base_b, base_c = g.tip_to_stage(
+                    np.asarray(points[0], dtype=float),
+                    tangent=np.asarray(tangents[0], dtype=float),
+                    prev_c=g.cur_c,
+                    prev_b=g.cur_b,
+                )
                 g.move_to_tip_with_explicit_bc(
                     p_tip=points[0],
-                    b=float(g.cur_b) + float(displacement.node_delta_b_deg),
-                    c=float(g.cur_c) + float(displacement.node_delta_c_deg),
+                    b=float(base_b) + float(displacement.node_delta_b_deg),
+                    c=float(base_c) + float(displacement.node_delta_c_deg),
                     feed=fine_approach_feed,
                     comment=(
                         f"{path.path_id}: saved node rotary offset "
@@ -3389,7 +5276,9 @@ def write_vessel_gcode(
                 tangents,
                 extrusion_multiplier=mult,
                 label=path.path_id,
-                path_radius_mm=max(0.0, float(path.radius_like) * float(geometry_scale)),
+                path_radius_mm=path_radius_mm,
+                print_feed_override=active_path_print_feed,
+                radius_profile_mm=np.asarray(path.radius_profile, dtype=float) * float(geometry_scale),
             )
             if displacement is not None:
                 g.apply_group_displacement(
@@ -3448,13 +5337,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--group-displacements-file",
         default=None,
         help=(
-            "Optional text file defining one manual post-group displacement per generated print group. "
+            "Optional text file defining one manual post-group displacement per generated print group. If the file does not exist, it is created automatically with zero defaults for every generated group. "
             "Each non-comment row must be: group_number dx dy dz [db_deg] [dc_deg] [feed_mm_min] [enabled] [node_dx_mm] [node_dy_mm] [node_dz_mm]. "
             "dx/dy/dz are machine/stage XYZ displacements for the post-group travel move, with optional dB/dC rotary offsets. "
             "node_dx_mm/node_dy_mm/node_dz_mm are machine/stage XYZ offsets applied to the full group path before printing."
         ),
     )
     ap.add_argument("--rotate-y-deg", type=float, default=0.0, help="Rotate input vessel tip geometry around the Y axis before ordering and writing.")
+    ap.add_argument("--rotate-z-deg", type=float, default=0.0, help="Rotate input vessel tip geometry around the vasculature XY-centroid anchor about the Z axis before ordering and writing.")
     ap.add_argument("--rotate-origin-x", type=float, default=0.0)
     ap.add_argument("--rotate-origin-y", type=float, default=0.0)
     ap.add_argument("--rotate-origin-z", type=float, default=0.0)
@@ -3463,7 +5353,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--align-lowest-centroid",
         nargs=3,
         type=float,
-        default=None,
+        default=DEFAULT_ALIGN_LOWEST_CENTROID,
         metavar=("X", "Y", "Z"),
         help="Translate vessel tip geometry so its XY centroid and lowest Z point are at this target XYZ.",
     )
@@ -3488,31 +5378,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--edge-samples", type=int, default=DEFAULT_EDGE_SAMPLES)
     ap.add_argument("--bc-solve-samples", type=int, default=DEFAULT_BC_SOLVE_SAMPLES)
 
-    ap.add_argument("--write-mode", choices=["calibrated", "cartesian"], default="calibrated")
-    ap.add_argument("--orientation-mode", choices=["tangent", "fixed"], default="tangent", help="tangent = align B/C to the local 3D vessel tangent; fixed = hold a constant orientation.")
+    ap.add_argument("--write-mode", choices=["calibrated", "cartesian"], default=DEFAULT_WRITE_MODE)
+    ap.add_argument("--orientation-mode", choices=["tangent", "fixed", "90mode"], default=DEFAULT_ORIENTATION_MODE, help="90mode = keep physical B at 90 deg while C follows print/travel azimuth; tangent = align B/C to local 3D vessel tangent; fixed = hold a constant orientation.")
     ap.add_argument(
         "--offplane-fit-mode",
         choices=["auto", "pull_pchip", "pull_cubic", "avg_pchip", "avg_cubic"],
-        default="auto",
+        default=DEFAULT_OFFPLANE_FIT_MODE,
         help="Select the off-plane Y calibration model used in calibrated mode. 'auto' keeps the script default behavior.",
     )
     ap.add_argument("--tangent-smooth-window", type=int, default=DEFAULT_TANGENT_SMOOTH_WINDOW, help="Neighborhood size used when differentiating the smoothed 3D centerline into local tangents.")
     ap.add_argument("--centerline-smooth-window", type=int, default=DEFAULT_CENTERLINE_SMOOTH_WINDOW, help="Optional moving-average half-window applied in XYZ before tangent estimation. 0 keeps the vessel geometry exact.")
-    ap.add_argument("--path-geometry-smooth-window", type=int, default=DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW, help="Optional moving-average half-window applied to the actual emitted XYZ path after resampling. Increase this to reduce local line oscillations.")
+    ap.add_argument("--path-geometry-smooth-window", type=int, default=DEFAULT_PATH_GEOMETRY_SMOOTH_WINDOW, help="Deprecated/no-op for emitted XYZ geometry. Kept for CLI compatibility; use --centerline-smooth-window and --tangent-smooth-window to smooth B/C without moving printed points.")
     ap.add_argument("--b-max-step-deg", type=float, default=DEFAULT_B_MAX_STEP_DEG, help="Maximum allowed B change per emitted move in tangent mode. Use 0 to disable B step limiting.")
     ap.add_argument("--c-max-step-deg", type=float, default=DEFAULT_C_MAX_STEP_DEG, help="Maximum allowed C change per emitted move in tangent mode. Use 0 to disable C step limiting.")
     ap.add_argument("--b-smoothing-alpha", type=float, default=DEFAULT_B_SMOOTHING_ALPHA, help="Low-pass smoothing alpha for B commands in tangent mode. 1 disables smoothing; smaller values damp local B oscillation.")
     ap.add_argument("--c-smoothing-alpha", type=float, default=DEFAULT_C_SMOOTHING_ALPHA, help="Low-pass smoothing alpha for C commands in tangent mode. 1 disables smoothing; smaller values damp local C oscillation.")
+    ap.add_argument("--travel-c-max-step-deg", type=float, default=DEFAULT_TRAVEL_C_MAX_STEP_DEG, help="Maximum allowed C change per emitted non-print travel move.")
+    ap.add_argument("--travel-c-smoothing-alpha", type=float, default=DEFAULT_TRAVEL_C_SMOOTHING_ALPHA, help="Low-pass smoothing alpha for C during non-print travel moves.")
+    ap.add_argument("--c-min-deg", type=float, default=DEFAULT_C_MIN_DEG, help="Lower physical command limit for the C axis in degrees. Equivalent azimuths are chosen inside this range.")
+    ap.add_argument("--c-max-deg", type=float, default=DEFAULT_C_MAX_DEG, help="Upper physical command limit for the C axis in degrees. Equivalent azimuths are chosen inside this range.")
     ap.add_argument("--min-tangent-xy-for-c", type=float, default=DEFAULT_MIN_TANGENT_XY, help="Minimum XY tangent magnitude needed to update C. Below this, C is held to avoid azimuth spin on near-vertical segments.")
     ap.add_argument("--path-resample-spacing", type=float, default=DEFAULT_PATH_RESAMPLE_SPACING, help="Optional arc-length spacing used to densify each vessel centerline before writing. 0 disables resampling.")
     ap.add_argument("--point-merge-tol", type=float, default=DEFAULT_POINT_MERGE_TOL, help="Tolerance used to remove duplicate consecutive points from a vessel polyline.")
     ap.add_argument("--min-group-length-mm", type=float, default=DEFAULT_MIN_GROUP_LENGTH_MM, help="Omit printable vessel groups/paths shorter than this final polyline length in mm.")
-    ap.add_argument("--vessel-order-mode", choices=["ascending_id", "ascending_start_z", "bottom_up_hierarchy", "lowest_longest_roots"], default="ascending_id")
+    ap.add_argument("--vessel-order-mode", choices=["aorta_first_lowest_branch", "ascending_id", "ascending_start_z", "bottom_up_hierarchy", "lowest_longest_roots"], default="aorta_first_lowest_branch", help="aorta_first_lowest_branch prints the main/aorta path first bottom-to-top, then branches by lowest aorta connection point.")
 
     ap.add_argument("--simplify-endpoint-chains", dest="simplify_endpoint_chains", action="store_true", default=False, help="Merge endpoint-connected vessel segments into longer continuous main-branch polylines.")
     ap.add_argument("--no-simplify-endpoint-chains", dest="simplify_endpoint_chains", action="store_false", help="Disable endpoint-chain simplification and write each vessel block separately.")
     ap.add_argument("--chain-merge-threshold", type=float, default=DEFAULT_NODE_ATTACH_THRESHOLD, help="Endpoint distance threshold for merging adjacent vessel segments into a continuous main branch.")
-    ap.add_argument("--force-bottom-to-top", action="store_true", help="Reverse each generated print path when needed so it starts at the lower-Z endpoint and ends at the higher-Z endpoint.")
+    ap.add_argument("--force-bottom-to-top", dest="force_bottom_to_top", action="store_true", help="Prefer lower-to-higher branch ordering priority without reversing the print direction within each generated branch path.")
+    ap.add_argument("--no-force-bottom-to-top", dest="force_bottom_to_top", action="store_false", help="Disable lower-to-higher branch ordering preference.")
+    ap.set_defaults(force_bottom_to_top=DEFAULT_FORCE_BOTTOM_TO_TOP)
     ap.add_argument("--branch-start-overlap-mm", type=float, default=0.0, help="For branch paths, start this much before the attachment point along the branch's own direction.")
     ap.add_argument("--branch-overlap-tangent-window-mm", type=float, default=DEFAULT_BRANCH_OVERLAP_TANGENT_WINDOW_MM, help="Legacy compatibility option for --branch-start-overlap-mm; currently unused.")
 
@@ -3520,11 +5416,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prime-mm", type=float, default=DEFAULT_PRIME_MM)
     ap.add_argument("--extrusion-multiplier-main", type=float, default=1.0)
     ap.add_argument("--extrusion-multiplier-branch", type=float, default=1.0)
+    ap.add_argument("--extrusion-feed-mode", choices=["traditional", "weighted"], default=DEFAULT_EXTRUSION_FEED_MODE, help="traditional keeps --print-feed for every path; weighted interpolates print feed from branch/aorta radius using --radius-feed-map.")
+    ap.add_argument("--radius-feed-map", default=DEFAULT_RADIUS_FEED_MAP, help="Radius-to-print-feed map for weighted mode, e.g. '0.10:900,0.30:650,0.60:350'. Larger radii can be assigned slower feeds.")
+    ap.add_argument("--radius-feed-map-file", default=None, help="Optional text or JSON file containing the same radius-feed map accepted by --radius-feed-map.")
 
     ap.add_argument("--pressure-offset-mm", type=float, default=DEFAULT_PRESSURE_OFFSET_MM)
     ap.add_argument("--pressure-advance-feed", type=float, default=DEFAULT_PRESSURE_ADVANCE_FEED)
     ap.add_argument("--pressure-retract-feed", type=float, default=DEFAULT_PRESSURE_RETRACT_FEED)
     ap.add_argument("--preflow-dwell-ms", type=int, default=DEFAULT_PREFLOW_DWELL_MS)
+    ap.add_argument("--start-node-dwell-ms", type=int, default=DEFAULT_START_NODE_DWELL_MS, help="Pause after pressure/extrusion starts and before the first print move of each path.")
     ap.add_argument("--node-dwell-ms", type=int, default=DEFAULT_NODE_DWELL_MS)
 
     ap.add_argument("--node-attach-threshold", type=float, default=DEFAULT_NODE_ATTACH_THRESHOLD, help="Endpoint-to-parent distance threshold used to classify a vessel as a branch.")
@@ -3539,13 +5439,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--post-print-travel-accel-scale", type=float, default=DEFAULT_POST_PRINT_TRAVEL_ACCEL_SCALE, help="Scale factor applied to travel acceleration only during the travel/approach sequence after a printed path.")
     ap.add_argument("--enable-travel-bbox-clearance", dest="enable_travel_bbox_clearance", action="store_true", help="Enable printed-bounding-box-aware travel rerouting.")
     ap.add_argument("--disable-travel-bbox-clearance", dest="enable_travel_bbox_clearance", action="store_false", help="Disable printed-bounding-box-aware travel rerouting and use direct travel moves.")
-    ap.set_defaults(enable_travel_bbox_clearance=True)
+    ap.set_defaults(enable_travel_bbox_clearance=DEFAULT_ENABLE_TRAVEL_BBOX_CLEARANCE)
     ap.add_argument("--enable-side-approach", dest="enable_side_approach", action="store_true", help="Use the side-approach travel strategy before each node start.")
     ap.add_argument("--disable-side-approach", dest="enable_side_approach", action="store_false", help="Disable side-approach planning and travel directly to the next node start with a final fine-approach segment.")
     ap.set_defaults(enable_side_approach=True)
     ap.add_argument("--fine-approach-distance", type=float, default=DEFAULT_FINE_APPROACH_DISTANCE, help="Distance from the vessel start/node over which approach moves use --fine-approach-feed.")
+    ap.add_argument(
+        "--travel-strategy",
+        "--travel-approach-mode",
+        choices=["auto", "side", "direct", "cylinder-surface", "aorta-cylinder"],
+        default=DEFAULT_TRAVEL_STRATEGY,
+        help=(
+            "Select how travel moves approach the next print group. "
+            "auto uses the legacy enable/disable flags; side uses side approach; "
+            "direct goes straight to the node; cylinder-surface/aorta-cylinder routes on the aorta-centered cylinder surface. "
+            "The cylinder-surface strategy works in both 90mode and tangent mode."
+        ),
+    )
+    ap.add_argument(
+        "--cylinder-surface-travel",
+        dest="travel_strategy",
+        action="store_const",
+        const="cylinder-surface",
+        help="Shortcut for --travel-strategy cylinder-surface.",
+    )
+    ap.add_argument("--enable-aorta-cylinder-travel", dest="enable_aorta_cylinder_travel", action="store_true", help="Legacy alias: route post-print travel on a cylinder centered on the first/aorta path. Works in 90mode and tangent mode.")
+    ap.add_argument("--disable-aorta-cylinder-travel", dest="enable_aorta_cylinder_travel", action="store_false", help="Legacy alias: disable aorta-cylinder travel and use the selected side/direct approach behavior.")
+    ap.set_defaults(enable_aorta_cylinder_travel=False)
+    ap.add_argument("--aorta-cylinder-clearance-mm", type=float, default=DEFAULT_AORTA_CYLINDER_CLEARANCE_MM, help="Additional clearance added to the radius of the aorta-centered travel cylinder.")
+    ap.add_argument("--aorta-cylinder-min-radius-mm", type=float, default=DEFAULT_AORTA_CYLINDER_MIN_RADIUS_MM, help="Minimum radius for the aorta-centered travel cylinder, useful before any non-aorta branch has been printed.")
+    ap.add_argument("--aorta-cylinder-samples", type=int, default=DEFAULT_AORTA_CYLINDER_SAMPLES, help="Legacy lower bound on interpolation segments used while following the aorta-cylinder surface between branch nodes.")
+    ap.add_argument("--aorta-cylinder-sample-spacing-mm", type=float, default=DEFAULT_AORTA_CYLINDER_SAMPLE_SPACING_MM, help="Target spacing in mm for adaptive cylinder-surface travel sampling. Smaller values emit smoother travel moves.")
     ap.add_argument("--skeleton-collision-clearance", type=float, default=DEFAULT_SKELETON_COLLISION_CLEARANCE, help="Additional radial clearance added between the robot skeleton body and already printed vessel centerlines during side-approach replanning.")
     ap.add_argument("--skeleton-collision-sample-step-mm", type=float, default=DEFAULT_SKELETON_COLLISION_SAMPLE_STEP_MM, help="Sampling step used to check robot-skeleton collisions along candidate travel and side-approach routes.")
+
+    ap.add_argument("--launch-viewer", dest="launch_viewer", action="store_true", help="After generating the G-code, run the G-code viewer using --out and --calibration.")
+    ap.add_argument("--no-launch-viewer", dest="launch_viewer", action="store_false", help="Do not launch the G-code viewer after generation.")
+    ap.set_defaults(launch_viewer=DEFAULT_LAUNCH_VIEWER)
+    ap.add_argument("--viewer-script", default="gcode_viewer.py", help="Viewer script to launch when --launch-viewer is set.")
+    ap.add_argument("--viewer-offplane-sign", type=float, default=-1.0, help="Value passed to gcode_viewer.py as --offplane-sign when --launch-viewer is set.")
+    ap.add_argument("--viewer-python", default=None, help="Python executable for launching the viewer. Defaults to the current Python interpreter.")
 
     ap.add_argument("--bbox-x-min", type=float, default=DEFAULT_BBOX_X_MIN)
     ap.add_argument("--bbox-x-max", type=float, default=DEFAULT_BBOX_X_MAX)
@@ -3556,9 +5489,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
+
+def launch_gcode_viewer_from_args(args: argparse.Namespace) -> None:
+    if not bool(args.launch_viewer):
+        return
+    if not args.calibration:
+        raise ValueError("--launch-viewer requires --calibration so the viewer can reconstruct calibrated tip/stage offsets.")
+
+    python_exe = str(args.viewer_python) if args.viewer_python else sys.executable
+    cmd = [
+        python_exe,
+        str(args.viewer_script),
+        "--gcode",
+        str(args.out),
+        "--calibration",
+        str(args.calibration),
+        "--offplane-fit-mode",
+        str(args.offplane_fit_mode),
+        "--print-summary",
+        "--show-stage",
+        "--offplane-sign",
+        str(float(args.viewer_offplane_sign)),
+    ]
+    print("Launching G-code viewer:")
+    print("  " + " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
 def main(args: argparse.Namespace) -> None:
     write_mode = str(args.write_mode).strip().lower()
     robot_skeleton_ref: Optional[RobotSkeletonReference] = None
+    if args.groups_out is None:
+        args.groups_out = default_groups_out_path(str(args.out))
+    if args.group_displacements_file is None:
+        args.group_displacements_file = default_group_displacements_path(str(args.out))
     group_displacements = None if args.group_displacements_file is None else parse_group_displacements_file(str(args.group_displacements_file))
     vessels = parse_vessel_file(args.vessels)
     selected_vessel_ids = parse_vessel_id_selection(args.vessel_ids)
@@ -3569,9 +5533,10 @@ def main(args: argparse.Namespace) -> None:
         float(args.rotate_origin_y),
         float(args.rotate_origin_z),
     )
-    transform_vessel_geometry(
+    transform_info = transform_vessel_geometry_with_z(
         vessels,
         rotate_y_deg=float(args.rotate_y_deg),
+        rotate_z_deg=float(args.rotate_z_deg),
         rotate_origin=rotate_origin,
     )
     scale_origin, geometry_scale = scale_vessel_geometry(vessels, float(args.geometry_scale))
@@ -3613,6 +5578,11 @@ def main(args: argparse.Namespace) -> None:
         "z_max": float(args.bbox_z_max),
     }
 
+    radius_feed_map = parse_radius_feed_map(
+        raw=str(args.radius_feed_map or ""),
+        file_path=None if args.radius_feed_map_file is None else str(args.radius_feed_map_file),
+    )
+
     preview_paths = build_print_paths(
         vessels=vessels,
         vessel_order_mode=str(args.vessel_order_mode),
@@ -3629,6 +5599,10 @@ def main(args: argparse.Namespace) -> None:
     )
     if not preview_paths:
         raise ValueError("No printable vessel paths were generated.")
+
+    if args.group_displacements_file is not None and not group_displacements_file_has_data_rows(str(args.group_displacements_file)):
+        write_default_group_displacements_file(str(args.group_displacements_file), preview_paths)
+        print(f"Wrote zero-offset manual displacement template for {len(preview_paths)} groups to {args.group_displacements_file}")
 
     first_points = np.asarray(preview_paths[0].points, dtype=float)
     first_tangents = build_tangents_for_points(first_points, smooth_window=int(args.tangent_smooth_window), centerline_smooth_window=int(args.centerline_smooth_window))
@@ -3660,6 +5634,18 @@ def main(args: argparse.Namespace) -> None:
         machine_start_pose = anchored_pose
         machine_end_pose = None
 
+    travel_strategy = str(args.travel_strategy).strip().lower()
+    effective_enable_side_approach = bool(args.enable_side_approach)
+    effective_enable_aorta_cylinder_travel = bool(args.enable_aorta_cylinder_travel)
+    if travel_strategy in {"cylinder-surface", "aorta-cylinder"}:
+        effective_enable_aorta_cylinder_travel = True
+    elif travel_strategy == "side":
+        effective_enable_aorta_cylinder_travel = False
+        effective_enable_side_approach = True
+    elif travel_strategy == "direct":
+        effective_enable_aorta_cylinder_travel = False
+        effective_enable_side_approach = False
+
     command_ranges = write_vessel_gcode(
         out_path=str(args.out),
         vessels=vessels,
@@ -3678,6 +5664,7 @@ def main(args: argparse.Namespace) -> None:
         pressure_advance_feed=float(args.pressure_advance_feed),
         pressure_retract_feed=float(args.pressure_retract_feed),
         preflow_dwell_ms=int(args.preflow_dwell_ms),
+        start_node_dwell_ms=int(args.start_node_dwell_ms),
         node_dwell_ms=int(args.node_dwell_ms),
         bbox=bbox,
         write_mode=write_mode,
@@ -3685,6 +5672,8 @@ def main(args: argparse.Namespace) -> None:
         bc_solve_samples=int(args.bc_solve_samples),
         extrusion_multiplier_main=float(args.extrusion_multiplier_main),
         extrusion_multiplier_branch=float(args.extrusion_multiplier_branch),
+        extrusion_feed_mode=str(args.extrusion_feed_mode),
+        radius_feed_map=radius_feed_map,
         side_approach_far=float(args.side_approach_far),
         side_approach_near=float(args.side_approach_near),
         side_retreat=float(args.side_retreat),
@@ -3695,9 +5684,15 @@ def main(args: argparse.Namespace) -> None:
         c_max_step_deg=float(args.c_max_step_deg),
         b_smoothing_alpha=float(args.b_smoothing_alpha),
         c_smoothing_alpha=float(args.c_smoothing_alpha),
+        travel_c_max_step_deg=None if args.travel_c_max_step_deg is None else float(args.travel_c_max_step_deg),
+        travel_c_smoothing_alpha=None if args.travel_c_smoothing_alpha is None else float(args.travel_c_smoothing_alpha),
+        c_min_deg=float(args.c_min_deg),
+        c_max_deg=float(args.c_max_deg),
         min_tangent_xy_for_c=float(args.min_tangent_xy_for_c),
         rotate_y_deg=float(args.rotate_y_deg),
+        rotate_z_deg=float(args.rotate_z_deg),
         rotate_origin=rotate_origin,
+        rotate_z_origin=transform_info["rotate_z_origin"],
         geometry_scale=float(args.geometry_scale),
         vessel_order_mode=str(args.vessel_order_mode),
         simplify_paths=bool(args.simplify_endpoint_chains),
@@ -3714,13 +5709,19 @@ def main(args: argparse.Namespace) -> None:
         travel_bbox_margin=float(args.travel_bbox_margin),
         travel_edge_clearance=float(args.travel_edge_clearance),
         enable_travel_bbox_clearance=bool(args.enable_travel_bbox_clearance),
-        enable_side_approach=bool(args.enable_side_approach),
+        enable_side_approach=effective_enable_side_approach,
         fine_approach_distance=float(args.fine_approach_distance),
         robot_skeleton_ref=robot_skeleton_ref,
         skeleton_collision_clearance=float(args.skeleton_collision_clearance),
         skeleton_collision_sample_step_mm=float(args.skeleton_collision_sample_step_mm),
         travel_accel_mm_s2=float(args.travel_accel_mm_s2),
         post_print_travel_accel_scale=float(args.post_print_travel_accel_scale),
+        travel_strategy=travel_strategy,
+        enable_aorta_cylinder_travel=effective_enable_aorta_cylinder_travel,
+        aorta_cylinder_clearance_mm=float(args.aorta_cylinder_clearance_mm),
+        aorta_cylinder_min_radius_mm=float(args.aorta_cylinder_min_radius_mm),
+        aorta_cylinder_samples=int(args.aorta_cylinder_samples),
+        aorta_cylinder_sample_spacing_mm=float(args.aorta_cylinder_sample_spacing_mm),
         group_displacements=group_displacements,
     )
 
@@ -3736,6 +5737,8 @@ def main(args: argparse.Namespace) -> None:
         print(f"Wrote print groups to {args.groups_out}")
     if group_displacements:
         print(f"Loaded manual post-group displacements for {len(group_displacements)} groups from {args.group_displacements_file}")
+    if str(args.extrusion_feed_mode).strip().lower() == "weighted":
+        print("Weighted radius-to-print-feed map: " + ", ".join(f"{r:.6f}->{feed:.1f}" for r, feed in radius_feed_map))
     if abs(float(geometry_scale) - 1.0) > 1e-12:
         print(
             "Scaled vasculature XYZ geometry "
@@ -3768,6 +5771,8 @@ def main(args: argparse.Namespace) -> None:
     )
     if float(args.min_group_length_mm) > 0.0:
         print(f"Omitted printable groups shorter than {float(args.min_group_length_mm):.6f} mm")
+
+    launch_gcode_viewer_from_args(args)
 
 
 if __name__ == "__main__":

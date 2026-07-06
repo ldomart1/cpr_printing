@@ -68,6 +68,22 @@ import shadow_calibration as shadow_calibration_module  # noqa: E402
 from shadow_calibration import CTR_Shadow_Calibration  # noqa: E402
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+DEFAULT_RED_TIP_SAT_MIN = 80
+DEFAULT_RED_TIP_VAL_MIN = 80
+DEFAULT_RED_TIP_MIN_AREA_PX = 20
+DEFAULT_RED_TIP_MORPH_KERNEL = 1
+DEFAULT_RED_TIP_HUE1_MIN = 0
+DEFAULT_RED_TIP_HUE1_MAX = 10
+DEFAULT_RED_TIP_HUE2_MIN = 150
+DEFAULT_RED_TIP_HUE2_MAX = 179
+DEFAULT_RED_TIP_SEARCH_RADIUS_PX = 320.0
+DEFAULT_RED_TIP_LOCAL_MIN_AREA_PX = 10
+DEFAULT_RED_TIP_DISTANCE_WEIGHT = 3.0
+DEFAULT_RED_TIP_MIN_CIRCULARITY = 0.0
+DEFAULT_RED_TIP_COMPONENT_SELECTION = "nearest_largest"
+DEFAULT_RED_TIP_USE_RGB_EXCESS = True
+DEFAULT_RED_TIP_RGB_EXCESS_MIN = 35
+DEFAULT_RED_TIP_DEBUG_SAVE_MASK = True
 _NEI8_W = [
     (-1, -1, 2 ** 0.5), (-1, 0, 1.0), (-1, 1, 2 ** 0.5),
     (0, -1, 1.0),                             (0, 1, 1.0),
@@ -147,7 +163,10 @@ def load_optional_tip_refiner(cal: CTR_Shadow_Calibration, args) -> None:
 def select_tracked_rows_for_analysis(cal: CTR_Shadow_Calibration, args) -> Tuple[np.ndarray, str]:
     source = str(getattr(args, "tracked_tip_source", "auto")).strip().lower()
     if source == "auto":
-        if getattr(args, "tip_refiner_model", None) and not bool(getattr(args, "tip_refiner_compare_only", False)):
+        tip_detection_mode = str(getattr(args, "tip_detection_mode", "classical")).strip().lower()
+        if tip_detection_mode in ("red", "red_dot", "red_marker", "red_centroid", "marker", "auto_red", "auto_red_dot", "red_dot_auto"):
+            source = "selected"
+        elif getattr(args, "tip_refiner_model", None) and not bool(getattr(args, "tip_refiner_compare_only", False)):
             source = "selected"
         else:
             source = "coarse"
@@ -1935,8 +1954,34 @@ def main():
                     help="Patch anchor for CNN inference. Defaults to the model checkpoint anchor.")
     ap.add_argument("--tip_refiner_compare_only", action="store_true",
                     help="Save CNN tips but keep non-CNN tips as the default tracked source.")
+    ap.add_argument("--tip_detection_mode", type=str, default="classical",
+                    choices=["classical", "red_dot", "auto_red_dot"],
+                    help="Tip detection mode from CTR shadow calibration. red_dot uses the red marker centroid as the selected tip.")
     ap.add_argument("--tracked_tip_source", type=str, default="auto", choices=["auto", "coarse", "selected", "cnn"],
-                    help="Which tip rows to convert to mm. auto uses selected/CNN when --tip_refiner_model is active, otherwise coarse.")
+                    help="Which tip rows to convert to mm. auto uses selected rows for red-dot or CNN-selected tips, otherwise coarse.")
+    ap.add_argument("--red_tip_sat_min", type=int, default=DEFAULT_RED_TIP_SAT_MIN)
+    ap.add_argument("--red_tip_val_min", type=int, default=DEFAULT_RED_TIP_VAL_MIN)
+    ap.add_argument("--red_tip_min_area_px", type=int, default=DEFAULT_RED_TIP_MIN_AREA_PX)
+    ap.add_argument("--red_tip_morph_kernel", type=int, default=DEFAULT_RED_TIP_MORPH_KERNEL)
+    ap.add_argument("--red_tip_hue1_min", type=int, default=DEFAULT_RED_TIP_HUE1_MIN)
+    ap.add_argument("--red_tip_hue1_max", type=int, default=DEFAULT_RED_TIP_HUE1_MAX)
+    ap.add_argument("--red_tip_hue2_min", type=int, default=DEFAULT_RED_TIP_HUE2_MIN)
+    ap.add_argument("--red_tip_hue2_max", type=int, default=DEFAULT_RED_TIP_HUE2_MAX)
+    ap.add_argument("--red_tip_search_radius_px", type=float, default=DEFAULT_RED_TIP_SEARCH_RADIUS_PX)
+    ap.add_argument("--red_tip_local_min_area_px", type=int, default=DEFAULT_RED_TIP_LOCAL_MIN_AREA_PX)
+    ap.add_argument("--red_tip_distance_weight", type=float, default=DEFAULT_RED_TIP_DISTANCE_WEIGHT)
+    ap.add_argument("--red_tip_min_circularity", type=float, default=DEFAULT_RED_TIP_MIN_CIRCULARITY)
+    ap.add_argument("--red_tip_component_selection", type=str, default=DEFAULT_RED_TIP_COMPONENT_SELECTION,
+                    choices=["largest", "nearest", "nearest_largest"])
+    ap.add_argument("--red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess",
+                    action="store_true", default=DEFAULT_RED_TIP_USE_RGB_EXCESS)
+    ap.add_argument("--no_red_tip_use_rgb_excess", dest="red_tip_use_rgb_excess",
+                    action="store_false")
+    ap.add_argument("--red_tip_rgb_excess_min", type=int, default=DEFAULT_RED_TIP_RGB_EXCESS_MIN)
+    ap.add_argument("--red_tip_debug_save_mask", dest="red_tip_debug_save_mask",
+                    action="store_true", default=DEFAULT_RED_TIP_DEBUG_SAVE_MASK)
+    ap.add_argument("--no_red_tip_debug_save_mask", dest="red_tip_debug_save_mask",
+                    action="store_false")
 
     ap.add_argument("--hist_bins", type=int, default=20,
                     help="Number of histogram bins.")
@@ -1976,6 +2021,23 @@ def main():
         add_date=False,
     )
     cal.calibration_data_folder = str(project_dir)
+    cal.tip_detection_mode = str(args.tip_detection_mode)
+    cal.red_tip_sat_min = int(args.red_tip_sat_min)
+    cal.red_tip_val_min = int(args.red_tip_val_min)
+    cal.red_tip_min_area_px = int(args.red_tip_min_area_px)
+    cal.red_tip_morph_kernel = int(args.red_tip_morph_kernel)
+    cal.red_tip_hue1_min = int(args.red_tip_hue1_min)
+    cal.red_tip_hue1_max = int(args.red_tip_hue1_max)
+    cal.red_tip_hue2_min = int(args.red_tip_hue2_min)
+    cal.red_tip_hue2_max = int(args.red_tip_hue2_max)
+    cal.red_tip_search_radius_px = float(args.red_tip_search_radius_px)
+    cal.red_tip_local_min_area_px = int(args.red_tip_local_min_area_px)
+    cal.red_tip_distance_weight = float(args.red_tip_distance_weight)
+    cal.red_tip_min_circularity = float(args.red_tip_min_circularity)
+    cal.red_tip_component_selection = str(args.red_tip_component_selection)
+    cal.red_tip_use_rgb_excess = bool(args.red_tip_use_rgb_excess)
+    cal.red_tip_rgb_excess_min = int(args.red_tip_rgb_excess_min)
+    cal.red_tip_debug_save_mask = bool(args.red_tip_debug_save_mask)
     load_optional_tip_refiner(cal, args)
 
     if args.tip_refine_mode != "none":

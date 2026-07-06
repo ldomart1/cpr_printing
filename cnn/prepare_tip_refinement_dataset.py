@@ -338,6 +338,19 @@ def main() -> None:
     parser.add_argument("--board_inner_corners", type=str, default=None, help="Checkerboard inner corners as Nx,Ny.")
     parser.add_argument("--board_square_size_mm", type=float, default=None)
     parser.add_argument("--board_no_undistort", action="store_true")
+    parser.add_argument("--tip_refine_mode", type=str, default="coarse", choices=["coarse", "parallel_centerline", "auto"])
+    parser.add_argument("--tip_detection_mode", type=str, default="classical", choices=["classical", "red_dot", "auto_red_dot"])
+    parser.add_argument("--red_tip_sat_min", type=int, default=80)
+    parser.add_argument("--red_tip_val_min", type=int, default=40)
+    parser.add_argument("--red_tip_min_area_px", type=int, default=8)
+    parser.add_argument("--red_tip_morph_kernel", type=int, default=2)
+    parser.add_argument("--red_tip_hue1_min", type=int, default=0)
+    parser.add_argument("--red_tip_hue1_max", type=int, default=10)
+    parser.add_argument("--red_tip_hue2_min", type=int, default=130)
+    parser.add_argument("--red_tip_hue2_max", type=int, default=179)
+    parser.add_argument("--red_tip_search_radius_px", type=float, default=140.0)
+    parser.add_argument("--red_tip_local_min_area_px", type=int, default=2)
+    parser.add_argument("--red_tip_distance_weight", type=float, default=3.0)
     parser.add_argument(
         "--patch-size",
         type=int,
@@ -391,6 +404,19 @@ def main() -> None:
         project_name=args.project_name or f"{project_dir.name}_tip_refinement_workspace",
         allow_existing=True,
     )
+    adapter.processor.tip_refine_mode = str(args.tip_refine_mode)
+    adapter.processor.tip_detection_mode = str(args.tip_detection_mode)
+    adapter.processor.red_tip_sat_min = int(args.red_tip_sat_min)
+    adapter.processor.red_tip_val_min = int(args.red_tip_val_min)
+    adapter.processor.red_tip_min_area_px = int(args.red_tip_min_area_px)
+    adapter.processor.red_tip_morph_kernel = int(args.red_tip_morph_kernel)
+    adapter.processor.red_tip_hue1_min = int(args.red_tip_hue1_min)
+    adapter.processor.red_tip_hue1_max = int(args.red_tip_hue1_max)
+    adapter.processor.red_tip_hue2_min = int(args.red_tip_hue2_min)
+    adapter.processor.red_tip_hue2_max = int(args.red_tip_hue2_max)
+    adapter.processor.red_tip_search_radius_px = float(args.red_tip_search_radius_px)
+    adapter.processor.red_tip_local_min_area_px = int(args.red_tip_local_min_area_px)
+    adapter.processor.red_tip_distance_weight = float(args.red_tip_distance_weight)
 
     if camera_calibration_path is not None:
         adapter.processor.load_camera_calibration(str(camera_calibration_path))
@@ -489,12 +515,25 @@ def main() -> None:
         "anchor": args.anchor,
         "patch_size": int(args.patch_size),
         "threshold": int(args.threshold),
+        "tip_refine_mode": str(args.tip_refine_mode),
+        "tip_detection_mode": str(args.tip_detection_mode),
         "crop": crop,
         "crop_source": crop_source,
         "crop_gui_per_folder": bool(args.crop_gui_per_folder),
         "crop_by_folder": crop_by_folder,
         "camera_calibration_file": None if camera_calibration_path is None else str(camera_calibration_path),
         "board_reference_image": None if board_reference_path is None else str(board_reference_path),
+        "red_tip_sat_min": int(args.red_tip_sat_min),
+        "red_tip_val_min": int(args.red_tip_val_min),
+        "red_tip_min_area_px": int(args.red_tip_min_area_px),
+        "red_tip_morph_kernel": int(args.red_tip_morph_kernel),
+        "red_tip_hue1_min": int(args.red_tip_hue1_min),
+        "red_tip_hue1_max": int(args.red_tip_hue1_max),
+        "red_tip_hue2_min": int(args.red_tip_hue2_min),
+        "red_tip_hue2_max": int(args.red_tip_hue2_max),
+        "red_tip_search_radius_px": float(args.red_tip_search_radius_px),
+        "red_tip_local_min_area_px": int(args.red_tip_local_min_area_px),
+        "red_tip_distance_weight": float(args.red_tip_distance_weight),
         "num_images": len(image_paths),
         "recursive": True,
         "num_success": int(len(records)),

@@ -1909,6 +1909,14 @@ def main():
                     help="raw_image_data_folder or any folder of images (will be wrapped into a project)")
     ap.add_argument("--threshold", type=int, default=200)
     ap.add_argument("--save_plots", action="store_true")
+    ap.add_argument("--crop_width_min", type=int, default=None,
+                    help="Optional preselected crop min X in image coordinates.")
+    ap.add_argument("--crop_width_max", type=int, default=None,
+                    help="Optional preselected crop max X in image coordinates.")
+    ap.add_argument("--crop_height_min", type=int, default=None,
+                    help="Optional preselected crop min height-from-bottom.")
+    ap.add_argument("--crop_height_max", type=int, default=None,
+                    help="Optional preselected crop max height-from-bottom.")
 
     ap.add_argument("--camera_calibration_file", type=str, required=True,
                     help="Path to camera calibration .npz for checkerboard-reference analysis.")
@@ -2102,10 +2110,22 @@ def main():
 
     print(f"[INFO] Checkerboard reference estimated from: {board_ref_path}")
 
-    analysis_crop = interactive_crop_from_image(
-        img_bgr,
-        default_crop=cal.default_analysis_crop,
-    )
+    if all(
+        getattr(args, key) is not None
+        for key in ("crop_width_min", "crop_width_max", "crop_height_min", "crop_height_max")
+    ):
+        analysis_crop = {
+            "crop_width_min": int(args.crop_width_min),
+            "crop_width_max": int(args.crop_width_max),
+            "crop_height_min": int(args.crop_height_min),
+            "crop_height_max": int(args.crop_height_max),
+        }
+        print(f"[INFO] Using preselected analysis_crop: {analysis_crop}")
+    else:
+        analysis_crop = interactive_crop_from_image(
+            img_bgr,
+            default_crop=cal.default_analysis_crop,
+        )
     cal.analysis_crop = dict(analysis_crop)
 
     if args.save_analysis_config:

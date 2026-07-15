@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Interactive vasculature printer wrapper for gcode_generation/vasc_manual_90.py.
+Interactive vasculature printer wrapper for gcode_generation/vasc_manual.py.
 
-This script keeps the existing vasc_manual_90 planning pipeline, but adds two modes:
+This script keeps the existing vasc_manual planning pipeline, but adds two modes:
 
   1) --run-mode save-gcode
-     Exactly writes a normal G-code file using vasc_manual_90.write_vessel_gcode.
+     Exactly writes a normal G-code file using vasc_manual.write_vessel_gcode.
 
   2) --run-mode print
      Physically sends the same generated commands to a Duet/RRF printer via
@@ -29,22 +29,43 @@ Node XY/Z tune keys:
     space: accept and save
     q or Esc: abort
 
-The saved manual text file uses the existing vasc_manual_90 displacement format:
+Travel-interrupt behavior:
+During non-print travel moves, moves are internally segmented. Press R/r to stop
+at the next segment boundary. The script rewinds by --travel-rewind-indices
+segments, then enters travel-offset tuning.
+
+Travel XYZ/B/C tune keys:
+    a/d, w/s, up/down : XYZ tune
+    i : B + step
+    k : B - step
+    l : C + step
+    j : C - step
+    space: accept and save
+    q or Esc: abort
+
+Print rewind:
+During printing, use the GUI toggle button or the left-arrow key to arm a
+short rewind. At the next print sample boundary, the script backs up a small
+number of emitted print samples and re-runs that local portion.
+
+The saved manual text file uses the existing vasc_manual displacement format:
     group dx dy dz db dc feed enabled node_dx node_dy node_dz node_db node_dc # note
 
 Where:
-  - dx/dy/dz and db/dc remain present for file-format compatibility and default to travel-feed values.
+  - dx/dy/dz are per-group machine XYZ stage offsets for travel/manual pose tuning.
+  - db/dc are per-group rotary offsets.
   - node_dx/node_dy/node_dz are start-node XYZ stage offsets applied to the full group path.
   - node_db/node_dc are saved node-start rotary offsets used when starting the branch.
 
-Typical usage is the same as vasc_manual_90.py, plus one of:
+Typical usage is the same as vasc_manual.py, plus one of:
     --run-mode print --duet-web-address http://192.168.2.21
     --run-mode save-gcode
 
 Important safety notes:
   - The script cannot preempt a single G1 already accepted by the controller.
-  - Interactive mode follows the same planned branch ordering and travel/approach
-    sequence as vasc_manual_90.py, with only a pause for node-start tuning before each branch prints.
+    Instead, travel moves are subdivided, and R is checked between segments.
+  - Printing moves are not interrupt-tuned by this script; only travel/approach
+    moves are segmented for R.
 """
 
 from __future__ import annotations
@@ -73,11 +94,10 @@ import numpy as np
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, ttk
+    from tkinter import ttk
 except Exception:
     tk = None
     ttk = None
-    filedialog = None
 
 try:
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -93,11 +113,11 @@ except Exception:
 
 
 def import_vasc_manual_module() -> Any:
-    """Import the sibling/original vasc_manual_90.py robustly.
+    """Import the sibling/original vasc_manual.py robustly.
 
     Works when this script is run from the repository root as
-    `python gcode_generation/vasc_manual_interactive_gui_90.py`, when run from
-    inside `gcode_generation`, or when copied next to `vasc_manual_90.py`.
+    `python gcode_generation/vasc_manual_interactive_gui.py`, when run from
+    inside `gcode_generation`, or when copied next to `vasc_manual.py`.
     """
     here = Path(__file__).resolve().parent
     repo_root = here.parent
@@ -108,28 +128,28 @@ def import_vasc_manual_module() -> Any:
             sys.path.insert(0, candidate_s)
 
     errors: List[str] = []
-    for module_name in ("gcode_generation.vasc_manual_90", "vasc_manual_90"):
+    for module_name in ("gcode_generation.vasc_manual", "vasc_manual"):
         try:
             return importlib.import_module(module_name)
         except Exception as exc:
             errors.append(f"{module_name}: {exc!r}")
 
     for module_path in (
-        here / "vasc_manual_90.py",
-        repo_root / "gcode_generation" / "vasc_manual_90.py",
+        here / "vasc_manual.py",
+        repo_root / "gcode_generation" / "vasc_manual.py",
     ):
         if not module_path.exists():
             continue
-        spec = importlib.util.spec_from_file_location("vasc_manual_90", module_path)
+        spec = importlib.util.spec_from_file_location("vasc_manual", module_path)
         if spec is None or spec.loader is None:
             continue
         module = importlib.util.module_from_spec(spec)
-        sys.modules.setdefault("vasc_manual_90", module)
+        sys.modules.setdefault("vasc_manual", module)
         spec.loader.exec_module(module)
         return module
 
     raise ModuleNotFoundError(
-        "Could not import vasc_manual_90.py. Place this script next to vasc_manual_90.py "
+        "Could not import vasc_manual.py. Place this script next to vasc_manual.py "
         "or run it from the repository root. Tried: " + "; ".join(errors)
     )
 
@@ -149,9 +169,6 @@ DEFAULT_C_TUNE_STEP_DEG = 1.0
 DEFAULT_TUNE_FEED = 1000.0
 DEFAULT_ROTARY_TUNE_FEED = 20000.0
 DEFAULT_MAX_B_MOVE_FEED = 1000.0
-DEFAULT_APPROACH_B_MOVE_FEED = 600.0
-DEFAULT_START_STOP_B_MOVE_FEED = 600.0
-DEFAULT_START_STOP_SLOW_SAMPLES = 4
 DEFAULT_MIN_C_MOVE_FEED = 4000.0
 DEFAULT_TRAVEL_SEGMENT_MM = 0.5
 DEFAULT_TRAVEL_REWIND_INDICES = 4
@@ -165,8 +182,6 @@ DEFAULT_PRINT_FEED_OVERRIDE = 500.0
 
 
 # ------------------------- manual displacement persistence -------------------------
-
-DEFAULT_MANUAL_FEED_FALLBACK = float(DEFAULT_TRAVEL_FEED_OVERRIDE)
 
 @dataclass
 class ManualGroupOffset:
@@ -209,64 +224,6 @@ class ManualGroupOffset:
             enabled=bool(self.enabled),
             note=str(self.note or ""),
         )
-
-
-def default_manual_group_offset(group_number: int) -> "ManualGroupOffset":
-    return ManualGroupOffset(group_number=int(group_number))
-
-
-def _normalized_feed_value(feed: Optional[float], default_feed: float = DEFAULT_MANUAL_FEED_FALLBACK) -> float:
-    if feed is None:
-        return float(default_feed)
-    try:
-        value = float(feed)
-    except Exception:
-        return float(default_feed)
-    if not math.isfinite(value):
-        return float(default_feed)
-    return value
-
-
-def normalize_manual_offset_feeds(
-    offsets: Dict[int, ManualGroupOffset],
-    default_feed: float = DEFAULT_MANUAL_FEED_FALLBACK,
-) -> Dict[int, ManualGroupOffset]:
-    for offset in offsets.values():
-        offset.feed = _normalized_feed_value(offset.feed, default_feed)
-    return offsets
-
-
-def ensure_manual_offsets_cover_paths(
-    offsets: Dict[int, ManualGroupOffset],
-    paths: Sequence[Any],
-) -> Dict[int, ManualGroupOffset]:
-    out: Dict[int, ManualGroupOffset] = {}
-    for group_idx, _path in enumerate(paths, start=1):
-        existing = offsets.get(group_idx)
-        out[group_idx] = existing if existing is not None else default_manual_group_offset(group_idx)
-    for group_idx, offset in offsets.items():
-        if int(group_idx) not in out:
-            out[int(group_idx)] = offset
-    return out
-
-
-def path_metadata_note(path: Optional[Any]) -> str:
-    if path is None:
-        return ""
-    vessel_ids = ",".join(str(int(v)) for v in getattr(path, "source_vessel_ids", []))
-    return f"path_id={getattr(path, 'path_id', '')} vessels={vessel_ids}".strip()
-
-
-def compose_manual_note(base_note: str, path: Optional[Any]) -> str:
-    base = str(base_note or "").strip()
-    meta = path_metadata_note(path)
-    if not meta:
-        return base
-    if not base:
-        return meta
-    if meta in base:
-        return base
-    return f"{base} | {meta}"
 
 
 def parse_manual_offsets(path: Optional[str], vm: Any) -> Dict[int, ManualGroupOffset]:
@@ -329,7 +286,7 @@ def parse_manual_offsets_text(text: str, vm: Any, source_label: str = "<memory>"
     return out
 
 
-def save_manual_offsets(path: str, offsets: Dict[int, ManualGroupOffset], paths: Optional[Sequence[Any]] = None) -> None:
+def save_manual_offsets(path: str, offsets: Dict[int, ManualGroupOffset]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -340,14 +297,10 @@ def save_manual_offsets(path: str, offsets: Dict[int, ManualGroupOffset], paths:
         "# node_dx/node_dy/node_dz are stage XYZ offsets applied to the full group path before printing.",
         "# node_db/node_dc are node-start rotary offsets used when starting the branch.",
     ]
-    ordered_offsets = ensure_manual_offsets_cover_paths(offsets, paths or [])
-    groups = list(range(1, len(paths) + 1)) if paths is not None else sorted(ordered_offsets)
-    for group in groups:
-        o = ordered_offsets.get(group, default_manual_group_offset(group))
-        feed = f"{_normalized_feed_value(o.feed):.6f}"
-        path_ref = None if paths is None or group < 1 or group > len(paths) else paths[group - 1]
-        note_text = compose_manual_note(o.note, path_ref)
-        note = f" # {note_text}" if note_text else ""
+    for group in sorted(offsets):
+        o = offsets[group]
+        feed = "nan" if o.feed is None else f"{float(o.feed):.6f}"
+        note = f" # {o.note}" if o.note else ""
         lines.append(
             f"{int(group)} "
             f"{float(o.delta_tip_xyz[0]):.6f} {float(o.delta_tip_xyz[1]):.6f} {float(o.delta_tip_xyz[2]):.6f} "
@@ -380,7 +333,6 @@ class SharedPrintState:
         self.done = False
         self.error_text = ""
         self.manual_file = str(manual_file or "")
-        self.plan_paths: List[Any] = []
         self.mode = "idle"
         self.status = "Idle"
         self.current_group: Optional[int] = None
@@ -600,11 +552,10 @@ class SharedPrintState:
             }
 
 
-def _manual_offset_line_for_group(offsets: Dict[int, ManualGroupOffset], group: int, path: Optional[Any] = None) -> str:
-    o = offsets.get(group, default_manual_group_offset(group))
-    feed = f"{_normalized_feed_value(o.feed):.6f}"
-    note_text = compose_manual_note(o.note, path)
-    note = f" # {note_text}" if note_text else ""
+def _manual_offset_line_for_group(offsets: Dict[int, ManualGroupOffset], group: int) -> str:
+    o = offsets.get(group, ManualGroupOffset(group_number=group))
+    feed = "nan" if o.feed is None else f"{float(o.feed):.6f}"
+    note = f" # {o.note}" if o.note else ""
     return (
         f"{int(group)} "
         f"{float(o.delta_tip_xyz[0]):.6f} {float(o.delta_tip_xyz[1]):.6f} {float(o.delta_tip_xyz[2]):.6f} "
@@ -616,24 +567,28 @@ def _manual_offset_line_for_group(offsets: Dict[int, ManualGroupOffset], group: 
     )
 
 
-def update_manual_window_state(
-    state: Optional[SharedPrintState],
-    offsets: Dict[int, ManualGroupOffset],
-    current_group: int,
-    paths: Optional[Sequence[Any]] = None,
-    lookahead: int = 5,
-) -> None:
+def update_manual_window_state(state: Optional[SharedPrintState], offsets: Dict[int, ManualGroupOffset], current_group: int, lookahead: int = 5) -> None:
     if state is None:
         return
-    current_path = None if paths is None or not (1 <= int(current_group) <= len(paths)) else paths[int(current_group) - 1]
-    current = _manual_offset_line_for_group(offsets, int(current_group), current_path)
-    upcoming: List[str] = []
-    for i in range(1, int(lookahead) + 1):
-        group = int(current_group) + i
-        path = None if paths is None or not (1 <= group <= len(paths)) else paths[group - 1]
-        line = _manual_offset_line_for_group(offsets, group, path)
-        upcoming.append(line)
+    current = _manual_offset_line_for_group(offsets, int(current_group))
+    upcoming = [_manual_offset_line_for_group(offsets, int(current_group) + i) for i in range(1, int(lookahead) + 1)]
     state.set_manual_window(current, upcoming)
+
+
+def apply_node_stage_offset_to_points(
+    points: np.ndarray,
+    offset: Optional[ManualGroupOffset],
+    cumulative_offset: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    pts = np.asarray(points, dtype=float)
+    if len(pts) == 0:
+        return pts
+    delta_stage = np.zeros(3, dtype=float)
+    if cumulative_offset is not None:
+        delta_stage = delta_stage + np.asarray(cumulative_offset, dtype=float).reshape(3)
+    if float(np.linalg.norm(delta_stage)) <= 1e-12:
+        return pts
+    return pts + delta_stage[None, :]
 
 
 def current_tip_matches_start(writer: Any, start_tip: np.ndarray, tol_mm: float = 0.05) -> bool:
@@ -642,6 +597,18 @@ def current_tip_matches_start(writer: Any, start_tip: np.ndarray, tol_mm: float 
     cur_tip = np.asarray(writer.base.cur_tip_xyz, dtype=float).reshape(3)
     start_tip = np.asarray(start_tip, dtype=float).reshape(3)
     return float(np.linalg.norm(cur_tip - start_tip)) <= float(tol_mm)
+
+
+class RewindCurrentBranchToTravel(Exception):
+    """Raised when node tuning requests an immediate rewind to travel retune."""
+
+
+class ImmediateBranchRewindRequested(Exception):
+    """Raised when the GUI requests an immediate rewind outside node tuning."""
+
+
+class RestartTravelTune(Exception):
+    """Raised when travel retune should jump back to the previous branch end again."""
 
 
 class GuiKeyboardProxy:
@@ -675,13 +642,11 @@ class HybridKeyboard:
 
 
 class PrintGUIApp:
-    def __init__(self, vm: Any, args: argparse.Namespace, state: SharedPrintState, plan: Dict[str, Any], manual_file: str, refresh_ms: int = DEFAULT_GUI_REFRESH_MS, plot_refresh_ms: int = DEFAULT_GUI_PLOT_REFRESH_MS) -> None:
+    def __init__(self, state: SharedPrintState, plan: Dict[str, Any], manual_file: str, refresh_ms: int = DEFAULT_GUI_REFRESH_MS, plot_refresh_ms: int = DEFAULT_GUI_PLOT_REFRESH_MS) -> None:
         if tk is None or ttk is None:
             raise RuntimeError("Tkinter is not available in this Python environment.")
         if Figure is None or FigureCanvasTkAgg is None:
             raise RuntimeError("Matplotlib TkAgg is not available; install matplotlib or use --no-gui.")
-        self.vm = vm
-        self.args = args
         self.state = state
         self.plan = plan
         self.manual_file = str(manual_file)
@@ -735,7 +700,6 @@ class PrintGUIApp:
         self.last_key_var = tk.StringVar(value="Last key: -")
         self.manual_file_var = tk.StringVar(value=f"Manual file: {self.manual_file}")
         self.manual_edit_status_var = tk.StringVar(value="Manual file editor: ready")
-        self.export_status_var = tk.StringVar(value="Teach mode: Accept saves the taught node; export uses the current taught state.")
 
         row = 0
         ttk.Label(left, text="Print status", font=("TkDefaultFont", 13, "bold")).grid(row=row, column=0, columnspan=4, sticky="w", pady=(0, 4)); row += 1
@@ -751,6 +715,11 @@ class PrintGUIApp:
         ttk.Button(left, text="Resume", command=self.state.resume).grid(row=row, column=1, sticky="ew", padx=2, pady=2)
         ttk.Button(left, text="Accept / Space", command=lambda: self.state.post_key("SPACE")).grid(row=row, column=2, sticky="ew", padx=2, pady=2)
         ttk.Button(left, text="Abort", command=self.state.request_abort).grid(row=row, column=3, sticky="ew", padx=2, pady=2); row += 1
+        ttk.Button(left, text="Travel interrupt R", command=lambda: self.state.post_key("R")).grid(row=row, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        ttk.Button(left, text="Rewind prev branch", command=self._handle_rewind_button).grid(row=row, column=2, columnspan=2, sticky="ew", padx=2, pady=2); row += 1
+        ttk.Label(left, text="Rewind mode: Left Arrow jumps back to the previous branch end for travel retuning. Right Arrow accepts the travel offset, moves to the current branch start, and enters node tuning.", wraplength=560).grid(row=row, column=0, columnspan=4, sticky="w"); row += 1
+
+        ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=6); row += 1
         ttk.Label(left, text="Jog buttons mirror the keyboard controls", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, columnspan=4, sticky="w"); row += 1
         for col in range(4):
             left.columnconfigure(col, weight=1)
@@ -775,11 +744,6 @@ class PrintGUIApp:
         self.last_command_text.grid(row=row, column=0, columnspan=4, sticky="ew"); row += 1
 
         ttk.Label(left, textvariable=self.manual_file_var, wraplength=560).grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0)); row += 1
-        ttk.Label(left, text="Teach / Export", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, columnspan=4, sticky="w"); row += 1
-        ttk.Button(left, text="Save Taught Offsets", command=self._save_taught_offsets).grid(row=row, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
-        ttk.Button(left, text="Export Taught G-code", command=self._export_taught_gcode).grid(row=row, column=2, columnspan=2, sticky="ew", padx=2, pady=2); row += 1
-        ttk.Button(left, text="Export Top-Down G-code", command=self._export_top_down_gcode).grid(row=row, column=0, columnspan=4, sticky="ew", padx=2, pady=2); row += 1
-        ttk.Label(left, textvariable=self.export_status_var, wraplength=560).grid(row=row, column=0, columnspan=4, sticky="w"); row += 1
         ttk.Label(left, text="Current and upcoming group-displacement lines", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, columnspan=4, sticky="w"); row += 1
         self.manual_text = tk.Text(left, width=74, height=6, wrap="none")
         self.manual_text.grid(row=row, column=0, columnspan=4, sticky="nsew")
@@ -843,14 +807,29 @@ class PrintGUIApp:
             if key == "space": mapped = "SPACE"
             elif key == "Up": mapped = "UP"
             elif key == "Down": mapped = "DOWN"
+            elif key == "Left": mapped = "BACK"
             elif key == "Right": mapped = "FORWARD"
             elif key == "Escape": mapped = "ESC"
-            elif char in {"a", "d", "w", "s", "i", "k", "j", "l", "q"}:
-                mapped = char
+            elif char in {"a", "d", "w", "s", "i", "k", "j", "l", "q", "r", "R"}:
+                mapped = "R" if char == "R" else char
             if mapped is not None:
-                self.state.post_key(mapped)
+                if mapped == "BACK":
+                    mode = str(self.state.snapshot().get("mode") or "")
+                    if mode in {"node_tune", "travel_tune"}:
+                        self.state.post_key("BACK")
+                    else:
+                        self._handle_rewind_button()
+                else:
+                    self.state.post_key(mapped)
             return "break"
         self.root.bind_all("<Key>", handler)
+
+    def _handle_rewind_button(self) -> None:
+        mode = str(self.state.snapshot().get("mode") or "")
+        if mode == "node_tune":
+            self.state.post_key("BACK")
+            return
+        self.state.request_branch_rewind()
 
     def _draw_static_paths(self) -> None:
         all_pts = []
@@ -892,86 +871,28 @@ class PrintGUIApp:
         self.manual_edit_status_var.set("Manual file editor reloaded from disk.")
 
     def _save_manual_editor(self) -> None:
+        vm = import_vasc_manual_module()
         text = self.manual_edit_text.get("1.0", "end")
         try:
-            parsed = parse_manual_offsets_text(text, self.vm, source_label=self.manual_file)
-            normalize_manual_offset_feeds(parsed, default_feed=float(self.plan.get("travel_feed", DEFAULT_MANUAL_FEED_FALLBACK)))
+            parsed = parse_manual_offsets_text(text, vm, source_label=self.manual_file)
             Path(self.manual_file).write_text(text.rstrip() + "\n")
             manual_offsets = self.plan["manual_offsets"]
             manual_offsets.clear()
             manual_offsets.update(parsed)
             snap = self.state.snapshot()
             current_group = int(snap["current_group"] or 1)
-            update_manual_window_state(self.state, manual_offsets, current_group, self.plan.get("paths"))
+            update_manual_window_state(self.state, manual_offsets, current_group)
             self.manual_edit_status_var.set(f"Saved manual file with {len(parsed)} group rows.")
         except Exception as exc:
             self.manual_edit_status_var.set(f"Save failed: {exc}")
-
-    def _save_taught_offsets(self) -> None:
-        try:
-            save_manual_offsets(self.manual_file, self.plan["manual_offsets"], self.plan.get("paths"))
-            self._reload_manual_editor_from_disk()
-            self.export_status_var.set(f"Saved taught offsets to {self.manual_file}")
-        except Exception as exc:
-            self.export_status_var.set(f"Save taught offsets failed: {exc}")
-
-    def _default_export_path(self, suffix_tag: str = "") -> str:
-        out_path = Path(str(getattr(self.args, "out", DEFAULT_OUT_FILE)))
-        suffix = out_path.suffix if out_path.suffix else ".gcode"
-        stem = out_path.stem if out_path.stem else out_path.name
-        if suffix_tag:
-            stem = f"{stem}_{suffix_tag}"
-        return str(out_path.with_name(stem + suffix))
-
-    def _choose_export_path(self, title: str, suffix_tag: str = "") -> Optional[str]:
-        initial_path = self._default_export_path(suffix_tag)
-        if filedialog is None:
-            return initial_path
-        return filedialog.asksaveasfilename(
-            parent=self.root,
-            title=title,
-            initialfile=Path(initial_path).name,
-            initialdir=str(Path(initial_path).parent),
-            defaultextension=".gcode",
-            filetypes=[("G-code", "*.gcode"), ("Text files", "*.txt"), ("All files", "*.*")],
-        ) or None
-
-    def _export_gcode_from_taught_state(self, orientation_mode: Optional[str], suffix_tag: str, title: str) -> None:
-        out_path = self._choose_export_path(title=title, suffix_tag=suffix_tag)
-        if not out_path:
-            self.export_status_var.set("Export cancelled.")
-            return
-        export_args = argparse.Namespace(**vars(self.args))
-        export_args.run_mode = "save-gcode"
-        export_args.out = str(out_path)
-        if orientation_mode is not None:
-            export_args.orientation_mode = str(orientation_mode)
-        try:
-            save_gcode(self.vm, export_args, self.plan)
-            self.export_status_var.set(f"Exported taught G-code to {out_path}")
-        except Exception as exc:
-            self.export_status_var.set(f"Export failed: {exc}")
-
-    def _export_taught_gcode(self) -> None:
-        self._export_gcode_from_taught_state(
-            orientation_mode=None,
-            suffix_tag="taught",
-            title="Export taught G-code",
-        )
-
-    def _export_top_down_gcode(self) -> None:
-        self._export_gcode_from_taught_state(
-            orientation_mode="fixed",
-            suffix_tag="topdown",
-            title="Export top-down taught G-code",
-        )
 
     def _refresh(self) -> None:
         snap = self.state.snapshot()
         group = snap["current_group"]
         total = snap["total_groups"]
         vessels = ",".join(str(x) for x in snap["current_source_vessels"])
-        self.status_var.set(f"{snap['mode'].upper()} - {snap['status']}")
+        rewind_txt = " [branch rewind requested]" if snap["branch_rewind_requested"] else ""
+        self.status_var.set(f"{snap['mode'].upper()} - {snap['status']}{rewind_txt}")
         self.group_var.set(f"Branch/group: {group if group is not None else '-'} / {total if total is not None else '-'}")
         self.path_var.set(f"Path: {snap['current_path_id'] or '-'}    source vessels: {vessels or '-'}")
         self.point_var.set(f"Point progress in group: {snap['current_point_index']} / {snap['current_point_total']}")
@@ -1012,6 +933,10 @@ class PrintGUIApp:
         mode = str(snap.get("mode") or "")
         if mode == "node_tune":
             self.plot_mode_text.set_text("NODE TUNING MODE")
+        elif mode == "travel_tune":
+            self.plot_mode_text.set_text("TRAVEL OFFSET TUNING")
+        elif mode == "travel_rewind":
+            self.plot_mode_text.set_text("REWIND / TRAVEL RETUNE")
         else:
             self.plot_mode_text.set_text("")
         if self.current_path_line is not None:
@@ -1121,9 +1046,6 @@ class InteractiveRobotWriter:
         self.inter_command_delay_s = max(0.0, float(inter_command_delay_s))
         self.min_move_wait_s = max(0.0, float(min_move_wait_s))
         self.max_b_move_feed = float(DEFAULT_MAX_B_MOVE_FEED)
-        self.approach_b_move_feed = max(0.0, float(kwargs.pop("approach_b_move_feed", DEFAULT_APPROACH_B_MOVE_FEED)))
-        self.start_stop_b_move_feed = max(0.0, float(kwargs.pop("start_stop_b_move_feed", DEFAULT_START_STOP_B_MOVE_FEED)))
-        self.start_stop_slow_samples = max(0, int(kwargs.pop("start_stop_slow_samples", DEFAULT_START_STOP_SLOW_SAMPLES)))
         self.min_c_move_feed = max(DEFAULT_MIN_C_MOVE_FEED, float(kwargs.get("c_feed", DEFAULT_MIN_C_MOVE_FEED)))
         self.estimated_motion_done_at = time.monotonic()
         self.current_group_number: Optional[int] = None
@@ -1132,7 +1054,6 @@ class InteractiveRobotWriter:
         self.in_tip_tracking_interpolation = False
         self._travel_history: List[Tuple[np.ndarray, float, float, Optional[np.ndarray]]] = []
         self.previous_branch_end_pose: Optional[Tuple[np.ndarray, float, float, Optional[np.ndarray]]] = None
-        self._accepted_node_start_group: Optional[int] = None
 
         # Construct the original writer against a StringIO sink. We reuse all
         # its planning, collision, tangent, pressure, and state logic, then
@@ -1175,46 +1096,11 @@ class InteractiveRobotWriter:
             return 0.0
         return max(self.min_move_wait_s, dist / max(1e-9, float(feed) / 60.0))
 
-    def _cap_feed_for_b_axis_component(
-        self,
-        requested_feed: float,
-        stage_dist: float,
-        b_dist: float,
-        c_dist: float,
-        max_b_axis_feed: Optional[float],
-    ) -> float:
-        feed = max(1.0, float(requested_feed))
-        if max_b_axis_feed is None:
-            return feed
-        max_b = float(max_b_axis_feed)
-        if max_b <= 0.0 or float(b_dist) <= 1e-12:
-            return feed
-        axis_dist = float(np.linalg.norm(np.array([float(stage_dist), float(b_dist), float(c_dist)], dtype=float)))
-        if axis_dist <= 1e-12:
-            return feed
-        return min(feed, float(max_b) * axis_dist / float(b_dist))
-
-    def _is_approach_reason(self, reason: Optional[str]) -> bool:
-        text = str(reason or "").strip().lower()
-        if not text:
-            return False
-        markers = (
-            "approach",
-            "pre-spin",
-            "travel to node start",
-            "fine-approach",
-            "fine approach",
-            "node start resync",
-        )
-        return any(marker in text for marker in markers)
-
-    def _b_feed_limit_for_reason(self, reason: Optional[str]) -> float:
-        if self._is_approach_reason(reason):
-            return float(self.approach_b_move_feed)
-        return float(self.max_b_move_feed)
-
     def _check_for_immediate_branch_rewind(self) -> None:
-        return
+        if self.ui_state is None or self.in_print_polyline:
+            return
+        if self.ui_state.consume_branch_rewind_request():
+            raise ImmediateBranchRewindRequested()
 
     def _sleep_interruptible(self, seconds: float) -> None:
         deadline = time.monotonic() + max(0.0, float(seconds))
@@ -1310,59 +1196,10 @@ class InteractiveRobotWriter:
             return
 
         c_cmd = float(self.vm.unwrap_angle_deg_near(float(c), float(self.base.cur_c)))
-        phase_key = self.vm._normalize_phase_key(getattr(self.base, "current_motion_phase", None))
-        p_stage = self.base.clamp_stage(
-            self.vm.stage_xyz_for_tip(self.base.cal, p_tip, float(b), c_cmd, motion_phase=phase_key),
-            "tip_to_stage_explicit_bc",
-        )
+        p_stage = self.base.clamp_stage(self.vm.stage_xyz_for_tip(self.base.cal, p_tip, float(b), c_cmd), "tip_to_stage_explicit_bc")
         self._send_atomic_stage_pose(p_stage, float(b), c_cmd, feed, reason=reason)
         self.base.cur_tip_xyz = p_tip.copy()
         self.base.last_tip_tangent = None
-        if phase_key is not None:
-            self.base.current_motion_phase = phase_key
-
-    def _move_to_tip_with_explicit_bc_synced(
-        self,
-        p_tip: np.ndarray,
-        b: float,
-        c: float,
-        feed: float,
-        reason: str,
-    ) -> np.ndarray:
-        p_tip = np.asarray(p_tip, dtype=float).copy()
-        if self.base.write_mode == "cartesian":
-            p_stage = self.base.clamp_stage(p_tip, "cartesian_tip_to_stage_explicit_bc_synced")
-            axes = {
-                self.base.cal.x_axis: float(p_stage[0]),
-                self.base.cal.y_axis: float(p_stage[1]),
-                self.base.cal.z_axis: float(p_stage[2]),
-            }
-            self.send_absolute_move_axes(axes, float(feed), reason=reason)
-            self._commit_state(p_stage, float(b), float(c))
-            self.base.cur_tip_xyz = p_tip.copy()
-            self.base.last_tip_tangent = None
-            return p_stage
-
-        c_cmd = float(self.vm.unwrap_angle_deg_near(float(c), float(self.base.cur_c)))
-        phase_key = self.vm._normalize_phase_key(getattr(self.base, "current_motion_phase", None))
-        p_stage = self.base.clamp_stage(
-            self.vm.stage_xyz_for_tip(self.base.cal, p_tip, float(b), c_cmd, motion_phase=phase_key),
-            "tip_to_stage_explicit_bc_synced",
-        )
-        axes = {
-            self.base.cal.x_axis: float(p_stage[0]),
-            self.base.cal.y_axis: float(p_stage[1]),
-            self.base.cal.z_axis: float(p_stage[2]),
-            self.base.cal.b_axis: float(b),
-            self.base.cal.c_axis: float(c_cmd),
-        }
-        self.send_absolute_move_axes(axes, float(feed), reason=reason)
-        self._commit_state(p_stage, float(b), c_cmd)
-        self.base.cur_tip_xyz = p_tip.copy()
-        self.base.last_tip_tangent = None
-        if phase_key is not None:
-            self.base.current_motion_phase = phase_key
-        return p_stage
 
     def _tip_and_rotary_match_target(self, p_tip: np.ndarray, b: float, c: float, tol_mm: float = 1e-6, tol_deg: float = 1e-6) -> bool:
         if self.base.cur_tip_xyz is None:
@@ -1376,15 +1213,6 @@ class InteractiveRobotWriter:
             abs(float(self.base.cur_b) - float(b)) <= float(tol_deg)
             and abs(float(self.base.cur_c) - c_target) <= float(tol_deg)
         )
-
-    def mark_node_start_accepted(self, group_number: int) -> None:
-        self._accepted_node_start_group = int(group_number)
-
-    def consume_node_start_accepted(self, group_number: int) -> bool:
-        if self._accepted_node_start_group is None or int(self._accepted_node_start_group) != int(group_number):
-            return False
-        self._accepted_node_start_group = None
-        return True
 
     # ----- overrides for original writer methods -----
 
@@ -1402,9 +1230,7 @@ class InteractiveRobotWriter:
     def pressure_preload_before_print(self) -> None:
         if not self.base.emit_extrusion or self.base.pressure_charged:
             return
-        if self.base.pressure_set_command:
-            self.send_code(self.base.pressure_set_command, reason="pressure set")
-        self.send_code(self.base.pressure_on_command, reason="pressure on")
+        self.send_code("M42 P0 S1", reason="pressure on")
         if self.base.pressure_offset_mm > 1e-9:
             self.send_code(f"G91", reason="relative mode")
             self.send_code(
@@ -1420,10 +1246,6 @@ class InteractiveRobotWriter:
     def pressure_release_after_print(self) -> None:
         if not self.base.emit_extrusion or not self.base.pressure_charged:
             return
-        self.enable_vacuum(reason="vacuum on before dwell")
-        if self.base.node_dwell_ms > 0:
-            time.sleep(float(self.base.node_dwell_ms) / 1000.0)
-        self.disable_vacuum(reason="vacuum off after dwell")
         if self.base.pressure_offset_mm > 1e-9:
             self.send_code("G91", reason="relative mode")
             self.send_code(
@@ -1432,19 +1254,8 @@ class InteractiveRobotWriter:
                 reason="pressure retract",
             )
             self.send_code("G90", reason="absolute mode")
-        self.send_code(self.base.pressure_off_command, reason="pressure off")
+        self.send_code("M42 P0 S0", reason="pressure off")
         self.base.pressure_charged = False
-
-    def enable_vacuum(self, reason: str = "vacuum on") -> None:
-        if not self.base.emit_extrusion or self.base.vacuum_enabled or not self.base.vacuum_on_command:
-            return
-        self.send_code(self.base.vacuum_on_command, reason=reason)
-        self.base.vacuum_enabled = True
-
-    def disable_vacuum(self, reason: str = "vacuum off") -> None:
-        if self.base.vacuum_enabled and self.base.vacuum_off_command:
-            self.send_code(self.base.vacuum_off_command, reason=reason)
-        self.base.vacuum_enabled = False
 
     def emit_vasculature_write_start(self, label: str, points: np.ndarray, tangents: np.ndarray, extrusion_multiplier: float) -> None:
         print(f"; VASCULATURE_WRITE_START path_id={label} point_count={len(points)}")
@@ -1465,6 +1276,11 @@ class InteractiveRobotWriter:
         if comment:
             print(f"; {comment}")
         p_stage = np.asarray(p_stage, dtype=float)
+        is_travel = (not self.in_print_polyline) and (u_value is None)
+
+        if is_travel and self.base.cur_stage_xyz is not None and self.travel_segment_mm > 0:
+            self._segmented_travel_move(p_stage, float(b), float(c), float(feed), comment=comment)
+            return
 
         if (self.base.write_mode == "calibrated"
                 and (not self.in_print_polyline)
@@ -1483,7 +1299,7 @@ class InteractiveRobotWriter:
                 and abs(float(b) - float(self.base.cur_b)) > 1e-9):
             self.send_absolute_move_axes(
                 {self.base.cal.b_axis: float(b)},
-                self._feed_with_rotary_limits(self._b_feed_limit_for_reason(comment), self.base.cur_b, b, self.base.cur_c, self.base.cur_c),
+                self._feed_with_rotary_limits(self.max_b_move_feed, self.base.cur_b, b, self.base.cur_c, self.base.cur_c),
                 reason="B move",
             )
             self._commit_rotary_only_state(b=float(b))
@@ -1499,9 +1315,11 @@ class InteractiveRobotWriter:
                 axes[self.base.cal.c_axis] = float(c)
         if u_value is not None:
             axes[self.base.cal.u_axis] = float(u_value)
-        move_feed = float(feed)
-        if self.base.write_mode == "calibrated" and not self.in_print_polyline:
-            move_feed = self._feed_with_rotary_limits(float(feed), self.base.cur_b, b, self.base.cur_c, c)
+        move_feed = (
+            self._feed_with_rotary_limits(float(feed), self.base.cur_b, b, self.base.cur_c, c)
+            if self.base.write_mode == "calibrated"
+            else float(feed)
+        )
         self.send_absolute_move_axes(axes, move_feed, reason="print move" if self.in_print_polyline else "move")
         self._commit_state(p_stage, b, c)
 
@@ -1553,64 +1371,6 @@ class InteractiveRobotWriter:
         finally:
             self.in_tip_tracking_interpolation = old
 
-    def write_tip_speed_move(
-        self,
-        p_stage: np.ndarray,
-        b: float,
-        c: float,
-        desired_tip_feed: float,
-        start_tip_xyz: np.ndarray,
-        end_tip_xyz: np.ndarray,
-        max_b_axis_feed: Optional[float] = None,
-        motion_phase: Optional[str] = None,
-        requested_tip_angle: Optional[float] = None,
-        comment: Optional[str] = None,
-    ) -> None:
-        if self.base.cur_stage_xyz is None:
-            raise RuntimeError("Cannot emit tip-speed move before machine pose is established.")
-        if comment:
-            print(f"; {comment}")
-
-        p_stage = np.asarray(p_stage, dtype=float)
-        start_tip = np.asarray(start_tip_xyz, dtype=float)
-        end_tip = np.asarray(end_tip_xyz, dtype=float)
-        c_cmd = float(self.vm.unwrap_angle_deg_near(float(c), float(self.base.cur_c)))
-
-        tip_dist = float(np.linalg.norm(end_tip - start_tip))
-        stage_dist = float(np.linalg.norm(p_stage - np.asarray(self.base.cur_stage_xyz, dtype=float)))
-        b_dist = abs(float(b) - float(self.base.cur_b))
-        c_dist = abs(float(c_cmd) - float(self.base.cur_c))
-        axis_dist = float(np.linalg.norm(np.array([stage_dist, b_dist, c_dist], dtype=float)))
-
-        if tip_dist <= 1e-12 or axis_dist <= 1e-12:
-            command_feed = float(max(desired_tip_feed, 1.0))
-        else:
-            desired_time_min = tip_dist / float(max(desired_tip_feed, 1e-9))
-            command_feed = float(max(axis_dist / max(desired_time_min, 1e-12), 1.0))
-        command_feed = self._cap_feed_for_b_axis_component(
-            command_feed,
-            stage_dist=stage_dist,
-            b_dist=b_dist,
-            c_dist=c_dist,
-            max_b_axis_feed=max_b_axis_feed,
-        )
-
-        axes = {
-            self.base.cal.x_axis: float(p_stage[0]),
-            self.base.cal.y_axis: float(p_stage[1]),
-            self.base.cal.z_axis: float(p_stage[2]),
-        }
-        if self.base.write_mode == "calibrated":
-            axes[self.base.cal.b_axis] = float(b)
-            axes[self.base.cal.c_axis] = float(c_cmd)
-        self.send_absolute_move_axes(axes, command_feed, reason="print move")
-        self._commit_state(p_stage, b, c_cmd)
-        self.base.cur_tip_xyz = end_tip.copy()
-        if motion_phase is not None:
-            self.base.current_motion_phase = self.vm._normalize_phase_key(motion_phase)
-        if requested_tip_angle is not None:
-            self.base.last_requested_tip_angle = float(requested_tip_angle)
-
     def _build_print_samples(self, points: np.ndarray, tangents: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
         samples: List[Tuple[np.ndarray, np.ndarray]] = []
         for i in range(1, len(points)):
@@ -1625,16 +1385,8 @@ class InteractiveRobotWriter:
                 samples.append((p_tip, tangent))
         return samples
 
-    def print_polyline(
-        self,
-        points: np.ndarray,
-        tangents: np.ndarray,
-        extrusion_multiplier: float,
-        label: str,
-        path_radius_mm: float = 0.0,
-        print_feed_override: Optional[float] = None,
-        radius_profile_mm: Optional[np.ndarray] = None,
-    ) -> None:
+    def print_polyline(self, points: np.ndarray, tangents: np.ndarray, extrusion_multiplier: float,
+                       label: str, path_radius_mm: float = 0.0) -> None:
         old = self.in_print_polyline
         self.in_print_polyline = True
         if self.ui_state is not None:
@@ -1644,75 +1396,46 @@ class InteractiveRobotWriter:
         try:
             if len(points) < 2:
                 return
-            active_print_feed = float(self.base.print_feed if print_feed_override is None else print_feed_override)
             self.pressure_preload_before_print()
             mode_note = "Cartesian centerline" if self.base.write_mode == "cartesian" else "calibration-based exact tip tracking"
-            print(f"; print {label} ({mode_note}); active_print_feed={active_print_feed:.3f} mm/min; path_radius_mm={float(path_radius_mm):.6f}")
+            print(f"; print {label} ({mode_note})")
             self.emit_vasculature_write_start(label, points, tangents, extrusion_multiplier)
 
             points = np.asarray(points, dtype=float)
             tangents = np.asarray(tangents, dtype=float)
-            rr = None if radius_profile_mm is None else np.asarray(radius_profile_mm, dtype=float).reshape(-1)
-            if rr is not None and len(rr) != len(points):
-                raise ValueError(f"Radius profile length mismatch for {label}: {len(rr)} radii for {len(points)} points.")
             if self.base.cur_tip_xyz is None:
                 self.base.cur_tip_xyz = np.asarray(points[0], dtype=float).copy()
             if self.base.last_tip_tangent is None:
                 self.base.last_tip_tangent = np.asarray(tangents[0], dtype=float).copy()
-            samples: List[Tuple[np.ndarray, np.ndarray, float]] = []
-            for idx in range(1, len(points)):
-                p0 = np.asarray(points[idx - 1], dtype=float)
-                p1 = np.asarray(points[idx], dtype=float)
-                seg_t0 = np.asarray(tangents[idx - 1], dtype=float)
-                seg_t1 = np.asarray(tangents[idx], dtype=float)
-                r0 = float(path_radius_mm if rr is None else rr[idx - 1])
-                r1 = float(path_radius_mm if rr is None else rr[idx])
-                for s in range(1, self.edge_samples + 1):
-                    t = s / float(self.edge_samples)
-                    p_tip = p0 + t * (p1 - p0)
-                    tangent = self.vm.normalize((1.0 - t) * seg_t0 + t * seg_t1)
-                    local_radius_mm = float((1.0 - t) * r0 + t * r1)
-                    samples.append((p_tip, tangent, local_radius_mm))
+            samples = self._build_print_samples(points, tangents)
             total_samples = len(samples)
             if self.ui_state is not None:
                 self.ui_state.current_point_total = total_samples
                 self.ui_state.current_point_index = 0
 
             i = 0
-            last_tip = np.asarray(points[0], dtype=float).copy()
             while i < total_samples:
-                p_tip, tangent, local_radius_mm = samples[i]
-                p_stage, b, c, motion_phase, used_tip_angle = self.base.tip_to_stage_with_phase(
-                    p_tip,
-                    tangent=tangent,
-                    prev_c=self.base.cur_c,
-                    prev_b=self.base.cur_b,
-                )
-                local_feed = active_print_feed
-                if self.base.extrusion_feed_mode == "weighted" and self.base.radius_feed_map:
-                    local_feed = self.vm.feed_from_radius_map(local_radius_mm, self.base.radius_feed_map, active_print_feed)
-                boundary_b_feed = None
-                if self.start_stop_slow_samples > 0 and self.start_stop_b_move_feed > 0.0:
-                    if i < self.start_stop_slow_samples or (total_samples - 1 - i) < self.start_stop_slow_samples:
-                        boundary_b_feed = self.start_stop_b_move_feed
-                self.write_tip_speed_move(
-                    p_stage=p_stage,
-                    b=b,
-                    c=c,
-                    desired_tip_feed=local_feed,
-                    start_tip_xyz=last_tip,
-                    end_tip_xyz=p_tip,
-                    max_b_axis_feed=boundary_b_feed,
-                    motion_phase=motion_phase,
-                    requested_tip_angle=used_tip_angle,
-                )
+                p_tip, tangent = samples[i]
+                p_stage, b, c = self.base.tip_to_stage(p_tip, tangent=tangent, prev_c=self.base.cur_c)
+                if i == 0 and self.base.cur_tip_xyz is not None:
+                    self.write_tip_tracking_pose_move(
+                        p_tip,
+                        b,
+                        c,
+                        self.base.print_feed,
+                        comment=None,
+                        max_tip_step_mm=max(0.25, float(self.travel_segment_mm)),
+                        max_b_step_deg=max(0.25, float(self.base.b_max_step_deg)),
+                        max_c_step_deg=max(0.25, float(self.base.c_max_step_deg)),
+                    )
+                else:
+                    self.write_move(p_stage, b, c, self.base.print_feed, comment=None, u_value=None)
+                self.base.cur_tip_xyz = p_tip.copy()
                 self.base.last_tip_tangent = tangent.copy()
-                last_tip = p_tip.copy()
                 if self.ui_state is not None:
                     self.ui_state.current_point_index = i + 1
                 i += 1
 
-            self._wait_estimated_complete(reason="print path completion")
             self.emit_vasculature_write_end(label)
             self.pressure_release_after_print()
             self.base.record_printed_path(points, radius_mm=path_radius_mm)
@@ -1742,7 +1465,6 @@ class InteractiveRobotWriter:
             "write_move", "write_tip_tracking_pose_move", "set_travel_acceleration",
             "pressure_preload_before_print", "pressure_release_after_print",
             "emit_vasculature_write_start", "emit_vasculature_write_end",
-            "move_to_tip_with_explicit_bc", "move_to_tip_aorta_cylinder_azimuth_plane",
         ]
         old = {n: getattr(self.base, n) for n in names}
         for n in names:
@@ -1753,69 +1475,12 @@ class InteractiveRobotWriter:
             for n, v in old.items():
                 setattr(self.base, n, v)
 
-    def move_to_tip_with_explicit_bc(
-        self,
-        p_tip: np.ndarray,
-        b: float,
-        c: float,
-        feed: float,
-        comment: Optional[str] = None,
-        motion_phase: Optional[str] = None,
-        requested_tip_angle: Optional[float] = None,
-    ) -> None:
-        if motion_phase is not None:
-            self.base.current_motion_phase = self.vm._normalize_phase_key(motion_phase)
-        self._move_to_tip_with_explicit_bc(
-            np.asarray(p_tip, dtype=float),
-            float(b),
-            float(c),
-            float(feed),
-            reason="move" if comment is None else str(comment),
-        )
-        if requested_tip_angle is not None:
-            self.base.last_requested_tip_angle = float(requested_tip_angle)
-
-    def move_to_tip_aorta_cylinder_azimuth_plane(
-        self,
-        p_tip: np.ndarray,
-        axis_tangent: np.ndarray,
-        radial_unit: np.ndarray,
-        feed: float,
-        comment: Optional[str] = None,
-    ) -> None:
-        self._with_patched_base(
-            lambda: self.base.move_to_tip_aorta_cylinder_azimuth_plane(
-                np.asarray(p_tip, dtype=float),
-                np.asarray(axis_tangent, dtype=float),
-                np.asarray(radial_unit, dtype=float),
-                float(feed),
-                comment=comment,
-            )
-        )
-
-    def approach_start_from_aorta_cylinder(
-        self,
-        start_tip: np.ndarray,
-        start_tangent: np.ndarray,
-        label: str,
-        final_approach_feed: Optional[float] = None,
-    ) -> None:
-        self._with_patched_base(
-            lambda: self.base.approach_start_from_aorta_cylinder(
-                np.asarray(start_tip, dtype=float),
-                np.asarray(start_tangent, dtype=float),
-                label,
-                final_approach_feed=final_approach_feed,
-            )
-        )
-
-    def approach_start_direct(self, start_tip: np.ndarray, start_tangent: np.ndarray, label: str, final_approach_feed: Optional[float] = None) -> None:
-        self._with_patched_base(lambda: self.base.approach_start_direct(start_tip, start_tangent, label, final_approach_feed=final_approach_feed))
+    def approach_start_direct(self, start_tip: np.ndarray, start_tangent: np.ndarray, label: str) -> None:
+        self._with_patched_base(lambda: self.base.approach_start_direct(start_tip, start_tangent, label))
 
     def approach_start_from_side(self, start_tip: np.ndarray, start_tangent: np.ndarray, far_clearance: float,
-                                 near_clearance: float, retreat_clearance: float, side_lift_z: float, label: str,
-                                 final_approach_feed: Optional[float] = None) -> None:
-        self._with_patched_base(lambda: self.base.approach_start_from_side(start_tip, start_tangent, far_clearance, near_clearance, retreat_clearance, side_lift_z, label, final_approach_feed=final_approach_feed))
+                                 near_clearance: float, retreat_clearance: float, side_lift_z: float, label: str) -> None:
+        self._with_patched_base(lambda: self.base.approach_start_from_side(start_tip, start_tangent, far_clearance, near_clearance, retreat_clearance, side_lift_z, label))
 
     def apply_group_displacement(self, displacement: Any, default_feed: float, label: str) -> None:
         if not displacement.enabled:
@@ -1829,29 +1494,62 @@ class InteractiveRobotWriter:
         if float(np.linalg.norm(delta_stage)) <= 1e-12 and abs(delta_b) <= 1e-12 and abs(delta_c) <= 1e-12:
             return
 
-        current_tip = (
-            np.asarray(self.base.cur_tip_xyz, dtype=float).copy()
-            if self.base.cur_tip_xyz is not None
-            else self.vm.tip_xyz_for_stage(
-                self.base.cal,
-                np.asarray(self.base.cur_stage_xyz, dtype=float),
-                self.base.cur_b,
-                self.base.cur_c,
-                motion_phase=getattr(self.base, "current_motion_phase", None),
-            )
-        )
-        target_tip = np.asarray(current_tip, dtype=float).copy() + delta_stage
+        target_stage = np.asarray(self.base.cur_stage_xyz, dtype=float).copy() + delta_stage
         target_b = float(self.base.cur_b) + delta_b
         target_c = float(self.base.cur_c) + delta_c
         feed = float(default_feed if displacement.feed is None else displacement.feed)
         note_suffix = f" ({displacement.note})" if displacement.note else ""
-        self._move_to_tip_with_explicit_bc_synced(
-            target_tip,
-            target_b,
-            target_c,
-            feed,
-            reason=f"{label}: manual stage displacement{note_suffix}",
-        )
+        self._send_atomic_stage_pose(target_stage, target_b, target_c, feed, reason=f"{label}: manual stage displacement{note_suffix}")
+
+    # ----- segmented travel with R interrupt -----
+
+    def _segmented_travel_move(self, target_stage: np.ndarray, target_b: float, target_c: float, feed: float, comment: Optional[str]) -> None:
+        start_stage = np.asarray(self.base.cur_stage_xyz, dtype=float).copy()
+        start_b = float(self.base.cur_b)
+        start_c = float(self.base.cur_c)
+        target_stage = np.asarray(target_stage, dtype=float).copy()
+        span = float(np.linalg.norm(target_stage - start_stage))
+        b_span = abs(float(target_b) - start_b)
+        c_span = abs(float(target_c) - start_c)
+        n = max(1,
+                int(math.ceil(span / self.travel_segment_mm)) if span > 1e-12 else 1,
+                int(math.ceil(b_span / max(self.b_tune_step_deg, 0.25))) if b_span > 1e-12 else 1,
+                int(math.ceil(c_span / max(self.c_tune_step_deg, 0.25))) if c_span > 1e-12 else 1)
+        if self.ui_state is not None:
+            preview_points: List[np.ndarray] = []
+            for i in range(0, n + 1):
+                t = i / float(n) if n > 0 else 1.0
+                p = start_stage + t * (target_stage - start_stage)
+                b = start_b + t * (float(target_b) - start_b)
+                c = start_c + t * (float(target_c) - start_c)
+                if self.base.write_mode == "calibrated":
+                    preview_points.append(self.vm.tip_xyz_for_stage(self.base.cal, p, b, c))
+                else:
+                    preview_points.append(np.asarray(p, dtype=float).copy())
+            self.ui_state.set_travel_preview_points(preview_points)
+        if self.ui_state is not None:
+            self.ui_state.set_mode("travel", f"Travel move segmented into {n} steps. Press R to interrupt before next segment.")
+        for i in range(1, n + 1):
+            t = i / float(n)
+            p = start_stage + t * (target_stage - start_stage)
+            b = start_b + t * (float(target_b) - start_b)
+            c = start_c + t * (float(target_c) - start_c)
+            self._send_atomic_stage_pose(p, b, c, feed, reason="travel segment")
+            tip = None
+            if self.base.write_mode == "calibrated":
+                tip = self.vm.tip_xyz_for_stage(self.base.cal, p, b, c)
+            self._travel_history.append((p.copy(), float(b), float(c), tip))
+            self._travel_history = self._travel_history[-200:]
+            key = self.keyboard.get_key(0.0)
+            if key in {"r", "R"}:
+                print("\nR pressed: stopping segmented travel and rewinding before manual travel tuning.")
+                if self.ui_state is not None:
+                    self.ui_state.set_mode("travel_interrupt", "R pressed: rewinding a few segments before travel tuning.")
+                self._rewind_and_tune_travel()
+                return
+        if self.ui_state is not None:
+            self.ui_state.clear_travel_preview_points()
+        self._commit_state(target_stage, target_b, target_c)
 
     def _send_atomic_stage_pose(self, p_stage: np.ndarray, b: float, c: float, feed: float, reason: str = "move") -> None:
         p_stage = np.asarray(p_stage, dtype=float)
@@ -1859,7 +1557,7 @@ class InteractiveRobotWriter:
             if abs(float(b) - float(self.base.cur_b)) > 1e-9:
                 self.send_absolute_move_axes(
                     {self.base.cal.b_axis: float(b)},
-                    self._feed_with_rotary_limits(self._b_feed_limit_for_reason(reason), self.base.cur_b, b, self.base.cur_c, self.base.cur_c),
+                    self._feed_with_rotary_limits(self.max_b_move_feed, self.base.cur_b, b, self.base.cur_c, self.base.cur_c),
                     reason="B move",
                 )
                 self._commit_rotary_only_state(b=float(b))
@@ -1878,13 +1576,33 @@ class InteractiveRobotWriter:
         self.send_absolute_move_axes(axes, float(feed), reason=reason)
         self._commit_state(p_stage, b, c)
 
-    def apply_node_rotary_offset(
-        self,
-        offset: ManualGroupOffset,
-        start_tip: np.ndarray,
-        start_tangent: np.ndarray,
-        feed: Optional[float] = None,
-    ) -> None:
+    def _rewind_and_tune_travel(self) -> str:
+        if not self._travel_history:
+            return self._manual_tune_travel_pose()
+        idx = max(0, len(self._travel_history) - 1 - self.travel_rewind_indices)
+        p, b, c, tip = self._travel_history[idx]
+        self._send_atomic_stage_pose(p, b, c, self.tune_feed, reason="travel rewind")
+        self.base.cur_tip_xyz = None if tip is None else np.asarray(tip, dtype=float).copy()
+        return self._manual_tune_travel_pose()
+
+    def rewind_to_previous_branch_end_and_tune_travel(self) -> str:
+        if self.previous_branch_end_pose is None:
+            if self.ui_state is not None:
+                self.ui_state.set_mode("travel_rewind", "No previous branch end pose is available yet.")
+            return "none"
+        p, b, c, tip = self.previous_branch_end_pose
+        if self.ui_state is not None:
+            self.ui_state.set_mode("travel_rewind", "Rewinding to previous branch end for manual travel retuning.")
+        self._send_atomic_stage_pose(np.asarray(p, dtype=float), float(b), float(c), self.tune_feed, reason="branch rewind")
+        self.base.cur_tip_xyz = None if tip is None else np.asarray(tip, dtype=float).copy()
+        while True:
+            try:
+                return self._manual_tune_travel_pose()
+            except RestartTravelTune:
+                self._send_atomic_stage_pose(np.asarray(p, dtype=float), float(b), float(c), self.tune_feed, reason="branch rewind")
+                self.base.cur_tip_xyz = None if tip is None else np.asarray(tip, dtype=float).copy()
+
+    def apply_node_rotary_offset(self, offset: ManualGroupOffset, start_tip: np.ndarray, start_tangent: np.ndarray) -> None:
         if abs(float(offset.node_delta_b_deg)) <= 1e-12 and abs(float(offset.node_delta_c_deg)) <= 1e-12:
             return
         _, base_b, base_c = self.base.tip_to_stage(
@@ -1898,11 +1616,11 @@ class InteractiveRobotWriter:
         target_c = float(self.vm.unwrap_angle_deg_near(target_c, float(self.base.cur_c)))
         if abs(target_b - float(self.base.cur_b)) <= 1e-9 and abs(target_c - float(self.base.cur_c)) <= 1e-9:
             return
-        self._move_to_tip_with_explicit_bc_synced(
+        self._move_to_tip_with_explicit_bc(
             np.asarray(start_tip, dtype=float),
             target_b,
             target_c,
-            self.tune_feed if feed is None else float(feed),
+            self.tune_feed,
             reason="node rotary tune",
         )
 
@@ -1917,7 +1635,7 @@ class InteractiveRobotWriter:
         print("=" * 72)
         if self.ui_state is not None:
             self.ui_state.set_mode("node_tune", f"Tune start node for group {group_number}. Use keys/buttons, then Space/Accept.")
-            update_manual_window_state(self.ui_state, self.manual_offsets, group_number, getattr(self.ui_state, "plan_paths", None))
+            update_manual_window_state(self.ui_state, self.manual_offsets, group_number)
 
         # Tune node start by moving machine XYZ directly while keeping B/C fixed.
         base_stage, base_b, base_c = self.base.tip_to_stage(
@@ -1933,26 +1651,29 @@ class InteractiveRobotWriter:
         target_b = base_b + working_b
         target_c = base_c + working_c
         if not self._tip_and_rotary_match_target(target_tip, target_b, target_c):
-            self._move_to_tip_with_explicit_bc_synced(target_tip, target_b, target_c, self.tune_feed, reason="manual node tune")
+            self._move_to_tip_with_explicit_bc(target_tip, target_b, target_c, self.tune_feed, reason="manual node tune")
         self.base.last_tip_tangent = np.asarray(start_tangent, dtype=float).copy()
 
         while True:
             key = self.keyboard.get_key(0.1)
             if key is None:
                 continue
+            if key in {"BACK", "LEFT"}:
+                if self.ui_state is not None:
+                    self.ui_state.set_mode("travel_rewind", f"Leaving node tuning for group {group_number}; rewinding to previous branch end.")
+                raise RewindCurrentBranchToTravel()
             if key in {"q", "Q", "ESC"}:
                 raise KeyboardInterrupt("Manual tuning aborted by user.")
-            if key in {"SPACE", "RIGHT", "FORWARD"}:
+            if key == "SPACE":
                 offset.node_gantry_offset_mm = working.copy()
                 offset.node_delta_b_deg = float(working_b)
                 offset.node_delta_c_deg = float(working_c)
-                offset.note = f"node taught {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                offset.note = f"node tuned {time.strftime('%Y-%m-%d %H:%M:%S')}"
                 self.manual_offsets[group_number] = offset
-                save_manual_offsets(self.manual_file, self.manual_offsets, getattr(self.ui_state, "plan_paths", None))
-                self.mark_node_start_accepted(group_number)
-                update_manual_window_state(self.ui_state, self.manual_offsets, group_number, getattr(self.ui_state, "plan_paths", None))
+                save_manual_offsets(self.manual_file, self.manual_offsets)
+                update_manual_window_state(self.ui_state, self.manual_offsets, group_number)
                 if self.ui_state is not None:
-                    self.ui_state.set_mode("moving", f"Accepted and saved node offset for group {group_number}.")
+                    self.ui_state.set_mode("moving", f"Accepted node offset for group {group_number}.")
                 print(f"Accepted node offset for group {group_number}: {working}")
                 return offset
             delta = np.zeros(3, dtype=float)
@@ -1982,129 +1703,113 @@ class InteractiveRobotWriter:
             if self.ui_state is not None:
                 self.ui_state.set_mode("node_tune", f"Node offset group {group_number}: [{working[0]:.3f}, {working[1]:.3f}, {working[2]:.3f}] dB={working_b:.3f} dC={working_c:.3f}")
             target_tip = np.asarray(base_start_tip, dtype=float).copy() + working
-            self._move_to_tip_with_explicit_bc_synced(target_tip, base_b + working_b, base_c + working_c, self.tune_feed, reason="manual node tune")
+            self._move_to_tip_with_explicit_bc(target_tip, base_b + working_b, base_c + working_c, self.tune_feed, reason="manual node tune")
             self.base.last_tip_tangent = np.asarray(start_tangent, dtype=float).copy()
             print(f" node_offset = [{working[0]:.3f}, {working[1]:.3f}, {working[2]:.3f}] dB={working_b:.3f} dC={working_c:.3f}", end="\r", flush=True)
 
-    def tune_group_travel(self, group_number: int, path_id: str, offset: ManualGroupOffset) -> ManualGroupOffset:
+    def _manual_tune_travel_pose(self) -> str:
+        group = self.current_group_number or 0
+        offset = self.manual_offsets.get(group, ManualGroupOffset(group_number=group))
         print("\n" + "=" * 72)
-        print(f"Manual travel tuning after group {group_number}: {path_id}")
-        print("Keys: a/d X-/X+, w/s Y-/Y+, ↑/↓ Z+/Z-, i/k B+/B-, l/j C+/C-, Right/Space accept, q/Esc abort")
-        print(f"Current travel offset: {offset.delta_tip_xyz} dB={offset.delta_b_deg:.3f} dC={offset.delta_c_deg:.3f}")
+        print(f"Manual travel tuning for group {group} / {self.current_path_id or 'unknown path'}")
+        print("Keys: a/d X-/X+, w/s Y-/Y+, ↑/↓ Z+/Z-, i/k B+/B-, l/j C+/C-, space accept, q/Esc abort")
         print("=" * 72)
-        if self.base.cur_stage_xyz is None:
-            raise RuntimeError("Cannot tune travel before any stage pose has been established.")
-
-        base_stage = np.asarray(self.base.cur_stage_xyz, dtype=float).copy()
-        base_b = float(self.base.cur_b)
-        base_c = float(self.base.cur_c)
-        base_tip = (
-            np.asarray(self.base.cur_tip_xyz, dtype=float).copy()
-            if self.base.cur_tip_xyz is not None
-            else self.vm.tip_xyz_for_stage(
-                self.base.cal,
-                base_stage,
-                base_b,
-                base_c,
-                motion_phase=getattr(self.base, "current_motion_phase", None),
-            )
-        )
-        working = np.asarray(offset.delta_tip_xyz, dtype=float).copy()
-        working_b = float(offset.delta_b_deg)
-        working_c = float(offset.delta_c_deg)
-
         if self.ui_state is not None:
-            self.ui_state.set_mode("travel_tune", f"Tune post-branch travel for group {group_number}. Use keys/buttons, then Space/Accept.")
-            self.ui_state.begin_manual_travel_trace(base_stage)
-
-        def move_to_working_target() -> None:
-            target_tip = np.asarray(base_tip, dtype=float).copy() + working
-            target_b = base_b + working_b
-            target_c = base_c + working_c
-            target_stage = self._move_to_tip_with_explicit_bc_synced(
-                target_tip,
-                target_b,
-                target_c,
-                self.tune_feed,
-                reason="manual travel tune",
-            )
-            if self.ui_state is not None:
-                self.ui_state.append_manual_travel_point(target_stage)
-
-        if float(np.linalg.norm(working)) > 1e-12 or abs(working_b) > 1e-12 or abs(working_c) > 1e-12:
-            move_to_working_target()
-
+            self.ui_state.set_mode("travel_tune", f"Tune travel pose for group {group}. Use XYZ/B/C keys/buttons, then Space/Accept.")
+            update_manual_window_state(self.ui_state, self.manual_offsets, group)
+            self.ui_state.begin_manual_travel_trace(self.base.cur_tip_xyz)
+        d_xyz = np.zeros(3, dtype=float)
+        d_b = 0.0
+        d_c = 0.0
         while True:
             key = self.keyboard.get_key(0.1)
             if key is None:
                 continue
             if key in {"q", "Q", "ESC"}:
                 raise KeyboardInterrupt("Manual travel tuning aborted by user.")
-            if key in {"SPACE", "RIGHT", "FORWARD"}:
-                offset.delta_tip_xyz = working.copy()
-                offset.delta_b_deg = float(working_b)
-                offset.delta_c_deg = float(working_c)
-                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-                base_note = str(offset.note or "").strip()
-                travel_note = f"travel taught {timestamp}"
-                offset.note = travel_note if not base_note else f"{base_note} | {travel_note}"
-                self.manual_offsets[group_number] = offset
-                save_manual_offsets(self.manual_file, self.manual_offsets, getattr(self.ui_state, "plan_paths", None))
-                update_manual_window_state(self.ui_state, self.manual_offsets, group_number, getattr(self.ui_state, "plan_paths", None))
+            if key in {"BACK", "LEFT"}:
                 if self.ui_state is not None:
-                    self.ui_state.set_mode("moving", f"Accepted and saved travel offset for group {group_number}.")
-                print(f"Accepted travel offset for group {group_number}: {working} dB={working_b:.3f} dC={working_c:.3f}")
-                return offset
-
-            delta = np.zeros(3, dtype=float)
-            if key == "a":
-                delta[0] -= self.travel_tune_step_mm
-            elif key == "d":
-                delta[0] += self.travel_tune_step_mm
-            elif key == "w":
-                delta[1] -= self.travel_tune_step_mm
-            elif key == "s":
-                delta[1] += self.travel_tune_step_mm
-            elif key == "UP":
-                delta[2] += self.travel_tune_step_mm
-            elif key == "DOWN":
-                delta[2] -= self.travel_tune_step_mm
-            elif key == "i":
-                working_b += self.b_tune_step_deg
-            elif key == "k":
-                working_b -= self.b_tune_step_deg
-            elif key == "l":
-                working_c += self.c_tune_step_deg
-            elif key == "j":
-                working_c -= self.c_tune_step_deg
-            else:
-                continue
-
-            working += delta
+                    self.ui_state.set_mode("travel_rewind", f"Returning to previous branch end for group {group}.")
+                raise RestartTravelTune()
+            if key in {"SPACE", "RIGHT", "FORWARD"}:
+                offset.delta_tip_xyz = np.asarray(offset.delta_tip_xyz, dtype=float) + d_xyz
+                offset.delta_b_deg = float(offset.delta_b_deg) + d_b
+                offset.delta_c_deg = float(offset.delta_c_deg) + d_c
+                offset.note = f"travel tuned {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                self.manual_offsets[group] = offset
+                save_manual_offsets(self.manual_file, self.manual_offsets)
+                update_manual_window_state(self.ui_state, self.manual_offsets, group)
+                if self.ui_state is not None:
+                    self.ui_state.set_mode("moving", f"Accepted travel offset for group {group}.")
+                print(f"Accepted travel offset for group {group}: dXYZ={offset.delta_tip_xyz}, dB={offset.delta_b_deg:.3f}, dC={offset.delta_c_deg:.3f}")
+                return "forward" if key in {"RIGHT", "FORWARD"} else "accept"
+            step_xyz = np.zeros(3, dtype=float)
+            step_b = 0.0
+            step_c = 0.0
+            if key == "a": step_xyz[0] -= self.travel_tune_step_mm
+            elif key == "d": step_xyz[0] += self.travel_tune_step_mm
+            elif key == "w": step_xyz[1] -= self.travel_tune_step_mm
+            elif key == "s": step_xyz[1] += self.travel_tune_step_mm
+            elif key == "UP": step_xyz[2] += self.travel_tune_step_mm
+            elif key == "DOWN": step_xyz[2] -= self.travel_tune_step_mm
+            elif key == "i": step_b += self.b_tune_step_deg
+            elif key == "k": step_b -= self.b_tune_step_deg
+            elif key == "l": step_c += self.c_tune_step_deg
+            elif key == "j": step_c -= self.c_tune_step_deg
+            else: continue
+            d_xyz += step_xyz
+            d_b += step_b
+            d_c += step_c
             if self.ui_state is not None:
-                self.ui_state.set_mode("travel_tune", f"Travel offset group {group_number}: [{working[0]:.3f}, {working[1]:.3f}, {working[2]:.3f}] dB={working_b:.3f} dC={working_c:.3f}")
-            move_to_working_target()
-            print(f" travel_offset = [{working[0]:.3f}, {working[1]:.3f}, {working[2]:.3f}] dB={working_b:.3f} dC={working_c:.3f}", end="\r", flush=True)
-
+                self.ui_state.set_mode("travel_tune", f"Travel delta dXYZ=[{d_xyz[0]:.3f},{d_xyz[1]:.3f},{d_xyz[2]:.3f}] dB={d_b:.3f} dC={d_c:.3f}")
+            p = np.asarray(self.base.cur_stage_xyz, dtype=float).copy()
+            if np.linalg.norm(step_xyz) > 0.0:
+                p = p + step_xyz
+                self.send_absolute_move_axes(
+                    {
+                        self.base.cal.x_axis: float(p[0]),
+                        self.base.cal.y_axis: float(p[1]),
+                        self.base.cal.z_axis: float(p[2]),
+                    },
+                    self.tune_feed,
+                    reason="manual travel XYZ tune",
+                )
+                self._commit_state(p, float(self.base.cur_b), float(self.base.cur_c))
+            b = float(self.base.cur_b)
+            c = float(self.base.cur_c)
+            if abs(step_b) > 0.0:
+                b = b + step_b
+                self.send_absolute_move_axes(
+                    {self.base.cal.b_axis: float(b)},
+                    self.max_b_move_feed,
+                    reason="manual travel B tune",
+                )
+                self._commit_rotary_only_state(b=float(b))
+            if abs(step_c) > 0.0:
+                c = c + step_c
+                self.send_absolute_move_axes(
+                    {self.base.cal.c_axis: float(c)},
+                    max(self.min_c_move_feed, self.rotary_tune_feed),
+                    reason="manual travel C tune",
+                )
+                self._commit_rotary_only_state(c=float(c))
+            if self.ui_state is not None:
+                self.ui_state.append_manual_travel_point(self.base.cur_tip_xyz)
+            print(f" travel_delta dXYZ=[{d_xyz[0]:.3f},{d_xyz[1]:.3f},{d_xyz[2]:.3f}] dB={d_b:.3f} dC={d_c:.3f}", end="\r", flush=True)
 
 # ------------------------- planning shared with vasc_manual.main -------------------------
 
 def build_plan_from_args(vm: Any, args: argparse.Namespace):
     write_mode = str(args.write_mode).strip().lower()
     manual_offsets = parse_manual_offsets(args.group_displacements_file, vm)
-    normalize_manual_offset_feeds(manual_offsets, default_feed=float(args.travel_feed))
+    group_displacements = {k: v.to_vm(vm) for k, v in manual_offsets.items()}
 
     vessels = vm.parse_vessel_file(args.vessels)
     selected_vessel_ids = vm.parse_vessel_id_selection(args.vessel_ids)
     vessels = vm.filter_vessels_by_id(vessels, selected_vessel_ids)
     preferred_main_vessel_ids = None if args.main_vessel_ids is None else vm.parse_vessel_id_selection(args.main_vessel_ids)
     rotate_origin = (float(args.rotate_origin_x), float(args.rotate_origin_y), float(args.rotate_origin_z))
-    transform_info = vm.transform_vessel_geometry_with_z(
-        vessels,
-        rotate_y_deg=float(args.rotate_y_deg),
-        rotate_z_deg=float(args.rotate_z_deg),
-        rotate_origin=rotate_origin,
-    )
+    vm.transform_vessel_geometry(vessels, rotate_y_deg=float(args.rotate_y_deg), rotate_origin=rotate_origin)
     scale_origin, geometry_scale = vm.scale_vessel_geometry(vessels, float(args.geometry_scale))
     alignment_info = None
     if args.align_lowest_centroid is not None:
@@ -2150,9 +1855,6 @@ def build_plan_from_args(vm: Any, args: argparse.Namespace):
         branch_overlap_tangent_window_mm=float(args.branch_overlap_tangent_window_mm),
         preferred_main_vessel_ids=preferred_main_vessel_ids,
     )
-    manual_offsets = ensure_manual_offsets_cover_paths(manual_offsets, paths)
-    normalize_manual_offset_feeds(manual_offsets, default_feed=float(args.travel_feed))
-    group_displacements = {k: v.to_vm(vm) for k, v in manual_offsets.items()}
 
     return {
         "vessels": vessels,
@@ -2165,25 +1867,13 @@ def build_plan_from_args(vm: Any, args: argparse.Namespace):
         "group_displacements": group_displacements,
         "preferred_main_vessel_ids": preferred_main_vessel_ids,
         "rotate_origin": rotate_origin,
-        "rotate_z_origin": np.asarray(transform_info["rotate_z_origin"], dtype=float).copy(),
         "scale_origin": scale_origin,
         "geometry_scale": geometry_scale,
         "alignment_info": alignment_info,
-        "travel_feed": float(args.travel_feed),
     }
 
 
 def save_gcode(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
-    group_displacements = {k: v.to_vm(vm) for k, v in plan["manual_offsets"].items()}
-    if str(args.orientation_mode).strip().lower() == "fixed":
-        for disp in group_displacements.values():
-            disp.node_gantry_offset_mm = np.zeros(3, dtype=float)
-            disp.node_delta_b_deg = 0.0
-            disp.node_delta_c_deg = 0.0
-    radius_feed_map = vm.parse_radius_feed_map(
-        raw=str(args.radius_feed_map or ""),
-        file_path=None if args.radius_feed_map_file is None else str(args.radius_feed_map_file),
-    )
     ranges = vm.write_vessel_gcode(
         out_path=args.out,
         vessels=plan["vessels"],
@@ -2200,7 +1890,6 @@ def save_gcode(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
         pressure_advance_feed=float(args.pressure_advance_feed),
         pressure_retract_feed=float(args.pressure_retract_feed),
         preflow_dwell_ms=int(args.preflow_dwell_ms),
-        start_node_dwell_ms=int(args.start_node_dwell_ms),
         node_dwell_ms=int(args.node_dwell_ms),
         edge_samples=int(args.edge_samples),
         write_mode=str(args.write_mode),
@@ -2210,17 +1899,11 @@ def save_gcode(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
         c_max_step_deg=float(args.c_max_step_deg),
         b_smoothing_alpha=float(args.b_smoothing_alpha),
         c_smoothing_alpha=float(args.c_smoothing_alpha),
-        travel_c_max_step_deg=None if args.travel_c_max_step_deg is None else float(args.travel_c_max_step_deg),
-        travel_c_smoothing_alpha=None if args.travel_c_smoothing_alpha is None else float(args.travel_c_smoothing_alpha),
-        c_min_deg=float(args.c_min_deg),
-        c_max_deg=float(args.c_max_deg),
         min_tangent_xy_for_c=float(args.min_tangent_xy_for_c),
         tangent_smooth_window=int(args.tangent_smooth_window),
         centerline_smooth_window=int(args.centerline_smooth_window),
         rotate_y_deg=float(args.rotate_y_deg),
-        rotate_z_deg=float(args.rotate_z_deg),
         rotate_origin=plan["rotate_origin"],
-        rotate_z_origin=plan["rotate_z_origin"],
         geometry_scale=float(plan["geometry_scale"]),
         vessel_order_mode=str(args.vessel_order_mode),
         simplify_paths=bool(args.simplify_endpoint_chains),
@@ -2250,16 +1933,9 @@ def save_gcode(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
         skeleton_collision_sample_step_mm=float(args.skeleton_collision_sample_step_mm),
         travel_accel_mm_s2=float(args.travel_accel_mm_s2),
         post_print_travel_accel_scale=float(args.post_print_travel_accel_scale),
-        travel_strategy=str(args.travel_strategy),
-        enable_aorta_cylinder_travel=bool(args.enable_aorta_cylinder_travel),
-        aorta_cylinder_clearance_mm=float(args.aorta_cylinder_clearance_mm),
-        aorta_cylinder_min_radius_mm=float(args.aorta_cylinder_min_radius_mm),
-        aorta_cylinder_samples=int(args.aorta_cylinder_samples),
         machine_start_pose=(float(args.machine_start_x), float(args.machine_start_y), float(args.machine_start_z), float(args.machine_start_b), float(args.machine_start_c)),
         machine_end_pose=(float(args.machine_end_x), float(args.machine_end_y), float(args.machine_end_z), float(args.machine_end_b), float(args.machine_end_c)),
-        extrusion_feed_mode=str(args.extrusion_feed_mode),
-        radius_feed_map=radius_feed_map,
-        group_displacements=group_displacements,
+        group_displacements=plan["group_displacements"],
     )
     print(f"Wrote G-code to {args.out}")
     print(f"Ranges: {ranges}")
@@ -2276,13 +1952,12 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
         raise ImportError("Missing duetwebapi. Install with: pip install duetwebapi==1.1.0")
     manual_file = args.group_displacements_file or DEFAULT_MANUAL_FILE
     if not Path(manual_file).exists():
-        save_manual_offsets(manual_file, plan["manual_offsets"], plan["paths"])
+        save_manual_offsets(manual_file, plan["manual_offsets"])
     if ui_state is not None:
         ui_state.manual_file = str(manual_file)
-        ui_state.plan_paths = list(plan["paths"])
         ui_state.total_groups = int(len(plan["paths"]))
         ui_state.set_mode("connecting", f"Connecting to Duet at {args.duet_web_address}")
-        update_manual_window_state(ui_state, plan["manual_offsets"], 1, plan["paths"])
+        update_manual_window_state(ui_state, plan["manual_offsets"], 1)
 
     rrf = DuetWebAPI(str(args.duet_web_address))
     print("Connection attempted. Requesting diagnostics with M122.")
@@ -2295,11 +1970,6 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
     terminal_ctx = contextlib.nullcontext(None) if ui_state is not None else TerminalKeyboard()
     with terminal_ctx as term_kb:
         kb = HybridKeyboard(ui_state, term_kb)
-        radius_feed_map = vm.parse_radius_feed_map(
-            raw=str(args.radius_feed_map or ""),
-            file_path=None if args.radius_feed_map_file is None else str(args.radius_feed_map_file),
-        )
-        feed_mode = str(args.extrusion_feed_mode).strip().lower()
         writer = InteractiveRobotWriter(
             vm, rrf, kb, manual_file, plan["manual_offsets"],
             float(args.node_tune_step_mm), float(args.travel_tune_step_mm),
@@ -2308,9 +1978,6 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             float(args.travel_segment_mm), int(args.travel_rewind_indices),
             float(args.inter_command_delay_s), float(args.min_move_wait_s),
             ui_state=ui_state,
-            approach_b_move_feed=float(args.approach_b_move_feed),
-            start_stop_b_move_feed=float(args.start_stop_b_move_feed),
-            start_stop_slow_samples=int(args.start_stop_slow_samples),
             cal=plan["cal"], bbox=plan["bbox"],
             travel_feed=float(args.travel_feed), approach_feed=float(args.approach_feed),
             fine_approach_feed=float(args.fine_approach_feed), print_feed=float(args.print_feed),
@@ -2318,17 +1985,12 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             pressure_offset_mm=float(args.pressure_offset_mm),
             pressure_advance_feed=float(args.pressure_advance_feed),
             pressure_retract_feed=float(args.pressure_retract_feed),
-            preflow_dwell_ms=int(args.preflow_dwell_ms),
-            start_node_dwell_ms=int(args.start_node_dwell_ms),
-            node_dwell_ms=int(args.node_dwell_ms),
+            preflow_dwell_ms=int(args.preflow_dwell_ms), node_dwell_ms=int(args.node_dwell_ms),
             edge_samples=int(args.edge_samples), emit_extrusion=(False if bool(args.no_extrusion) else float(args.extrusion_per_mm) != 0.0),
             write_mode=str(args.write_mode), orientation_mode=str(args.orientation_mode),
             bc_solve_samples=int(args.bc_solve_samples),
             b_max_step_deg=float(args.b_max_step_deg), c_max_step_deg=float(args.c_max_step_deg),
             b_smoothing_alpha=float(args.b_smoothing_alpha), c_smoothing_alpha=float(args.c_smoothing_alpha),
-            travel_c_max_step_deg=None if args.travel_c_max_step_deg is None else float(args.travel_c_max_step_deg),
-            travel_c_smoothing_alpha=None if args.travel_c_smoothing_alpha is None else float(args.travel_c_smoothing_alpha),
-            c_min_deg=float(args.c_min_deg), c_max_deg=float(args.c_max_deg),
             min_tangent_xy_for_c=float(args.min_tangent_xy_for_c),
             travel_clearance_above_printed_z=float(args.travel_clearance_above_printed_z),
             travel_bbox_margin=float(args.travel_bbox_margin),
@@ -2340,44 +2002,12 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             skeleton_collision_sample_step_mm=float(args.skeleton_collision_sample_step_mm),
             travel_accel_mm_s2=float(args.travel_accel_mm_s2),
             post_print_travel_accel_scale=float(args.post_print_travel_accel_scale),
-            enable_aorta_cylinder_travel=bool(args.enable_aorta_cylinder_travel),
-            aorta_cylinder_clearance_mm=float(args.aorta_cylinder_clearance_mm),
-            aorta_cylinder_min_radius_mm=float(args.aorta_cylinder_min_radius_mm),
-            aorta_cylinder_samples=int(args.aorta_cylinder_samples),
         )
-
-        group_displacements_vm = {k: v.to_vm(vm) for k, v in plan["manual_offsets"].items()}
-        planned_vasculature_paths: List[Any] = []
-        for group_idx, path in enumerate(plan["paths"], start=1):
-            displacement = group_displacements_vm.get(group_idx)
-            cumulative_offset = vm.cumulative_group_node_offset_mm(
-                group_idx,
-                group_displacements_vm,
-                plan.get("group_parent_map"),
-            )
-            planned_points = vm.prepend_group_node_gantry_offset(
-                points=np.asarray(path.points, dtype=float),
-                displacement=displacement,
-                point_merge_tol=float(args.point_merge_tol),
-                cumulative_offset=cumulative_offset,
-            )
-            if len(planned_points) < 2:
-                continue
-            path_radius_mm = max(0.0, float(path.radius_like) * float(plan["geometry_scale"]))
-            planned_vasculature_paths.append(
-                vm.PrintedVasculaturePath(
-                    points_xyz_mm=np.asarray(planned_points, dtype=float).copy(),
-                    radius_mm=path_radius_mm,
-                )
-            )
-        writer.set_planned_vasculature_paths(planned_vasculature_paths)
 
         try:
             writer.send_code("G90", reason="absolute mode")
             if not bool(args.no_extrusion):
-                writer.send_code(writer.base.pressure_off_command, reason="pressure off")
-                if writer.base.vacuum_off_command:
-                    writer.send_code(writer.base.vacuum_off_command, reason="vacuum off")
+                writer.send_code("M42 P0 S0", reason="pressure off")
             if float(args.travel_accel_mm_s2) > 0.0:
                 writer.set_travel_acceleration(float(args.travel_accel_mm_s2), comment="startup: nominal travel acceleration")
 
@@ -2400,99 +2030,94 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
                     continue
                 if ui_state is not None:
                     ui_state.set_group(group_idx, total_paths, str(path.path_id), getattr(path, "source_vessel_ids", []), raw_points)
-                    update_manual_window_state(ui_state, plan["manual_offsets"], group_idx, plan["paths"])
+                    update_manual_window_state(ui_state, plan["manual_offsets"], group_idx)
                 base_tangents = vm.build_tangents_for_points(raw_points, smooth_window=int(args.tangent_smooth_window), centerline_smooth_window=int(args.centerline_smooth_window))
-                group_displacements_vm = {k: v.to_vm(vm) for k, v in plan["manual_offsets"].items()}
-                cumulative_offset = vm.cumulative_group_node_offset_mm(
-                    group_idx,
-                    group_displacements_vm,
-                    plan.get("group_parent_map"),
-                )
-                current_node_offset = np.zeros(3, dtype=float)
-                current_disp = group_displacements_vm.get(group_idx)
-                if current_disp is not None:
-                    current_node_offset = np.asarray(current_disp.node_gantry_offset_mm, dtype=float).reshape(3)
-                inherited_node_offset = np.asarray(cumulative_offset, dtype=float).reshape(3) - current_node_offset
-                base_start_tip = np.asarray(raw_points[0], dtype=float).copy()
-                base_start_tip = base_start_tip + inherited_node_offset
-                points = vm.prepend_group_node_gantry_offset(
-                    points=raw_points,
-                    displacement=group_displacements_vm.get(group_idx),
-                    point_merge_tol=float(args.point_merge_tol),
-                    cumulative_offset=cumulative_offset,
-                )
-                if len(points) < 2:
-                    continue
-                tangents = vm.build_tangents_for_points(points, smooth_window=int(args.tangent_smooth_window), centerline_smooth_window=int(args.centerline_smooth_window))
-                mult = float(args.extrusion_multiplier_main) if bool(path.is_main) else float(args.extrusion_multiplier_branch)
-                path_radius_mm = max(0.0, float(path.radius_like) * float(plan["geometry_scale"]))
-                active_path_print_feed = (
-                    vm.feed_from_radius_map(path_radius_mm, radius_feed_map, float(args.print_feed))
-                    if feed_mode == "weighted"
-                    else float(args.print_feed)
-                )
-                if group_idx == 1:
-                    writer.set_aorta_reference(points)
 
-                print("\n" + "-" * 72)
-                print(f"Printing group {group_idx}: {path.path_id} source_vessels={path.source_vessel_ids}")
-                print("-" * 72)
-                if ui_state is not None:
-                    ui_state.set_mode("approach", f"Approaching group {group_idx}: {path.path_id}")
+                while True:
+                    group_print_complete = False
+                    try:
+                        writer._check_for_immediate_branch_rewind()
+                        advance_from_travel_tune = False
 
-                if (
-                    str(args.orientation_mode).strip().lower() in {"90mode", "90", "ninety", "tangent"}
-                    and group_idx > 1
-                    and bool(args.enable_aorta_cylinder_travel)
-                ):
-                    writer.approach_start_from_aorta_cylinder(points[0], tangents[0], str(path.path_id), final_approach_feed=active_path_print_feed)
-                elif bool(args.enable_side_approach):
-                    writer.approach_start_from_side(points[0], tangents[0], float(args.side_approach_far), float(args.side_approach_near), float(args.side_retreat), float(args.side_lift_z), str(path.path_id), final_approach_feed=active_path_print_feed)
-                else:
-                    writer.approach_start_direct(points[0], tangents[0], str(path.path_id), final_approach_feed=active_path_print_feed)
-                writer.apply_node_rotary_offset(offset, points[0], tangents[0], feed=float(args.fine_approach_feed))
+                        # First go to saved offset node and pause for manual adjustment.
+                        while True:
+                            try:
+                                tuned_offset = writer.tune_node_start(group_idx, str(path.path_id), raw_points[0], base_tangents[0], offset)
+                                break
+                            except RewindCurrentBranchToTravel:
+                                rewind_action = writer.rewind_to_previous_branch_end_and_tune_travel()
+                                offset = plan["manual_offsets"].get(group_idx, ManualGroupOffset(group_number=group_idx))
+                                advance_from_travel_tune = (rewind_action == "forward")
+                                if advance_from_travel_tune:
+                                    break
+                        if advance_from_travel_tune:
+                            tuned_offset = plan["manual_offsets"].get(group_idx, ManualGroupOffset(group_number=group_idx))
+                        plan["manual_offsets"][group_idx] = tuned_offset
+                        update_manual_window_state(ui_state, plan["manual_offsets"], group_idx)
 
-                tuned_offset = writer.tune_node_start(group_idx, str(path.path_id), base_start_tip, base_tangents[0], offset)
-                plan["manual_offsets"][group_idx] = tuned_offset
-                normalize_manual_offset_feeds(plan["manual_offsets"], default_feed=float(args.travel_feed))
-                update_manual_window_state(ui_state, plan["manual_offsets"], group_idx, plan["paths"])
+                        cumulative_offset = vm.cumulative_group_node_offset_mm(
+                            group_idx,
+                            {k: v.to_vm(vm) for k, v in plan["manual_offsets"].items()},
+                            plan.get("group_parent_map"),
+                        )
+                        points = apply_node_stage_offset_to_points(raw_points, tuned_offset, cumulative_offset=cumulative_offset)
+                        if len(points) < 2:
+                            break
+                        tangents = vm.build_tangents_for_points(points, smooth_window=int(args.tangent_smooth_window), centerline_smooth_window=int(args.centerline_smooth_window))
+                        mult = float(args.extrusion_multiplier_main) if bool(path.is_main) else float(args.extrusion_multiplier_branch)
 
-                group_displacements_vm = {k: v.to_vm(vm) for k, v in plan["manual_offsets"].items()}
-                cumulative_offset = vm.cumulative_group_node_offset_mm(
-                    group_idx,
-                    group_displacements_vm,
-                    plan.get("group_parent_map"),
-                )
-                points = vm.prepend_group_node_gantry_offset(
-                    points=raw_points,
-                    displacement=group_displacements_vm.get(group_idx),
-                    point_merge_tol=float(args.point_merge_tol),
-                    cumulative_offset=cumulative_offset,
-                )
-                if len(points) < 2:
-                    continue
-                tangents = vm.build_tangents_for_points(points, smooth_window=int(args.tangent_smooth_window), centerline_smooth_window=int(args.centerline_smooth_window))
+                        if advance_from_travel_tune:
+                            if ui_state is not None:
+                                ui_state.set_mode("approach", f"Advancing to group {group_idx} start for node tuning.")
+                            if not current_tip_matches_start(writer, points[0]):
+                                if bool(args.enable_side_approach):
+                                    writer.approach_start_from_side(points[0], tangents[0], float(args.side_approach_far), float(args.side_approach_near), float(args.side_retreat), float(args.side_lift_z), str(path.path_id))
+                                else:
+                                    writer.approach_start_direct(points[0], tangents[0], str(path.path_id))
+                            writer.apply_node_rotary_offset(tuned_offset, points[0], tangents[0])
+                            continue
 
-                if writer.consume_node_start_accepted(group_idx) or current_tip_matches_start(writer, points[0]):
-                    if ui_state is not None:
-                        ui_state.set_mode("ready_to_print", f"At node start for group {group_idx}; starting print.")
-                else:
-                    writer._move_to_tip_with_explicit_bc(points[0], writer.base.cur_b, writer.base.cur_c, float(args.fine_approach_feed), reason="node start resync")
+                        print("\n" + "-" * 72)
+                        print(f"Printing group {group_idx}: {path.path_id} source_vessels={path.source_vessel_ids}")
+                        print("-" * 72)
+                        if ui_state is not None:
+                            ui_state.set_mode("approach", f"Approaching group {group_idx}: {path.path_id}")
 
-                writer.print_polyline(
-                    points,
-                    tangents,
-                    extrusion_multiplier=mult,
-                    label=str(path.path_id),
-                    path_radius_mm=path_radius_mm,
-                    print_feed_override=active_path_print_feed,
-                    radius_profile_mm=np.asarray(path.radius_profile, dtype=float) * float(plan["geometry_scale"]),
-                )
-                if group_idx < total_paths:
-                    tuned_offset = writer.tune_group_travel(group_idx, str(path.path_id), plan["manual_offsets"][group_idx])
-                    plan["manual_offsets"][group_idx] = tuned_offset
-                    normalize_manual_offset_feeds(plan["manual_offsets"], default_feed=float(args.travel_feed))
-                update_manual_window_state(ui_state, plan["manual_offsets"], group_idx + 1 if group_idx < total_paths else group_idx, plan["paths"])
+                        start_pose_ready = current_tip_matches_start(writer, points[0])
+                        if start_pose_ready:
+                            print("Accepted node tune is already at the print start; skipping extra approach/orientation sync.")
+                            if ui_state is not None:
+                                ui_state.set_mode("ready_to_print", f"At node start for group {group_idx}; starting print without extra approach move.")
+                        else:
+                            if bool(args.enable_side_approach):
+                                writer.approach_start_from_side(points[0], tangents[0], float(args.side_approach_far), float(args.side_approach_near), float(args.side_retreat), float(args.side_lift_z), str(path.path_id))
+                            else:
+                                writer.approach_start_direct(points[0], tangents[0], str(path.path_id))
+                            writer.apply_node_rotary_offset(tuned_offset, points[0], tangents[0])
+
+                        writer.print_polyline(points, tangents, extrusion_multiplier=mult, label=str(path.path_id), path_radius_mm=max(0.0, float(path.radius_like) * float(plan["geometry_scale"])))
+                        group_print_complete = True
+                        # Keep compatibility with existing post-group displacement behavior.
+                        if tuned_offset is not None:
+                            if ui_state is not None:
+                                ui_state.set_mode("post_group", f"Applying saved post-group displacement for {path.path_id}")
+                            writer.apply_group_displacement(tuned_offset.to_vm(vm), default_feed=float(args.travel_feed), label=f"group_{group_idx:03d}_{path.path_id}")
+                        save_manual_offsets(manual_file, plan["manual_offsets"])
+                        update_manual_window_state(ui_state, plan["manual_offsets"], group_idx + 1 if group_idx < total_paths else group_idx)
+                        break
+                    except ImmediateBranchRewindRequested:
+                        rewind_action = writer.rewind_to_previous_branch_end_and_tune_travel()
+                        offset = plan["manual_offsets"].get(group_idx, ManualGroupOffset(group_number=group_idx))
+                        if ui_state is not None:
+                            if group_print_complete:
+                                ui_state.set_mode("travel_rewind", f"Rewind complete after printing group {group_idx}; travel retuned, proceeding to the next branch.")
+                            else:
+                                next_step = "moving to the branch start for node tuning." if rewind_action == "forward" else "retune travel, then retune the node start again."
+                                ui_state.set_mode("travel_rewind", f"Rewind complete for group {group_idx}; {next_step}")
+                        if group_print_complete:
+                            save_manual_offsets(manual_file, plan["manual_offsets"])
+                            update_manual_window_state(ui_state, plan["manual_offsets"], group_idx + 1 if group_idx < total_paths else group_idx)
+                            break
 
             if writer.base.cur_stage_xyz is None:
                 raise RuntimeError("No machine pose established; cannot shut down.")
@@ -2502,15 +2127,13 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             shutdown_stage[2] = float(args.machine_end_z)
             writer.write_move(shutdown_stage, float(writer.base.cur_b), float(writer.base.cur_c), float(args.travel_feed), comment=f"shutdown: lift to Z={float(args.machine_end_z):.3f}")
             if not bool(args.no_extrusion):
-                writer.send_code(writer.base.pressure_off_command, reason="pressure off")
-                if writer.base.vacuum_off_command:
-                    writer.send_code(writer.base.vacuum_off_command, reason="vacuum off")
+                writer.send_code("M42 P0 S0", reason="pressure off")
 
             print("\nInteractive print complete.")
-            print(f"Taught offsets saved to {manual_file}")
+            print(f"Manual offsets saved to {manual_file}")
             print(f"Command ranges: {writer.base.command_ranges()}")
             if ui_state is not None:
-                ui_state.set_done(f"Interactive print complete. Taught offsets saved to {manual_file}.")
+                ui_state.set_done(f"Interactive print complete. Manual offsets saved to {manual_file}")
         except KeyboardInterrupt as exc:
             if ui_state is not None:
                 ui_state.set_error(f"Stopped: {exc}")
@@ -2524,11 +2147,8 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
 def run_interactive_print_gui(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
     manual_file = args.group_displacements_file or DEFAULT_MANUAL_FILE
     state = SharedPrintState(manual_file=str(manual_file))
-    state.plan_paths = list(plan["paths"])
-    update_manual_window_state(state, plan["manual_offsets"], 1, plan["paths"])
+    update_manual_window_state(state, plan["manual_offsets"], 1)
     app = PrintGUIApp(
-        vm=vm,
-        args=args,
         state=state,
         plan=plan,
         manual_file=str(manual_file),
@@ -2580,8 +2200,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         orientation_mode="tangent",
         rotate_y_deg=180.0,
         align_lowest_centroid=[100.0, 100.0, -160.0],
+        vessel_order_mode="ascending_start_z",
         simplify_endpoint_chains=True,
         branch_start_overlap_mm=1.5,
+        main_vessel_ids="79,78,80,30,29,55,53,56,73,5,4",
         travel_clearance_above_printed_z=10.0,
         fine_approach_distance=3.0,
         geometry_scale=1.0,
@@ -2600,7 +2222,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         travel_feed=DEFAULT_TRAVEL_FEED_OVERRIDE,
         print_feed=DEFAULT_PRINT_FEED_OVERRIDE,
     )
-    ap.description = "Interactive physical runner for gcode_generation/vasc_manual_90.py, with optional save-gcode mode."
+    ap.description = "Interactive physical runner for gcode_generation/vasc_manual.py, with optional save-gcode mode."
     ap.add_argument("--run-mode", choices=["print", "save-gcode"], default="print", help="print sends commands to the robot; save-gcode writes --out only.")
     ap.add_argument("--no-extrusion", action="store_true", default=False, help="Do not actuate pressure/extrusion commands during --run-mode print; in save-gcode mode, sets effective extrusion_per_mm to 0.")
     ap.add_argument("--duet-web-address", default=DEFAULT_DUET_WEB_ADDRESS, help="Duet Web Control address used in --run-mode print.")
@@ -2610,9 +2232,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--c-tune-step-deg", type=float, default=DEFAULT_C_TUNE_STEP_DEG, help="C tuning step. Default 1 deg.")
     ap.add_argument("--tune-feed", type=float, default=DEFAULT_TUNE_FEED)
     ap.add_argument("--rotary-tune-feed", type=float, default=DEFAULT_ROTARY_TUNE_FEED, help="Higher feedrate used for B/C manual tuning moves.")
-    ap.add_argument("--approach-b-move-feed", type=float, default=DEFAULT_APPROACH_B_MOVE_FEED, help="Maximum standalone B-axis feed, in deg/min, during approach/reorientation moves before printing.")
-    ap.add_argument("--start-stop-b-move-feed", type=float, default=DEFAULT_START_STOP_B_MOVE_FEED, help="Maximum B-axis component speed, in deg/min, for the first/last print samples of each branch.")
-    ap.add_argument("--start-stop-slow-samples", type=int, default=DEFAULT_START_STOP_SLOW_SAMPLES, help="How many print samples at the start and end of each branch use the slower B-axis cap.")
     ap.add_argument("--travel-segment-mm", type=float, default=DEFAULT_TRAVEL_SEGMENT_MM, help="Maximum stage-space segment length for interruptible travel moves.")
     ap.add_argument("--travel-rewind-indices", type=int, default=DEFAULT_TRAVEL_REWIND_INDICES, help="How many internal travel segments to move back after R.")
     ap.add_argument("--print-rewind-samples", type=int, default=DEFAULT_PRINT_REWIND_SAMPLES, help="How many print samples to rewind when the print-rewind toggle is armed.")
@@ -2627,7 +2246,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     # Import once here so this script can live outside the package but still use
-    # the current local vasc_manual_90.py implementation.
+    # the current local vasc_manual.py implementation.
     vm = import_vasc_manual_module()
     ap = build_arg_parser()
     args = ap.parse_args()
@@ -2641,7 +2260,7 @@ def main() -> None:
         print(f"Wrote print groups to {args.groups_out}")
 
     # Keep the manual file in sync before doing anything risky.
-    save_manual_offsets(str(args.group_displacements_file), plan["manual_offsets"], plan["paths"])
+    save_manual_offsets(str(args.group_displacements_file), plan["manual_offsets"])
 
     summary = vm.summarize_vessels(plan["vessels"])
     path_summary = vm.summarize_paths(plan["paths"])

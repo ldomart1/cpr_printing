@@ -120,8 +120,8 @@ DEFAULT_FLIP_RZ_SIGN = True
 
 OFFPLANE_SIGN = -1.0
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
-DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260627_161714.png")
+DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260708_120830.npz")
+DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260708_120944.png")
 DEFAULT_POST_THRESHOLD = 200
 DEFAULT_POST_TIP_REFINE_MODE = "none"
 DEFAULT_POST_TIP_DETECTION_MODE = "red_dot"
@@ -793,6 +793,18 @@ class FixedOrientationGridRunner:
             cv2.destroyAllWindows()
             print("Camera disconnected.")
 
+    def capture_preview_frame(self, flush_frames: int = 1) -> np.ndarray:
+        if self.cam is None:
+            raise RuntimeError("Camera is not connected.")
+        for _ in range(max(0, int(flush_frames))):
+            _ = self.cam.read()
+        ret, image = self.cam.read()
+        if not ret or image is None:
+            ret, image = self.cam.read()
+        if not ret or image is None:
+            raise RuntimeError("Failed to capture preview frame for manual crop selection.")
+        return image
+
     def capture_and_save(
         self,
         sample_idx: int,
@@ -1197,6 +1209,18 @@ class FixedOrientationGridRunner:
 # Main
 # =========================
 
+def _prepare_post_analysis_crop_from_camera(runner, process_module_name: str, flush_frames: int) -> dict:
+    process_module = __import__(process_module_name, fromlist=["interactive_crop_from_image"])
+    interactive_crop = getattr(process_module, "interactive_crop_from_image", None)
+    if interactive_crop is None:
+        raise RuntimeError(f"{process_module_name} is missing interactive_crop_from_image().")
+    print("\nLaunching manual crop selection on a live sample frame before acquisition...")
+    preview_image = runner.capture_preview_frame(flush_frames=flush_frames)
+    analysis_crop = interactive_crop(preview_image)
+    print(f"Selected pre-acquisition analysis_crop: {analysis_crop}")
+    return dict(analysis_crop)
+
+
 def main(args):
     cal = load_calibration(args.calibration)
 
@@ -1284,6 +1308,7 @@ def main(args):
         add_date=bool(args.add_date),
     )
 
+    post_analysis_crop = None
     try:
         runner.connect_to_camera(
             cam_port=int(args.cam_port),
@@ -1293,6 +1318,13 @@ def main(args):
             width=int(args.camera_width),
             height=int(args.camera_height),
         )
+
+        if bool(args.enable_post):
+            post_analysis_crop = _prepare_post_analysis_crop_from_camera(
+                runner,
+                process_module_name="calib_point_process",
+                flush_frames=int(args.camera_flush_frames),
+            )
 
         runner.connect_to_robot(args.duet_web_address)
 
@@ -1384,6 +1416,13 @@ def main(args):
                 post_cmd.append("--save_plots")
             if bool(args.post_save_analysis_config):
                 post_cmd.append("--save_analysis_config")
+            if post_analysis_crop is not None:
+                post_cmd.extend([
+                    "--crop_width_min", str(int(post_analysis_crop["crop_width_min"])),
+                    "--crop_width_max", str(int(post_analysis_crop["crop_width_max"])),
+                    "--crop_height_min", str(int(post_analysis_crop["crop_height_min"])),
+                    "--crop_height_max", str(int(post_analysis_crop["crop_height_max"])),
+                ])
 
             print("\nRunning post-processing:")
             print(" ".join(post_cmd))

@@ -8,6 +8,9 @@ This script keeps the offline workflow:
 - create/reuse a calibration project with `raw_image_data_folder`
 - use the first image for crop and ruler setup
 
+It can also reuse an existing `processed_image_data_folder` to rerun only the
+postprocessing/export stage when the raw images are no longer available.
+
 The actual image analysis and postprocessing are performed by
 `shadow_calibration.CTR_Shadow_Calibration` without monkey-patching or
 re-implementing its analysis pipeline.
@@ -36,8 +39,8 @@ DEFAULT_THRESHOLD = 220
 DEFAULT_FIT_MODEL = "pchip"
 DEFAULT_OFFPLANE_FIT_MODEL = "pchip"
 DEFAULT_CAMERA_CALIBRATION_FILE = SCRIPT_DIR / "captures" / "calibration_webcam_20260406_104136.npz"
-DEFAULT_BOARD_REFERENCE_IMAGE = SCRIPT_DIR / "captures" / "photo_20260615_174257.png"
-DEFAULT_TIP_REFINER_MODEL = SCRIPT_DIR / "CNN_Calib" / "processed_image_data_folder" / "tip_refinement_model" / "best_tip_refiner.pt"
+DEFAULT_BOARD_REFERENCE_IMAGE = SCRIPT_DIR / "captures" / "photo_20260630_174948.png"
+DEFAULT_TIP_REFINER_MODEL = SCRIPT_DIR / "cnn_ushape" / "processed_image_data_folder" / "tip_refinement_model" / "best_tip_refiner.pt"
 DEFAULT_TIP_REFINER_ANCHOR = None
 DEFAULT_TIP_REFINER_COMPARE_ONLY = False
 DEFAULT_TIP_REFINE_MODE = "coarse"
@@ -429,7 +432,7 @@ def resolve_input_folders(
     project_dir: str | None,
     raw_dir: str | None,
     link_mode: str,
-) -> tuple[Path, Path]:
+) -> tuple[Path, Path | None]:
     project_path = Path(project_dir).expanduser().resolve() if project_dir else None
     raw_path = Path(raw_dir).expanduser().resolve() if raw_dir else None
 
@@ -444,6 +447,9 @@ def resolve_input_folders(
 
     if project_path is not None and (project_path / "raw_image_data_folder").is_dir():
         return project_path, (project_path / "raw_image_data_folder").resolve()
+
+    if project_path is not None and (project_path / "processed_image_data_folder").is_dir() and raw_path is None:
+        return project_path, None
 
     if raw_path is None:
         raise SystemExit("Could not resolve input folder.")
@@ -464,7 +470,7 @@ def resolve_input_folders(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Offline runner for shadow_calibration.py")
-    parser.add_argument("--project_dir", type=str, default=None, help="Existing project folder containing raw_image_data_folder")
+    parser.add_argument("--project_dir", type=str, default=None, help="Existing project folder containing raw_image_data_folder or processed_image_data_folder")
     parser.add_argument("--raw_dir", type=str, default=None, help="Folder of raw images or raw_image_data_folder")
     parser.add_argument("--link_mode", type=str, default="symlink", choices=["symlink", "copy"])
     parser.add_argument("--threshold", type=int, default=DEFAULT_THRESHOLD)
@@ -551,14 +557,17 @@ def main() -> None:
     args = build_arg_parser().parse_args()
 
     project_dir, raw_folder = resolve_input_folders(args.project_dir, args.raw_dir, args.link_mode)
-    images = list_images(raw_folder)
-    if not images:
-        raise SystemExit(f"No images found in {raw_folder}")
-
-    first_image_path = images[0]
-    first_image = cv2.imread(str(first_image_path), cv2.IMREAD_COLOR)
-    if first_image is None:
-        raise SystemExit(f"Could not read first image: {first_image_path}")
+    images: list[Path] = []
+    first_image_path: Path | None = None
+    first_image = None
+    if raw_folder is not None:
+        images = list_images(raw_folder)
+        if not images:
+            raise SystemExit(f"No images found in {raw_folder}")
+        first_image_path = images[0]
+        first_image = cv2.imread(str(first_image_path), cv2.IMREAD_COLOR)
+        if first_image is None:
+            raise SystemExit(f"Could not read first image: {first_image_path}")
 
     cal = CTR_Shadow_Calibration(
         parent_directory=str(project_dir.parent),
@@ -624,11 +633,22 @@ def main() -> None:
     elif args.board_reference_image:
         print("Board reference image was provided without camera calibration; skipping board-reference setup.")
 
+    if raw_folder is None:
+        print("\nRaw images not found; reusing existing processed outputs and skipping analyze_data_batch().")
+        if not args.use_default_analysis_crop and not args.skip_ruler_setup:
+            raise SystemExit(
+                "Processed-only project detected. Re-run with --skip_ruler_setup or provide raw images "
+                "if you need interactive crop/ruler setup."
+            )
+
     if args.use_default_analysis_crop:
         cal.analysis_crop = dict(cal.default_analysis_crop)
         ruler_p1 = None
         ruler_p2 = None
         print(f"\nUsing default analysis crop: {cal.analysis_crop}")
+    elif first_image is None:
+        ruler_p1 = None
+        ruler_p2 = None
     else:
         print(f"\nUsing first image for setup: {first_image_path.name}")
         analysis_crop, ruler_p1, ruler_p2 = interactive_crop_and_ruler_from_image(
@@ -663,11 +683,14 @@ def main() -> None:
             json.dump(_json_ready(config), handle, indent=2)
         print(f"Saved analysis config to {config_path}")
 
-    print("\nRunning analyze_data_batch...")
-    cal.analyze_data_batch(
-        threshold=int(args.threshold),
-        export_analysis_outputs=bool(args.export_analysis_outputs),
-    )
+    if raw_folder is not None:
+        print("\nRunning analyze_data_batch...")
+        cal.analyze_data_batch(
+            threshold=int(args.threshold),
+            export_analysis_outputs=bool(args.export_analysis_outputs),
+        )
+    else:
+        print("\nSkipping analyze_data_batch; using saved processed outputs.")
 
     print("\nRunning postprocess_calibration_data...")
     cal.postprocess_calibration_data(

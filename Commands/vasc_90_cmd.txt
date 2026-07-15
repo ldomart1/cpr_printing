@@ -1,0 +1,210 @@
+
+python Run_Calibration.py \
+  --no_run_curl_angle_specific_daq \
+  --main_motion_mode stepped \
+  --curl_pass 0-180-0 \
+  --export_analysis_outputs \
+  0-180-0 
+
+python Run_Calibration.py \
+  --project_name Test_Calibration_2026-07-06_00 \
+  --curl_only \
+  --calibration_file ./Test_Calibration_2026-07-06_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --curl_pass 0-180-0 0-90-0
+
+python gcode_generation/vasc_manual_90.py \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-23_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-23_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030.gcode \
+  --groups-out vessels_0030_groups.txt \
+  --group-displacements-file vessels_0030_group_displacements.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --vessel-order-mode aorta_first_lowest_branch \
+  --travel-strategy cylinder-surface \
+  --extrusion-feed-mode weighted \
+  --radius-feed-map "0.20:1000,0.50:500,1.00:200,2.00:20" \
+  --rotate-y-deg 0 \
+  --align-lowest-centroid 100 80 -130 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 3 \
+  --geometry-scale 1.0 \
+  --tangent-smooth-window 32 \
+  --centerline-smooth-window 8 \
+  --path-geometry-smooth-window 0 \
+  --path-resample-spacing 1.2 \
+  --b-max-step-deg 3 \
+  --c-max-step-deg 1.5 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.08 \
+  --travel-c-max-step-deg 4 \
+  --travel-c-smoothing-alpha 0.25 \
+  --c-min-deg -360 \
+  --c-max-deg 360 \
+  --min-tangent-xy-for-c 0.30 \
+  --force-bottom-to-top \
+  --disable-travel-bbox-clearance \
+  --offplane-fit-mode avg_cubic \
+  --aorta-cylinder-sample-spacing-mm 0.5 \
+  --start-node-dwell-ms 400 \
+  --launch-viewer
+
+python gcode_generation/vasc_manual_interactive_gui_90.py \
+  --run-mode print \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-07-06_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-07-06_05/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030_gui.gcode \
+  --groups-out vessels_0030_groups.txt \
+  --group-displacements-file vessels_0030_group_displacements.txt \
+  --write-mode calibrated \
+  --vessel-order-mode aorta_first_lowest_branch \
+  --travel-strategy cylinder-surface \
+  --extrusion-feed-mode weighted \
+  --radius-feed-map "0.15:1600,0.20:1200,0.25:1000,0.30:800,0.40:500,0.60:240,1.00:140,1.30:100" \
+  --rotate-y-deg 0 \
+  --align-lowest-centroid 100 80 -135 \
+  --travel-clearance-above-printed-z 20 \
+  --fine-approach-distance 3 \
+  --geometry-scale 1.0 \
+  --tangent-smooth-window 40 \
+  --centerline-smooth-window 8 \
+  --path-geometry-smooth-window 0 \
+  --path-resample-spacing 1.2 \
+  --b-max-step-deg 2 \
+  --c-max-step-deg 1.5 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.08 \
+  --travel-c-max-step-deg 4 \
+  --travel-c-smoothing-alpha 0.25 \
+  --c-min-deg -360 \
+  --c-max-deg 360 \
+  --min-tangent-xy-for-c 0.30 \
+  --force-bottom-to-top \
+  --disable-travel-bbox-clearance \
+  --offplane-fit-mode avg_cubic \
+  --aorta-cylinder-sample-spacing-mm 0.5 \
+  --start-node-dwell-ms 500
+
+
+python gcode_generation/vasc_manual_90_intermediate_backup.py \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-16_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-16_01/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030.gcode
+
+python gcode_generation/vasc_manual_90_backup_0616_1641.py \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-18_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-18_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030_bis_short_tube.gcode
+
+python gcode_generation/vasc_90_0618_1132_Breset.py \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-18_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-18_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vasc_90_0618_1132_Breset_last.gcode
+
+python Run_Calibration.py \
+  --calibration_file Test_Calibration_2026-06-27_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --curl_only \
+  --curl_pass 0-180-0
+
+python3 Run_Calibration.py \
+  --tip_detection_mode classical \
+  --no_run_curl_angle_specific_daq \
+  --offplane_fit_model linear \
+  --export_analysis_outputs \
+  --no_c90_y_compensation_from_planar_pchip
+
+python Run_Calibration.py \
+  --main_motion_mode stepped \
+  --curl_pass 0-180-0
+
+python Run_Calibration.py \
+  --calibration_file Test_Calibration_2026-06-30_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --curl_only \
+  --curl_pass 0-180-0
+
+
+
+python gcode_generation/vasc_manual_interactive_gui_90_cartes.py \
+  --run-mode print \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-24_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-24_01/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030_gui.gcode \
+  --groups-out vessels_0030_groups_cartes.txt \
+  --group-displacements-file vessels_0030_group_displacements_cartes_fixed.txt \
+  --write-mode cartesian \
+  --orientation-mode fixed \
+  --vessel-order-mode aorta_first_lowest_branch \
+  --travel-strategy cylinder-surface \
+  --extrusion-feed-mode weighted \
+  --radius-feed-map "0.070:1200,0.1325:900,0.200:600,0.250:450,0.350:300,0.3325:120,0.500:120,0.605:60,0.7625:30" \
+  --rotate-y-deg 0 \
+  --align-lowest-centroid 100 80 -145 \
+  --travel-clearance-above-printed-z 20 \
+  --fine-approach-distance 3 \
+  --geometry-scale 1.0 \
+  --tangent-smooth-window 40 \
+  --centerline-smooth-window 8 \
+  --path-geometry-smooth-window 0 \
+  --path-resample-spacing 1.2 \
+  --b-max-step-deg 2 \
+  --c-max-step-deg 1.5 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.08 \
+  --travel-c-max-step-deg 4 \
+  --travel-c-smoothing-alpha 0.25 \
+  --c-min-deg -360 \
+  --c-max-deg 360 \
+  --min-tangent-xy-for-c 0.30 \
+  --force-bottom-to-top \
+  --disable-travel-bbox-clearance \
+  --offplane-fit-mode avg_cubic \
+  --aorta-cylinder-sample-spacing-mm 0.5 \
+  --start-node-dwell-ms 100
+
+--radius-feed-map "0.412:4800,0.478:3600,0.592:2400,0.763:1800,0.952:1200,1.245:800,1.377:480" \
+--radius-feed-map "0.070:1200,0.1325:900,0.200:600,0.250:450,0.350:300,0.3325:120,0.500:120,0.605:60,0.7625:30" \
+
+python gcode_generation/vasc_manual_interactive_gui_90_cartes.py \
+  --run-mode save-gcode \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-24_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-24_01/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030_gui.gcode \
+  --groups-out vessels_0030_groups_cartes.txt \
+  --group-displacements-file vessels_0030_group_displacements_cartes_fixed.txt \
+  --write-mode cartesian \
+  --orientation-mode fixed \
+  --vessel-order-mode aorta_first_lowest_branch \
+  --travel-strategy cylinder-surface \
+  --extrusion-feed-mode weighted \
+  --radius-feed-map "0.070:1200,0.1325:900,0.200:600,0.250:450,0.350:300,0.3325:120,0.500:120,0.605:60,0.7625:30" \
+  --rotate-y-deg 0 \
+  --align-lowest-centroid 100 80 -145 \
+  --travel-clearance-above-printed-z 20 \
+  --fine-approach-distance 3 \
+  --geometry-scale 1.0 \
+  --tangent-smooth-window 40 \
+  --centerline-smooth-window 8 \
+  --path-geometry-smooth-window 0 \
+  --path-resample-spacing 1.2 \
+  --b-max-step-deg 2 \
+  --c-max-step-deg 1.5 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.08 \
+  --travel-c-max-step-deg 4 \
+  --travel-c-smoothing-alpha 0.25 \
+  --c-min-deg -360 \
+  --c-max-deg 360 \
+  --min-tangent-xy-for-c 0.30 \
+  --force-bottom-to-top \
+  --disable-travel-bbox-clearance \
+  --offplane-fit-mode avg_cubic \
+  --aorta-cylinder-sample-spacing-mm 0.5 \
+  --start-node-dwell-ms 100 \
+  --start-stop-slow-samples 0

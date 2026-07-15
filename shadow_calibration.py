@@ -1306,12 +1306,12 @@ class CTR_Shadow_Calibration:
         self._curl_angle_pass_sequences_deg = {}
 
         # On 3840x2160 frames this maps to the GUI box:
-        # x:[1394,2856] y:[458,1393]
+        # x:[1105,2909] y:[360,1460]
         self.default_analysis_crop = {
-            "crop_width_min": 1394,
-            "crop_width_max": 2856,
-            "crop_height_min": 767,
-            "crop_height_max": 1702,
+            "crop_width_min": 1105,
+            "crop_width_max": 2909,
+            "crop_height_min": 700,
+            "crop_height_max": 1800,
         }
         self.analysis_crop = dict(self.default_analysis_crop)
 

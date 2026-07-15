@@ -78,13 +78,13 @@ except Exception:
 
 DEFAULT_DUET_WEB_ADDRESS = "http://192.168.2.21"
 DEFAULT_CAMERA_PORT = 0
-DEFAULT_PROJECT_NAME = "Point_Tracking_Run"
+DEFAULT_PROJECT_NAME = "Test_Gcode_point_track"
 DEFAULT_ALLOW_EXISTING = True
 DEFAULT_ADD_DATE = True
 
 DEFAULT_POINT_X = 100.0
-DEFAULT_POINT_Y = 125.0
-DEFAULT_POINT_Z = -90.0
+DEFAULT_POINT_Y = 50.0
+DEFAULT_POINT_Z = -100.0
 
 DEFAULT_TRAVEL_FEED = 2000.0
 DEFAULT_FINE_APPROACH_FEED = 1000.0
@@ -165,11 +165,13 @@ DEFAULT_STREAMING_LOOKAHEAD_S = 0.12
 
 DEFAULT_FLIP_RZ_SIGN = True
 DEFAULT_Y_OFFSET_FIT = "avg_pchip"
-DEFAULT_CURVE_SET = "0-180-0"
-DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK = False
+DEFAULT_CURVE_SET = "auto"
+DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK = True
+DEFAULT_ENABLE_BRANCH_CONDITIONING = True
+DEFAULT_BRANCH_CONDITIONING_TIP_MAX_DEG = 180.0
 
-DEFAULT_POST_CAMERA_CALIBRATION_FILE = str(SCRIPT_DIR / "captures" / "calibration_webcam_20260406_104136.npz")
-DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = str(SCRIPT_DIR / "captures" / "photo_20260526_200532.png")
+DEFAULT_POST_CAMERA_CALIBRATION_FILE = str(SCRIPT_DIR / "captures" / "calibration_webcam_20260708_120830.npz")
+DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = str(SCRIPT_DIR / "captures" / "photo_20260708_120944.png")
 DEFAULT_POST_THRESHOLD = 220
 DEFAULT_POST_TIP_REFINE_MODE = "none"
 DEFAULT_POST_TIP_DETECTION_MODE = "red_dot"
@@ -218,6 +220,9 @@ class Calibration:
 
     c_180_deg: float
     selected_curve_set: str
+    requested_curve_set: str
+    available_curve_sets: List[str]
+    curve_selection_reason: str
     y_offset_fit: str
 
     offplane_y_equation: Optional[str] = None
@@ -333,30 +338,86 @@ def _normalize_curve_set_name(value: Any) -> str:
     return str(value).strip().lower().replace("_", "-")
 
 
+def _curve_set_lookup(curl_payload: Any) -> dict:
+    if not isinstance(curl_payload, dict):
+        return {}
+    out = {}
+    for key, payload in curl_payload.items():
+        if isinstance(payload, dict):
+            out[_normalize_curve_set_name(key)] = (str(key), payload)
+    return out
+
+
 def _extract_selected_phase_payload(
     data: dict,
     curve_set: str,
     allow_global_fallback: bool = DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
-) -> Tuple[dict, str]:
+    prefer_0_to_90: bool = False,
+) -> Tuple[dict, str, List[str], str]:
+    """Select the branch-model payload.
+
+    Auto policy used by point tracking:
+      - In --b-0-to-90-only mode, prefer curl_angle_specific_fit_models['0-90-0']
+        when it exists.
+      - Otherwise, or when 0-90-0 is unavailable, use 0-180-0 when it exists.
+      - If neither curl-specific set exists, fall back to the top-level/global
+        fit_models_by_phase when fallback is allowed.
+
+    This makes the point-tracking script use the shortest valid hysteresis loop
+    available in the calibration file, while retaining compatibility with older
+    calibration exports that only contain global pull/release branches.
+    """
     requested_norm = _normalize_curve_set_name(curve_set)
     curl_payload = data.get("curl_angle_specific_fit_models") or {}
-
-    if requested_norm in {"", "global", "fitmodelsbyphase", "globalfallback"}:
-        return {"fit_models_by_phase": data.get("fit_models_by_phase", {})}, "global"
-
-    if isinstance(curl_payload, dict):
-        for key, payload in curl_payload.items():
-            if _normalize_curve_set_name(key) == requested_norm and isinstance(payload, dict):
-                return payload, str(key)
-
-    if allow_global_fallback:
-        return {"fit_models_by_phase": data.get("fit_models_by_phase", {})}, "global_fallback"
-
+    curve_lookup = _curve_set_lookup(curl_payload)
     available = sorted(str(k) for k in curl_payload.keys()) if isinstance(curl_payload, dict) else []
+
+    def global_payload(reason: str) -> Tuple[dict, str, List[str], str]:
+        return {"fit_models_by_phase": data.get("fit_models_by_phase", {})}, "global_fallback", available, reason
+
+    if requested_norm in {"", "auto"}:
+        if bool(prefer_0_to_90) and "0-90-0" in curve_lookup:
+            selected_key, payload = curve_lookup["0-90-0"]
+            return payload, selected_key, available, "auto: selected 0-90-0 because --b-0-to-90-only is active"
+        if "0-180-0" in curve_lookup:
+            selected_key, payload = curve_lookup["0-180-0"]
+            reason = "auto: selected 0-180-0"
+            if bool(prefer_0_to_90):
+                reason = "auto: 0-90-0 unavailable; selected 0-180-0"
+            return payload, selected_key, available, reason
+        if bool(allow_global_fallback):
+            reason = "auto: no curl-specific 0-90-0/0-180-0 set found; using global fit_models_by_phase"
+            return global_payload(reason)
+        raise KeyError(
+            "Calibration does not contain curl-specific 0-90-0 or 0-180-0 branch models. "
+            f"Available curl-specific sets: {available}. "
+            "Use --curve-set global or enable global fallback."
+        )
+
+    if requested_norm in {"global", "fitmodelsbyphase", "globalfallback"}:
+        return {"fit_models_by_phase": data.get("fit_models_by_phase", {})}, "global", available, "explicit: using global fit_models_by_phase"
+
+    # For legacy commands that still say --curve-set 0-180-0 in 0..90-only
+    # mode, prefer the dedicated 0-90-0 loop if it exists. This is intentional:
+    # a 0-90-0 release branch has the correct hysteretic history for a 90-deg
+    # reversal, so no hidden 90->180->90 conditioning is needed.
+    if bool(prefer_0_to_90) and requested_norm == "0-180-0" and "0-90-0" in curve_lookup:
+        selected_key, payload = curve_lookup["0-90-0"]
+        return payload, selected_key, available, "0..90 mode: overriding 0-180-0 request with available 0-90-0 branch set"
+
+    if requested_norm in curve_lookup:
+        selected_key, payload = curve_lookup[requested_norm]
+        return payload, selected_key, available, f"explicit: selected {selected_key}"
+
+    if bool(allow_global_fallback):
+        return global_payload(
+            f"requested {curve_set!r} was not found in curl_angle_specific_fit_models; using global fit_models_by_phase"
+        )
+
     raise KeyError(
         f"Calibration does not contain curl_angle_specific_fit_models['{curve_set}']. "
         f"Available curl-specific sets: {available}. "
-        "Use --curve-set global, or pass --allow-global-curve-set-fallback."
+        "Use --curve-set auto/global, or pass --allow-global-curve-set-fallback."
     )
 
 
@@ -485,6 +546,7 @@ def load_calibration(
     y_offset_fit: str = DEFAULT_Y_OFFSET_FIT,
     curve_set: str = DEFAULT_CURVE_SET,
     allow_global_curve_set_fallback: bool = DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
+    prefer_0_to_90_curve: bool = False,
 ) -> Calibration:
     p = Path(json_path)
     if not p.exists():
@@ -493,10 +555,11 @@ def load_calibration(
     with p.open("r") as f:
         data = json.load(f)
 
-    selected_phase_payload, selected_curve_set = _extract_selected_phase_payload(
+    selected_phase_payload, selected_curve_set, available_curve_sets, curve_selection_reason = _extract_selected_phase_payload(
         data,
         curve_set=curve_set,
         allow_global_fallback=allow_global_curve_set_fallback,
+        prefer_0_to_90=bool(prefer_0_to_90_curve),
     )
     phase_models, default_phase = _extract_phase_models(selected_phase_payload)
     fit_models = data.get("fit_models", {})
@@ -559,6 +622,9 @@ def load_calibration(
         c_axis=c_axis,
         c_180_deg=c_180,
         selected_curve_set=selected_curve_set,
+        requested_curve_set=str(curve_set),
+        available_curve_sets=list(available_curve_sets),
+        curve_selection_reason=str(curve_selection_reason),
         y_offset_fit=str(y_offset_fit),
         offplane_y_equation=cubic.get("offplane_y_equation"),
         offplane_y_r_squared=(
@@ -568,10 +634,27 @@ def load_calibration(
     )
 
 
-def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Any:
+def _resolve_phase_bundle(cal: Calibration, motion_phase: Optional[str]) -> dict:
     phase_name = _normalize_motion_phase_name(motion_phase) or cal.default_motion_phase
+    if phase_name in cal.phase_models:
+        return cal.phase_models[phase_name]
+
+    # Calibration exports can name phases either pull/release or pull_1/release_1.
+    # Match the requested logical branch first by prefix before falling back.
+    phase_prefix = str(phase_name).split("_")[0].split("-")[0]
+    for key, bundle in cal.phase_models.items():
+        key_prefix = str(key).split("_")[0].split("-")[0]
+        if key_prefix == phase_prefix:
+            return bundle
+
+    if cal.default_motion_phase in cal.phase_models:
+        return cal.phase_models[cal.default_motion_phase]
+    return {}
+
+
+def _select_fit_model(cal: Calibration, model_name: str, motion_phase: Optional[str] = None) -> Any:
     phase_model = _get_phase_model_descriptor(
-        cal.phase_models.get(phase_name, {}),
+        _resolve_phase_bundle(cal, motion_phase),
         model_name,
         y_offset_fit=cal.y_offset_fit,
     )
@@ -766,12 +849,28 @@ def tip_angle_deg_to_b_continuous(
     if angle_arr.size != b_arr.size or angle_arr.size < 2:
         raise ValueError("Continuous tip-angle inversion requires matched dense B/angle samples.")
 
+    finite_mask = np.isfinite(angle_arr) & np.isfinite(b_arr)
+    angle_arr = angle_arr[finite_mask]
+    b_arr = b_arr[finite_mask]
+    if angle_arr.size < 2:
+        raise ValueError("Continuous tip-angle inversion has too few finite samples.")
+
     amin = float(np.nanmin(angle_arr))
     amax = float(np.nanmax(angle_arr))
     used_angle = clamp(float(requested_tip_angle_deg), amin, amax)
 
-    candidates: List[float] = []
+    # Fast path for the usual calibration case: tip angle is monotonic with B.
+    # This avoids scanning every dense interval for every trajectory point.
+    diffs = np.diff(angle_arr)
     tol = 1e-9
+    if np.all(diffs >= -tol):
+        b_val = float(np.interp(used_angle, angle_arr, b_arr))
+        return b_val, used_angle
+    if np.all(diffs <= tol):
+        b_val = float(np.interp(used_angle, angle_arr[::-1], b_arr[::-1]))
+        return b_val, used_angle
+
+    candidates: List[float] = []
     for i in range(len(angle_arr) - 1):
         a0 = float(angle_arr[i])
         a1 = float(angle_arr[i + 1])
@@ -1016,12 +1115,44 @@ def _append_recorded_phase_leg(
     forced_motion_phase: str,
     flip_rz_sign: bool = False,
     include_first_point: bool = False,
+    b_samples: Optional[np.ndarray] = None,
+    angle_samples_deg: Optional[np.ndarray] = None,
+    initial_prev_b: Optional[float] = None,
 ):
+    """
+    Append a recorded C/B leg.
+
+    Important fix relative to the old point-tracking script:
+    use branch-continuous inversion when dense branch samples are supplied.
+    The old sorted angle->B table could choose a different root at the
+    pull/release handoff. The circle script avoids that by solving B with the
+    previous B as a reference; this function now does the same.
+    """
     nmove = max(1, int(move_steps))
     ncap = max(1, int(capture_steps))
     monotone_tip_leg = float(b_oscillations_per_cycle) <= 1.0 + 1e-9
 
     capture_move_indices: Set[int] = set()
+
+    def tip_for_phases(leg_phase: float, cycle_phase: float) -> float:
+        if monotone_tip_leg:
+            return _tip_angle_monotone_cycle_deg(
+                cycle_phase_01=cycle_phase,
+                tip_min_deg=tip_min_deg,
+                tip_max_deg=tip_max_deg,
+                boundary_ease_frac=tip_boundary_ease_frac,
+            )
+        tip_phase = _smoothstep01(_smooth_cosine_edge_map_01(leg_phase, tip_boundary_ease_frac))
+        cycle_phase_for_tip = (
+            (1.0 - tip_phase) * float(cycle_phase_start) + tip_phase * float(cycle_phase_end)
+        )
+        return _tip_angle_cycle_deg(
+            cycle_phase_01=cycle_phase_for_tip,
+            tip_min_deg=tip_min_deg,
+            tip_max_deg=tip_max_deg,
+            oscillations_per_cycle=b_oscillations_per_cycle,
+            phase_offset_deg=b_phase_offset_deg,
+        )
 
     for j in range(1, ncap + 1):
         leg_phase = j / float(ncap)
@@ -1032,21 +1163,7 @@ def _append_recorded_phase_leg(
             c_end_deg=c_end_deg,
             boundary_ease_frac=boundary_ease_frac,
         )
-        if monotone_tip_leg:
-            req_tip = _tip_angle_monotone_cycle_deg(
-                cycle_phase_01=cycle_phase,
-                tip_min_deg=tip_min_deg,
-                tip_max_deg=tip_max_deg,
-                boundary_ease_frac=tip_boundary_ease_frac,
-            )
-        else:
-            req_tip = _tip_angle_cycle_deg(
-                cycle_phase_01=cycle_phase,
-                tip_min_deg=tip_min_deg,
-                tip_max_deg=tip_max_deg,
-                oscillations_per_cycle=b_oscillations_per_cycle,
-                phase_offset_deg=b_phase_offset_deg,
-            )
+        req_tip = tip_for_phases(leg_phase, cycle_phase)
         if _capture_allowed(
             tip_angle_deg=req_tip,
             c_deg=c_cmd,
@@ -1061,35 +1178,30 @@ def _append_recorded_phase_leg(
             idx = max(1, min(nmove, idx))
             capture_move_indices.add(idx)
 
-    raw_points = []
+    prev_b = initial_prev_b
+    if prev_b is None and traj:
+        prev_b = float(traj[-1].b)
+
     i_start = 0 if include_first_point else 1
     for i in range(i_start, nmove + 1):
         leg_phase = i / float(nmove)
         cycle_phase = (1.0 - leg_phase) * float(cycle_phase_start) + leg_phase * float(cycle_phase_end)
-        if monotone_tip_leg:
-            req_tip = _tip_angle_monotone_cycle_deg(
-                cycle_phase_01=cycle_phase,
-                tip_min_deg=tip_min_deg,
-                tip_max_deg=tip_max_deg,
-                boundary_ease_frac=tip_boundary_ease_frac,
+        req_tip = tip_for_phases(leg_phase, cycle_phase)
+
+        if b_samples is not None and angle_samples_deg is not None:
+            b_cmd, used_tip = tip_angle_deg_to_b_continuous(
+                requested_tip_angle_deg=req_tip,
+                b_samples=b_samples,
+                angle_samples_deg=angle_samples_deg,
+                prev_b=prev_b,
             )
         else:
-            tip_phase = _smoothstep01(_smooth_cosine_edge_map_01(leg_phase, tip_boundary_ease_frac))
-            cycle_phase_for_tip = (
-                (1.0 - tip_phase) * float(cycle_phase_start) + tip_phase * float(cycle_phase_end)
+            b_cmd, used_tip = tip_angle_deg_to_b_clipped(
+                requested_tip_angle_deg=req_tip,
+                angle_table_deg=angle_table_deg,
+                b_table=b_table,
             )
-            req_tip = _tip_angle_cycle_deg(
-                cycle_phase_01=cycle_phase_for_tip,
-                tip_min_deg=tip_min_deg,
-                tip_max_deg=tip_max_deg,
-                oscillations_per_cycle=b_oscillations_per_cycle,
-                phase_offset_deg=b_phase_offset_deg,
-            )
-        b_cmd, used_tip = tip_angle_deg_to_b_clipped(
-            requested_tip_angle_deg=req_tip,
-            angle_table_deg=angle_table_deg,
-            b_table=b_table,
-        )
+        prev_b = float(b_cmd)
 
         c_cmd = _c_deg_for_leg_phase(
             leg_phase_01=leg_phase,
@@ -1097,43 +1209,28 @@ def _append_recorded_phase_leg(
             c_end_deg=c_end_deg,
             boundary_ease_frac=boundary_ease_frac,
         )
-
-        raw_points.append(
-            {
-                "b": float(b_cmd),
-                "c": float(c_cmd),
-                "capture_image": (i in capture_move_indices),
-                "tip_angle_deg": float(used_tip),
-                "cycle_phase_01": float(cycle_phase),
-                "leg_phase_01": float(leg_phase),
-                "leg_name": str(leg_name),
-            }
-        )
-
-    for point in raw_points:
         stage_xyz = stage_xyz_for_fixed_tip(
             cal=cal,
             p_tip_xyz=p_tip_fixed,
-            b=point["b"],
-            c_deg=point["c"],
+            b=float(b_cmd),
+            c_deg=float(c_cmd),
             flip_rz_sign=flip_rz_sign,
             motion_phase=forced_motion_phase,
         )
         traj.append(
             TrajectoryPoint(
-                b=point["b"],
-                c=point["c"],
+                b=float(b_cmd),
+                c=float(c_cmd),
                 stage_xyz=stage_xyz,
                 segment_kind="cycle",
-                capture_image=bool(point["capture_image"]),
-                tip_angle_deg=point["tip_angle_deg"],
-                cycle_phase_01=point["cycle_phase_01"],
-                leg_phase_01=point["leg_phase_01"],
-                leg_name=point["leg_name"],
+                capture_image=bool(i in capture_move_indices),
+                tip_angle_deg=float(used_tip),
+                cycle_phase_01=float(cycle_phase),
+                leg_phase_01=float(leg_phase),
+                leg_name=str(leg_name),
                 motion_phase=str(forced_motion_phase),
             )
         )
-
 
 def _append_phase_reposition_point(
     traj: List[TrajectoryPoint],
@@ -1223,6 +1320,77 @@ def _append_phase_transition_ramp(
         )
 
 
+def _append_unrecorded_tip_angle_ramp(
+    traj: List[TrajectoryPoint],
+    cal: Calibration,
+    p_tip_fixed: np.ndarray,
+    b_samples: np.ndarray,
+    angle_samples_deg: np.ndarray,
+    tip_start_deg: float,
+    tip_end_deg: float,
+    c_deg: float,
+    leg_name: str,
+    motion_phase: str,
+    steps: int,
+    boundary_ease_frac: float = DEFAULT_C_BOUNDARY_EASE_FRAC,
+    flip_rz_sign: bool = False,
+    initial_prev_b: Optional[float] = None,
+    include_first_point: bool = False,
+):
+    """
+    Hidden fixed-tip angle ramp used to respect hysteretic branch history.
+
+    Example for --curve-set 0-180-0 with --b-0-to-90-only:
+      visible pull:    0 -> 90
+      hidden pull:    90 -> 180
+      branch switch at the calibrated endpoint
+      hidden release: 180 -> 90
+      visible release:90 -> 0
+
+    This matches the circle script's branch history: branch switches occur at
+    the calibrated endpoints, not at a truncated visible angle.
+    """
+    nsteps = max(1, int(steps))
+    prev_b = initial_prev_b
+    if prev_b is None and traj:
+        prev_b = float(traj[-1].b)
+
+    i_start = 0 if include_first_point else 1
+    for i in range(i_start, nsteps + 1):
+        u = i / float(nsteps)
+        s = _smoothstep01(_smooth_cosine_edge_map_01(u, boundary_ease_frac))
+        req_tip = (1.0 - s) * float(tip_start_deg) + s * float(tip_end_deg)
+        b_cmd, used_tip = tip_angle_deg_to_b_continuous(
+            requested_tip_angle_deg=req_tip,
+            b_samples=b_samples,
+            angle_samples_deg=angle_samples_deg,
+            prev_b=prev_b,
+        )
+        prev_b = float(b_cmd)
+        stage_xyz = stage_xyz_for_fixed_tip(
+            cal=cal,
+            p_tip_xyz=p_tip_fixed,
+            b=float(b_cmd),
+            c_deg=float(c_deg),
+            flip_rz_sign=flip_rz_sign,
+            motion_phase=motion_phase,
+        )
+        traj.append(
+            TrajectoryPoint(
+                b=float(b_cmd),
+                c=float(c_deg),
+                stage_xyz=stage_xyz,
+                segment_kind="branch_conditioning",
+                capture_image=False,
+                tip_angle_deg=float(used_tip),
+                cycle_phase_01=None,
+                leg_phase_01=float(u),
+                leg_name=str(leg_name),
+                motion_phase=str(motion_phase),
+            )
+        )
+
+
 def _append_multi_sweep_monotone_leg(
     traj: List[TrajectoryPoint],
     cal: Calibration,
@@ -1250,6 +1418,9 @@ def _append_multi_sweep_monotone_leg(
     c_two_way_sweeps: int,
     flip_rz_sign: bool = False,
     include_first_point: bool = False,
+    b_samples: Optional[np.ndarray] = None,
+    angle_samples_deg: Optional[np.ndarray] = None,
+    initial_prev_b: Optional[float] = None,
 ):
     n_two_way = max(1, int(c_two_way_sweeps))
     n_sublegs = max(1, 2 * n_two_way - 1)
@@ -1288,6 +1459,9 @@ def _append_multi_sweep_monotone_leg(
             forced_motion_phase=str(forced_motion_phase),
             flip_rz_sign=flip_rz_sign,
             include_first_point=bool(include_first_point and subleg_idx == 0),
+            b_samples=b_samples,
+            angle_samples_deg=angle_samples_deg,
+            initial_prev_b=(initial_prev_b if subleg_idx == 0 else None),
         )
 
 
@@ -1312,7 +1486,22 @@ def generate_cyclic_visibility_gated_trajectory(
     phase_transition_steps: int = DEFAULT_PHASE_TRANSITION_STEPS,
     c_two_way_sweeps_per_b_oscillation: int = DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION,
     flip_rz_sign: bool = False,
+    enable_branch_conditioning: bool = DEFAULT_ENABLE_BRANCH_CONDITIONING,
+    branch_conditioning_tip_max_deg: float = DEFAULT_BRANCH_CONDITIONING_TIP_MAX_DEG,
 ) -> Tuple[List[TrajectoryPoint], dict]:
+    """
+    Generate the fixed-tip cyclic point-tracking trajectory.
+
+    Fixes compared with the old version:
+    1) B is solved with previous-B continuity, matching the circle script's
+       solve-with-reference behavior.
+    2) If a truncated visible range such as 0..90 is requested while using a
+       0-180-0 branch calibration, the robot still completes the hidden
+       90->180 pull and 180->90 release conditioning at fixed tip/C before
+       recording the visible release. This avoids reversing hysteresis at 90
+       while applying a release model calibrated after 180.
+    3) --phase-transition-steps is honored for monotone branch switches too.
+    """
     pull_b_dense, pull_angle_dense = build_tip_angle_phase_samples(
         cal=cal,
         num_samples=int(inverse_samples),
@@ -1345,18 +1534,33 @@ def generate_cyclic_visibility_gated_trajectory(
     if used_tip_min > used_tip_max:
         used_tip_min, used_tip_max = used_tip_max, used_tip_min
 
-    # One cycle = recorded curl rotation + reposition + recorded uncurl rotation + reposition.
-    # This parameter is intentionally "per sweep", so each one-way C leg gets the requested count.
     b_oscillations_per_cycle = float(b_oscillations_per_sweep)
     monotone_multi_sweep = float(b_oscillations_per_cycle) <= 1.0 + 1e-9
 
+    curve_set_norm = _normalize_curve_set_name(cal.selected_curve_set)
+    requested_condition_tip_max = clamp(
+        float(branch_conditioning_tip_max_deg),
+        available_tip_min,
+        available_tip_max,
+    )
+    uses_dedicated_0_90_loop = ("0-90-0" in curve_set_norm)
+    branch_conditioning_active = (
+        bool(enable_branch_conditioning)
+        and monotone_multi_sweep
+        and (not uses_dedicated_0_90_loop)
+        and (requested_condition_tip_max > used_tip_max + 1e-6)
+    )
+    conditioning_tip_max = requested_condition_tip_max if branch_conditioning_active else used_tip_max
+    conditioning_steps = max(2, int(phase_transition_steps))
+
     traj: List[TrajectoryPoint] = []
 
-    # Exact first point: start of curl cycle at C = -360 using the curl/pull phase model.
-    b0, used_tip0 = tip_angle_deg_to_b_clipped(
-        used_tip_min,
-        pull_angle_table_deg,
-        pull_b_table,
+    # Exact first point: start of curl cycle at C = -360 using the pull branch.
+    b0, used_tip0 = tip_angle_deg_to_b_continuous(
+        requested_tip_angle_deg=used_tip_min,
+        b_samples=pull_b_dense,
+        angle_samples_deg=pull_angle_dense,
+        prev_b=0.0,
     )
     c0 = -360.0
     stage_xyz0 = stage_xyz_for_fixed_tip(
@@ -1382,7 +1586,45 @@ def generate_cyclic_visibility_gated_trajectory(
         )
     )
 
+    def append_branch_switch(
+        target_phase: str,
+        target_b: float,
+        target_tip: float,
+        c_deg: float,
+        leg_name: str,
+    ) -> None:
+        if not traj:
+            return
+        if int(phase_transition_steps) <= 0:
+            return
+        start_point = traj[-1]
+        target_stage = stage_xyz_for_fixed_tip(
+            cal=cal,
+            p_tip_xyz=p_tip_fixed,
+            b=float(target_b),
+            c_deg=float(c_deg),
+            flip_rz_sign=flip_rz_sign,
+            motion_phase=target_phase,
+        )
+        _append_phase_transition_ramp(
+            traj=traj,
+            cal=cal,
+            p_tip_fixed=p_tip_fixed,
+            b_start=float(start_point.b),
+            b_end=float(target_b),
+            c=float(c_deg),
+            leg_name=str(leg_name),
+            motion_phase=str(target_phase),
+            steps=int(phase_transition_steps),
+            stage_xyz_start=np.asarray(start_point.stage_xyz, dtype=float),
+            stage_xyz_end=target_stage,
+            tip_angle_start_deg=float(start_point.tip_angle_deg if start_point.tip_angle_deg is not None else target_tip),
+            tip_angle_end_deg=float(target_tip),
+            flip_rz_sign=flip_rz_sign,
+        )
+
     for rep in range(max(1, int(repeats))):
+        # Visible/recorded pull portion.
         if monotone_multi_sweep:
             _append_multi_sweep_monotone_leg(
                 traj=traj,
@@ -1410,7 +1652,9 @@ def generate_cyclic_visibility_gated_trajectory(
                 forced_motion_phase="pull",
                 c_two_way_sweeps=int(c_two_way_sweeps_per_b_oscillation),
                 flip_rz_sign=flip_rz_sign,
-                include_first_point=bool(rep > 0),
+                include_first_point=False,
+                b_samples=pull_b_dense,
+                angle_samples_deg=pull_angle_dense,
             )
         else:
             _append_recorded_phase_leg(
@@ -1440,52 +1684,65 @@ def generate_cyclic_visibility_gated_trajectory(
                 tip_boundary_ease_frac=float(boundary_ease_frac),
                 forced_motion_phase="pull",
                 flip_rz_sign=flip_rz_sign,
-                include_first_point=bool(monotone_multi_sweep and rep > 0),
+                include_first_point=False,
+                b_samples=pull_b_dense,
+                angle_samples_deg=pull_angle_dense,
             )
 
-        pull_end = traj[-1]
-        pull_b_end = float(pull_end.b)
-        pull_tip_end = float(
-            pull_end.tip_angle_deg
-            if pull_end.tip_angle_deg is not None
-            else eval_tip_angle_deg(cal, float(pull_end.b), motion_phase="pull")
-        )
-        release_b_start, release_tip_start = tip_angle_deg_to_b_clipped(
-            used_tip_max,
-            release_angle_table_deg,
-            release_b_table,
-        )
-        if monotone_multi_sweep:
-            # Match the 0-180-0 circle branch switch behavior: do not insert an
-            # explicit jump point. Start the next branch directly at the shared
-            # boundary sample so the geometry changes inside the sampled motion.
-            pass
-        else:
-            release_stage_start = stage_xyz_for_fixed_tip(
-                cal=cal,
-                p_tip_xyz=p_tip_fixed,
-                b=float(release_b_start),
-                c_deg=360.0,
-                flip_rz_sign=flip_rz_sign,
-                motion_phase="release",
-            )
-            _append_phase_transition_ramp(
+        # If visible max is truncated (e.g. 90) but the selected calibration is
+        # 0-180-0, first complete the hidden pull to 180 before switching to release.
+        if branch_conditioning_active:
+            _append_unrecorded_tip_angle_ramp(
                 traj=traj,
                 cal=cal,
                 p_tip_fixed=p_tip_fixed,
-                b_start=float(pull_b_end),
-                b_end=float(release_b_start),
-                c=360.0,
-                leg_name="to_uncurl_transition",
-                motion_phase="release",
-                steps=int(phase_transition_steps),
-                stage_xyz_start=np.asarray(pull_end.stage_xyz, dtype=float),
-                stage_xyz_end=release_stage_start,
-                tip_angle_start_deg=float(pull_tip_end),
-                tip_angle_end_deg=float(release_tip_start),
+                b_samples=pull_b_dense,
+                angle_samples_deg=pull_angle_dense,
+                tip_start_deg=float(used_tip_max),
+                tip_end_deg=float(conditioning_tip_max),
+                c_deg=360.0,
+                leg_name="hidden_pull_to_branch_endpoint",
+                motion_phase="pull",
+                steps=conditioning_steps,
+                boundary_ease_frac=float(boundary_ease_frac),
                 flip_rz_sign=flip_rz_sign,
             )
 
+        pull_end = traj[-1]
+        release_b_start, release_tip_start = tip_angle_deg_to_b_continuous(
+            requested_tip_angle_deg=float(conditioning_tip_max),
+            b_samples=release_b_dense,
+            angle_samples_deg=release_angle_dense,
+            prev_b=float(pull_end.b),
+        )
+        append_branch_switch(
+            target_phase="release",
+            target_b=float(release_b_start),
+            target_tip=float(release_tip_start),
+            c_deg=360.0,
+            leg_name="to_uncurl_transition",
+        )
+
+        if branch_conditioning_active:
+            _append_unrecorded_tip_angle_ramp(
+                traj=traj,
+                cal=cal,
+                p_tip_fixed=p_tip_fixed,
+                b_samples=release_b_dense,
+                angle_samples_deg=release_angle_dense,
+                tip_start_deg=float(conditioning_tip_max),
+                tip_end_deg=float(used_tip_max),
+                c_deg=360.0,
+                leg_name="hidden_release_from_branch_endpoint",
+                motion_phase="release",
+                steps=conditioning_steps,
+                boundary_ease_frac=float(boundary_ease_frac),
+                flip_rz_sign=flip_rz_sign,
+                include_first_point=(int(phase_transition_steps) <= 0),
+                initial_prev_b=float(release_b_start),
+            )
+
+        # Visible/recorded release portion.
         if monotone_multi_sweep:
             _append_multi_sweep_monotone_leg(
                 traj=traj,
@@ -1513,7 +1770,10 @@ def generate_cyclic_visibility_gated_trajectory(
                 forced_motion_phase="release",
                 c_two_way_sweeps=int(c_two_way_sweeps_per_b_oscillation),
                 flip_rz_sign=flip_rz_sign,
-                include_first_point=True,
+                include_first_point=(not branch_conditioning_active and int(phase_transition_steps) <= 0),
+                b_samples=release_b_dense,
+                angle_samples_deg=release_angle_dense,
+                initial_prev_b=float(release_b_start),
             )
         else:
             _append_recorded_phase_leg(
@@ -1543,49 +1803,28 @@ def generate_cyclic_visibility_gated_trajectory(
                 tip_boundary_ease_frac=float(boundary_ease_frac),
                 forced_motion_phase="release",
                 flip_rz_sign=flip_rz_sign,
-                include_first_point=bool(monotone_multi_sweep),
+                include_first_point=(int(phase_transition_steps) <= 0 and not branch_conditioning_active),
+                b_samples=release_b_dense,
+                angle_samples_deg=release_angle_dense,
+                initial_prev_b=float(release_b_start),
             )
 
+        # Prepare the next repeat by switching release->pull at the lower endpoint.
         if rep + 1 < max(1, int(repeats)):
             release_end = traj[-1]
-            release_b_end = float(release_end.b)
-            release_tip_end = float(
-                release_end.tip_angle_deg
-                if release_end.tip_angle_deg is not None
-                else eval_tip_angle_deg(cal, float(release_end.b), motion_phase="release")
+            pull_b_start, pull_tip_start = tip_angle_deg_to_b_continuous(
+                requested_tip_angle_deg=float(used_tip_min),
+                b_samples=pull_b_dense,
+                angle_samples_deg=pull_angle_dense,
+                prev_b=float(release_end.b),
             )
-            pull_b_start, _ = tip_angle_deg_to_b_clipped(
-                used_tip_min,
-                pull_angle_table_deg,
-                pull_b_table,
+            append_branch_switch(
+                target_phase="pull",
+                target_b=float(pull_b_start),
+                target_tip=float(pull_tip_start),
+                c_deg=-360.0,
+                leg_name="to_curl_transition",
             )
-            if monotone_multi_sweep:
-                pass
-            else:
-                pull_stage_start = stage_xyz_for_fixed_tip(
-                    cal=cal,
-                    p_tip_xyz=p_tip_fixed,
-                    b=float(pull_b_start),
-                    c_deg=-360.0,
-                    flip_rz_sign=flip_rz_sign,
-                    motion_phase="pull",
-                )
-                _append_phase_transition_ramp(
-                    traj=traj,
-                    cal=cal,
-                    p_tip_fixed=p_tip_fixed,
-                    b_start=float(release_b_end),
-                    b_end=float(pull_b_start),
-                    c=-360.0,
-                    leg_name="to_curl_transition",
-                    motion_phase="pull",
-                    steps=int(phase_transition_steps),
-                    stage_xyz_start=np.asarray(release_end.stage_xyz, dtype=float),
-                    stage_xyz_end=pull_stage_start,
-                    tip_angle_start_deg=float(release_tip_end),
-                    tip_angle_end_deg=float(used_tip_min),
-                    flip_rz_sign=flip_rz_sign,
-                )
 
     n_captures = int(sum(1 for pt in traj if pt.capture_image))
     meta = {
@@ -1593,6 +1832,9 @@ def generate_cyclic_visibility_gated_trajectory(
         "requested_tip_max_deg": float(tip_max_deg),
         "used_tip_min_deg": float(used_tip_min),
         "used_tip_max_deg": float(used_tip_max),
+        "branch_conditioning_active": bool(branch_conditioning_active),
+        "uses_dedicated_0_90_loop": bool(uses_dedicated_0_90_loop),
+        "branch_conditioning_tip_max_deg": float(conditioning_tip_max),
         "available_tip_angle_range_deg": [available_tip_min, available_tip_max],
         "leg_move_steps": int(leg_move_steps),
         "leg_capture_steps": int(leg_capture_steps),
@@ -1609,14 +1851,11 @@ def generate_cyclic_visibility_gated_trajectory(
         ],
         "planned_capture_points": n_captures,
         "flip_rz_sign": bool(flip_rz_sign),
-        "phase_sequence": ["pull_record", "release_record"],
+        "phase_sequence": ["pull_record", "hidden_pull_to_branch_endpoint", "release_record" if not branch_conditioning_active else "hidden_release_from_branch_endpoint", "release_record"],
         "phase_transition_steps": int(phase_transition_steps),
-        "phase_transition_mode": (
-            "direct_branch_boundary_sample" if monotone_multi_sweep else "blended_ramp"
-        ),
+        "phase_transition_mode": "continuous_reference_b_with_endpoint_conditioning" if branch_conditioning_active else "continuous_reference_b_blended_ramp",
     }
     return traj, meta
-
 
 def generate_fast_routine_trajectory(
     cal: Calibration,
@@ -2544,6 +2783,9 @@ def _default_export_config() -> dict:
         "c_boundary_ease_frac": DEFAULT_C_BOUNDARY_EASE_FRAC,
         "custom_inverse_samples": DEFAULT_CUSTOM_INV_SAMPLES,
         "phase_transition_steps": DEFAULT_PHASE_TRANSITION_STEPS,
+        "c_two_way_sweeps_per_b_oscillation": DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION,
+        "enable_branch_conditioning": DEFAULT_ENABLE_BRANCH_CONDITIONING,
+        "branch_conditioning_tip_max_deg": DEFAULT_BRANCH_CONDITIONING_TIP_MAX_DEG,
         "capture_tip_full_visible_min_deg": DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MIN_DEG,
         "capture_tip_full_visible_max_deg": DEFAULT_CAPTURE_TIP_FULL_VISIBLE_MAX_DEG,
         "c_visible_win1_min_deg": DEFAULT_C_VISIBLE_WIN1_MIN,
@@ -2634,7 +2876,10 @@ def _generate_trajectory_from_config(cal: Calibration, cfg: dict) -> Tuple[List[
         boundary_ease_frac=float(cfg["c_boundary_ease_frac"]),
         inverse_samples=int(cfg["custom_inverse_samples"]),
         phase_transition_steps=int(cfg["phase_transition_steps"]),
+        c_two_way_sweeps_per_b_oscillation=int(cfg.get("c_two_way_sweeps_per_b_oscillation", DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION)),
         flip_rz_sign=bool(cfg["flip_rz_sign"]),
+        enable_branch_conditioning=bool(cfg.get("enable_branch_conditioning", DEFAULT_ENABLE_BRANCH_CONDITIONING)),
+        branch_conditioning_tip_max_deg=float(cfg.get("branch_conditioning_tip_max_deg", DEFAULT_BRANCH_CONDITIONING_TIP_MAX_DEG)),
     )
 
 
@@ -3455,11 +3700,13 @@ class FixedTipPointTracker:
 
 def main(args):
     script_dir = Path(__file__).resolve().parent
+    prefer_0_to_90_curve = bool(args.b_0_to_90_only)
     cal = load_calibration(
         args.calibration,
         y_offset_fit=args.y_offset_fit,
         curve_set=args.curve_set,
         allow_global_curve_set_fallback=bool(args.allow_global_curve_set_fallback),
+        prefer_0_to_90_curve=prefer_0_to_90_curve,
     )
 
     p_tip_fixed = np.array(
@@ -3516,6 +3763,8 @@ def main(args):
             phase_transition_steps=int(args.phase_transition_steps),
             c_two_way_sweeps_per_b_oscillation=int(args.c_two_way_sweeps_per_b_oscillation),
             flip_rz_sign=bool(args.flip_rz_sign),
+            enable_branch_conditioning=not bool(args.disable_branch_conditioning),
+            branch_conditioning_tip_max_deg=float(args.branch_conditioning_tip_max_deg),
         )
 
     meta = compute_traj_meta(traj)
@@ -3524,7 +3773,11 @@ def main(args):
     print(f"  Samples: {meta['n_samples']} (segments={meta['n_segments']})")
     print(f"  Capture points: {meta['n_capture_points']}")
     print(f"  B range used: [{meta['b_min_used']:.3f}, {meta['b_max_used']:.3f}]")
-    print(f"  Curve set: {cal.selected_curve_set}")
+    print(f"  Requested curve set: {cal.requested_curve_set}")
+    print(f"  Selected curve set:  {cal.selected_curve_set}")
+    print(f"  Curve selection:     {cal.curve_selection_reason}")
+    if cal.available_curve_sets:
+        print(f"  Available curl-specific sets: {cal.available_curve_sets}")
     if cal.tip_angle_model is not None and meta["n_samples"] > 0:
         bb = np.array([meta["b_min_used"], meta["b_max_used"]], dtype=float)
         tip_angle_used = eval_tip_angle_deg(cal, bb)
@@ -3800,10 +4053,10 @@ if __name__ == "__main__":
                     choices=["avg_pchip", "avg_cubic", "pchip", "cubic", "legacy"],
                     help="Which calibration y-offset fit to use for DAQ motion.")
     ap.add_argument("--curve-set", type=str, default=DEFAULT_CURVE_SET,
-                    help="Branch model source to use from curl_angle_specific_fit_models. Use 'global' for top-level fit_models_by_phase. Default: 0-180-0.")
+                    help="Branch model source from curl_angle_specific_fit_models. Use 'auto' to prefer 0-90-0 in --b-0-to-90-only mode, otherwise 0-180-0; use 'global' for top-level fit_models_by_phase. Default: auto.")
     ap.add_argument("--allow-global-curve-set-fallback", action="store_true",
                     default=DEFAULT_ALLOW_GLOBAL_CURVE_SET_FALLBACK,
-                    help="If the requested --curve-set is missing, fall back to global fit_models_by_phase instead of raising.")
+                    help="If the requested --curve-set is missing, fall back to global fit_models_by_phase. Enabled by default in this version for older calibration JSONs.")
     ap.add_argument("--motion-mode", type=str, default=DEFAULT_MOTION_MODE,
                     choices=["custom", "fast_routine"],
                     help="Use the legacy cyclic trajectory ('custom') or the requested fast routine preset.")
@@ -3849,6 +4102,11 @@ if __name__ == "__main__":
     ap.add_argument("--c-two-way-sweeps-per-b-oscillation", type=int,
                     default=DEFAULT_C_TWO_WAY_SWEEPS_PER_B_OSCILLATION,
                     help="For monotonic B curl/uncurl mode, how many back-and-forth C sweep groups are spread across one B oscillation. 2 gives -360->360->-360->360 during one curl.")
+    ap.add_argument("--disable-branch-conditioning", action="store_true",
+                    help="Disable hidden endpoint conditioning for truncated visible ranges such as --b-0-to-90-only with --curve-set 0-180-0.")
+    ap.add_argument("--branch-conditioning-tip-max-deg", type=float,
+                    default=DEFAULT_BRANCH_CONDITIONING_TIP_MAX_DEG,
+                    help="Endpoint angle used for hidden hysteresis conditioning when --curve-set is 0-180-0 and the visible sweep is truncated. Default: 180.")
 
     # Capture visibility controls
     ap.add_argument("--capture-tip-full-visible-min-deg", type=float,

@@ -19,13 +19,13 @@ What it does:
        - B
   7) Reconstructs desired grid coordinates from unique commanded X/Z values
      using user-specified step sizes (default: 5 mm in X and Z)
-  8) For each used tip-angle pass:
+  8) For each used tip-angle pass and orientation:
        - compares each measured point directly to its sampled grid point
        - computes per-point errors
-       - computes per-angle RMSE
+       - computes per-angle and per-orientation RMSE
   9) Computes a global score as the average of the per-angle RMSE values
  10) Saves:
-       - CSV of desired / aligned desired / measured / errors
+       - CSV of desired / centroid-aligned desired / measured / errors
        - JSON metrics summary
        - desired-vs-actual plot for each B tip angle
        - optional checkerboard overlay, including centroid alignment overlay
@@ -1720,6 +1720,30 @@ def angle_group_key(angle_deg: Any, decimals: int = 6) -> Optional[float]:
         return None
 
 
+def orientation_group_key(c_cmd_deg: Any, tolerance_deg: float = 5.0) -> Optional[float]:
+    if c_cmd_deg is None:
+        return None
+    try:
+        c_val = float(c_cmd_deg)
+        if not np.isfinite(c_val):
+            return None
+    except Exception:
+        return None
+
+    c_norm = ((c_val + 180.0) % 360.0) - 180.0
+    orientation_candidates = {
+        0.0: abs(c_norm - 0.0),
+        90.0: abs(c_norm - 90.0),
+        180.0: min(abs(c_norm - 180.0), abs(c_norm + 180.0)),
+    }
+    best = min(orientation_candidates, key=orientation_candidates.get)
+    err = orientation_candidates[best]
+
+    if err > float(tolerance_deg):
+        return round(c_norm, 6)
+    return float(best)
+
+
 # -----------------------------------------
 # Convert tracked tips to checkerboard mm
 # and attach desired commanded coordinates
@@ -2021,7 +2045,40 @@ def align_desired_to_measured_per_angle(
     return records, alignments
 
 
-def compute_errors_against_aligned_desired(
+def _summarize_error_group(
+    records: List[Dict[str, Any]],
+    group_value: float,
+    group_label: str,
+) -> Dict[str, Any]:
+    errs = np.asarray(
+        [float(r["error_distance_mm"]) for r in records if r.get("error_distance_mm") is not None],
+        dtype=float
+    )
+    if errs.size == 0:
+        return {
+            group_label: float(group_value),
+            "num_samples": 0,
+            "rmse_mm": None,
+            "mean_error_mm": None,
+            "std_error_mm": None,
+            "median_error_mm": None,
+            "min_error_mm": None,
+            "max_error_mm": None,
+        }
+
+    return {
+        group_label: float(group_value),
+        "num_samples": int(errs.size),
+        "rmse_mm": float(np.sqrt(np.mean(errs ** 2))),
+        "mean_error_mm": float(np.mean(errs)),
+        "std_error_mm": float(np.std(errs)),
+        "median_error_mm": float(np.median(errs)),
+        "min_error_mm": float(np.min(errs)),
+        "max_error_mm": float(np.max(errs)),
+    }
+
+
+def compute_errors_against_aligned_desired_grid(
     records: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
@@ -2031,10 +2088,12 @@ def compute_errors_against_aligned_desired(
       error_distance_mm = sqrt(du^2 + dz^2)
 
     Returns updated records and summary metrics:
-      - global_rmse_mm
-      - per_angle_rmse_mm
+        - global_rmse_mm
+        - per_angle_rmse_mm
+      - per_orientation_rmse_mm
     """
-    grouped = defaultdict(list)
+    grouped_by_angle = defaultdict(list)
+    grouped_by_orientation = defaultdict(list)
 
     for rec in records:
         u = rec.get("u_mm")
@@ -2063,7 +2122,12 @@ def compute_errors_against_aligned_desired(
 
         ang = angle_group_key(rec.get("used_tip_angle_deg"))
         if ang is not None:
-            grouped[ang].append(rec)
+            grouped_by_angle[ang].append(rec)
+
+        orientation = orientation_group_key(rec.get("c_cmd"))
+        rec["orientation_deg"] = orientation
+        if orientation is not None:
+            grouped_by_orientation[orientation].append(rec)
 
     all_err = np.asarray(
         [float(r["error_distance_mm"]) for r in records if r.get("error_distance_mm") is not None],
@@ -2071,7 +2135,7 @@ def compute_errors_against_aligned_desired(
     )
 
     if all_err.size == 0:
-        raise RuntimeError("No valid aligned points available for RMSE calculation.")
+        raise RuntimeError("No valid centroid-aligned desired-grid points available for error calculation.")
 
     global_pointwise_rmse_mm = float(np.sqrt(np.mean(all_err ** 2)))
     global_mean_err_mm = float(np.mean(all_err))
@@ -2081,34 +2145,12 @@ def compute_errors_against_aligned_desired(
     global_max_err_mm = float(np.max(all_err))
 
     per_angle = {}
-    for ang, grecs in grouped.items():
-        errs = np.asarray(
-            [float(r["error_distance_mm"]) for r in grecs if r.get("error_distance_mm") is not None],
-            dtype=float
-        )
-        if errs.size == 0:
-            per_angle[ang] = {
-                "used_tip_angle_deg": float(ang),
-                "num_samples": 0,
-                "rmse_mm": None,
-                "mean_error_mm": None,
-                "std_error_mm": None,
-                "median_error_mm": None,
-                "min_error_mm": None,
-                "max_error_mm": None,
-            }
-            continue
+    for ang, grecs in grouped_by_angle.items():
+        per_angle[ang] = _summarize_error_group(grecs, ang, "used_tip_angle_deg")
 
-        per_angle[ang] = {
-            "used_tip_angle_deg": float(ang),
-            "num_samples": int(errs.size),
-            "rmse_mm": float(np.sqrt(np.mean(errs ** 2))),
-            "mean_error_mm": float(np.mean(errs)),
-            "std_error_mm": float(np.std(errs)),
-            "median_error_mm": float(np.median(errs)),
-            "min_error_mm": float(np.min(errs)),
-            "max_error_mm": float(np.max(errs)),
-        }
+    per_orientation = {}
+    for orientation, grecs in grouped_by_orientation.items():
+        per_orientation[orientation] = _summarize_error_group(grecs, orientation, "orientation_deg")
 
     per_angle_rmse_values = [
         float(item["rmse_mm"])
@@ -2131,6 +2173,7 @@ def compute_errors_against_aligned_desired(
         "global_min_error_mm": global_min_err_mm,
         "global_max_error_mm": global_max_err_mm,
         "per_angle_metrics": per_angle,
+        "per_orientation_metrics": per_orientation,
     }
     return records, metrics
 
@@ -2146,6 +2189,7 @@ def save_desired_vs_measured_csv(csv_path: Path, records: List[Dict[str, Any]]):
         "pass_index",
         "requested_tip_angle_deg",
         "used_tip_angle_deg",
+        "orientation_deg",
         "b_cmd",
         "c_cmd",
         "tip_x_cmd",
@@ -2203,6 +2247,7 @@ def save_metrics_json(
             "max_error_mm": metrics["global_max_error_mm"],
         },
         "per_angle_metrics": metrics["per_angle_metrics"],
+        "per_orientation_metrics": metrics["per_orientation_metrics"],
         "per_angle_alignments": alignments,
         "per_angle_grid_meta": grid_meta,
         "analysis_crop": getattr(cal, "analysis_crop", None),
@@ -2577,11 +2622,11 @@ def main():
         z_step_mm=float(args.desired_z_step_mm),
     )
 
-    print("[INFO] Using sampled grid points directly as the reference targets...")
+    print("[INFO] Keeping centroid alignment only for overlay/reference outputs...")
     records, alignments = align_desired_to_measured_per_angle(records)
 
-    print("[INFO] Computing per-angle RMSE and global score...")
-    records, metrics = compute_errors_against_aligned_desired(records)
+    print("[INFO] Computing errors against centroid-aligned sampled grid points...")
+    records, metrics = compute_errors_against_aligned_desired_grid(records)
 
     csv_path = processed_dir / "tracked_tip_positions_desired_vs_measured_mm.csv"
     metrics_json_path = processed_dir / "tracked_tip_desired_vs_measured_metrics.json"
@@ -2632,6 +2677,17 @@ def main():
         else:
             print(
                 f"  Used angle {ang:.3f} deg: "
+                f"RMSE = {m['rmse_mm']:.6f} mm, "
+                f"n = {m['num_samples']}"
+            )
+    print("\nPer-orientation RMSE:")
+    for orientation in sorted(metrics["per_orientation_metrics"].keys()):
+        m = metrics["per_orientation_metrics"][orientation]
+        if m["rmse_mm"] is None:
+            print(f"  Orientation {orientation:.3f} deg: no valid data")
+        else:
+            print(
+                f"  Orientation {orientation:.3f} deg: "
                 f"RMSE = {m['rmse_mm']:.6f} mm, "
                 f"n = {m['num_samples']}"
             )

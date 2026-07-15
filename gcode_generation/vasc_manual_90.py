@@ -99,6 +99,12 @@ DEFAULT_PRIME_MM = 0.2
 DEFAULT_PRESSURE_OFFSET_MM = 5.0
 DEFAULT_PRESSURE_ADVANCE_FEED = 1000.0
 DEFAULT_PRESSURE_RETRACT_FEED = 1000.0
+DEFAULT_PRESSURE_ON_COMMAND = "M42 P10 S1"
+DEFAULT_PRESSURE_OFF_COMMAND = "M42 P10 S0"
+DEFAULT_PRESSURE_SET_COMMAND = "M42 P11 S0.3"
+DEFAULT_VACUUM_ON_COMMAND = "M42 P13 S0.333"
+DEFAULT_VACUUM_OFF_COMMAND = "M42 P13 S0.0001"
+DEFAULT_VACUUM_LEAD_DISTANCE_MM = 3.0
 DEFAULT_PREFLOW_DWELL_MS = 500
 DEFAULT_START_NODE_DWELL_MS = 500
 DEFAULT_NODE_DWELL_MS = 500
@@ -2503,6 +2509,12 @@ class GCodeWriter:
         aorta_cylinder_sample_spacing_mm: float = DEFAULT_AORTA_CYLINDER_SAMPLE_SPACING_MM,
         extrusion_feed_mode: str = DEFAULT_EXTRUSION_FEED_MODE,
         radius_feed_map: Optional[Sequence[Tuple[float, float]]] = None,
+        pressure_on_command: str = DEFAULT_PRESSURE_ON_COMMAND,
+        pressure_off_command: str = DEFAULT_PRESSURE_OFF_COMMAND,
+        pressure_set_command: str = DEFAULT_PRESSURE_SET_COMMAND,
+        vacuum_on_command: str = DEFAULT_VACUUM_ON_COMMAND,
+        vacuum_off_command: str = DEFAULT_VACUUM_OFF_COMMAND,
+        vacuum_lead_distance_mm: float = DEFAULT_VACUUM_LEAD_DISTANCE_MM,
     ) -> None:
         self.f = fh
         self.cal = cal
@@ -2557,8 +2569,15 @@ class GCodeWriter:
         self.extrusion_feed_mode = str(extrusion_feed_mode).strip().lower()
         self.radius_feed_map = [] if radius_feed_map is None else [(float(r), float(f)) for r, f in radius_feed_map]
         self.aorta_centerline_points: Optional[np.ndarray] = None
+        self.pressure_on_command = str(pressure_on_command or "").strip()
+        self.pressure_off_command = str(pressure_off_command or "").strip()
+        self.pressure_set_command = str(pressure_set_command or "").strip()
+        self.vacuum_on_command = str(vacuum_on_command or "").strip()
+        self.vacuum_off_command = str(vacuum_off_command or "").strip()
+        self.vacuum_lead_distance_mm = max(0.0, float(vacuum_lead_distance_mm))
 
         self.pressure_charged = False
+        self.vacuum_enabled = False
         self.cur_stage_xyz: Optional[np.ndarray] = None
         self.cur_tip_xyz: Optional[np.ndarray] = None
         self.cur_b: float = 0.0
@@ -3697,6 +3716,9 @@ class GCodeWriter:
         start_tip = np.asarray(start_tip, dtype=float).reshape(3)
         start_tangent = normalize(np.asarray(start_tangent, dtype=float).reshape(3))
         final_feed = float(self.print_feed if final_approach_feed is None else final_approach_feed)
+        if self.write_mode == "cartesian" and self.orientation_mode == "fixed":
+            self.approach_start_direct(start_tip=start_tip, start_tangent=start_tangent, label=label, final_approach_feed=final_feed)
+            return
         if (
             not self.enable_aorta_cylinder_travel
             or self.aorta_centerline_points is None
@@ -3840,19 +3862,36 @@ class GCodeWriter:
     def pressure_preload_before_print(self) -> None:
         if self.emit_extrusion and not self.pressure_charged:
             self.pressure_charged = True
+            if self.pressure_set_command:
+                self.f.write("; set pressure before print pass\n")
+                self.f.write(f"{self.pressure_set_command}\n")
             self.f.write("; enable pressure solenoid before print pass\n")
-            self.f.write("M42 P0 S1\n")
+            self.f.write(f"{self.pressure_on_command}\n")
             if self.preflow_dwell_ms > 0:
                 self.f.write(f"G4 P{self.preflow_dwell_ms}\n")
 
     def pressure_release_after_print(self) -> None:
         if self.emit_extrusion and self.pressure_charged:
+            self.enable_vacuum(comment="; enable vacuum before end-of-pass dwell")
             if self.node_dwell_ms > 0:
                 self.f.write("; end-of-pass dwell for node formation / liquid flow\n")
                 self.f.write(f"G4 P{self.node_dwell_ms}\n")
+            self.disable_vacuum(comment="; disable vacuum after end-of-pass dwell")
             self.pressure_charged = False
             self.f.write("; disable pressure solenoid after print pass\n")
-            self.f.write("M42 P0 S0\n")
+            self.f.write(f"{self.pressure_off_command}\n")
+
+    def enable_vacuum(self, comment: str = "; enable vacuum near end of branch") -> None:
+        if self.emit_extrusion and not self.vacuum_enabled and self.vacuum_on_command:
+            self.f.write(f"{comment}\n")
+            self.f.write(f"{self.vacuum_on_command}\n")
+            self.vacuum_enabled = True
+
+    def disable_vacuum(self, comment: str = "; disable vacuum after branch") -> None:
+        if self.vacuum_enabled and self.vacuum_off_command:
+            self.f.write(f"{comment}\n")
+            self.f.write(f"{self.vacuum_off_command}\n")
+        self.vacuum_enabled = False
 
     def start_node_dwell_before_print(self) -> None:
         if self.emit_extrusion and self.pressure_charged and self.start_node_dwell_ms > 0:
@@ -3871,6 +3910,10 @@ class GCodeWriter:
         final_approach_feed: Optional[float] = None,
     ) -> None:
         start_tip = np.asarray(start_tip, dtype=float)
+        if self.write_mode == "cartesian" and self.orientation_mode == "fixed":
+            final_feed = float(self.print_feed if final_approach_feed is None else final_approach_feed)
+            self.approach_start_direct(start_tip=start_tip, start_tangent=start_tangent, label=label, final_approach_feed=final_feed)
+            return
         base_side = side_vector_from_tangent(start_tangent, fallback=self.last_tip_tangent)
         approach_distance = max(float(far_clearance), float(self.fine_approach_distance))
         final_feed = float(self.print_feed if final_approach_feed is None else final_approach_feed)
@@ -4009,6 +4052,90 @@ class GCodeWriter:
                 prev_b=self.cur_b,
                 travel_mode=True,
             )
+
+            if self.write_mode == "cartesian" and self.orientation_mode == "fixed":
+                if self.cur_tip_xyz is None:
+                    self.move_to_tip_with_explicit_bc(
+                        start_tip,
+                        b=start_b,
+                        c=start_c,
+                        feed=self.travel_feed,
+                        comment=f"{label}: startup travel to first node start",
+                        motion_phase=start_phase,
+                        requested_tip_angle=start_tip_angle,
+                    )
+                    return
+
+                cur_tip = np.asarray(self.cur_tip_xyz, dtype=float).copy()
+                bbox = self.printed_tip_bbox()
+                max_printed_z = None if bbox is None else float(bbox[4])
+                safe_z = max(
+                    float(cur_tip[2]),
+                    float(start_tip[2]),
+                    (float(start_tip[2]) if max_printed_z is None else max_printed_z + float(self.travel_clearance_above_printed_z)),
+                )
+
+                self.move_to_tip_with_explicit_bc(
+                    cur_tip,
+                    b=start_b,
+                    c=start_c,
+                    feed=self.travel_feed,
+                    comment=f"{label}: orientation sync before raised-Z travel",
+                    motion_phase=start_phase,
+                    requested_tip_angle=start_tip_angle,
+                )
+
+                if abs(float(cur_tip[2]) - safe_z) > 1e-9:
+                    lift_tip = cur_tip.copy()
+                    lift_tip[2] = safe_z
+                    self.move_to_tip_with_explicit_bc(
+                        lift_tip,
+                        b=start_b,
+                        c=start_c,
+                        feed=self.travel_feed,
+                        comment=f"{label}: lift above previously printed geometry",
+                        motion_phase=start_phase,
+                        requested_tip_angle=start_tip_angle,
+                    )
+                    cur_tip = lift_tip
+
+                xy_tip = np.array([float(start_tip[0]), float(start_tip[1]), float(cur_tip[2])], dtype=float)
+                if float(np.linalg.norm(xy_tip - cur_tip)) > 1e-9:
+                    self.move_to_tip_with_explicit_bc(
+                        xy_tip,
+                        b=start_b,
+                        c=start_c,
+                        feed=self.travel_feed,
+                        comment=f"{label}: XY travel at raised clearance Z",
+                        motion_phase=start_phase,
+                        requested_tip_angle=start_tip_angle,
+                    )
+
+                if float(np.linalg.norm(start_tip - xy_tip)) > 1e-9:
+                    plunge_vec = start_tip - xy_tip
+                    plunge_dist = float(np.linalg.norm(plunge_vec))
+                    fine_dist = min(float(self.fine_approach_distance), plunge_dist)
+                    if plunge_dist - fine_dist > 1e-9:
+                        fine_start_tip = xy_tip + ((plunge_dist - fine_dist) / plunge_dist) * plunge_vec
+                        self.move_to_tip_with_explicit_bc(
+                            fine_start_tip,
+                            b=start_b,
+                            c=start_c,
+                            feed=self.travel_feed,
+                            comment=f"{label}: vertical plunge to fine-approach start",
+                            motion_phase=start_phase,
+                            requested_tip_angle=start_tip_angle,
+                        )
+                    self.move_to_tip_with_explicit_bc(
+                        start_tip,
+                        b=start_b,
+                        c=start_c,
+                        feed=final_feed,
+                        comment=f"{label}: final vertical fine approach to node start",
+                        motion_phase=start_phase,
+                        requested_tip_angle=start_tip_angle,
+                    )
+                return
 
             if self.cur_tip_xyz is None:
                 self.move_to_tip_with_explicit_bc(
@@ -4166,6 +4293,7 @@ class GCodeWriter:
         self.cur_tip_xyz = last_tip.copy()
         self.last_tip_tangent = np.asarray(tangents[0], dtype=float).copy()
 
+        samples: List[Tuple[np.ndarray, np.ndarray, float]] = []
         for i in range(1, len(points)):
             p0 = np.asarray(points[i - 1], dtype=float)
             p1 = np.asarray(points[i], dtype=float)
@@ -4177,28 +4305,31 @@ class GCodeWriter:
                 t = s / float(self.edge_samples)
                 p_tip = p0 + t * (p1 - p0)
                 tangent = normalize((1.0 - t) * seg_t0 + t * seg_t1)
-                p_stage, b, c, motion_phase, used_tip_angle = self.tip_to_stage_with_phase(
-                    p_tip,
-                    tangent=tangent,
-                    prev_c=self.cur_c,
-                    prev_b=self.cur_b,
-                )
                 local_radius_mm = float((1.0 - t) * r0 + t * r1)
-                local_feed = active_print_feed
-                if self.extrusion_feed_mode == "weighted" and self.radius_feed_map:
-                    local_feed = feed_from_radius_map(local_radius_mm, self.radius_feed_map, active_print_feed)
-                self.write_tip_speed_move(
-                    p_stage=p_stage,
-                    b=b,
-                    c=c,
-                    desired_tip_feed=local_feed,
-                    start_tip_xyz=last_tip,
-                    end_tip_xyz=p_tip,
-                    motion_phase=motion_phase,
-                    requested_tip_angle=used_tip_angle,
-                )
-                self.last_tip_tangent = tangent.copy()
-                last_tip = p_tip.copy()
+                samples.append((p_tip, tangent, local_radius_mm))
+
+        for p_tip, tangent, local_radius_mm in samples:
+            p_stage, b, c, motion_phase, used_tip_angle = self.tip_to_stage_with_phase(
+                p_tip,
+                tangent=tangent,
+                prev_c=self.cur_c,
+                prev_b=self.cur_b,
+            )
+            local_feed = active_print_feed
+            if self.extrusion_feed_mode == "weighted" and self.radius_feed_map:
+                local_feed = feed_from_radius_map(local_radius_mm, self.radius_feed_map, active_print_feed)
+            self.write_tip_speed_move(
+                p_stage=p_stage,
+                b=b,
+                c=c,
+                desired_tip_feed=local_feed,
+                start_tip_xyz=last_tip,
+                end_tip_xyz=p_tip,
+                motion_phase=motion_phase,
+                requested_tip_angle=used_tip_angle,
+            )
+            self.last_tip_tangent = tangent.copy()
+            last_tip = p_tip.copy()
 
         self.emit_vasculature_write_end(label)
         self.pressure_release_after_print()
@@ -4235,6 +4366,8 @@ def build_print_paths(
     path_resample_spacing: float,
     path_geometry_smooth_window: int,
     point_merge_tol: float,
+    write_mode: str = DEFAULT_WRITE_MODE,
+    orientation_mode: str = DEFAULT_ORIENTATION_MODE,
     min_group_length_mm: float = DEFAULT_MIN_GROUP_LENGTH_MM,
     force_bottom_to_top: bool = False,
     branch_start_overlap_mm: float = 0.0,
@@ -4309,6 +4442,8 @@ def build_print_paths(
         point_merge_tol=float(point_merge_tol),
         tangent_window_mm=float(branch_overlap_tangent_window_mm),
     )
+    if str(write_mode).strip().lower() == "cartesian" and str(orientation_mode).strip().lower() == "fixed":
+        final_paths = order_paths_fixed_cartesian_leaf_to_root(final_paths)
     min_len = max(0.0, float(min_group_length_mm))
     if min_len <= 0.0:
         return final_paths
@@ -4853,6 +4988,265 @@ def order_paths_from_printed_tree(paths: List[PrintPath], connection_threshold: 
     return ordered
 
 
+def order_paths_fixed_cartesian_leaf_to_root(paths: List[PrintPath]) -> List[PrintPath]:
+    """For fixed cartesian printing, emit outer leaves before parent branches.
+
+    Branch paths are reversed so extrusion starts at the outer leaf and ends at
+    the parent-node connection. Paths are then emitted in tree postorder so a
+    branch's descendants print before that branch, with lower connections
+    emitted before higher ones.
+    """
+    if len(paths) <= 1:
+        return list(paths)
+
+    oriented: List[PrintPath] = []
+    for path in paths:
+        pts = np.asarray(path.points, dtype=float).copy()
+        rr = np.asarray(path.radius_profile, dtype=float).copy()
+        source_ids = [int(v) for v in path.source_vessel_ids]
+        should_reverse = False
+        if not bool(path.is_main) and len(pts) >= 2:
+            if path.connection_xyz is not None:
+                conn = np.asarray(path.connection_xyz, dtype=float).reshape(3)
+                start_dist = float(np.linalg.norm(pts[0] - conn))
+                end_dist = float(np.linalg.norm(pts[-1] - conn))
+                should_reverse = start_dist <= end_dist + 1e-9
+            else:
+                should_reverse = True
+        if should_reverse:
+            pts = pts[::-1].copy()
+            rr = rr[::-1].copy()
+            source_ids = list(reversed(source_ids))
+        oriented.append(PrintPath(
+            path_id=path.path_id,
+            source_vessel_ids=source_ids,
+            points=pts,
+            radius_profile=rr,
+            root_vessel_id=path.root_vessel_id,
+            parent_vessel_id=path.parent_vessel_id,
+            depth=path.depth,
+            is_main=path.is_main,
+            radius_like=path.radius_like,
+            connection_xyz=None if path.connection_xyz is None else np.asarray(path.connection_xyz, dtype=float).copy(),
+            connection_z=path.connection_z,
+        ))
+
+    vessel_to_path_idx: Dict[int, int] = {}
+    for idx, path in enumerate(oriented):
+        for vessel_id in path.source_vessel_ids:
+            vessel_to_path_idx[int(vessel_id)] = int(idx)
+
+    def infer_parent_idx(path_idx: int) -> Optional[int]:
+        path = oriented[int(path_idx)]
+        if path.parent_vessel_id is not None:
+            candidate = vessel_to_path_idx.get(int(path.parent_vessel_id))
+            if candidate is not None and candidate != path_idx:
+                return int(candidate)
+        if path.connection_xyz is None:
+            return None
+
+        conn = np.asarray(path.connection_xyz, dtype=float).reshape(3)
+        best_parent_idx: Optional[int] = None
+        best_dist = float("inf")
+        best_is_main = 1
+        for other_idx, other in enumerate(oriented):
+            if other_idx == path_idx:
+                continue
+            other_pts = np.asarray(other.points, dtype=float)
+            if len(other_pts) < 2:
+                continue
+            _q, _t, dist = nearest_point_and_tangent_on_polyline(conn, other_pts)
+            is_main_rank = 0 if bool(other.is_main) else 1
+            key = (float(dist), is_main_rank, int(other_idx))
+            if key < (best_dist, best_is_main, int(best_parent_idx if best_parent_idx is not None else 10**9)):
+                best_dist = float(dist)
+                best_is_main = is_main_rank
+                best_parent_idx = int(other_idx)
+        return best_parent_idx
+
+    children_by_parent: Dict[Optional[int], List[int]] = {}
+    for idx, path in enumerate(oriented):
+        parent_idx = infer_parent_idx(int(idx))
+        children_by_parent.setdefault(parent_idx, []).append(int(idx))
+
+    def _path_sort_key(path_idx: int) -> Tuple[float, float, int, int]:
+        path = oriented[int(path_idx)]
+        pts = np.asarray(path.points, dtype=float)
+        conn_z = float(path.connection_z) if path.connection_z is not None else float(pts[-1, 2] if len(pts) else 0.0)
+        leaf_z = float(pts[0, 2] if len(pts) else conn_z)
+        return (
+            conn_z,
+            leaf_z,
+            -int(path.depth),
+            int(min(path.source_vessel_ids)) if path.source_vessel_ids else int(path_idx),
+        )
+
+    for bucket in children_by_parent.values():
+        bucket.sort(key=_path_sort_key)
+
+    split_candidate_idx: Optional[int] = None
+    split_candidate_length = -1.0
+    for idx, path in enumerate(oriented):
+        if not children_by_parent.get(int(idx)):
+            continue
+        path_len = polyline_length(np.asarray(path.points, dtype=float))
+        if path_len > split_candidate_length:
+            split_candidate_length = float(path_len)
+            split_candidate_idx = int(idx)
+
+    visited: set[int] = set()
+    ordered: List[PrintPath] = []
+    synthetic_id_counter = -1
+
+    def next_synthetic_id() -> int:
+        nonlocal synthetic_id_counter
+        out = int(synthetic_id_counter)
+        synthetic_id_counter -= 1
+        return out
+
+    def split_path_segment(
+        path: PrintPath,
+        s_start: float,
+        s_end: float,
+        synthetic_id: int,
+        parent_vessel_id: Optional[int],
+        segment_index: int,
+    ) -> Optional[PrintPath]:
+        pts = np.asarray(path.points, dtype=float)
+        rr = np.asarray(path.radius_profile, dtype=float)
+        if len(pts) < 2:
+            return None
+        arc = polyline_arc_lengths(pts)
+        total = float(arc[-1])
+        a = float(np.clip(min(s_start, s_end), 0.0, total))
+        b = float(np.clip(max(s_start, s_end), 0.0, total))
+        if b - a <= 1e-6:
+            return None
+
+        start_pt = point_on_polyline_at_arclength(pts, a)
+        end_pt = point_on_polyline_at_arclength(pts, b)
+        start_r = float(np.interp(a, arc, rr))
+        end_r = float(np.interp(b, arc, rr))
+        keep = (arc > a + 1e-9) & (arc < b - 1e-9)
+        seg_pts = [np.asarray(start_pt, dtype=float)]
+        seg_rr = [start_r]
+        for pt, rad in zip(pts[keep], rr[keep]):
+            seg_pts.append(np.asarray(pt, dtype=float).copy())
+            seg_rr.append(float(rad))
+        seg_pts.append(np.asarray(end_pt, dtype=float))
+        seg_rr.append(end_r)
+
+        cleaned_pts: List[np.ndarray] = []
+        cleaned_rr: List[float] = []
+        for pt, rad in zip(seg_pts, seg_rr):
+            if cleaned_pts and float(np.linalg.norm(np.asarray(pt, dtype=float) - cleaned_pts[-1])) <= 1e-9:
+                cleaned_pts[-1] = np.asarray(pt, dtype=float).copy()
+                cleaned_rr[-1] = float(rad)
+                continue
+            cleaned_pts.append(np.asarray(pt, dtype=float).copy())
+            cleaned_rr.append(float(rad))
+        if len(cleaned_pts) < 2 or polyline_length(np.asarray(cleaned_pts, dtype=float)) <= 1e-6:
+            return None
+
+        source_ids = [int(synthetic_id)] + [int(v) for v in path.source_vessel_ids if int(v) >= 0]
+        conn_xyz = None if parent_vessel_id is None else np.asarray(cleaned_pts[0], dtype=float).copy()
+        conn_z = None if parent_vessel_id is None else float(cleaned_pts[0][2])
+        return PrintPath(
+            path_id=f"{path.path_id}__seg{int(segment_index):02d}",
+            source_vessel_ids=source_ids,
+            points=np.asarray(cleaned_pts, dtype=float).copy(),
+            radius_profile=np.asarray(cleaned_rr, dtype=float).copy(),
+            root_vessel_id=path.root_vessel_id,
+            parent_vessel_id=None if parent_vessel_id is None else int(parent_vessel_id),
+            depth=path.depth,
+            is_main=path.is_main,
+            radius_like=path.radius_like,
+            connection_xyz=conn_xyz,
+            connection_z=conn_z,
+        )
+
+    def emit_path_subtree(path_idx: int, parent_override: Optional[int] = None) -> None:
+        path_idx = int(path_idx)
+        if path_idx in visited:
+            return
+        visited.add(path_idx)
+
+        path = oriented[path_idx]
+        child_indices = [int(child_idx) for child_idx in children_by_parent.get(path_idx, [])]
+        if child_indices and split_candidate_idx is not None and int(path_idx) == int(split_candidate_idx):
+            pts = np.asarray(path.points, dtype=float)
+            split_records: List[Tuple[float, int]] = []
+            for child_idx in child_indices:
+                child = oriented[int(child_idx)]
+                conn = child.connection_xyz
+                if conn is None:
+                    conn = np.asarray(child.points, dtype=float)[-1]
+                _q, s_conn, _tan, _dist = projected_point_and_arclength_on_polyline(np.asarray(conn, dtype=float), pts)
+                split_records.append((float(s_conn), int(child_idx)))
+            split_records.sort(key=lambda item: (item[0], _path_sort_key(item[1])))
+
+            split_s = 0.5 * float(polyline_length(pts))
+            lower_seg_id = next_synthetic_id()
+            lower_segment = split_path_segment(
+                path=path,
+                s_start=0.0,
+                s_end=split_s,
+                synthetic_id=lower_seg_id,
+                parent_vessel_id=parent_override,
+                segment_index=1,
+            )
+            branch_parent_id = parent_override
+            if lower_segment is not None:
+                ordered.append(lower_segment)
+                branch_parent_id = int(lower_seg_id)
+
+            for _s_conn, child_idx in split_records:
+                emit_path_subtree(int(child_idx), parent_override=branch_parent_id)
+
+            upper_seg_id = next_synthetic_id()
+            upper_segment = split_path_segment(
+                path=path,
+                s_start=split_s,
+                s_end=float(polyline_length(pts)),
+                synthetic_id=upper_seg_id,
+                parent_vessel_id=branch_parent_id,
+                segment_index=2,
+            )
+            if upper_segment is not None:
+                ordered.append(upper_segment)
+            return
+
+        for child_idx in child_indices:
+            emit_path_subtree(int(child_idx))
+
+        appended = path
+        if parent_override is not None:
+            appended = PrintPath(
+                path_id=path.path_id,
+                source_vessel_ids=[int(v) for v in path.source_vessel_ids],
+                points=np.asarray(path.points, dtype=float).copy(),
+                radius_profile=np.asarray(path.radius_profile, dtype=float).copy(),
+                root_vessel_id=path.root_vessel_id,
+                parent_vessel_id=int(parent_override),
+                depth=path.depth,
+                is_main=path.is_main,
+                radius_like=path.radius_like,
+                connection_xyz=None if path.connection_xyz is None else np.asarray(path.connection_xyz, dtype=float).copy(),
+                connection_z=path.connection_z,
+            )
+        ordered.append(appended)
+
+    root_indices = list(children_by_parent.get(None, []))
+    root_indices.sort(key=_path_sort_key)
+    for root_idx in root_indices:
+        emit_path_subtree(int(root_idx))
+
+    for idx in range(len(oriented)):
+        emit_path_subtree(idx)
+
+    return ordered
+
+
 def export_print_groups(out_path: str, paths: List[PrintPath]) -> None:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
@@ -4860,7 +5254,9 @@ def export_print_groups(out_path: str, paths: List[PrintPath]) -> None:
         f.write("# group_number\tpath_id\tvessel_ids_in_order\tpath_length_mm\tstart_z\tend_z\tmin_z\tmax_z\tconnection_z\tis_main\tdepth\tparent_vessel_id\n")
         for i, path in enumerate(paths, start=1):
             pts = np.asarray(path.points, dtype=float)
-            vessel_ids = ",".join(str(vessel_id) for vessel_id in path.source_vessel_ids)
+            raw_vessel_ids = [int(vessel_id) for vessel_id in path.source_vessel_ids]
+            visible_vessel_ids = [vessel_id for vessel_id in raw_vessel_ids if vessel_id >= 0] or raw_vessel_ids
+            vessel_ids = ",".join(str(vessel_id) for vessel_id in visible_vessel_ids)
             parent = "" if path.parent_vessel_id is None else str(path.parent_vessel_id)
             connection_z = "" if path.connection_z is None else f"{float(path.connection_z):.6f}"
             f.write(
@@ -4988,6 +5384,12 @@ def write_vessel_gcode(
     aorta_cylinder_sample_spacing_mm: float = DEFAULT_AORTA_CYLINDER_SAMPLE_SPACING_MM,
     extrusion_feed_mode: str = DEFAULT_EXTRUSION_FEED_MODE,
     radius_feed_map: Optional[Sequence[Tuple[float, float]]] = None,
+    pressure_on_command: str = DEFAULT_PRESSURE_ON_COMMAND,
+    pressure_off_command: str = DEFAULT_PRESSURE_OFF_COMMAND,
+    pressure_set_command: str = DEFAULT_PRESSURE_SET_COMMAND,
+    vacuum_on_command: str = DEFAULT_VACUUM_ON_COMMAND,
+    vacuum_off_command: str = DEFAULT_VACUUM_OFF_COMMAND,
+    vacuum_lead_distance_mm: float = DEFAULT_VACUUM_LEAD_DISTANCE_MM,
     group_displacements: Optional[Dict[int, GroupDisplacement]] = None,
 ) -> Dict[str, Tuple[float, float]]:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -5007,6 +5409,8 @@ def write_vessel_gcode(
         path_resample_spacing=path_resample_spacing,
         path_geometry_smooth_window=path_geometry_smooth_window,
         point_merge_tol=point_merge_tol,
+        write_mode=write_mode,
+        orientation_mode=orientation_mode,
         min_group_length_mm=min_group_length_mm,
         force_bottom_to_top=force_bottom_to_top,
         branch_start_overlap_mm=branch_start_overlap_mm,
@@ -5040,7 +5444,8 @@ def write_vessel_gcode(
         f.write(f"; path_count = {path_summary['path_count']} (main={path_summary['main_path_count']}, secondary={path_summary['secondary_path_count']})\n")
         f.write(f"; radius_like range = [{vessel_summary['min_radius']:.6f}, {vessel_summary['max_radius']:.6f}]\n")
         f.write(f"; axes: X->{cal.x_axis}, Y->{cal.y_axis}, Z->{cal.z_axis}, B->{cal.b_axis}, C->{cal.c_axis}, U->{cal.u_axis}\n")
-        f.write("; extrusion actuation: pressure solenoid valve via M42 P0 S1 / M42 P0 S0\n")
+        f.write(f"; extrusion actuation: on='{pressure_on_command}' off='{pressure_off_command}' set='{pressure_set_command}'\n")
+        f.write(f"; vacuum actuation: on='{vacuum_on_command}' off='{vacuum_off_command}' lead_mm={float(vacuum_lead_distance_mm):.6f}\n")
         f.write(f"; preflow_dwell_ms = {int(preflow_dwell_ms)}\n")
         f.write(f"; start_node_dwell_ms = {int(start_node_dwell_ms)}\n")
         f.write(f"; node_dwell_ms = {int(node_dwell_ms)}\n")
@@ -5111,7 +5516,9 @@ def write_vessel_gcode(
         f.write(f"; side approach: far={side_approach_far:.3f}, near={side_approach_near:.3f}, retreat={side_retreat:.3f}, lift_z={side_lift_z:.3f}\n")
         f.write("G90\n")
         if emit_extrusion:
-            f.write("M42 P0 S0\n")
+            f.write(f"{pressure_off_command}\n")
+            if vacuum_off_command:
+                f.write(f"{vacuum_off_command}\n")
 
         g = GCodeWriter(
             fh=f,
@@ -5160,6 +5567,12 @@ def write_vessel_gcode(
             aorta_cylinder_sample_spacing_mm=aorta_cylinder_sample_spacing_mm,
             extrusion_feed_mode=feed_mode,
             radius_feed_map=radius_feed_map,
+            pressure_on_command=pressure_on_command,
+            pressure_off_command=pressure_off_command,
+            pressure_set_command=pressure_set_command,
+            vacuum_on_command=vacuum_on_command,
+            vacuum_off_command=vacuum_off_command,
+            vacuum_lead_distance_mm=vacuum_lead_distance_mm,
         )
 
         if float(travel_accel_mm_s2) > 0.0:
@@ -5215,6 +5628,7 @@ def write_vessel_gcode(
                 if feed_mode == "weighted"
                 else float(print_feed)
             )
+            final_approach_feed = float(travel_feed) if group_idx == 1 else active_path_print_feed
             if group_idx == 1:
                 g.set_aorta_reference(points)
 
@@ -5230,7 +5644,7 @@ def write_vessel_gcode(
                     start_tip=points[0],
                     start_tangent=tangents[0],
                     label=path.path_id,
-                    final_approach_feed=active_path_print_feed,
+                    final_approach_feed=final_approach_feed,
                 )
             elif enable_side_approach:
                 g.approach_start_from_side(
@@ -5241,14 +5655,14 @@ def write_vessel_gcode(
                     retreat_clearance=side_retreat,
                     side_lift_z=side_lift_z,
                     label=path.path_id,
-                    final_approach_feed=active_path_print_feed,
+                    final_approach_feed=final_approach_feed,
                 )
             else:
                 g.approach_start_direct(
                     start_tip=points[0],
                     start_tangent=tangents[0],
                     label=path.path_id,
-                    final_approach_feed=active_path_print_feed,
+                    final_approach_feed=final_approach_feed,
                 )
             if displacement is not None and (
                 abs(float(displacement.node_delta_b_deg)) > 1e-12
@@ -5299,7 +5713,9 @@ def write_vessel_gcode(
             comment=f"shutdown: lift in place to Z={shutdown_z:.3f}",
         )
         if emit_extrusion:
-            f.write("M42 P0 S0\n")
+            f.write(f"{pressure_off_command}\n")
+            if vacuum_off_command:
+                f.write(f"{vacuum_off_command}\n")
 
         if g.warnings:
             f.write("; ==================== warnings ====================\n")
@@ -5591,6 +6007,8 @@ def main(args: argparse.Namespace) -> None:
         path_resample_spacing=float(args.path_resample_spacing),
         path_geometry_smooth_window=int(args.path_geometry_smooth_window),
         point_merge_tol=float(args.point_merge_tol),
+        write_mode=str(args.write_mode),
+        orientation_mode=str(args.orientation_mode),
         min_group_length_mm=float(args.min_group_length_mm),
         force_bottom_to_top=bool(args.force_bottom_to_top),
         branch_start_overlap_mm=float(args.branch_start_overlap_mm),

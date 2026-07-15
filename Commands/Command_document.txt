@@ -1,0 +1,1964 @@
+python circle_cpr.py --calibration "Test_Calibration_2026-02-24_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+
+python circle_cpr.py \
+ --calibration "Test_Calibration_2026-02-24_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+
+
+
+
+
+python gcode_viewer.py \
+  --gcode gcode_generation/star_two_mirrored_halves_tip_priority_xoffset.gcode \
+  --calibration "Test_Calibration_2026-02-25_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+  python gcode_viewer.py \
+  --gcode octet_3x3x3.gcode \
+  --calibration "Test_Calibration_2026-02-25_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+python gcode_generation/star_cpr.py \
+ --calibration "Test_Calibration_2026-02-25_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+
+2.368454804443107
+
+
+python gcode_generation/octet_truss.py \
+  --calibration "Test_Calibration_2026-02-25_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out octet_3x3x3.gcode \
+  --cells-x 2 --cells-y 2 --cells-z 2 \
+  --pitch 15 \
+  --origin-x 65 --origin-y 40 --origin-z -110 \
+  --edge-samples 12 \
+  --print-feed 250 --travel-feed 200 \
+  --extrusion-per-mm 0.020
+
+  python gcode_generation/triangle_truss.py \
+  --calibration "Test_Calibration_2026-02-25_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out triangle_truss.gcode \
+  --cells-x 1 --cells-y 1 --cells-z 1 \
+  --pitch 14 \
+  --layer-height 10 \
+  --edge-samples 10 \
+  --print-feed 250 --travel-feed 1200 \
+  --extrusion-per-mm 0.020
+
+
+python gcode_viewer.py \
+  --gcode triangle_truss.gcode \
+  --calibration "Test_Calibration_2026-02-25_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+
+
+
+python gcode_generation/triangle_truss.py \
+  --calibration "Test_Calibration_2026-02-25_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out double_tetra_order2.gcode \
+  --double-tetra \
+  --order 2 \
+  --pitch 10 \
+  --edge-samples 8 \
+  --print-feed 300 --travel-feed 1200 \
+  --min-head-lead 0.5 \
+  --origin-x 50 \
+  --origin-y 50 \
+  --origin-z -60\
+  --extrusion-per-mm 0.020 \
+  --pressure-offset-mm 5.0 \
+  --preflow-dwell-ms 500 \
+  --node-dwell-ms 500 \
+  --pressure-advance-feed 120 \
+  --pressure-retract-feed 240 \
+  --attack-azimuth-flip-deg 180
+
+python gcode_viewer.py \
+  --gcode gcode_generation/double_tetra_order2.gcode \
+  --calibration "Test_Calibration_2026-02-27_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+python gcode_generation/triangle_truss.py \
+  --calibration "Test_Calibration_2026-02-27_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/double_tetra_order2.gcode \
+  --double-tetra \
+  --order 2 \
+  --pitch 15 \
+  --edge-samples 8 \
+  --print-feed 300 --travel-feed 1200 \
+  --min-head-lead 0.5 \
+  --origin-x 50 \
+  --origin-y 50 \
+  --origin-z -90\
+  --extrusion-per-mm 0.020 \
+  --pressure-offset-mm 3.0 \
+  --preflow-dwell-ms 700 \
+  --node-dwell-ms 700 \
+  --pressure-advance-feed 120 \
+  --pressure-retract-feed 240 \
+  --attack-azimuth-flip-deg 180
+
+
+cd /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima
+source venv/bin/activate
+python camera_capture.py
+
+python gcode_generation/point_track.py \
+  --calibration "Test_Calibration_2026-03-02_02_measured/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/probe_point_360_sine.gcode \
+  --c-profile oscillate \
+  --c-center-deg 0 \
+  --c-amp-deg 360 \
+  --c-cycles 10 \
+  --c-waveform sine \
+  --osc-samples-per-cycle 180 \
+  --probe-feed 1000 \
+  --c-feed 10000
+
+
+python gcode_viewer.py \
+  --gcode probe_point_360_sine.gcode \
+  --calibration "Test_Calibration_2026-02-27_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_generation/attack_angles_2.py \
+  --calibration "Test_Calibration_2026-03-02_02_measured/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/attack_angles_2.gcode \
+  --calibration "Test_Calibration_2026-03-02_02_measured/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_viewer.py \
+  --gcode custom_xz_geometry.gcode \
+  --calibration "Test_Calibration_2026-02-27_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+python gcode_generation/point_track.py \
+  --calibration "Test_Calibration_2026-03-02_02_measured/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/probe_point_360_sine_fast.gcode \
+  --c-profile oscillate \
+  --c-center-deg 0 \
+  --c-amp-deg 360 \
+  --c-cycles 10 \
+  --c-waveform sine \
+  --osc-samples-per-cycle 180 \
+  --probe-feed 8000 \
+  --c-feed 20000 \
+  --c-max-feed 20000 \
+  --c-accel-time 0.2 \
+  --c-decel-time 0.2
+
+
+python3 gcode_generation/attack_angles_3.py \
+  --out gcode_generation/xz_pattern_test.gcode \
+  --origin-x 65 \
+  --origin-y 40 \
+  --origin-z -110 \
+  --c-feed 5000 \
+  --extrusion-per-mm 0.020 \
+  --pressure-offset-mm 3.0 \
+  --pressure-advance-feed 120 \
+  --pressure-retract-feed 240 \
+  --preflow-dwell-ms 150 \
+  --node-dwell-ms 250 \
+  --group-y-step 15
+
+
+python gcode_viewer.py \
+  --gcode gcode_generation/xz_pattern_test_2.gcode \
+  --calibration "Test_Calibration_2026-03-12_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python3 gcode_generation/attack_angles_3.py \
+  --calibration "Test_Calibration_2026-03-12_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/xz_pattern_test_2.gcode
+
+python gcode_generation/triangle_truss.py \
+  --calibration "Test_Calibration_2026-03-04_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/double_tetra_order2.gcode \
+  --double-tetra \
+  --order 2 \
+  --edge-samples 8 \
+  --print-feed 300 --travel-feed 1200 \
+  --min-head-lead 0.5 \
+  --extrusion-per-mm 0.008 \
+  --pressure-offset-mm 5.0 \
+  --preflow-dwell-ms 200 \
+  --node-dwell-ms 200 \
+  --pressure-advance-feed 120 \
+  --pressure-retract-feed 240 \
+  --attack-azimuth-flip-deg 180
+
+python gcode_viewer.py \
+  --gcode gcode_generation/double_tetra_order2.gcode \
+  --calibration "Test_Calibration_2026-03-04_01_ruler/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_generation/point_track.py \
+  --calibration "Test_Calibration_2026-03-04_03_copy/processed_image_data_folder/calibrated_robot_tiprefine_dt_gcode_calibration.json" \
+  --out gcode_generation/probe_point_360_sine_fast.gcode \
+  --c-profile oscillate \
+  --c-center-deg 0 \
+  --c-amp-deg 360 \
+  --c-cycles 10 \
+  --c-waveform sine \
+  --osc-samples-per-cycle 180 \
+  --probe-feed 8000 \
+  --c-feed 2000 \
+  --c-max-feed 2000 \
+  --c-accel-time 0.2 \
+  --c-decel-time 0.2
+
+python gcode_viewer.py \
+  --gcode gcode_generation/xz_line_pattern_test_calibrated_axial.gcode \
+  --calibration "Test_Calibration_2026-03-04_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python3 offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-05-20_03" \
+  --threshold 220 \
+  --tip_detection_mode red_dot \
+  --tip_refine_mode coarse \
+  --red_tip_hue1_min 0 \
+  --red_tip_hue1_max 10 \
+  --red_tip_hue2_min 150 \
+  --red_tip_hue2_max 179 \
+  --red_tip_sat_min 80 \
+  --red_tip_val_min 80 \
+  --red_tip_min_area_px 20 \
+  --red_tip_local_min_area_px 10 \
+  --red_tip_morph_kernel 1 \
+  --red_tip_search_radius_px 700 \
+  --red_tip_min_circularity 0.0 \
+  --c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --save_plots \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "../captures/photo_20260519_121426.png"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/xz_line_pattern_test_calibrated_axial.gcode \
+  --calibration "Test_Calibration_2026-03-04_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+python3 gcode_generation/klein_bottle_1.py \
+  --calibration "Test_Calibration_2026-03-04_03_copy/processed_image_data_folder/calibrated_robot_tiprefine_dt_gcode_calibration.json" \
+  --out gcode_generation/xz_line_pattern_test_calibrated_axial.gcode
+
+
+
+python3 offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-03-04_03_copy" \
+  --threshold 190 \
+  --tip_refine_mode edge_dt \
+  --tip_refine_dt_step_px 0.5 \
+  --tip_refine_max_step_px 120 \
+  --save_plots \
+  --robot_name "calibrated_robot_tiprefine_dt" \
+  --ruler_mm 150 \
+  --export_skeleton \
+  --skeleton_links 6 \
+  --skeleton_reference_stl
+
+
+python3 gcode_generation/deflect_palm_1.py \
+  --calibration "Test_Calibration_2026-04-07_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-feed-1 200 \
+  --print-feed-2 500 \
+  --print-feed-3 1000
+
+python gcode_viewer.py \
+  --gcode gcode_generation/xy_radial_15deg_3levels_20260408.gcode \
+  --calibration "Test_Calibration_2026-04-07_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python3 gcode_generation/attack_angles_5.py \
+  --calibration "Test_Calibration_2026-04-08_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+python3 gcode_generation/attack_angles_3.py \
+  --calibration "Test_Calibration_2026-04-07_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/attack_5.gcode \
+  --calibration "Test_Calibration_2026-04-08_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python3 gcode_generation/klein_bottle_gui.py \
+  --calibration "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" 
+
+python gcode_viewer.py \
+  --gcode klein_bottle_shell_lattice_shell.gcode \
+  --calibration "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage
+
+python3 gcode_generation/vase_gui.py \
+  --calibration "Test_Calibration_2026-05-22_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --preset "gcode_generation/vase_20260512.json" \
+  --export "gcode_generation/rotary_vase_outer_inner_shell.gcode"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/rotary_vase_outer_inner_shell.gcode \
+  --calibration "Test_Calibration_2026-05-22_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-05-22_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage
+
+python3 gcode_generation/circle_multi.py \
+  --calibration "Test_Calibration_2026-05-04_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out "gcode_generation/xz_xy_circles.gcode"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/xz_xy_circles.gcode \
+  --calibration "Test_Calibration_2026-05-04_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+python3 gcode_generation/octet_truss_4.py \
+  --calibration "Test_Calibration_2026-04-08_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out "gcode_generation/octet_truss_4.gcode"
+
+python3 gcode_generation/octet_truss_5.py \
+  --calibration "Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out "gcode_generation/octet_truss_5.gcode"
+  
+python gcode_viewer.py \
+  --gcode gcode_generation/octet_truss_5.gcode \
+  --calibration "Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python3 gcode_generation/octet_truss_straight.py \
+  --calibration "Test_Calibration_2026-05-11_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/octet_truss_cartesian_topdown.gcode \
+  --calibration "Test_Calibration_2026-05-11_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python calib_circle_daq.py \
+  --calibration Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Circle_Tracking \
+  --enable-post \
+  --use-average-cubic-fit
+
+python calib_circle_process.py \
+  --project_dir "Test_Circle_Tracking_2026-04-07_11-30-35" \
+  --camera_calibration_file "captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard_reference_image "captures/photo_20260406_104134.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode none
+
+python calib_point_track_daq.py \
+  --calibration Test_Calibration_2026-05-19_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Point_Tracking \
+  --enable-post \
+  --y-offset-fit pchip  \
+  --b-0-to-90-only
+
+
+python calib_point_process.py \
+  --project_dir "Test_Point_Tracking_2026-04-06_13-58-14" \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard_reference_image "../captures/photo_20260406_104134.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode none
+  
+python calib_hourglass_daq.py \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --post-camera-calibration-file captures/calibration_webcam_20260406_104136.npz \
+  --post-checkerboard-reference-image captures/photo_20260430_103919.png \
+  --enable-post \
+  --post-tip-detection-mode red_dot \
+  --post-tracked-tip-source selected \
+  --post-script calib_hourglass_process_2.py \
+  --b-0-to-90-only
+
+python calib_hourglass_process_2.py \
+  --project_dir "Test_Hourglass_Tracking_Run_2026-04-21_12-41-39" \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard_reference_image "../captures/photo_20260406_104134.png" \
+  --threshold 200 \
+  --post-tip-refiner-model "../CNN_Calib/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --tracked_tip_source "cnn" \
+  --save_plots
+
+python calib_hourglass_process.py \
+  --project_dir "Hourglass_Tracking_Run_2026-04-21_12-29-40" \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard_reference_image "../captures/photo_20260406_104134.png" \
+  --threshold 200 \
+  --post-tip-refiner-model "Test_Calibration_2026-04-07_02_daq/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --post-tracked-tip-source "cnn" \
+  --save_plots
+
+
+
+python calib_star_daq.py \
+  --calibration Test_Calibration_2026-04-07_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Star_Tracking \
+  --enable-post
+
+python calib_cartes_daq.py \
+  --calibration Test_Calibration_2026-03-31_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Cartesian_Tracking \
+  --x-step 5 \
+  --z-step 5
+
+python calib_cartes_process.py \
+  --project_dir "Test_Cartesian_Tracking_2026-04-01_17-05-49" \
+  --camera_calibration_file "../captures/calibration_webcam_20260401_163844.npz" \
+  --checkerboard_reference_image "../captures/photo_20260401_163839.png" \
+  --threshold 200 \
+  --tip_refine_mode parallel_centerline \
+  --desired_x_step_mm 5 \
+  --desired_z_step_mm 5
+
+python calib_point_track_daq.py \
+  --calibration Test_Calibration_2026-06-02_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Point_Tracking \
+  --enable-post \
+  --y-offset-fit pchip \
+  --post-tip-detection-mode red_dot \
+  --post-tracked-tip-source auto
+  --motion-mode fast_routine \
+  --routine-repeats 1 \
+  --probe-feed 8000 \
+  --c-max-feed 20000 \
+  --c-accel-time 0.15 \
+  --c-decel-time 0.6 \
+  --motion-accel-mm-s2 80
+
+  --b-0-to-90-only \
+
+
+
+
+python calib_plane_process.py \
+  --project_dir "Test_Plane_Tracking_2026-04-06_13-44-04_bis" \
+  --camera_calibration_file "../captures/calibration_webcam_20260401_163844.npz" \
+  --checkerboard_reference_image "../captures/photo_20260401_163839.png" \
+  --threshold 200 \
+  --tip_refine_mode none \
+  --save_plots
+
+python calib_plane_curl_daq.py \
+  --calibration Test_Calibration_2026-03-24_06/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Curl_Tracking
+
+python calib_plane_curl_process.py \
+  --calibration Test_Calibration_2026-03-24_06/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project_dir "Test_Curl_Tracking_2026-03-24_16-43-32/B_feed_50" \
+  --camera_calibration_file "../../captures/calibration_webcam_20260324_132727.npz" \
+  --checkerboard_reference_image "../../captures/photo_20260324_132737.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode parallel_centerline
+
+python calib_plane_curl_process.py \
+  --calibration Test_Calibration_2026-03-24_06/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project_dir "Test_Curl_Tracking_2026-03-24_16-43-32/B_feed_1000" \
+  --camera_calibration_file "../../captures/calibration_webcam_20260324_132727.npz" \
+  --checkerboard_reference_image "../../captures/photo_20260324_132737.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode parallel_centerline
+
+python calib_plane_curl_process.py \
+  --calibration Test_Calibration_2026-03-24_06/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project_dir "Test_Curl_Tracking_2026-03-24_16-43-32/B_feed_100" \
+  --camera_calibration_file "../../captures/calibration_webcam_20260324_132727.npz" \
+  --checkerboard_reference_image "../../captures/photo_20260324_132737.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode parallel_centerline
+
+python calib_plane_curl_process.py \
+  --calibration Test_Calibration_2026-03-24_06/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project_dir "Test_Curl_Tracking_2026-03-24_16-43-32/B_feed_500" \
+  --camera_calibration_file "../../captures/calibration_webcam_20260324_132727.npz" \
+  --checkerboard_reference_image "../../captures/photo_20260324_132737.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode parallel_centerline
+
+python calib_plane_curl_process.py \
+  --calibration Test_Calibration_2026-03-24_06/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project_dir "Test_Curl_Tracking_2026-03-24_16-43-32/B_feed_2500" \
+  --camera_calibration_file "../../captures/calibration_webcam_20260324_132727.npz" \
+  --checkerboard_reference_image "../../captures/photo_20260324_132737.png" \
+  --threshold 200 \
+  --save_plots \
+  --tip_refine_mode parallel_centerline
+
+
+python3 calib_star_process.py \
+  --project_dir "Test_Star_Tracking_2026-03-19_11-34-24" \
+  --camera_calibration_file "../captures/calibration_webcam_20260318_154836.npz" \
+  --checkerboard_reference_image "../captures/photo_20260319_103954.png" \
+  --threshold 200 \
+  --save_analysis_config \
+  --tip_refine_mode parallel_centerline
+ 
+python3 offline_run_calibration.py \
+  --project_dir Test_Calibration_2026-03-20_00_offline \
+  --threshold 200 \
+  --save_plots \
+  --save_analysis_config \
+  --export_skeleton \
+  --camera_calibration_file "../captures/calibration_webcam_20260320_091517.npz" \
+  --checkerboard_reference_image "../captures/photo_20260320_091547.png" \
+  --tip_refine_mode parallel_centerline
+
+python3 offline_run_calibration.py \
+  --project_dir Test_Calibration_2026-03-31_03_off \
+  --threshold 250 \
+  --save_plots \
+  --save_analysis_config \
+  --export_skeleton \
+  --camera_calibration_file "../captures/calibration_webcam_20260331_100557.npz" \
+  --board_reference_image "../captures/photo_20260331_100553.png" \
+  --fit_model pchip
+
+python3 drift_plot.py \
+  --folders Drift_Test_2026-04_06_00_500pulls/processed_image_data_folder \
+  --csv-name tip_drift_measurements.csv \
+  --output-dir Drift_Test_2026-04_06_00_500pulls
+
+python3 drift_plot.py \
+  --folders Drift_Test_2026-03-31_500 \
+  --csv-name tip_drift_measurements.csv \
+  --output-dir Drift_Test_2026-03-31_500
+
+python ctr_tip_batch_annotate.py \
+  --input Test_Calibration_2026-03-31_03_off_avgbg/raw_image_data_folder \
+  --output Test_Calibration_2026-03-31_03_off_avgbg \
+  --anchor-edge top \
+  --threshold-mode fixed_then_otsu \
+  --threshold 90
+
+python ctr_tip_batch_annotate.py \
+  --input Test_Calibration_2026-03-31_03_off_avgbg/raw_image_data_folder \
+  --output Test_Calibration_2026-03-31_03_off_avgbg \
+  --anchor-edge top \
+  --threshold-mode bg_subtracted_otsu \
+  --tip-mode straight_edge_corner \
+  --threshold-upsample 1.0
+
+
+  --tube-proximal-frac 0.8 \
+  --tube-straight-edge-scan-half-r 1.3
+
+
+python ctr_tip_batch_annotate.py \
+  --input Test_Calibration_2026-04-02_02_off/raw_image_data_folder \
+  --output Test_Calibration_2026-04-02_02_off \
+  --anchor-edge top \
+  --threshold-mode bg_subtracted_otsu \
+  --tip-mode default
+
+
+python commands/test_m400.py --duet http://192.168.2.21 --axis X --distance 20 --feed 10
+
+python Run_Deflect.py --speeds 100 250 500 1000 1500
+
+python plot_deflect.py --project-dir "Y_Axis_Speed_2026_04_14_short_tube 2026-04-14"
+
+python plot_deflect.py --project-dir "Y_Axis_Speed_2026_06_04_cnn"
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-08_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_1.gcode \
+  --write-mode calibrated \
+  --orientation-mode tangent
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-08_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_1.gcode \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --vessel-order-mode ascending_id
+
+python vessel_tangent_gcode.py \
+  --vessels "Pasted text(4).txt" \
+  --calibration calibration.json \
+  --out vessels_tangent.gcode \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --vessel-order-mode ascending_id
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_1.gcode \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --vessel-order-mode ascending_id \
+  --simplify-endpoint-chains \
+  --chain-merge-threshold 0.5
+
+
+python gcode_viewer.py \
+  --gcode vessels_1.gcode \
+  --calibration "Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_viewer.py \
+  --gcode vessels_3.gcode \
+  --calibration "Test_Calibration_2026-04-07_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+
+python gcode_generation/vasc_2.py "vessel_table_raw_Louis.txt"
+
+--simplify-endpoint-chains \
+--chain-merge-threshold 0.30
+
+--chain-merge-threshold 0.40
+
+--tangent-smooth-window 9
+--tangent-smooth-window 11
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-08_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_1.gcode \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --vessel-order-mode ascending_id \
+  --simplify-endpoint-chains \
+  --chain-merge-threshold 0.15 \
+  --tangent-smooth-window 3 \
+  --centerline-smooth-window 2
+
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --out vessels_4.gcode \
+  --write-mode cartesian \
+  --vessel-ids 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-07_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_3.gcode \
+  --write-mode calibrated \x
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --vessel-order-mode lowest_longest_roots
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_3.gcode \
+  --groups-out vessels_3_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --vessel-order-mode lowest_longest_roots \
+  --simplify-endpoint-chains \
+  --force-bottom-to-top
+
+python gcode_generation/vasc_1.py \
+  --vessels "vessel_table_raw_Louis.txt" \
+  --calibration "Test_Calibration_2026-04-20_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out vessels_3.gcode \
+  --groups-out vessels_3_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --vessel-order-mode lowest_longest_roots \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 1 \
+  --main-vessel-ids 79,78,80,30,29,55,53,56,73,5,4 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 5 \
+  --travel-bbox-margin 2 \
+  --align-lowest-centroid 90 60 -175
+
+python gcode_generation/vasc_manual.py \
+  --vessels vessel_table_raw_Louis.txt \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --out vessels_1.gcode \
+  --groups-out vessels_1_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --align-lowest-centroid 90 60 -165 \
+  --vessel-order-mode ascending_start_z \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 1 \
+  --main-vessel-ids 79,78,80,30,29,55,53,56,73,5,4 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 5 \
+  --scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-resample-spacing 0.5 \
+  --b-max-step-deg 3 \
+  --c-max-step-deg 3 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.15 \
+  --min-tangent-xy-for-c 0.30 \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --min-group-length-mm 8.0 \
+  --group-displacements-file vessels_5_group_displacements.txt \
+  --disable-side-approach
+  
+  
+python gcode_viewer.py \
+  --gcode vessels_1.gcode \
+  --calibration "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/vasc_manual.py \
+  --vessels vessel_table_raw_Louis.txt \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --out vessels_3.gcode \
+  --groups-out vessels_3_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --align-lowest-centroid 90 60 -165 \
+  --vessel-order-mode lowest_longest_roots \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 0 \
+  --branch-end-overtravel-mm 5 \
+  --branch-overlap-tangent-window-mm 5 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 5 \
+  --scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-geometry-smooth-window 2 \
+  --path-resample-spacing 0.20 \
+  --b-max-step-deg 3 \
+  --c-max-step-deg 3 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.15 \
+  --min-tangent-xy-for-c 0.30 \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --min-group-length-mm 6.0 \
+  --disable-travel-bbox-clearance
+
+
+python gcode_viewer.py \
+  --gcode vessels_5.gcode \
+  --calibration "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/vasc_manual.py \
+  --vessels vessel_table_raw_Louis.txt \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --out vessels_5.gcode \
+  --groups-out vessels_5_groups.txt \
+  --write-mode cartesian \
+  --orientation-mode fixed \
+  --rotate-y-deg 180 \
+  --align-lowest-centroid 90 60 -165 \
+  --vessel-order-mode lowest_longest_roots \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 0 \
+  --branch-overlap-tangent-window-mm 5 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 5 \
+  --scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-geometry-smooth-window 4 \
+  --path-resample-spacing 0.1 \
+  --b-max-step-deg 5 \
+  --c-max-step-deg 5 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.15 \
+  --min-tangent-xy-for-c 0.30 \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --min-group-length-mm 7.0 \
+  --disable-travel-bbox-clearance \
+  --group-displacements-file vessels_5_group_displacements.txt \
+  --disable-side-approach \
+  --offplane-fit-mode avg_cubic
+
+# TESTING HERE
+python gcode_generation/vasc_manual.py \
+  --vessels vessel_table_raw_Louis.txt \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --out vessels_2.gcode \
+  --groups-out vessels_2_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --align-lowest-centroid 90 60 -165 \
+  --vessel-order-mode lowest_longest_roots \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 0 \
+  --branch-overlap-tangent-window-mm 5 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 5 \
+  --scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-geometry-smooth-window 2 \
+  --path-resample-spacing 0.20 \
+  --b-smoothing-alpha 0.9 \
+  --c-smoothing-alpha 0.9 \
+  --b-max-step-deg 8 \
+  --c-max-step-deg 12 \
+  --min-tangent-xy-for-c 0.08
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --min-group-length-mm 8.0 \
+  --group-displacements-file vessels_3_group_displacements.txt \
+  --disable-travel-bbox-clearance \
+  --disable-side-approach \
+  --offplane-fit-mode avg_cubic
+
+#Thisoneworks!!
+python gcode_generation/vasc_manual.py \
+  --vessels vessel_table_raw_Louis.txt \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --out vessels_5.gcode \
+  --groups-out vessels_5_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 180 \
+  --align-lowest-centroid 90 60 -165 \
+  --vessel-order-mode ascending_start_z \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 1 \
+  --main-vessel-ids 79,78,80,30,29,55,53,56,73,5,4 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 5 \
+  --scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-resample-spacing 0.8 \
+  --b-max-step-deg 3 \
+  --c-max-step-deg 3 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.15 \
+  --min-tangent-xy-for-c 0.30 \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --min-group-length-mm 8.0 \
+  --group-displacements-file vessels_5_group_displacements.txt \
+  --disable-travel-bbox-clearance \
+  --disable-side-approach \
+  --offplane-fit-mode avg_cubic
+
+python gcode_viewer.py \
+  --gcode vessels_5.gcode \
+  --calibration "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python vasc_group_displacement_editor.py \
+  --gcode vessels_5.gcode \
+  --calibration Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --group-displacements vessels_5_group_displacements.txt \
+  --groups vessels_5_groups.txt \
+  --write-mode calibrated \
+  --print-summary \
+  --offplane-sign -1
+
+
+python gcode_generation/node_1.py --out gcode_generation/node_1.gcode
+
+python gcode_generation/node_2.py \
+  --out gcode_generation/node_4.gcode \
+  --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --y-offplane-sign -1 \
+  --pull-phase-only \
+  --orientation-mode tangent \
+  --rows 4
+
+python gcode_generation/node_3.py \
+  --out gcode_generation/node_3_double.gcode \
+  --calibration "Test_Calibration_2026-05-05_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --y-offplane-sign -1 \
+  --pull-phase-only \
+  --orientation-mode tangent \
+  --row2-subfig1-branch-start-extension-mm 3.5 \
+  --row2-subfig2-branch-start-extension-mm 2.6 \
+  --row2-subfig3-branch-start-extension-mm 4.5 \
+  --row2-subfig4-branch-start-extension-mm 2.7 \
+  --rows 2
+
+  #(4, 2, 1, 3) from left to right
+
+
+
+python gcode_viewer.py \
+  --gcode gcode_generation/node_3_double.gcode \
+  --calibration "Test_Calibration_2026-05-04_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+
+python gcode_generation/wave_1.py \
+  --calibration "Test_Calibration_2026-05-11_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --z-amplitude 10 \
+  --cycles 4.5 \
+  --gaussian-sigma 50 \
+  --phase-deg 0 \
+  --out gcode_generation/wave_1.gcode \
+  --orientation-mode extrema-step
+
+python gcode_viewer.py \
+  --gcode gcode_generation/wave_1.gcode \
+  --calibration "Test_Calibration_2026-05-11_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/wave_1.py \
+  --calibration "Test_Calibration_2026-05-11_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --z-amplitude 10 \
+  --cycles 4.5 \
+  --gaussian-sigma 50 \
+  --phase-deg 0 \
+  --out gcode_generation/wave_1.gcode \
+  --orientation-mode extrema-step
+
+python gcode_viewer.py \
+  --gcode gcode_generation/wave_1.gcode \
+  --calibration "Test_Calibration_2026-05-11_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/wave_1_worm.py \
+  --calibration "Test_Calibration_2026-04-28_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --z-amplitude 10 \
+  --cycles 4.5 \
+  --gaussian-sigma 50 \
+  --phase-deg 0 \
+  --out gcode_generation/wave_1_worm.gcode
+
+python gcode_viewer.py \
+  --gcode gcode_generation/wave_1_worm.gcode \
+  --calibration "Test_Calibration_2026-04-28_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+  
+python gcode_generation/wave_sine.py \
+  --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --print-feed 600 \
+  --out gcode_generation/wave_sine.gcode
+
+python gcode_viewer.py \
+  --gcode gcode_generation/wave_sine.gcode \
+  --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/wave_sine_worm.py \
+  --calibration "Test_Calibration_2026-04-29_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --print-feed 600 \
+  --out gcode_generation/wave_sine_worm.gcode
+
+python gcode_viewer.py \
+  --gcode gcode_generation/wave_sine_worm.gcode \
+  --calibration "Test_Calibration_2026-04-29_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/cobra_1.py \
+  --calibration "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --write-mode calibrated \
+  --out gcode_generation/cobra_1.gcode
+
+python gcode_viewer.py \
+  --gcode gcode_generation/cobra_1.gcode \
+  --calibration "Test_Calibration_2026-05-07_breadwinner/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/torus_1.py \
+  --calibration "Test_Calibration_2026-04-17_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/torus_1.gcode
+
+python gcode_viewer.py \
+  --gcode gcode_generation/torus_bis.gcode \
+  --calibration "Test_Calibration_2026-05-07_00_CNN/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/torus_bis.py \
+  --out gcode_generation/torus_bis.gcode
+
+python3 offline_run_calibration.py \
+  --project_dir Test_Calibration_2026-03-31_03_off \
+  --threshold 250 \
+  --save_plots \
+  --save_analysis_config \
+  --export_skeleton \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "../captures/photo_20260630_174948.png" \
+  --fit_model pchip
+
+python cnn/prepare_tip_refinement_dataset.py \
+  --project_dir "cnn_ushape" \
+  --threshold 200 \
+  --anchor coarse \
+  --patch-size 128 \
+  --save_analysis_config \
+  --camera_calibration_file "captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "captures/photo_20260630_174948.png" \
+  --crop_gui_per_folder
+
+python cnn/annotate_tip_refinement_gui.py \
+  --project_dir "cnn_ushape" \
+  --window-width 1700 \
+  --window-height 1300
+
+python cnn/train_tip_refiner.py \
+  --manifest "cnn_ushape/processed_image_data_folder/tip_refinement_dataset/manifest_annotated.csv" \
+  --output-dir "cnn_ushape/processed_image_data_folder/tip_refinement_model" \
+  --epochs 80 \
+  --batch-size 8 \
+  --learning-rate 0.0005 \
+  --heatmap-sigma-px 3.5
+
+python cnn/infer_tip_refiner.py \
+  --manifest "cnn_ushape/processed_image_data_folder/tip_refinement_dataset/manifest.csv" \
+  --model "cnn_ushape/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --output-manifest "cnn_ushape/processed_image_data_folder/tip_refinement_dataset/manifest_with_model_preds.csv"
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-06-30_CTR_03_CNN" \
+  --threshold 200 \
+  --save_plots \
+  --save_analysis_config \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "../captures/photo_20260630_174948.png" \
+  --tip_refiner_model "../cnn_ushape/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --export_analysis_outputs
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-03-27_01_off" \
+  --threshold 200 \
+  --save_plots \
+  --robot_name "calibrated_robot_classical_compare" \
+  --save_analysis_config \
+  --camera_calibration_file "../captures/calibration_webcam_20260401_163844.npz" \
+  --board_reference_image "../captures/photo_20260427_093725.png" \
+  --tip_refiner_model "../Test_Calibration_2026-04-07_02_daq/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --tip_refiner_compare_only
+
+python cnn/prepare_tip_refinement_dataset.py \
+  --project_dir "Test_Calibration_2026-04-07_03_daq" \
+  --threshold -1 \
+  --anchor selected \
+  --patch-size 128 \
+  --save_analysis_config \
+  --camera_calibration_file "captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "captures/photo_20260406_104134.png"
+
+python cnn/annotate_tip_refinement_gui.py \
+  --project_dir "Test_Calibration_2026-04-07_03_daq"
+
+python cnn/train_tip_refiner.py \
+  --manifest "CNN_Calib/processed_image_data_folder/tip_refinement_dataset/manifest_annotated.csv" \
+  --output-dir "CNN_Calib/processed_image_data_folder/tip_refinement_model" \
+  --epochs 80 \
+  --batch-size 8 \
+  --learning-rate 0.0005 \
+  --heatmap-sigma-px 3.5
+
+python3 cnn/train_tip_refiner.py \
+  --project_dir CNN_calib_2026-04-27 \
+  --epochs 80 \
+  --batch-size 8 \
+  --learning-rate 0.0005 \
+  --heatmap-sigma-px 3.5
+
+python cnn/infer_tip_refiner.py \
+  --manifest "Test_Calibration_2026-04-07_03_daq/processed_image_data_folder/tip_refinement_dataset/manifest.csv" \
+  --model "Test_Calibration_2026-04-07_03_daq/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --output-manifest "Test_Calibration_2026-04-07_03_daq/processed_image_data_folder/tip_refinement_dataset/manifest_with_model_preds.csv"
+
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-04-07_03_test" \
+  --threshold -1 \
+  --save_plots \
+  --robot_name "calibrated_robot_classical_compare" \
+  --save_analysis_config \
+  --camera_calibration_file "../captures/calibration_webcam_20260401_163844.npz" \
+  --board_reference_image "../captures/photo_20260401_163839.png" \
+  --tip_refiner_model "../Test_Calibration_2026-04-07_03_daq/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --tip_refiner_compare_only
+
+python gcode_generation/pi_1.py \
+ --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/pi_1.gcode \
+  --write-mode calibrated
+
+python gcode_viewer.py \
+  --gcode gcode_generation/pi_1.gcode \
+  --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+
+python gcode_generation/surf_1.py \
+ --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/surf_1.gcode \
+  --backside-handle-end-frac 0.30 \
+  --curl-arc-len 3 \
+  --lip-start-handle-mm 25 \
+  --lip-end-handle-mm 40 \
+  --write-mode calibrated
+
+python gcode_viewer.py \
+  --gcode gcode_generation/surf_1.gcode \
+  --calibration "Test_Calibration_2026-04-28_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-05-05_00" \
+  --threshold 220 \
+  --save_plots \
+  --fit_model pchip \
+  --robot_name "calibrated_robot" \
+  --save_analysis_config \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "../captures/captures/photo_20260430_103919.png" \
+  --tip_refiner_model "../CNN_Calib/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --export_skeleton \
+  --board_xz_axis_sign -1
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-05-04_00_bis" \
+  --threshold 220 \
+  --save_plots \
+  --robot_name "calibrated_robot" \
+  --save_analysis_config \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "../captures/photo_20260430_103919.png" \
+  --tip_detection_mode red_dot \
+  -c90_y_compensation_from_planar_pchip \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --export_skeleton
+
+
+python gcode_viewer.py \
+  --gcode vessels_3.gcode \
+  --calibration "Test_Calibration_2026-04-21_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-04-21_02/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+
+python dance_1.py \
+  --calibration "Test_Calibration_2026-04-28_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/jumping_leg_circle.gcode \
+  --calibration "Test_Calibration_2026-04-28_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-04-28_05/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign 1
+
+
+python manuscript_plots/calibration/hourglass/hourglass_manu_plot.py \
+  manuscript_plots/calibration/hourglass/processed_image_data_folder/tracked_tip_positions_mm.csv \
+  --outdir manuscript_plots/calibration/hourglass/figures_sr \
+  --use-closest-desired \
+  --show-error-vectors
+
+
+python gcode_generation/torus_2.py \
+  --calibration "Test_Calibration_2026-04-28_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out "gcode_generation/torus_2.gcode"
+
+python gcode_viewer.py \
+  --gcode gcode_generation/torus_2.gcode \
+  --calibration "Test_Calibration_2026-05-07_00_CNN/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --robot-skeleton-file "Test_Calibration_2026-05-07_00_CNN/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python shadow_compare.py \
+  --cal_a Test_Calibration_2026-04-28_02 \
+  --cal_b Test_Calibration_2026-04-28_02_bis \
+  --label_a Prior \
+  --label_b Posterior \
+  --out_dir Calib_Compared \
+  --x_axis index
+
+python manuscript_plots/calibration/point_tracking/point_tracking_plot.py \
+    manuscript_plots/calibration/point_tracking/processed_image_data_folder/tracked_tip_positions_mm.csv \
+    --outdir manuscript_plots/calibration/point_tracking/figures_sr \
+    --width double \
+    --dpi 600
+
+
+python manuscript_plots/calibration/hysteresis/hysteresis_plot.py \
+    manuscript_plots/calibration/hysteresis/combined_tip_drift_measurements.csv \
+    --outdir manuscript_plots/calibration/hysteresis/figures_sr \
+    --width double \
+    --dpi 600
+
+python manuscript_plots/calibration/hysteresis/hysteresis_plot.py \
+    manuscript_plots/calibration/hysteresis/combined_tip_drift_measurements.csv \
+    --outdir manuscript_plots/calibration/hysteresis/figures_sr \
+    --width double \
+    --dpi 600
+
+
+python gcode_viewer.py \
+  --gcode "/Users/louisdomart/Documents/CPPR/CTR-X-CAVATE-GIMBAL/outputs/test_loulou/gcode/network_0_b_splines_14_vessels_5dof.gcode" \
+  --calibration "Test_Calibration_2026-04-30_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_viewer.py \
+  --gcode "/Users/louisdomart/Documents/CPPR/CTR-X-CAVATE-GIMBAL/outputs/test_loulou_C/gcode/network_0_b_splines_14_vessels_5dof.gcode" \
+  --calibration "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_viewer.py \
+  --gcode "/Users/louisdomart/Documents/CPPR/CTR-X-CAVATE-GIMBAL/outputs/test_loulou_C/gcode/network_0_b_splines_500_vessels_5dof.gcode" \
+  --calibration "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+
+--c90_y_compensation_from_planar_pchip --tip_detection_mode red_dot
+
+python3 calib_plane_process.py \
+  --project_dir "Test_Plane_Tracking_2026-05-04_11-27-12" \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard_reference_image "../captures/photo_20260430_103919.png" \
+  --threshold 200 \
+  --tip_detection_mode red_dot \
+  --save_plots
+
+python Run_Calibration.py \
+  --tip_detection_mode red_dot \
+  -c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --fit_model pchip \
+  --red_tip_sat_min 25 \
+  --red_tip_val_min 20 \
+  --red_tip_min_area_px 2
+
+python Run_Calibration.py
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-05-07_00_CNN copy" \
+  --threshold 220 \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --tip_detection_mode red_dot \
+  -c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --red_tip_sat_min 25 \
+  --red_tip_val_min 20 \
+  --red_tip_min_area_px 2 \
+  --camera_calibration_file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --board_reference_image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260430_103919.png \
+  --use_default_analysis_crop \
+  --skip_ruler_setup \
+  --save_plots \
+  --save_analysis_config
+
+python Run_Calibration.py \
+  --tip_detection_mode red_dot \
+  -c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --red_tip_sat_min 25 \
+  --red_tip_val_min 20 \
+  --red_tip_min_area_px 50 \
+  --red_tip_hue1_min 0 \
+  --red_tip_hue1_max 10 \
+  --red_tip_hue2_min 130 \
+  --red_tip_hue2_max 179
+
+
+python offline_run_calibration.py \
+  --project_dir "Test_Calibration_2026-05-07_01" \
+  --threshold 220 \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --tip_detection_mode red_dot \
+  -c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --camera_calibration_file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --board_reference_image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260430_103919.png \
+  --use_default_analysis_crop \
+  --skip_ruler_setup \
+  --save_analysis_config \
+  --save_plots \
+  --export_skeleton \
+  --tip_detection_mode red_dot \
+  -c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --red_tip_sat_min 25 \
+  --red_tip_val_min 20 \
+  --red_tip_min_area_px 2 \
+  --red_tip_hue1_min 0 \
+  --red_tip_hue1_max 10 \
+  --red_tip_hue2_min 130 \
+  --red_tip_hue2_max 179
+
+
+
+python Run_Calibration.py \
+  --tip_detection_mode red_dot \
+  --red_tip_component_selection nearest_largest \
+  --red_tip_use_rgb_excess \
+  --red_tip_rgb_excess_min 35 \
+  --red_tip_hue1_min 0 \
+  --red_tip_hue1_max 10 \
+  --red_tip_hue2_min 150 \
+  --red_tip_hue2_max 179 \
+  --red_tip_sat_min 80 \
+  --red_tip_val_min 80 \
+  --red_tip_min_area_px 20 \
+  --red_tip_local_min_area_px 20 \
+  --red_tip_morph_kernel 2 \
+  --red_tip_search_radius_px 80 \
+  --red_tip_min_circularity 0.0 \
+  -c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference \
+  --fit_model pchip \
+  --offplane_fit_model pchip
+
+python gcode_generation/circle_quadrants.py \
+  --calibration "Test_Calibration_2026-05-20_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --radius 20 \
+  --quadrants 1,2,3,4 \
+  --fit-strategy avg-pchip \
+  --q4-b-start 90 \
+  --q4-b-end 180 \
+  --out gcode_generation/circle_avg_pchip.gcode
+
+python gcode_generation/circle_quadrants.py \
+  --calibration "Test_Calibration_2026-05-20_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --radius 20 \
+  --quadrants 1,2,3,4 \
+  --fit-strategy avg-cubic \
+  --q4-b-start 90 \
+  --q4-b-end 180 \
+  --out gcode_generation/circle_phase_avgcubic.gcode
+
+python gcode_generation/circle_quadrants.py \
+  --calibration "Test_Calibration_2026-06-03_01_new/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --radius 20 \
+  --quadrants 1,2,3,4 \
+  --fit-strategy avg-pchip \
+  --phase-branch-mode half-circle \
+  --q4-b-start 90 \
+  --q4-b-end 180 \
+  --out gcode_generation/A_circle.gcode
+
+
+  --phase-branch-mode curl-specific-0-180-0
+
+
+    --feedrate-mode inverse-time \
+
+python gcode_viewer.py \
+  --gcode "gcode_generation/A_circle.gcode" \
+  --calibration "Test_Calibration_2026-05-27_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage
+
+python gcode_generation/plotting.py \
+    gcode_generation/circle_straight.gcode \
+    gcode_generation/circle_pchip.gcode \
+    gcode_generation/circle_cubic.gcode \
+    -o gcode_generation/figures
+
+
+python calib_hysteresis.py \
+  --calibration "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-05-26_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --angle-fit pull \
+  --attack-min-deg 0 \
+  --attack-max-deg 180 \
+  --attack-c-deg 0 \
+  --run-processing \
+  --camera-calibration-file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard-reference-image "../captures/photo_20260526_200532.png" \
+  --tip-detection-mode red_dot \
+  --tip-refine-mode none \
+  --tracked-tip-source selected \
+  --trajectory-mode one_daq_all_metrics \
+  --project-dir "Hysteresis_Run_2026-05-27_09-34-48_pull" \
+  --no-acquire
+  
+   \
+  --project-dir "Hysteresis_Run_2026-05-27_09-34-48_pull" \
+  --no-acquire
+
+  --trajectory-mode vertical_line
+
+--offset-fit avg_pchip
+--offset-fit avg_cubic
+--offset-fit linear
+--offset-fit pull
+--offset-fit release
+--offset-fit phase_specific
+--trajectory-mode horizontal_offset
+--trajectory-mode radial_offset
+--trajectory-mode z_offset
+--trajectory-mode vertical_offset
+--trajectory-mode one_daq_all_metrics
+
+python calib_hysteresis.py \
+  --no-acquire \
+  --run-processing \
+  --process-all-fits \
+  --fit-combination-mode paired \
+  --fit-output-root fit_sweeps \
+  --project-dir "Hysteresis_Run_2026-05-27_10-52-49" \
+  --calibration "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-05-26_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --processing-angle-fits avg_pchip avg_cubic linear pull release phase_specific \
+  --processing-offset-fits avg_pchip avg_cubic linear pull release phase_specific \
+  --camera-calibration-file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard-reference-image "../captures/photo_20260526_200532.png" \
+  --tip-detection-mode red_dot \
+  --tip-refine-mode none \
+  --tracked-tip-source selected
+
+python calib_hysteresis.py \
+  --calibration "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-05-28_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --trajectory-mode one_daq_all_metrics \
+  --fit-branch global \
+  --angle-fit avg_pchip \
+  --attack-min-deg 0 \
+  --attack-max-deg 180 \
+  --attack-c-deg 0 \
+  --run-processing \
+  --plot-all-calibration-models \
+  --processing-fit-branches all \
+  --fit-combination-mode paired \
+  --camera-calibration-file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard-reference-image "../captures/photo_20260526_200532.png" \
+  --tip-detection-mode red_dot \
+  --tip-refine-mode none \
+  --tracked-tip-source selected
+
+   --no-acquire \
+  --project-dir "Hysteresis_Run_2026-05-27_14-20-53" \
+
+python3 Run_Calibration.py \
+  --probe_mode middle \
+  --pull_b_steps 14 \
+  --pull_b_step_size -0.40 \
+  --curl_pull_b_steps 28 \
+  --curl_pull_b_step_size -0.20
+
+python3 offline_run_calibration.py \
+  --project_dir Test_Calibration_2026-05-27_00 \
+  --skip_ruler_setup \
+  --save_plots
+
+
+python3 offline_run_calibration.py \
+  --project_dir /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-06-30_CTR_03_CN \
+  --robot_name calibrated_robot \
+  --threshold 220 \
+  --fit_model pchip \
+  --offplane_fit_model pchip \
+  --save_plots \
+  --skip_ruler_setup \
+  --c90_y_compensation_from_planar_pchip \
+  --full_c90_partial_cneg90_reference
+
+python offline_run_calibration.py \
+  --project_dir /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-06-30_CTR_02_CNN \
+  --threshold 200 \
+  --save_plots \
+  --save_analysis_config \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "../captures/photo_20260630_174948.png" \
+  --tip_refiner_model "../cnn_ushape/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --tip_detection_mode classical \
+  --export_analysis_outputs
+
+python calib_hysteresis.py \
+  --run-processing \
+  --plot-all-calibration-models \
+  --processing-fit-branches all \
+  --calibration "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-05-28_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --fit-combination-mode paired \
+  --camera-calibration-file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard-reference-image "../captures/photo_20260526_200532.png" \
+  --tip-detection-mode red_dot \
+  --tip-refine-mode none \
+  --tracked-tip-source selected \
+  --no-acquire \
+  --project-dir "Hysteresis_Run_2026-05-27_14-45-34"
+
+python hysteresis_tests.py \                                                                   
+  --project_name Hysteresis_2026_05_29_01 \
+  --calibration_file Test_Calibration_2026-05-29_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json
+
+python3 gcode_generation/wave_triangle.py \
+  --calibration "Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/triangle_wave_xz.gcode \
+  --half-cycles 6 \
+  --x-start 60 \
+  --x-end 115 \
+  --y 55 \
+  --z-min -145 \
+  --z-max -130 \
+  --lead-in 5 \
+  --lead-out 5
+
+python gcode_viewer.py \
+  --gcode gcode_generation/triangle_wave_xz.gcode \
+  --calibration "Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/knot.py \
+  --calibration "Test_Calibration_2026-06-03_01_new/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --out gcode_generation/overhand_knot_xz.gcode
+
+python gcode_viewer.py \
+  --gcode gcode_generation/tie_it.gcode \
+  --calibration "Test_Calibration_2026-06-03_01_new/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+
+python gcode_generation/vasc_manual_interactive_gui.py
+
+python gcode_generation/vasc_manual_interactive_gui.py --run-mode save-gcode
+
+
+python3 Run_Calibration.py \
+  --main_motion_mode continuous \
+  --main_continuous_feedrate 100 \
+  --main_continuous_accel_mm_s2 200 \
+  --main_continuous_capture_period_s 0.10 \
+  --curl_motion_mode continuous \
+  --curl_continuous_feedrate 100 \
+  --curl_continuous_accel_mm_s2 200 \
+  --curl_continuous_capture_period_s 0.10
+
+python3 Run_Deflect.py \
+  --speeds 1000 900 50 100 200 300 400 500 600 700 800 900 \
+  --fixed-y 0 \
+  --y-final-mm -40 \
+  --y-accel-mm-s2 200 \
+  --orientation-seq-deg 0 180 90 \
+  --pass-repeats 5
+
+python3 Run_Deflect.py \
+  --speeds 1000 900 50 100 200 300 400 500 600 700 800 \
+  --fixed-y 0 \
+  --fixed-b-values -5.1 \
+  --y-final-mm -40 \
+  --y-accel-mm-s2 200 \
+  --orientation-seq-deg 0 180 90 \
+  --pass-repeats 5 \
+  --run-type direct
+
+python3 Run_Deflect.py \
+  --daq-mode b_attack_sweep \
+  --project-name Test_B_Attack_Sweep \
+  --attack-speed-mm-min 500 \
+  --b-curl-calibration-file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-06-24_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --orientation-seq-deg 0 \
+  --b-attack-start-deg 0 \
+  --b-attack-stop-deg 180 \
+  --b-attack-step-deg 5 \
+  --pass-repeats 5
+
+python3 plot_deflect.py \
+  --project-dir "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_B_Attack_Sweep 2026-06-24" \
+  --tip-refiner-model "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/CNN_calib_2/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
+
+python plot_deflect.py \
+  --project-dir "Y_Axis_Speed_2026_06_16_overnight 2026-06-28_Money" \
+  --reuse-existing-analysis \
+  --plot-theme dark \
+  --plot-theme light
+
+python calib_deadband.py \
+  --trajectory-mode deadband_micro_release \
+  --calibration /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-06-24_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Deadband_Run \
+  --attack-min-deg 0 \
+  --attack-max-deg 180 \
+  --deadband-attack-step-deg 5 \
+  --deadband-repeats 5 \
+  --deadband-max-release-extension-mm 1.0 \
+  --deadband-max-release-steps 80 \
+  --probe-feed 50 \
+  --fine-approach-feed 50 \
+  --point-x 100 \
+  --point-y 40 \
+  --point-z -170 \
+  --start-x 100 \
+  --start-y 40 \
+  --start-z -170 \
+  --end-x 100 \
+  --end-y 40 \
+  --end-z -170 \
+  --tip_detection_mode red_dot \
+  --tracked_tip_source selected \
+  --run-processing \
+  --camera-calibration-file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --checkerboard-reference-image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260624_150531.png \
+  --save-plot \
+  --select-crop-before-acquisition
+
+
+python3 plot_deflect.py \
+  --project-dir "/Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Y_Axis_Speed_2026_06_16_overnight" \
+  --camera-calibration-file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --board-reference-image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260615_174257.png \
+  --tip-refiner-model /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/CNN_calib_2/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt
+
+
+python calib_point_track_daq.py \
+  --calibration Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Point_Tracking \
+  --y-offset-fit pchip \
+  --motion-mode fast_routine \
+  --routine-repeats 1 \
+  --probe-feed 8000 \
+  --c-max-feed 20000 \
+  --c-accel-time 0.15 \
+  --c-decel-time 0.6 \
+  --motion-accel-mm-s2 80
+  
+python calib_point_track_daq.py \
+  --calibration Test_Calibration_2026-06-30_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --export-gcode "smooth_tracking_motion_90_faster_1000_high.gcode" \
+  --export-gcode-only \
+  --c-accel-time 0.3 \
+  --c-decel-time 0.3 \
+  --phase-transition-steps 40 \
+  --probe-feed 7000 \
+  --travel-feed 3000 \
+  --b-0-to-90-only \
+  --phase-transition-steps 40 \
+  --curve-set 0-180-0
+
+python calib_point_track_daq.py \
+  --calibration Test_Calibration_2026-07-06_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --export-gcode "smooth_tracking_motion_90_faster_1000.gcode" \
+  --export-gcode-only \
+  --c-accel-time 0.3 \
+  --c-decel-time 0.3 \
+  --phase-transition-steps 40 \
+  --probe-feed 6000 \
+  --travel-feed 3000 \
+  --phase-transition-steps 40 \
+  --b-0-to-90-only \
+  --curve-set 0-180-0
+
+
+python calib_point_process.py \
+  --project_dir "Test_Point_Tracking_2026-06-09_10-48-17" \
+  --camera_calibration_file "../captures/calibration_webcam_20260406_104136.npz" \
+  --checkerboard_reference_image "../captures/photo_20260526_200532.png" \
+  --threshold 220 \
+  --tip_detection_mode red_dot \
+  --tip_refine_mode none \
+  --tracked_tip_source cnn \
+  --save_plots
+
+python calib_point_track_daq.py \
+  --calibration Test_Calibration_2026-07-06_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_Point_Tracking \
+  --enable-post \
+  --y-offset-fit avg_cubic \
+  --post-tip-detection-mode red_dot \
+  --post-tracked-tip-source auto \
+  --motion-mode fast_routine \
+  --routine-repeats 1 \
+  --probe-feed 5000 \
+  --c-max-feed 20000 \
+  --c-accel-time 0.15 \
+  --c-decel-time 0.6 \
+  --motion-accel-mm-s2 200 \
+  --streaming-lookahead-s 0.00 \
+  --b-0-to-90-only
+
+python cnn/prepare_tip_refinement_dataset.py \
+  --project_dir "CNN_calib_2" \
+  --threshold -1 \
+  --anchor selected \
+  --patch-size 128 \
+  --save_analysis_config \
+  --camera_calibration_file "captures/calibration_webcam_20260406_104136.npz" \
+  --board_reference_image "captures/photo_20260526_200532.png"
+
+python3 cnn/transfer_tip_annotations.py \
+  --project_dir "CNN_calib_2" \
+  --old-manifest "CNN_calib_2/processed_image_data_folder/tip_refinement_dataset/manifest_annotated_before.csv" \
+  --overwrite
+  --dry-run
+
+python cnn/annotate_tip_refinement_gui.py \
+  --project_dir "CNN_calib_2"
+
+python cnn/train_tip_refiner.py \
+  --manifest "CNN_calib_2/processed_image_data_folder/tip_refinement_dataset/manifest_annotated.csv" \
+  --output-dir "CNN_calib_2/processed_image_data_folder/tip_refinement_model" \
+  --epochs 80 \
+  --batch-size 8 \
+  --learning-rate 0.0005 \
+  --heatmap-sigma-px 3.5
+
+python3 cnn/train_tip_refiner.py \
+  --project_dir CNN_calib_2 \
+  --epochs 80 \
+  --batch-size 8 \
+  --learning-rate 0.0005 \
+  --heatmap-sigma-px 3.5
+
+python cnn/infer_tip_refiner.py \
+  --manifest "CNN_calib_2/processed_image_data_folder/tip_refinement_dataset/manifest.csv" \
+  --model "CNN_calib_2/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt" \
+  --output-manifest "CNN_calib_2/processed_image_data_folder/tip_refinement_dataset/manifest_with_model_preds.csv"
+
+
+FIGURE 5 VASC:
+python gcode_generation/vasc_manual.py \
+  --vessels vessel_table_raw_Louis.txt \
+  --calibration Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --out vessels_6.gcode \
+  --groups-out vessels_6_groups.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --rotate-y-deg 0 \
+  --align-lowest-centroid 100 100 -125 \
+  --vessel-order-mode ascending_start_z \
+  --simplify-endpoint-chains \
+  --branch-start-overlap-mm 0 \
+  --main-vessel-ids 79,78,80,30,29,55,53,56,73,5,4 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 3 \
+  --scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-resample-spacing 0.8 \
+  --b-max-step-deg 3 \
+  --c-max-step-deg 3 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.15 \
+  --min-tangent-xy-for-c 0.30 \
+  --robot-skeleton-file "Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json" \
+  --min-group-length-mm 6.0 \
+  --group-displacements-file vessels_6_group_displacements.txt \
+  --disable-travel-bbox-clearance \
+  --disable-side-approach \
+  --offplane-fit-mode avg_pchip
+
+python gcode_viewer.py \
+  --gcode vessels_0030.gcode \
+  --calibration "Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json" \
+  --print-summary \
+  --show-stage \
+  --offplane-sign -1
+
+python gcode_generation/vasc_manual_90.py \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-09_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030.gcode \
+  --groups-out vessels_0030_groups.txt \
+  --group-displacements-file vessels_0030_group_displacements.txt \
+  --write-mode calibrated \
+  --orientation-mode tangent \
+  --vessel-order-mode aorta_first_lowest_branch \
+  --travel-strategy cylinder-surface \
+  --extrusion-feed-mode weighted \
+  --radius-feed-map "0.20:800,0.50:600,1.00:400,2.00:250" \
+  --rotate-y-deg 0 \
+  --align-lowest-centroid 100 100 -125 \
+  --travel-clearance-above-printed-z 10 \
+  --fine-approach-distance 3 \
+  --geometry-scale 1.0 \
+  --tangent-smooth-window 16 \
+  --centerline-smooth-window 4 \
+  --path-resample-spacing 0.8 \
+  --b-max-step-deg 3 \
+  --c-max-step-deg 3 \
+  --b-smoothing-alpha 0.15 \
+  --c-smoothing-alpha 0.15 \
+  --min-tangent-xy-for-c 0.30 \
+  --disable-travel-bbox-clearance \
+  --offplane-fit-mode pull_cubic \
+  --launch-viewer
+
+python gcode_generation/vasc_manual_90.py \
+  --vessels /Users/louisdomart/Documents/CPPR/SimVascular_Models/0030_H_ABAO_H/0030_H_ABAO_H_network_bspline.txt \
+  --calibration Test_Calibration_2026-06-16_01/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --robot-skeleton-file Test_Calibration_2026-06-16_01/processed_image_data_folder/calibrated_robot_skeleton_parametric.json \
+  --out vessels_0030.gcode
+
+python3 calib_plane_daq.py \
+  --calibration Test_Calibration_2026-07-06_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --b-0-to-90-only \
+  --enable-post
+
+python3 calib_plane_process.py \
+  --project_dir Point_Tracking_Run_2026-06-20_20-44-16 \
+  --camera_calibration_file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --checkerboard_reference_image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260615_174257.png \
+  --tip_detection_mode red_dot \
+  --tracked_tip_source selected \
+  --save_plots
+
+python3 calib_hourglass_daq.py \
+  --calibration Test_Calibration_2026-07-06_04/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --enable-post \
+  --post-tip-detection-mode red_dot \
+  --post-tracked-tip-source selected
+
+python3 calib_hourglass_process.py \
+  --project_dir Hourglass_Tracking_Run_2026-06-27_16-43-11 \
+  --camera_calibration_file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --calibration /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_Calibration_2026-06-27_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --checkerboard_reference_image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260627_161714.png \
+  --planned_command_csv Hourglass_Tracking_Run_2026-06-27_16-43-11/planned_hourglass_command_sequence.csv \
+  --capture_every_n_shape_moves 7 \
+  --tip_refiner_model /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/CNN_Calib/processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt \
+  --tip_detection_mode red_dot \
+  --tracked_tip_source selected \
+  --save_plots
+
+python calib_compensate_curl.py \
+  --project_name Planar_Release_Comp_Test_Speeds \
+  --calibration_file Test_Calibration_2026-07-06_05/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --feedrate 50 \
+  --feedrate_sweep \
+  --feedrates 50 \
+  --max_points 200 \
+  --repeats 1 \
+  --x_compensation_sign -1 \
+  --export_curl_gcode \
+  --gcode_output_file ../gcode_generation/curl_uncurl_comp_test.gcode \
+  --gcode_pause_s 2 \
+  --export_analysis_outputs
+
+python calib_compensate_circle.py \
+  --project_name Test_Circle_0_180_Quick \
+  --calibration_file Test_Calibration_2026-06-27_02/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --center_x 100 \
+  --center_y 40 \
+  --center_z -130 \
+  --radius 20 \
+  --debug_motion_points_per_half 8 \
+  --precurl_steps 8 \
+  --capture_points_per_half 5
+
+python calib_compensate_circle.py \
+  --project_name Test_Circle_0_180_Print \
+  --calibration_file Test_Calibration_2026-06-30_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --center_x 110 \
+  --center_y 80 \
+  --center_z -110 \
+  --radius 20 \
+  --export_only \
+  --emit_extrusion \
+  --curve_overtrace_mm 0 \
+  --combined_noncomp_y_offset 10 \
+  --points_per_mm 5
+
+
+python circle_0_180_capture_and_gcode_p10_precurl_debug_xsign.py \
+  --project_name Circle_0_180_Debug \
+  --calibration_file Test_Calibration_2026-06-27_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --center_x 100 \
+  --center_y 52 \
+  --center_z -130 \
+  --radius 20 \
+  --debug_motion_points_per_half 8 \
+  --precurl_steps 8 \
+  --capture_points_per_half 5 \
+  --export_analysis_outputs
+
+python3 calib_cartes_daq.py \
+  --calibration Test_Calibration_2026-07-06_03/processed_image_data_folder/calibrated_robot_gcode_calibration.json \
+  --project-name Test_cartesian_2026-07-08 \
+  --enable-post \
+  --cycle-repeats 5 \
+  --desired_x_step_mm 5 \
+  --desired_z_step_mm 5 \
+  --post-camera-calibration-file captures/calibration_webcam_20260406_104136.npz \
+  --post-checkerboard-reference-image captures/photo_20260627_161714.png \
+  --post-tip-detection-mode red_dot \
+  --post-tracked-tip-source auto
+
+python measure_notch_separation.py analysis_notch_separation/A_test_1/curl
+
+python3 calib_cartes_process.py \
+  --project_dir /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/Test_cartesian_2026-07-08_2026-07-08_14-04-01 \
+  --camera_calibration_file /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/calibration_webcam_20260406_104136.npz \
+  --checkerboard_reference_image /Users/louisdomart/Documents/CPPR/Calibration_code/Calibration_Cosima/captures/photo_20260708_120944.png \
+  --threshold 200 \
+  --tip_refine_mode none \
+  --skip_image_analysis

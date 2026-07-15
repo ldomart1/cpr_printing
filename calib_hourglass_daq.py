@@ -60,12 +60,13 @@ DEFAULT_CAMERA_WIDTH = 3840
 DEFAULT_CAMERA_HEIGHT = 2160
 DEFAULT_CAMERA_FLUSH_FRAMES = 1
 
-DEFAULT_TRAVEL_FEED = 4500.0
-DEFAULT_PRINT_FEED = 4500.0
+DEFAULT_TRAVEL_FEED = 1500.0
+DEFAULT_PRINT_FEED = 1500.0
 DEFAULT_FINE_APPROACH_FEED = 120.0
 DEFAULT_PRINT_FEED_B = 350.0
 DEFAULT_PRINT_FEED_C = 20000.0
 DEFAULT_TRANSITION_FEED = 1600.0
+DEFAULT_B_TRAVEL_MAX_FEED = 1000.0
 DEFAULT_C_FLIP_DELAY_S = 4.0
 
 DEFAULT_DWELL_BEFORE_MS = 0
@@ -81,9 +82,11 @@ DEFAULT_FINAL_RECENTER = True
 DEFAULT_ENABLE_POST = False
 DEFAULT_USE_AVERAGE_CUBIC_FIT = False
 DEFAULT_B_0_TO_90_PREFERRED = True
+DEFAULT_TIP_ANGLE_MIN_DEG = 0.0
+DEFAULT_TIP_ANGLE_MAX_DEG = 70.0
 
-DEFAULT_POST_CAMERA_CALIBRATION_FILE = "captures/calibration_webcam_20260406_104136.npz"
-DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "captures/photo_20260627_161714.png"
+DEFAULT_POST_CAMERA_CALIBRATION_FILE = "captures/calibration_webcam_20260708_120830.npz"
+DEFAULT_POST_CHECKERBOARD_REFERENCE_IMAGE = "captures/photo_20260708_120944.png"
 DEFAULT_POST_SCRIPT = "calib_hourglass_process.py"
 DEFAULT_POST_TRACKED_TIP_SOURCE = "selected"
 
@@ -92,17 +95,17 @@ DEFAULT_POST_TIP_REFINER_MODEL = (
     "processed_image_data_folder/tip_refinement_model/best_tip_refiner.pt"
 )
 
-DEFAULT_SAFE_APPROACH_Z = -140.0
+DEFAULT_SAFE_APPROACH_Z = -155.0
 
 DEFAULT_START_X = 100.0
-DEFAULT_START_Y = 52.0
-DEFAULT_START_Z = -140.0
+DEFAULT_START_Y = 55.0
+DEFAULT_START_Z = -155.0
 DEFAULT_START_B = 0.0
 DEFAULT_START_C = 0.0
 
 DEFAULT_END_X = 100.0
-DEFAULT_END_Y = 52.0
-DEFAULT_END_Z = -140.0
+DEFAULT_END_Y = 55.0
+DEFAULT_END_Z = -155.0
 DEFAULT_END_B = 0.0
 DEFAULT_END_C = 0.0
 
@@ -122,11 +125,11 @@ DEFAULT_QUARTER_GAP_MM = 10.0
 DEFAULT_Y_OFFSET_FIT = "avg_cubic"
 DEFAULT_POST_TIP_DETECTION_MODE = "red_dot"
 DEFAULT_HOURGLASS_CENTER_X = 100.0
-DEFAULT_HOURGLASS_CENTER_Y = 52.0
-DEFAULT_HOURGLASS_CENTER_Z = -140.0
-DEFAULT_ARC_VERTICAL_GAP_MM = 18.0
-DEFAULT_CIRCLE_DIAMETER_MM = 18.0
-DEFAULT_MIDDLE_GAP_MM = 9.0
+DEFAULT_HOURGLASS_CENTER_Y = 55.0
+DEFAULT_HOURGLASS_CENTER_Z = -155.0
+DEFAULT_ARC_VERTICAL_GAP_MM = 8.0
+DEFAULT_CIRCLE_DIAMETER_MM = 10.0
+DEFAULT_MIDDLE_GAP_MM = 4
 DEFAULT_ARC_OVERTRAVEL_DEG = 20.0
 DEFAULT_SAMPLES_PER_ARC = 180
 DEFAULT_SAMPLES_PER_DIAGONAL = 120
@@ -621,6 +624,18 @@ def eval_tip_angle_deg(cal: Calibration, b: Any, motion_phase: Optional[str] = N
     )
 
 
+def _validate_tip_angle_band(min_deg: float, max_deg: float) -> Tuple[float, float]:
+    lo = float(min_deg)
+    hi = float(max_deg)
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        raise ValueError("Tip-angle band limits must be finite.")
+    if lo > hi:
+        raise ValueError(
+            f"Tip-angle band is invalid: min={lo:.3f} deg exceeds max={hi:.3f} deg."
+        )
+    return lo, hi
+
+
 def tip_offset_xyz_physical(
     cal: Calibration,
     b: float,
@@ -712,6 +727,8 @@ def choose_segment_b_endpoint(
     release_phase: str,
     segment_b_override: Optional[float] = None,
     prefer_0_to_90_deg: bool = False,
+    tip_angle_min_deg: float = 0.0,
+    tip_angle_max_deg: float = 90.0,
 ) -> float:
     common_lo, common_hi = common_b_window_for_pull_release(
         cal=cal,
@@ -737,12 +754,21 @@ def choose_segment_b_endpoint(
             raise ValueError("--segment-b must differ from 0 so the tracked motion is non-degenerate.")
         if bool(prefer_0_to_90_deg):
             in_band = [
-                bool(_tip_angle_primary_branch_mask(cal, [b_ext], motion_phase=str(phase))[0])
+                bool(
+                    _tip_angle_primary_branch_mask(
+                        cal,
+                        [b_ext],
+                        motion_phase=str(phase),
+                        min_angle_deg=float(tip_angle_min_deg),
+                        max_angle_deg=float(tip_angle_max_deg),
+                    )[0]
+                )
                 for phase in (pull_phase, release_phase)
             ]
             if not all(in_band):
                 raise ValueError(
-                    f"--segment-b={b_ext:.3f} does not stay on the enforced 0..90 deg attack-angle branch "
+                    f"--segment-b={b_ext:.3f} does not stay inside the enforced "
+                    f"[{float(tip_angle_min_deg):.1f}, {float(tip_angle_max_deg):.1f}] deg attack-angle band "
                     f"for phases '{pull_phase}' and '{release_phase}'."
                 )
         return float(b_ext)
@@ -756,17 +782,22 @@ def choose_segment_b_endpoint(
                 cal,
                 b_nonzero,
                 motion_phase=str(pull_phase),
+                min_angle_deg=float(tip_angle_min_deg),
+                max_angle_deg=float(tip_angle_max_deg),
             ) & _tip_angle_primary_branch_mask(
                 cal,
                 b_nonzero,
                 motion_phase=str(release_phase),
+                min_angle_deg=float(tip_angle_min_deg),
+                max_angle_deg=float(tip_angle_max_deg),
             )
             if np.any(inside_band):
                 valid_b = b_nonzero[inside_band]
                 return float(valid_b[np.argmax(np.abs(valid_b))])
         raise RuntimeError(
-            "Could not find any non-zero B endpoint that stays on the enforced 0..90 deg attack-angle "
-            f"branch for both '{pull_phase}' and '{release_phase}' inside [{common_lo:.3f}, {common_hi:.3f}]."
+            "Could not find any non-zero B endpoint that stays inside the enforced attack-angle band "
+            f"[{float(tip_angle_min_deg):.1f}, {float(tip_angle_max_deg):.1f}] deg "
+            f"for both '{pull_phase}' and '{release_phase}' inside [{common_lo:.3f}, {common_hi:.3f}]."
         )
 
     candidates = [float(v) for v in (common_lo, common_hi) if abs(float(v)) > 1e-9]
@@ -1032,6 +1063,8 @@ def _tip_angle_primary_branch_mask(
     cal: Calibration,
     b_values: Any,
     motion_phase: str,
+    min_angle_deg: float = 0.0,
+    max_angle_deg: float = 90.0,
     atol_deg: float = 1e-6,
 ) -> np.ndarray:
     model = _select_fit_model(cal, "tip_angle", motion_phase=motion_phase)
@@ -1040,8 +1073,50 @@ def _tip_angle_primary_branch_mask(
             f"Cannot enforce the 0..90 deg attack-angle branch because phase '{motion_phase}' "
             f"has no tip-angle calibration model."
         )
+    min_angle_deg, max_angle_deg = _validate_tip_angle_band(min_angle_deg, max_angle_deg)
     angles = np.asarray(eval_tip_angle_deg(cal, b_values, motion_phase=motion_phase), dtype=float)
-    return np.isfinite(angles) & (angles >= -float(atol_deg)) & (angles <= 90.0 + float(atol_deg))
+    return (
+        np.isfinite(angles)
+        & (angles >= float(min_angle_deg) - float(atol_deg))
+        & (angles <= float(max_angle_deg) + float(atol_deg))
+    )
+
+
+def _filtered_b_and_x_for_phase(
+    cal: Calibration,
+    b_start: float,
+    b_end: float,
+    c_deg: float,
+    motion_phase: str,
+    flip_rz_sign: bool,
+    enforce_tip_angle_band: bool,
+    tip_angle_min_deg: float,
+    tip_angle_max_deg: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    b_dense, x_dense = _dense_b_and_x_for_phase(
+        cal=cal,
+        b_start=float(b_start),
+        b_end=float(b_end),
+        c_deg=float(c_deg),
+        motion_phase=str(motion_phase),
+        flip_rz_sign=flip_rz_sign,
+    )
+    if not bool(enforce_tip_angle_band):
+        return b_dense, x_dense
+
+    mask = _tip_angle_primary_branch_mask(
+        cal,
+        b_dense,
+        motion_phase=str(motion_phase),
+        min_angle_deg=float(tip_angle_min_deg),
+        max_angle_deg=float(tip_angle_max_deg),
+    )
+    if not np.any(mask):
+        raise RuntimeError(
+            f"Phase '{motion_phase}' has no valid samples inside the enforced attack-angle band "
+            f"[{float(tip_angle_min_deg):.3f}, {float(tip_angle_max_deg):.3f}] deg."
+        )
+    return b_dense[mask], x_dense[mask]
 
 
 def _invert_b_from_x_targets(
@@ -1051,6 +1126,9 @@ def _invert_b_from_x_targets(
     b_dense: np.ndarray,
     x_dense: np.ndarray,
     require_0_to_90_deg: bool = False,
+    tip_angle_min_deg: float = 0.0,
+    tip_angle_max_deg: float = 90.0,
+    initial_b_hint: Optional[float] = None,
 ) -> np.ndarray:
     x_targets = np.asarray(x_targets, dtype=float).reshape(-1)
     b_dense = np.asarray(b_dense, dtype=float).reshape(-1)
@@ -1060,16 +1138,22 @@ def _invert_b_from_x_targets(
 
     x_min = float(np.min(x_dense))
     x_max = float(np.max(x_dense))
-    if np.min(x_targets) < x_min - 1e-6 or np.max(x_targets) > x_max + 1e-6:
+    x_span = max(abs(x_max - x_min), 1.0)
+    boundary_tol = max(1e-6, 1e-4 * x_span)
+    min_violation = float(x_min - np.min(x_targets))
+    max_violation = float(np.max(x_targets) - x_max)
+    if min_violation > boundary_tol or max_violation > boundary_tol:
         raise RuntimeError(
             f'Target X values [{np.min(x_targets):.6f}, {np.max(x_targets):.6f}] are outside the reachable range '
             f'[{x_min:.6f}, {x_max:.6f}] for this motion phase.'
         )
+    if min_violation > 0.0 or max_violation > 0.0:
+        x_targets = np.clip(x_targets, x_min, x_max)
 
     def _candidate_b_roots_for_x_target(x_target: float) -> np.ndarray:
         roots: List[float] = []
         x_t = float(x_target)
-        tol = 1e-9
+        tol = max(1e-9, 0.5 * boundary_tol)
 
         for i in range(b_dense.size - 1):
             b0 = float(b_dense[i])
@@ -1098,7 +1182,7 @@ def _invert_b_from_x_targets(
         if not roots:
             nearest_idx = int(np.argmin(np.abs(x_dense - x_t)))
             nearest_x = float(x_dense[nearest_idx])
-            if abs(nearest_x - x_t) <= 1e-6:
+            if abs(nearest_x - x_t) <= boundary_tol:
                 return np.asarray([float(b_dense[nearest_idx])], dtype=float)
             raise RuntimeError(
                 f'Could not find any valid B roots for target X={x_t:.6f} on the sampled phase curve.'
@@ -1115,6 +1199,8 @@ def _invert_b_from_x_targets(
                 cal,
                 roots_out,
                 motion_phase=str(motion_phase),
+                min_angle_deg=float(tip_angle_min_deg),
+                max_angle_deg=float(tip_angle_max_deg),
             )
             if not np.any(branch_mask):
                 angles = np.asarray(
@@ -1122,7 +1208,7 @@ def _invert_b_from_x_targets(
                     dtype=float,
                 )
                 raise RuntimeError(
-                    f"No 0..90 deg attack-angle B root is available for target X={x_t:.6f} "
+                    f"No attack-angle-band B root is available for target X={x_t:.6f} "
                     f"in phase '{motion_phase}'. Candidate angles: "
                     + ", ".join(f"{float(a):.3f}" for a in angles[:8])
                 )
@@ -1133,7 +1219,11 @@ def _invert_b_from_x_targets(
     if not candidate_lists:
         return np.empty((0,), dtype=float)
 
-    path_costs: List[np.ndarray] = [np.zeros(candidate_lists[0].shape[0], dtype=float)]
+    if initial_b_hint is None:
+        first_cost = np.zeros(candidate_lists[0].shape[0], dtype=float)
+    else:
+        first_cost = (candidate_lists[0] - float(initial_b_hint)) ** 2
+    path_costs: List[np.ndarray] = [np.asarray(first_cost, dtype=float)]
     back_ptrs: List[np.ndarray] = [np.full(candidate_lists[0].shape[0], -1, dtype=int)]
 
     for i in range(1, len(candidate_lists)):
@@ -1173,6 +1263,9 @@ def build_fixed_x_segment_from_desired_tip_targets(
     move_feed_start: float,
     move_feed_rest: float,
     require_b_0_to_90_tip_angle: bool = False,
+    tip_angle_min_deg: float = 0.0,
+    tip_angle_max_deg: float = 90.0,
+    initial_b_hint: Optional[float] = None,
 ) -> Tuple[List[CommandPoint], Dict[str, float]]:
     c_state = assert_c_in_safe_range('c_state', c_state)
     desired_tip_xz_points = np.asarray(desired_tip_xz_points, dtype=float)
@@ -1195,6 +1288,9 @@ def build_fixed_x_segment_from_desired_tip_targets(
         b_dense=b_dense,
         x_dense=x_dense,
         require_0_to_90_deg=bool(require_b_0_to_90_tip_angle),
+        tip_angle_min_deg=float(tip_angle_min_deg),
+        tip_angle_max_deg=float(tip_angle_max_deg),
+        initial_b_hint=(None if initial_b_hint is None else float(initial_b_hint)),
     )
 
     pts: List[CommandPoint] = []
@@ -1280,6 +1376,8 @@ def build_fixed_x_segment_from_desired_tip_targets(
                         cal,
                         np.asarray(b_values, dtype=float),
                         motion_phase=str(motion_phase),
+                        min_angle_deg=float(tip_angle_min_deg),
+                        max_angle_deg=float(tip_angle_max_deg),
                     )
                 )
             )
@@ -1310,6 +1408,8 @@ def build_hourglass_command_sequence(
     transition_feed: float,
     segment_b_override: Optional[float] = None,
     b_0_to_90_preferred: bool = False,
+    tip_angle_min_deg: float = 0.0,
+    tip_angle_max_deg: float = 90.0,
     final_recenter: bool = True,
 ) -> Tuple[List[CommandPoint], dict]:
     c0_deg = assert_c_in_safe_range('c0_deg', c0_deg)
@@ -1325,6 +1425,10 @@ def build_hourglass_command_sequence(
         raise ValueError('--middle-gap-mm must be non-negative.')
     if float(middle_gap_mm) >= 2.0 * float(radius_req):
         raise ValueError('--middle-gap-mm must be smaller than the circle diameter so the diagonals converge inward.')
+    tip_angle_min_deg, tip_angle_max_deg = _validate_tip_angle_band(
+        float(tip_angle_min_deg),
+        float(tip_angle_max_deg),
+    )
 
     phi_deg = float(max(0.0, min(80.0, float(arc_overtravel_deg))))
     n_arc = max(2, int(samples_per_arc))
@@ -1332,41 +1436,32 @@ def build_hourglass_command_sequence(
 
     pull_phase = resolve_phase_name(cal, 'pull')
     release_phase = resolve_phase_name(cal, 'release')
+    tracking_phase = str(pull_phase)
     b_ext = choose_segment_b_endpoint(
         cal=cal,
         b_lo=b_lo,
         b_hi=b_hi,
-        pull_phase=pull_phase,
-        release_phase=release_phase,
+        pull_phase=tracking_phase,
+        release_phase=tracking_phase,
         segment_b_override=segment_b_override,
         prefer_0_to_90_deg=bool(b_0_to_90_preferred),
+        tip_angle_min_deg=float(tip_angle_min_deg),
+        tip_angle_max_deg=float(tip_angle_max_deg),
     )
 
-    b_pull_dense, x_pull_dense = _dense_b_and_x_for_phase(
+    b_pull_dense, x_pull_dense = _filtered_b_and_x_for_phase(
         cal=cal,
         b_start=0.0,
         b_end=float(b_ext),
         c_deg=float(c0_deg),
-        motion_phase=pull_phase,
+        motion_phase=tracking_phase,
         flip_rz_sign=flip_rz_sign,
+        enforce_tip_angle_band=bool(b_0_to_90_preferred),
+        tip_angle_min_deg=float(tip_angle_min_deg),
+        tip_angle_max_deg=float(tip_angle_max_deg),
     )
-    b_release_dense, x_release_dense = _dense_b_and_x_for_phase(
-        cal=cal,
-        b_start=float(b_ext),
-        b_end=0.0,
-        c_deg=float(c0_deg),
-        motion_phase=release_phase,
-        flip_rz_sign=flip_rz_sign,
-    )
-
-    common_x_min_off = max(float(np.min(x_pull_dense)), float(np.min(x_release_dense)))
-    common_x_max_off = min(float(np.max(x_pull_dense)), float(np.max(x_release_dense)))
-    if common_x_min_off >= common_x_max_off:
-        raise RuntimeError(
-            'No common fixed-X radial range is available between pull and release phases at C=0. '
-            f'pull=[{float(np.min(x_pull_dense)):.6f}, {float(np.max(x_pull_dense)):.6f}], '
-            f'release=[{float(np.min(x_release_dense)):.6f}, {float(np.max(x_release_dense)):.6f}]'
-        )
+    common_x_min_off = float(np.min(x_pull_dense))
+    common_x_max_off = float(np.max(x_pull_dense))
     common_half_span = 0.5 * (common_x_max_off - common_x_min_off)
     common_mid_off = 0.5 * (common_x_max_off + common_x_min_off)
     stage_x_const = float(center_x) - common_mid_off
@@ -1470,7 +1565,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'arc',
             'phase_name': 'top_arc_right_pull',
-            'motion_phase': str(pull_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': 0.0,
             'b_end': float(b_ext),
             'move_feed_start': float(jog_feed),
@@ -1485,7 +1580,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'line',
             'phase_name': 'right_diag_upper_release',
-            'motion_phase': str(release_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': float(b_ext),
             'b_end': 0.0,
             'move_feed_start': float(transition_feed),
@@ -1497,7 +1592,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'line',
             'phase_name': 'right_diag_lower_pull',
-            'motion_phase': str(pull_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': 0.0,
             'b_end': float(b_ext),
             'move_feed_start': float(transition_feed),
@@ -1509,7 +1604,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'arc',
             'phase_name': 'bottom_arc_right_release',
-            'motion_phase': str(release_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': float(b_ext),
             'b_end': 0.0,
             'move_feed_start': float(transition_feed),
@@ -1524,7 +1619,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'arc',
             'phase_name': 'bottom_arc_left_pull',
-            'motion_phase': str(pull_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': 0.0,
             'b_end': float(b_ext),
             'move_feed_start': float(transition_feed),
@@ -1539,7 +1634,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'line',
             'phase_name': 'left_diag_lower_release',
-            'motion_phase': str(release_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': float(b_ext),
             'b_end': 0.0,
             'move_feed_start': float(transition_feed),
@@ -1551,7 +1646,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'line',
             'phase_name': 'left_diag_upper_pull',
-            'motion_phase': str(pull_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': 0.0,
             'b_end': float(b_ext),
             'move_feed_start': float(transition_feed),
@@ -1563,7 +1658,7 @@ def build_hourglass_command_sequence(
         {
             'kind': 'arc',
             'phase_name': 'top_arc_left_release',
-            'motion_phase': str(release_phase),
+            'motion_phase': str(tracking_phase),
             'b_start': float(b_ext),
             'b_end': 0.0,
             'move_feed_start': float(transition_feed),
@@ -1583,6 +1678,7 @@ def build_hourglass_command_sequence(
 
     sequence: List[CommandPoint] = []
     segment_meta: Dict[str, Dict[str, float]] = {}
+    prev_terminal_b: Optional[float] = None
     for seg_idx, spec in enumerate(segments):
         phase_name = str(spec['phase_name'])
         pts, meta_seg = build_fixed_x_segment_from_desired_tip_targets(
@@ -1599,10 +1695,16 @@ def build_hourglass_command_sequence(
             move_feed_start=float(spec['move_feed_start']),
             move_feed_rest=float(spec['move_feed_rest']),
             require_b_0_to_90_tip_angle=bool(b_0_to_90_preferred),
+            tip_angle_min_deg=float(tip_angle_min_deg),
+            tip_angle_max_deg=float(tip_angle_max_deg),
+            initial_b_hint=(None if seg_idx == 0 else prev_terminal_b),
         )
         meta_seg['desired_path_length_mm'] = float(spec['path_length_mm'])
         meta_seg['uniform_sample_count'] = int(spec['sample_count'])
+        if prev_terminal_b is not None:
+            meta_seg['boundary_b_jump_from_previous_segment'] = float(meta_seg['b_start'] - prev_terminal_b)
         segment_meta[str(phase_name)] = meta_seg
+        prev_terminal_b = float(meta_seg['b_end'])
         if seg_idx > 0:
             pts = pts[1:]
         sequence.extend(pts)
@@ -1626,7 +1728,7 @@ def build_hourglass_command_sequence(
             0.0,
             float(c0_deg),
             flip_rz_sign=flip_rz_sign,
-            motion_phase=release_phase,
+            motion_phase=tracking_phase,
         )
         final_recenter_cp = CommandPoint(
             phase='final_recenter',
@@ -1639,7 +1741,7 @@ def build_hourglass_command_sequence(
             tip_x=float(stage_x_const + offset0[0]),
             tip_y=float(start_tip[1]),
             tip_z=float(start_tip[2]),
-            motion_phase=str(release_phase),
+            motion_phase=str(tracking_phase),
         )
         sequence.append(final_recenter_cp)
 
@@ -1651,8 +1753,12 @@ def build_hourglass_command_sequence(
     meta = {
         'pull_phase': str(pull_phase),
         'release_phase': str(release_phase),
+        'tracking_phase': str(tracking_phase),
         'segment_b': float(b_ext),
         'b_0_to_90_preferred': bool(b_0_to_90_preferred),
+        'tip_angle_band_enforced': bool(b_0_to_90_preferred),
+        'tip_angle_min_deg': float(tip_angle_min_deg),
+        'tip_angle_max_deg': float(tip_angle_max_deg),
         'center_x': float(center_x),
         'center_y': float(center_y),
         'center_z': float(center_z),
@@ -1947,6 +2053,18 @@ class CircleTrackerRunner:
             cv2.destroyAllWindows()
             print("Camera disconnected.")
 
+    def capture_preview_frame(self, flush_frames: int = 1) -> np.ndarray:
+        if self.cam is None:
+            raise RuntimeError("Camera is not connected.")
+        for _ in range(max(0, int(flush_frames))):
+            _ = self.cam.read()
+        ret, image = self.cam.read()
+        if not ret or image is None:
+            ret, image = self.cam.read()
+        if not ret or image is None:
+            raise RuntimeError("Failed to capture preview frame for manual crop selection.")
+        return image
+
     def capture_and_save(
         self,
         sample_idx: int,
@@ -2104,6 +2222,27 @@ class CircleTrackerRunner:
             self.commanded_axes[str(ax)] = float(val)
         return est_move_time_s
 
+    def _move_b_axis_only(
+        self,
+        cal: Calibration,
+        b: float,
+        requested_feed: float,
+        settle_s: float,
+        context: str,
+    ) -> None:
+        b_feed = min(float(requested_feed), float(DEFAULT_B_TRAVEL_MAX_FEED))
+        print(
+            f" {context}: moving {cal.b_axis} separately at capped feed "
+            f"{b_feed:.3f} (requested {float(requested_feed):.3f})..."
+        )
+        est_move_time_s = self.send_absolute_move(
+            b_feed,
+            **{
+                cal.b_axis: float(b),
+            }
+        )
+        self.wait_for_duet_motion_complete(est_move_time_s=est_move_time_s, extra_settle=settle_s)
+
     def _move_to_pose_safe(
         self,
         cal: Calibration,
@@ -2119,18 +2258,24 @@ class CircleTrackerRunner:
             travel_feed,
             **{
                 cal.z_axis: float(safe_approach_z),
-                cal.b_axis: b,
                 cal.c_axis: c,
             }
         )
         self.wait_for_duet_motion_complete(est_move_time_s=est_move_time_s, extra_settle=settle_s)
+
+        self._move_b_axis_only(
+            cal=cal,
+            b=float(b),
+            requested_feed=float(travel_feed),
+            settle_s=float(settle_s),
+            context="Safe travel",
+        )
 
         est_move_time_s = self.send_absolute_move(
             travel_feed,
             **{
                 cal.x_axis: x,
                 cal.y_axis: y,
-                cal.b_axis: b,
                 cal.c_axis: c,
             }
         )
@@ -2140,7 +2285,6 @@ class CircleTrackerRunner:
             travel_feed,
             **{
                 cal.z_axis: z,
-                cal.b_axis: b,
                 cal.c_axis: c,
             }
         )
@@ -2229,13 +2373,19 @@ class CircleTrackerRunner:
             )
 
             print("\nMoving to first tracked sample...")
+            self._move_b_axis_only(
+                cal=cal,
+                b=float(first.b),
+                requested_feed=float(first.feed),
+                settle_s=float(travel_move_settle_s),
+                context="Jog to tracked start",
+            )
             est_move_time_s = self.send_absolute_move(
                 first.feed,
                 **{
                     cal.x_axis: x0,
                     cal.y_axis: y0,
                     cal.z_axis: z0,
-                    cal.b_axis: first.b,
                     cal.c_axis: first.c,
                 }
             )
@@ -2381,6 +2531,18 @@ class CircleTrackerRunner:
 # Main
 # =========================
 
+def _prepare_post_analysis_crop_from_camera(runner, process_module_name: str, flush_frames: int) -> dict:
+    process_module = __import__(process_module_name, fromlist=["interactive_crop_from_image"])
+    interactive_crop = getattr(process_module, "interactive_crop_from_image", None)
+    if interactive_crop is None:
+        raise RuntimeError(f"{process_module_name} is missing interactive_crop_from_image().")
+    print("\nLaunching manual crop selection on a live sample frame before acquisition...")
+    preview_image = runner.capture_preview_frame(flush_frames=flush_frames)
+    analysis_crop = interactive_crop(preview_image)
+    print(f"Selected pre-acquisition analysis_crop: {analysis_crop}")
+    return dict(analysis_crop)
+
+
 def main(args):
     cal = load_calibration(args.calibration, y_offset_fit=args.y_offset_fit)
     if bool(args.use_average_cubic_fit):
@@ -2418,6 +2580,8 @@ def main(args):
         transition_feed=float(args.transition_feed),
         segment_b_override=(None if args.segment_b is None else float(args.segment_b)),
         b_0_to_90_preferred=bool(args.b_0_to_90_only),
+        tip_angle_min_deg=float(args.tip_angle_min_deg),
+        tip_angle_max_deg=float(args.tip_angle_max_deg),
         final_recenter=bool(args.final_recenter),
     )
     command_sequence = repeat_command_sequence(command_sequence, cycles=int(args.cycles))
@@ -2426,6 +2590,8 @@ def main(args):
     meta["use_solenoid_extrusion"] = bool(args.use_solenoid_extrusion)
     meta["capture_buffer_s"] = float(args.capture_buffer_s)
     meta["b_0_to_90_only"] = bool(args.b_0_to_90_only)
+    meta["tip_angle_min_deg_requested"] = float(args.tip_angle_min_deg)
+    meta["tip_angle_max_deg_requested"] = float(args.tip_angle_max_deg)
     meta["cycles"] = int(max(1, int(args.cycles)))
 
     print("Trajectory summary:")
@@ -2434,6 +2600,11 @@ def main(args):
     print(f"  capture_buffer_s: {float(args.capture_buffer_s):.3f}")
     print(f"  cycles: {int(meta['cycles'])}")
     print(f"  B 0..90 enforcement: {bool(args.b_0_to_90_only)}")
+    if bool(args.b_0_to_90_only):
+        print(
+            f"  preferred attack-angle band: "
+            f"[{float(args.tip_angle_min_deg):.1f}, {float(args.tip_angle_max_deg):.1f}] deg"
+        )
     print(
         f"  sample_spacing_mm: requested={float(args.sample_spacing_mm):.4f}, "
         f"actual={float(meta['uniform_sample_spacing_mm_actual']):.4f}"
@@ -2505,6 +2676,7 @@ def main(args):
         add_date=bool(args.add_date),
     )
 
+    post_analysis_crop = None
     try:
         meta_path = save_json(os.path.join(runner.run_folder, "trajectory_meta.json"), meta)
         csv_path = save_command_sequence_csv(
@@ -2531,6 +2703,13 @@ def main(args):
             width=int(args.camera_width),
             height=int(args.camera_height),
         )
+
+        if bool(args.enable_post):
+            post_analysis_crop = _prepare_post_analysis_crop_from_camera(
+                runner,
+                process_module_name="calib_hourglass_process",
+                flush_frames=int(args.camera_flush_frames),
+            )
 
         runner.connect_to_robot(args.duet_web_address)
 
@@ -2644,6 +2823,13 @@ def main(args):
                 post_cmd.append("--capture_at_start")
             if bool(args.post_save_plots):
                 post_cmd.append("--save_plots")
+            if post_analysis_crop is not None:
+                post_cmd.extend([
+                    "--crop_width_min", str(int(post_analysis_crop["crop_width_min"])),
+                    "--crop_width_max", str(int(post_analysis_crop["crop_width_max"])),
+                    "--crop_height_min", str(int(post_analysis_crop["crop_height_min"])),
+                    "--crop_height_max", str(int(post_analysis_crop["crop_height_max"])),
+                ])
 
             print("\nStarting hourglass post-processing:")
             print("  " + " ".join(post_cmd))
@@ -2751,7 +2937,11 @@ if __name__ == "__main__":
     ap.add_argument("--segment-b", type=float, default=None,
                     help="Optional non-zero B endpoint used for each tracked segment. Default: farthest valid common pull/release value from 0.")
     ap.add_argument("--b-0-to-90-only", action="store_true", default=DEFAULT_B_0_TO_90_PREFERRED,
-                    help="Enforce the 0..90 deg attack-angle branch when choosing the hourglass B endpoint and all fixed-X inverse-B roots.")
+                    help="Enforce the preferred attack-angle band when choosing the hourglass B endpoint, the common fixed-X overlap, and all fixed-X inverse-B roots.")
+    ap.add_argument("--tip-angle-min-deg", type=float, default=DEFAULT_TIP_ANGLE_MIN_DEG,
+                    help="Lower bound of the preferred attack-angle band used when --b-0-to-90-only is enabled.")
+    ap.add_argument("--tip-angle-max-deg", type=float, default=DEFAULT_TIP_ANGLE_MAX_DEG,
+                    help="Upper bound of the preferred attack-angle band used when --b-0-to-90-only is enabled.")
     ap.add_argument("--c0-deg", type=float, default=DEFAULT_C0_DEG,
                     help="Fixed C value used for the full hourglass path.")
 

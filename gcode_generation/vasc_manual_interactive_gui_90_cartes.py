@@ -140,8 +140,14 @@ DEFAULT_VESSELS_FILE = "vessel_table_raw_Louis.txt"
 DEFAULT_CALIBRATION_FILE = "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_gcode_calibration.json"
 DEFAULT_ROBOT_SKELETON_FILE = "Test_Calibration_2026-06-05_00/processed_image_data_folder/calibrated_robot_skeleton_parametric.json"
 DEFAULT_OUT_FILE = "vessels_5.gcode"
-DEFAULT_GROUPS_OUT_FILE = "vessels_5_groups.txt"
-DEFAULT_GROUP_DISPLACEMENTS_FILE = "vessels_5_group_displacements.txt"
+DEFAULT_GROUPS_OUT_FILE = "vessels_5_groups_cartes.txt"
+DEFAULT_GROUP_DISPLACEMENTS_FILE = "vessels_5_group_displacements_cartes.txt"
+DEFAULT_PRESSURE_ON_COMMAND = "M42 P10 S1"
+DEFAULT_PRESSURE_OFF_COMMAND = "M42 P10 S0"
+DEFAULT_PRESSURE_SET_COMMAND = "M42 P11 S0.15"
+DEFAULT_VACUUM_ON_COMMAND = "M42 P13 S0.333"
+DEFAULT_VACUUM_OFF_COMMAND = "M42 P13 S0.00001"
+DEFAULT_VACUUM_LEAD_DISTANCE_MM = 3.0
 DEFAULT_NODE_TUNE_STEP_MM = 0.25
 DEFAULT_TRAVEL_TUNE_STEP_MM = 0.25
 DEFAULT_B_TUNE_STEP_DEG = 0.1
@@ -253,7 +259,9 @@ def ensure_manual_offsets_cover_paths(
 def path_metadata_note(path: Optional[Any]) -> str:
     if path is None:
         return ""
-    vessel_ids = ",".join(str(int(v)) for v in getattr(path, "source_vessel_ids", []))
+    raw_ids = [int(v) for v in getattr(path, "source_vessel_ids", [])]
+    visible_ids = [v for v in raw_ids if v >= 0] or raw_ids
+    vessel_ids = ",".join(str(v) for v in visible_ids)
     return f"path_id={getattr(path, 'path_id', '')} vessels={vessel_ids}".strip()
 
 
@@ -473,7 +481,8 @@ class SharedPrintState:
             self.current_group = int(group)
             self.total_groups = int(total)
             self.current_path_id = str(path_id)
-            self.current_source_vessels = [int(x) for x in source_vessels]
+            raw_source_vessels = [int(x) for x in source_vessels]
+            self.current_source_vessels = [x for x in raw_source_vessels if x >= 0] or raw_source_vessels
             self.current_path_points = [tuple(map(float, p)) for p in pts[:, :3]] if pts.ndim == 2 and pts.shape[1] >= 3 else []
             self.current_point_index = 0
             self.current_point_total = int(len(pts))
@@ -1133,6 +1142,13 @@ class InteractiveRobotWriter:
         self._travel_history: List[Tuple[np.ndarray, float, float, Optional[np.ndarray]]] = []
         self.previous_branch_end_pose: Optional[Tuple[np.ndarray, float, float, Optional[np.ndarray]]] = None
         self._accepted_node_start_group: Optional[int] = None
+        self.vacuum_enabled = False
+        self.pressure_on_command = str(kwargs.pop("pressure_on_command", DEFAULT_PRESSURE_ON_COMMAND))
+        self.pressure_off_command = str(kwargs.pop("pressure_off_command", DEFAULT_PRESSURE_OFF_COMMAND))
+        self.pressure_set_command = str(kwargs.pop("pressure_set_command", DEFAULT_PRESSURE_SET_COMMAND))
+        self.vacuum_on_command = str(kwargs.pop("vacuum_on_command", DEFAULT_VACUUM_ON_COMMAND))
+        self.vacuum_off_command = str(kwargs.pop("vacuum_off_command", DEFAULT_VACUUM_OFF_COMMAND))
+        self.vacuum_lead_distance_mm = max(0.0, float(kwargs.pop("vacuum_lead_distance_mm", DEFAULT_VACUUM_LEAD_DISTANCE_MM)))
 
         # Construct the original writer against a StringIO sink. We reuse all
         # its planning, collision, tangent, pressure, and state logic, then
@@ -1402,9 +1418,9 @@ class InteractiveRobotWriter:
     def pressure_preload_before_print(self) -> None:
         if not self.base.emit_extrusion or self.base.pressure_charged:
             return
-        if self.base.pressure_set_command:
-            self.send_code(self.base.pressure_set_command, reason="pressure set")
-        self.send_code(self.base.pressure_on_command, reason="pressure on")
+        if self.pressure_set_command:
+            self.send_code(self.pressure_set_command, reason="pressure set")
+        self.send_code(self.pressure_on_command, reason="pressure on")
         if self.base.pressure_offset_mm > 1e-9:
             self.send_code(f"G91", reason="relative mode")
             self.send_code(
@@ -1420,10 +1436,6 @@ class InteractiveRobotWriter:
     def pressure_release_after_print(self) -> None:
         if not self.base.emit_extrusion or not self.base.pressure_charged:
             return
-        self.enable_vacuum(reason="vacuum on before dwell")
-        if self.base.node_dwell_ms > 0:
-            time.sleep(float(self.base.node_dwell_ms) / 1000.0)
-        self.disable_vacuum(reason="vacuum off after dwell")
         if self.base.pressure_offset_mm > 1e-9:
             self.send_code("G91", reason="relative mode")
             self.send_code(
@@ -1432,19 +1444,20 @@ class InteractiveRobotWriter:
                 reason="pressure retract",
             )
             self.send_code("G90", reason="absolute mode")
-        self.send_code(self.base.pressure_off_command, reason="pressure off")
+        self.send_code(self.pressure_off_command, reason="pressure off")
         self.base.pressure_charged = False
 
-    def enable_vacuum(self, reason: str = "vacuum on") -> None:
-        if not self.base.emit_extrusion or self.base.vacuum_enabled or not self.base.vacuum_on_command:
+    def enable_vacuum(self) -> None:
+        if not self.base.emit_extrusion or self.vacuum_enabled or not self.vacuum_on_command:
             return
-        self.send_code(self.base.vacuum_on_command, reason=reason)
-        self.base.vacuum_enabled = True
+        self.send_code(self.vacuum_on_command, reason="vacuum on")
+        self.vacuum_enabled = True
 
-    def disable_vacuum(self, reason: str = "vacuum off") -> None:
-        if self.base.vacuum_enabled and self.base.vacuum_off_command:
-            self.send_code(self.base.vacuum_off_command, reason=reason)
-        self.base.vacuum_enabled = False
+    def disable_vacuum(self) -> None:
+        if not self.vacuum_enabled or not self.vacuum_off_command:
+            return
+        self.send_code(self.vacuum_off_command, reason="vacuum off")
+        self.vacuum_enabled = False
 
     def emit_vasculature_write_start(self, label: str, points: np.ndarray, tangents: np.ndarray, extrusion_multiplier: float) -> None:
         print(f"; VASCULATURE_WRITE_START path_id={label} point_count={len(points)}")
@@ -1677,11 +1690,19 @@ class InteractiveRobotWriter:
             if self.ui_state is not None:
                 self.ui_state.current_point_total = total_samples
                 self.ui_state.current_point_index = 0
+            remaining_lengths = [0.0] * total_samples
+            remaining = 0.0
+            for idx in range(total_samples - 1, -1, -1):
+                if idx < total_samples - 1:
+                    remaining += float(np.linalg.norm(samples[idx + 1][0] - samples[idx][0]))
+                remaining_lengths[idx] = remaining
 
             i = 0
             last_tip = np.asarray(points[0], dtype=float).copy()
             while i < total_samples:
                 p_tip, tangent, local_radius_mm = samples[i]
+                if remaining_lengths[i] <= self.vacuum_lead_distance_mm:
+                    self.enable_vacuum()
                 p_stage, b, c, motion_phase, used_tip_angle = self.base.tip_to_stage_with_phase(
                     p_tip,
                     tangent=tangent,
@@ -1715,6 +1736,7 @@ class InteractiveRobotWriter:
             self._wait_estimated_complete(reason="print path completion")
             self.emit_vasculature_write_end(label)
             self.pressure_release_after_print()
+            self.disable_vacuum()
             self.base.record_printed_path(points, radius_mm=path_radius_mm)
             self.previous_branch_end_pose = (
                 np.asarray(self.base.cur_stage_xyz, dtype=float).copy(),
@@ -2144,6 +2166,8 @@ def build_plan_from_args(vm: Any, args: argparse.Namespace):
         path_resample_spacing=float(args.path_resample_spacing),
         path_geometry_smooth_window=int(args.path_geometry_smooth_window),
         point_merge_tol=float(args.point_merge_tol),
+        write_mode=str(args.write_mode),
+        orientation_mode=str(args.orientation_mode),
         min_group_length_mm=float(args.min_group_length_mm),
         force_bottom_to_top=bool(args.force_bottom_to_top),
         branch_start_overlap_mm=float(args.branch_start_overlap_mm),
@@ -2255,6 +2279,12 @@ def save_gcode(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
         aorta_cylinder_clearance_mm=float(args.aorta_cylinder_clearance_mm),
         aorta_cylinder_min_radius_mm=float(args.aorta_cylinder_min_radius_mm),
         aorta_cylinder_samples=int(args.aorta_cylinder_samples),
+        pressure_on_command=str(args.pressure_on_command),
+        pressure_off_command=str(args.pressure_off_command),
+        pressure_set_command=str(args.pressure_set_command),
+        vacuum_on_command=str(args.vacuum_on_command),
+        vacuum_off_command=str(args.vacuum_off_command),
+        vacuum_lead_distance_mm=float(args.vacuum_lead_distance_mm),
         machine_start_pose=(float(args.machine_start_x), float(args.machine_start_y), float(args.machine_start_z), float(args.machine_start_b), float(args.machine_start_c)),
         machine_end_pose=(float(args.machine_end_x), float(args.machine_end_y), float(args.machine_end_z), float(args.machine_end_b), float(args.machine_end_c)),
         extrusion_feed_mode=str(args.extrusion_feed_mode),
@@ -2344,6 +2374,12 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             aorta_cylinder_clearance_mm=float(args.aorta_cylinder_clearance_mm),
             aorta_cylinder_min_radius_mm=float(args.aorta_cylinder_min_radius_mm),
             aorta_cylinder_samples=int(args.aorta_cylinder_samples),
+            pressure_on_command=str(args.pressure_on_command),
+            pressure_off_command=str(args.pressure_off_command),
+            pressure_set_command=str(args.pressure_set_command),
+            vacuum_on_command=str(args.vacuum_on_command),
+            vacuum_off_command=str(args.vacuum_off_command),
+            vacuum_lead_distance_mm=float(args.vacuum_lead_distance_mm),
         )
 
         group_displacements_vm = {k: v.to_vm(vm) for k, v in plan["manual_offsets"].items()}
@@ -2375,9 +2411,10 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
         try:
             writer.send_code("G90", reason="absolute mode")
             if not bool(args.no_extrusion):
-                writer.send_code(writer.base.pressure_off_command, reason="pressure off")
-                if writer.base.vacuum_off_command:
-                    writer.send_code(writer.base.vacuum_off_command, reason="vacuum off")
+                writer.send_code(writer.pressure_off_command, reason="pressure off")
+                if writer.vacuum_off_command:
+                    writer.send_code(writer.vacuum_off_command, reason="vacuum off")
+                writer.vacuum_enabled = False
             if float(args.travel_accel_mm_s2) > 0.0:
                 writer.set_travel_acceleration(float(args.travel_accel_mm_s2), comment="startup: nominal travel acceleration")
 
@@ -2431,11 +2468,13 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
                     if feed_mode == "weighted"
                     else float(args.print_feed)
                 )
+                final_approach_feed = float(args.travel_feed) if group_idx == 1 else active_path_print_feed
                 if group_idx == 1:
                     writer.set_aorta_reference(points)
 
                 print("\n" + "-" * 72)
-                print(f"Printing group {group_idx}: {path.path_id} source_vessels={path.source_vessel_ids}")
+                visible_source_ids = [int(v) for v in path.source_vessel_ids if int(v) >= 0] or [int(v) for v in path.source_vessel_ids]
+                print(f"Printing group {group_idx}: {path.path_id} source_vessels={visible_source_ids}")
                 print("-" * 72)
                 if ui_state is not None:
                     ui_state.set_mode("approach", f"Approaching group {group_idx}: {path.path_id}")
@@ -2445,11 +2484,11 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
                     and group_idx > 1
                     and bool(args.enable_aorta_cylinder_travel)
                 ):
-                    writer.approach_start_from_aorta_cylinder(points[0], tangents[0], str(path.path_id), final_approach_feed=active_path_print_feed)
+                    writer.approach_start_from_aorta_cylinder(points[0], tangents[0], str(path.path_id), final_approach_feed=final_approach_feed)
                 elif bool(args.enable_side_approach):
-                    writer.approach_start_from_side(points[0], tangents[0], float(args.side_approach_far), float(args.side_approach_near), float(args.side_retreat), float(args.side_lift_z), str(path.path_id), final_approach_feed=active_path_print_feed)
+                    writer.approach_start_from_side(points[0], tangents[0], float(args.side_approach_far), float(args.side_approach_near), float(args.side_retreat), float(args.side_lift_z), str(path.path_id), final_approach_feed=final_approach_feed)
                 else:
-                    writer.approach_start_direct(points[0], tangents[0], str(path.path_id), final_approach_feed=active_path_print_feed)
+                    writer.approach_start_direct(points[0], tangents[0], str(path.path_id), final_approach_feed=final_approach_feed)
                 writer.apply_node_rotary_offset(offset, points[0], tangents[0], feed=float(args.fine_approach_feed))
 
                 tuned_offset = writer.tune_node_start(group_idx, str(path.path_id), base_start_tip, base_tangents[0], offset)
@@ -2502,9 +2541,10 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             shutdown_stage[2] = float(args.machine_end_z)
             writer.write_move(shutdown_stage, float(writer.base.cur_b), float(writer.base.cur_c), float(args.travel_feed), comment=f"shutdown: lift to Z={float(args.machine_end_z):.3f}")
             if not bool(args.no_extrusion):
-                writer.send_code(writer.base.pressure_off_command, reason="pressure off")
-                if writer.base.vacuum_off_command:
-                    writer.send_code(writer.base.vacuum_off_command, reason="vacuum off")
+                writer.send_code(writer.pressure_off_command, reason="pressure off")
+                if writer.vacuum_off_command:
+                    writer.send_code(writer.vacuum_off_command, reason="vacuum off")
+                writer.vacuum_enabled = False
 
             print("\nInteractive print complete.")
             print(f"Taught offsets saved to {manual_file}")
@@ -2519,6 +2559,16 @@ def run_interactive_print(vm: Any, args: argparse.Namespace, plan: Dict[str, Any
             if ui_state is not None:
                 ui_state.set_error(f"Error: {exc}")
             raise
+        finally:
+            if not bool(args.no_extrusion):
+                try:
+                    writer.send_code(writer.pressure_off_command, reason="final pressure off")
+                    if writer.vacuum_off_command:
+                        writer.send_code(writer.vacuum_off_command, reason="final vacuum off")
+                    writer.vacuum_enabled = False
+                    writer.base.pressure_charged = False
+                except Exception:
+                    pass
 
 
 def run_interactive_print_gui(vm: Any, args: argparse.Namespace, plan: Dict[str, Any]) -> None:
@@ -2576,7 +2626,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         out=DEFAULT_OUT_FILE,
         groups_out=DEFAULT_GROUPS_OUT_FILE,
         group_displacements_file=DEFAULT_GROUP_DISPLACEMENTS_FILE,
-        write_mode="calibrated",
+        write_mode="cartesian",
         orientation_mode="tangent",
         rotate_y_deg=180.0,
         align_lowest_centroid=[100.0, 100.0, -160.0],
@@ -2622,6 +2672,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-gui", dest="gui", action="store_false", help="Use terminal-only keyboard interaction instead of the GUI.")
     ap.add_argument("--gui-refresh-ms", type=int, default=DEFAULT_GUI_REFRESH_MS, help="GUI status refresh interval in milliseconds.")
     ap.add_argument("--gui-plot-refresh-ms", type=int, default=DEFAULT_GUI_PLOT_REFRESH_MS, help="3D plot refresh interval in milliseconds.")
+    ap.add_argument("--pressure-on-command", default=DEFAULT_PRESSURE_ON_COMMAND, help="Command used to start extrusion.")
+    ap.add_argument("--pressure-off-command", default=DEFAULT_PRESSURE_OFF_COMMAND, help="Command used to stop extrusion.")
+    ap.add_argument("--pressure-set-command", default=DEFAULT_PRESSURE_SET_COMMAND, help="Command used to set extrusion pressure before each branch. Use an empty string to disable.")
+    ap.add_argument("--vacuum-on-command", default=DEFAULT_VACUUM_ON_COMMAND, help="Command used to enable vacuum near the end of each branch. Use an empty string to disable.")
+    ap.add_argument("--vacuum-off-command", default=DEFAULT_VACUUM_OFF_COMMAND, help="Command used to disable vacuum after each branch. Use an empty string to disable.")
+    ap.add_argument("--vacuum-lead-distance-mm", type=float, default=DEFAULT_VACUUM_LEAD_DISTANCE_MM, help="Distance before branch end at which vacuum turns on.")
     return ap
 
 

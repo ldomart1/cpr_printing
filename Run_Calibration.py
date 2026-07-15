@@ -16,7 +16,7 @@ from shadow_calibration import CTR_Shadow_Calibration
 import shadow_calibration
 
 
-DEFAULT_PROJECT_NAME = "Test_Calibration_2026-06-30_02"
+DEFAULT_PROJECT_NAME = "Test_Calibration_2026-07-06_05"
 DEFAULT_MANUAL_CROP_ADJUSTMENT = True
 DEFAULT_THRESHOLD = 220
 DEFAULT_PULL_B_START = 0.0
@@ -34,8 +34,8 @@ DEFAULT_CURL_MOTION_MODE = "stepped"
 DEFAULT_CURL_CONTINUOUS_FEEDRATE = 100.0
 DEFAULT_CURL_CONTINUOUS_ACCEL_MM_S2 = 200.0
 DEFAULT_CURL_CONTINUOUS_CAPTURE_PERIOD_S = None
-DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260406_104136.npz")
-DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260630_174948.png")
+DEFAULT_CAMERA_CALIBRATION_FILE = os.path.join(SCRIPT_DIR, "captures/calibration_webcam_20260708_120830.npz")
+DEFAULT_BOARD_REFERENCE_IMAGE = os.path.join(SCRIPT_DIR, "captures/photo_20260708_120944.png")
 DEFAULT_BOARD_XZ_AXIS_SIGN = 1
 DEFAULT_PROBE_MODE = "middle"
 DEFAULT_FIT_MODEL = "pchip"
@@ -51,7 +51,7 @@ DEFAULT_TIP_REFINER_ANCHOR = None
 DEFAULT_TIP_REFINER_COMPARE_ONLY = False
 DEFAULT_TIP_REFINE_MODE = "coarse"
 DEFAULT_TIP_DETECTION_MODE = "red_dot"
-DEFAULT_CURL_PASS = "all"
+DEFAULT_CURL_PASSES = ("0-90-0", "0-180-0")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -72,9 +72,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--curl_pass",
         type=str,
-        default=DEFAULT_CURL_PASS,
+        nargs="+",
+        default=list(DEFAULT_CURL_PASSES),
         choices=["all", "0-90-0", "0-180-0", "90-180-90"],
-        help="Curl-angle pass to run when curl DAQ is enabled. Use 'all' to run every predefined pass.",
+        help="Curl-angle pass sequence to run when curl DAQ is enabled. Pass multiple values after --curl_pass. Use 'all' to expand to every predefined pass.",
     )
     parser.add_argument("--manual_crop_adjustment", action="store_true", default=DEFAULT_MANUAL_CROP_ADJUSTMENT)
     parser.add_argument("--no_manual_crop_adjustment", dest="manual_crop_adjustment", action="store_false")
@@ -203,18 +204,35 @@ def resolve_project_location(args: argparse.Namespace) -> tuple[str, str]:
     return SCRIPT_DIR, str(args.project_name)
 
 
-def get_curl_angle_passes(curl_pass: str) -> list[dict]:
+def get_curl_angle_passes(curl_passes: list[str] | tuple[str, ...] | str) -> list[dict]:
     predefined_passes = [
         {"name": "0-90-0", "angle_sequence_deg": [0, 90, 0]},
         {"name": "0-180-0", "angle_sequence_deg": [0, 180, 0]},
         {"name": "90-180-90", "angle_sequence_deg": [90, 180, 90]},
     ]
-    if str(curl_pass) == "all":
-        return predefined_passes
-    for pass_cfg in predefined_passes:
-        if pass_cfg["name"] == str(curl_pass):
-            return [pass_cfg]
-    raise ValueError(f"Unknown curl pass: {curl_pass}")
+    if isinstance(curl_passes, str):
+        requested_passes = [curl_passes]
+    else:
+        requested_passes = list(curl_passes)
+
+    ordered_passes: list[dict] = []
+    seen_names: set[str] = set()
+    for requested_pass in requested_passes:
+        if requested_pass == "all":
+            for pass_cfg in predefined_passes:
+                if pass_cfg["name"] not in seen_names:
+                    ordered_passes.append(pass_cfg)
+                    seen_names.add(pass_cfg["name"])
+            continue
+
+        matched_pass = next((pass_cfg for pass_cfg in predefined_passes if pass_cfg["name"] == requested_pass), None)
+        if matched_pass is None:
+            raise ValueError(f"Unknown curl pass: {requested_pass}")
+        if matched_pass["name"] not in seen_names:
+            ordered_passes.append(matched_pass)
+            seen_names.add(matched_pass["name"])
+
+    return ordered_passes
 
 
 def main(args: argparse.Namespace) -> None:
@@ -238,7 +256,7 @@ def main(args: argparse.Namespace) -> None:
 
     probe_points = probe_points_for_mode(str(args.probe_mode))
     curl_probe_points = probe_points_for_mode(str(args.curl_probe_mode))
-    curl_angle_passes = get_curl_angle_passes(str(args.curl_pass))
+    curl_angle_passes = get_curl_angle_passes(args.curl_pass)
 
     camera_calibration_file = None if args.camera_calibration_file is None else os.path.expanduser(str(args.camera_calibration_file))
     board_reference_image = None if args.board_reference_image is None else os.path.expanduser(str(args.board_reference_image))

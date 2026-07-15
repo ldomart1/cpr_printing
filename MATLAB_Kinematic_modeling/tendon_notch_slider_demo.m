@@ -30,6 +30,13 @@ P.endOffsetApex   = -2.0;  R.endOffsetApex   = [-3 3];
 distribution = "proportional_to_length"; % "uniform" or "proportional_to_length"
 bend_dir = +1;
 
+% Capstan / tendon friction model
+% T_out = T_in * exp(-mu * beta), where beta is the local wrap angle.
+% The relative tendon tension biases how much pull is assigned to each notch.
+useCapstan = true;
+pullSide   = "base";   % "base" if tendon is pulled from notch 1; use "tip" otherwise
+P.muCapstan = 0.15;    R.muCapstan = [0 1.5];
+
 %% ------------------- ANIMATION / GIF SETTINGS -------------------
 gifFilename           = "full_curl.gif";
 gifFrames             = 140;
@@ -110,6 +117,21 @@ chkLockView = uicontrol(fig,'Style','checkbox', ...
     'BackgroundColor','none', ...
     'Value',0);
 
+chkCapstan = uicontrol(fig,'Style','checkbox', ...
+    'String','Use capstan friction', ...
+    'Units','pixels','Position',[740 btnY-24 170 22], ...
+    'BackgroundColor','none', ...
+    'Value',useCapstan);
+
+uicontrol(fig,'Style','text','String','Pull side:', ...
+    'Units','pixels','Position',[920 btnY-20 60 18], ...
+    'BackgroundColor','none','HorizontalAlignment','right');
+
+popPullSide = uicontrol(fig,'Style','popupmenu', ...
+    'Units','pixels','Position',[985 btnY-24 75 24], ...
+    'String',{'base','tip'}, ...
+    'Value', find(strcmp({'base','tip'}, char(pullSide)), 1));
+
 tipTxt = uicontrol(fig,'Style','text', ...
     'Units','pixels', ...
     'Position',[920 btnY-2 270 44], ...
@@ -138,6 +160,7 @@ UI = struct();
 [UI.h_eSp,    UI.t_eSp,    UI.v_eSp   ] = makeParamSlider('endSpacing',      P.endSpacing,      R.endSpacing,      col2x, rowYs(2));
 [UI.h_sOA,    UI.t_sOA,    UI.v_sOA   ] = makeParamSlider('startOffsetApex', P.startOffsetApex, R.startOffsetApex, col2x, rowYs(3));
 [UI.h_eOA,    UI.t_eOA,    UI.v_eOA   ] = makeParamSlider('endOffsetApex',   P.endOffsetApex,   R.endOffsetApex,   col2x, rowYs(4));
+[UI.h_muCapstan, UI.t_muCapstan, UI.v_muCapstan] = makeParamSlider('muCapstan', P.muCapstan, R.muCapstan, col2x, rowYs(5));
 
 %% ------------------- STATE -------------------
 S = struct();
@@ -147,6 +170,8 @@ S.tipTxt = tipTxt;
 
 S.btnPlay = btnPlay; S.btnStop = btnStop;
 S.popSpeed = popSpeed;
+S.chkCapstan = chkCapstan;
+S.popPullSide = popPullSide;
 
 S.chkLockView = chkLockView;
 S.lockView = false;
@@ -157,6 +182,8 @@ S.viewSideUp   = [0 0 1];   % Z up
 S.P = P; S.R = R;
 S.distribution = distribution;
 S.bend_dir = bend_dir;
+S.useCapstan = logical(useCapstan);
+S.pullSide = string(pullSide);
 
 S.animTimer = [];
 S.animFPS = animFPS;
@@ -196,9 +223,11 @@ set(btnGif,'Callback',@(~,~) saveGifFromUI());
 set(btnClose,'Callback',@(~,~) closeAndCleanup());
 set(popSpeed,'Callback',@(~,~) onSpeedChanged());
 set(chkLockView,'Callback',@(~,~) onLockViewToggled());
+set(chkCapstan,'Callback',@(~,~) onCapstanToggled());
+set(popPullSide,'Callback',@(~,~) onPullSideChanged());
 
 paramNames = {'height','depth','offset','startNotchWidth','endNotchWidth', ...
-              'startSpacing','endSpacing','startOffsetApex','endOffsetApex'};
+              'startSpacing','endSpacing','startOffsetApex','endOffsetApex','muCapstan'};
 for k = 1:numel(paramNames)
     name = paramNames{k};
     h = UI.(['h_' shortName(name)]);
@@ -249,6 +278,20 @@ rebuildGeometryAndPlots(true);
         applyViewLock();
     end
 
+    function onCapstanToggled()
+        if ~ishandle(S.fig), return; end
+        S.useCapstan = logical(get(S.chkCapstan,'Value'));
+        updatePlot(S, get(S.pullSld,'Value'));
+    end
+
+    function onPullSideChanged()
+        if ~ishandle(S.fig), return; end
+        strs = get(S.popPullSide,'String');
+        val = get(S.popPullSide,'Value');
+        S.pullSide = string(strs{val});
+        updatePlot(S, get(S.pullSld,'Value'));
+    end
+
     function onPull()
         if ~ishandle(S.fig), return; end
         DeltaL = get(S.pullSld,'Value');
@@ -281,6 +324,7 @@ rebuildGeometryAndPlots(true);
             case 'endSpacing',      hval = UI.v_eSp;
             case 'startOffsetApex', hval = UI.v_sOA;
             case 'endOffsetApex',   hval = UI.v_eOA;
+            case 'muCapstan',       hval = UI.v_muCapstan;
             otherwise, return;
         end
         set(hval,'String',sprintf('%.3f', newVal));
@@ -480,7 +524,7 @@ rebuildGeometryAndPlots(true);
 
         saveFullCurlGif( ...
             out, gifFrames, gifDelay, gifLoopCount, gifTransparentBg, ...
-            S.P, S.distribution, S.bend_dir, ...
+            S.P, S.distribution, S.bend_dir, S.useCapstan, S.pullSide, ...
             S.lockView, S.viewSideDir, S.viewSideUp, viewAzEl, ...
             S.notches0, S.pins0, S.p0_list, S.p2_list, S.L_notch, S.theta0, S.d, S.DeltaL_max, ...
             S.notchColors, S.undeformedDarkenFactor, S.colLinkUndeformed, S.colTendonPins);
@@ -515,7 +559,13 @@ end
 function updatePlot(S, DeltaL)
 set(S.pullLbl, 'String', sprintf('Pulled tendon ΔL = %.4f mm (max ≈ %.4f mm)', DeltaL, S.DeltaL_max));
 
-theta = solveAnglesWithLimits(DeltaL, S.d, S.L_notch, S.theta0, S.distribution);
+if S.useCapstan
+    theta = solveAnglesWithCapstanLimits( ...
+        DeltaL, S.d, S.L_notch, S.theta0, S.distribution, ...
+        S.P.muCapstan, S.pullSide);
+else
+    theta = solveAnglesWithLimits(DeltaL, S.d, S.L_notch, S.theta0, S.distribution);
+end
 [pinsDef, yawBefore, yawAfter] = deformPinsFromThetas(S.pins0, theta, S.bend_dir);
 
 N = numel(S.notches0);
@@ -564,7 +614,7 @@ end
 %% ========================= GIF EXPORT =========================
 function saveFullCurlGif( ...
     filename, nFrames, delay, loopCount, makeTransparent, ...
-    P, distribution, bend_dir, ...
+    P, distribution, bend_dir, useCapstan, pullSide, ...
     lockView, viewSideDir, viewSideUp, viewAzEl, ...
     notches0, pins0, p0_list, p2_list, L_notch, theta0, d, DeltaL_max, ...
     notchColors, undeformedDarkenFactor, colLinkUndeformed, colTendonPins)
@@ -633,7 +683,7 @@ hTip = annotation(f,'textbox',[0.0 0.90 0.86 0.08], ...
     'FontSize',11);
 
 % Metadata (bottom-left), smaller
-paramStr = formatParamString(P, distribution, bend_dir);
+paramStr = formatParamString(P, distribution, bend_dir, useCapstan, pullSide);
 annotation(f,'textbox',[0.00 0.01 0.6 0.20], ...
     'String',paramStr, ...
     'FitBoxToText','on', ...
@@ -703,7 +753,13 @@ for k = 1:nFrames
     t = (k-1) / max(nFrames-1,1);
     DeltaL = t * DeltaL_max;
 
-    theta = solveAnglesWithLimits(DeltaL, d, L_notch, theta0, distribution);
+    if useCapstan
+        theta = solveAnglesWithCapstanLimits( ...
+            DeltaL, d, L_notch, theta0, distribution, ...
+            P.muCapstan, pullSide);
+    else
+        theta = solveAnglesWithLimits(DeltaL, d, L_notch, theta0, distribution);
+    end
     [pinsDef, yawBefore, yawAfter] = deformPinsFromThetas(pins0, theta, bend_dir);
 
     p2_def = zeros(N,3);
@@ -780,7 +836,7 @@ end
 delete(f);
 end
 
-function s = formatParamString(P, distribution, bend_dir)
+function s = formatParamString(P, distribution, bend_dir, useCapstan, pullSide)
 s = sprintf([ ...
     'Settings used:\n' ...
     'height = %.3f\n' ...
@@ -792,13 +848,16 @@ s = sprintf([ ...
     'endSpacing      = %.3f\n' ...
     'startOffsetApex = %.3f\n' ...
     'endOffsetApex   = %.3f\n' ...
+    'muCapstan       = %.3f\n' ...
+    'capstan         = %d\n' ...
+    'pullSide        = %s\n' ...
     'distribution    = %s\n' ...
     'bend_dir        = %+d' ], ...
     P.height, P.depth, P.offset, ...
     P.startNotchWidth, P.endNotchWidth, ...
     P.startSpacing, P.endSpacing, ...
-    P.startOffsetApex, P.endOffsetApex, ...
-    char(distribution), bend_dir);
+    P.startOffsetApex, P.endOffsetApex, P.muCapstan, ...
+    logical(useCapstan), char(pullSide), char(distribution), bend_dir);
 end
 
 %% ========================= GEOMETRY BUILD =========================
@@ -891,14 +950,127 @@ if N == 0 || DeltaL <= 0
     return;
 end
 
-d_safe = max(d, 1e-12);
-thetaCap = max(theta0, 0);
-
 switch string(distribution)
     case "uniform"
         w = ones(N,1);
     otherwise
-        w = max(L_notch, 1e-12);
+        w = max(L_notch(:), 1e-12);
+end
+
+theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, w);
+end
+
+function theta = solveAnglesWithCapstanLimits( ...
+    DeltaL, d, L_notch, theta0, distribution, mu, pullSide)
+% Kinematic capstan approximation for a tendon routed through notch tips.
+%
+% Capstan law:
+%   T_out = T_in * exp(-mu * beta)
+%
+% Here beta is approximated as the local notch closing angle. The resulting
+% relative tension distribution is used as an effective weighting for how
+% much of the commanded tendon shortening is assigned to each notch.
+
+N = numel(d);
+theta = zeros(N,1);
+
+if N == 0 || DeltaL <= 0
+    return;
+end
+
+switch string(distribution)
+    case "uniform"
+        baseW = ones(N,1);
+    otherwise
+        baseW = max(L_notch(:), 1e-12);
+end
+
+if mu <= 0
+    theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, baseW);
+    return;
+end
+
+% Start from the frictionless solution, then iterate because the frictional
+% tension decay depends on wrap angle, which depends on theta.
+theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, baseW);
+
+maxIter = 40;
+tol     = 1e-6;
+relax   = 0.5;
+
+for it = 1:maxIter %#ok<NASGU>
+    thetaOld = theta;
+
+    % Local tendon wrap angle approximation at each notch.
+    beta = abs(thetaOld);
+
+    % Relative local tendon tension according to pull direction.
+    Trel = capstanRelativeTension(beta, mu, pullSide);
+
+    % Less tension means that notch gets a smaller share of the global pull.
+    wEff = baseW .* Trel;
+
+    thetaNew = solveAnglesWeightedWithLimits(DeltaL, d, theta0, wEff);
+
+    % Under-relaxation improves numerical stability when mu is high.
+    theta = (1 - relax)*thetaOld + relax*thetaNew;
+
+    if norm(theta - thetaOld, inf) < tol
+        break;
+    end
+end
+
+thetaCap = max(theta0(:), 0);
+theta = min(theta, thetaCap);
+theta = max(theta, 0);
+end
+
+function Trel = capstanRelativeTension(beta, mu, pullSide)
+beta = beta(:);
+N = numel(beta);
+Trel = ones(N,1);
+
+switch string(pullSide)
+    case "base"
+        % Tendon is pulled from notch 1 toward notch N.
+        % Notch 1 sees the highest tension; distal notches see reduced tension.
+        accumulatedWrap = 0;
+        for i = 1:N
+            Trel(i) = exp(-mu * accumulatedWrap);
+            accumulatedWrap = accumulatedWrap + beta(i);
+        end
+
+    case "tip"
+        % Tendon is pulled from notch N toward notch 1.
+        % Tip notch sees the highest tension; proximal notches see reduced tension.
+        accumulatedWrap = 0;
+        for i = N:-1:1
+            Trel(i) = exp(-mu * accumulatedWrap);
+            accumulatedWrap = accumulatedWrap + beta(i);
+        end
+
+    otherwise
+        error('pullSide must be "base" or "tip".');
+end
+
+% Avoid fully starving a section numerically.
+Trel = max(Trel, 1e-6);
+end
+
+function theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, w)
+N = numel(d);
+theta = zeros(N,1);
+
+if N == 0 || DeltaL <= 0
+    return;
+end
+
+d_safe = max(d(:), 1e-12);
+thetaCap = max(theta0(:), 0);
+
+w = max(w(:), 0);
+if sum(w) < 1e-12
+    return;
 end
 
 free = true(N,1);
@@ -907,6 +1079,7 @@ remaining = DeltaL;
 while remaining > 1e-12 && any(free)
     wf = w .* free;
     wf_sum = sum(wf);
+
     if wf_sum < 1e-12
         break;
     end
@@ -932,7 +1105,8 @@ while remaining > 1e-12 && any(free)
     end
 end
 
-theta = min(max(theta,0), thetaCap);
+theta = min(theta, thetaCap);
+theta = max(theta, 0);
 end
 
 %% ========================= MATH HELPERS =========================

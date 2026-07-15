@@ -1,32 +1,21 @@
 function tendon_notch_slider_demo()
-%% Tendon-pull notch demo (FORCE + TUBE STIFFNESS + ELASTIC LIMIT) with live geometry sliders + animation + GIF export
-%
-% Key additions vs your original:
-% 1) Force-driven bending with tube stiffness:
-%       theta_i = (F * r_eff(i)) / k_theta(i), capped by geometric theta0(i)
-%    where k_theta(i) = E * I_y(i) / L_i and I_y(i) is computed numerically for a notched ring section.
-%
-% 2) Elastic-limit detection (linear elastic proxy) using max bending strain / stress:
-%       kappa_i = theta_i / L_i
-%       eps_max(i)   = |kappa_i| * c_i
-%       sigma_max(i) = E * eps_max(i)
-%    If eps_max > epsElasticLimit OR sigma_max > sigmaElasticLimit => "out of elastic"
-%    Those notches are colored RED and their pin markers become RED.
-%
-% Tube dimensions:
-%   ID = 0.0414"  (1.05156 mm)
-%   OD = 0.0570"  (1.44780 mm)
+%% Tendon-pull notch demo with live geometry sliders + animation + GIF export
+% Final requested updates:
+% - Legend restored
+% - Attack angle is UNWRAPPED (0 -> 370 -> ...), not folding after 180
+% - Title placed slightly higher
+% - Tip display includes total number of notches (before attack angle)
+% - Side view lock is X-Z plane (camera along +Y)
+% - Tip reference base is offset by -startSpacing in Z
+% - GIF export: black-key transparency (or black opaque fallback), no frame accumulation,
+%   metadata bottom-left (smaller), tip+notch+attack top-left, legend included.
 
 clc; close all;
 
 %% ------------------- DEFAULT PARAMS + RANGES -------------------
 P = struct();
 P.height          = 30.0;  R.height          = [0 70];
-
-% IMPORTANT: "depth" here is interpreted as notch cut depth across diameter along +X,
-% removing region x > (ro - depth). Range 0..~OD(mm) makes sense.
-P.depth           = 1.30;  R.depth           = [0 1.45];
-
+P.depth           = 1.3;   R.depth           = [0 1.45];
 P.offset          = 0.5;   R.offset          = [-2 2];
 
 P.startNotchWidth = 1.5;   R.startNotchWidth = [0 4];
@@ -38,25 +27,18 @@ P.endSpacing      = 0.0;   R.endSpacing      = [-2 2];
 P.startOffsetApex = -1.0;  R.startOffsetApex = [-3 3];
 P.endOffsetApex   = -2.0;  R.endOffsetApex   = [-3 3];
 
-% ------------------- PHYSICS -------------------
-P.tubeID_in   = 0.0414;
-P.tubeOD_in   = 0.0570;
-P.E_GPa       = 60;        % Nitinol effective E (GPa)
-P.tendon_x_mm = 0.92456;       % NaN -> assume tendon rides at +ri (inner wall at +x)
-
-% Elastic limit proxy (linear elastic region):
-% Use either strain limit, stress limit, or both. If either is exceeded => "out of elastic".
-P.epsElasticLimit       = 0.010;  % 1% (change to match your definition)
-P.sigmaElasticLimit_MPa = 800;    % MPa (change to match your definition)
-
-% Force slider cap (user preference); actual max is also limited by theta0 caps.
-P.Fmax_user_N = 20;
-
-distribution = "force_based"; % metadata only
+distribution = "proportional_to_length"; % "uniform" or "proportional_to_length"
 bend_dir = +1;
 
+% Capstan / tendon friction model
+% T_out = T_in * exp(-mu * beta), where beta is the local wrap angle.
+% The relative tendon tension biases how much pull is assigned to each notch.
+useCapstan = true;
+pullSide   = "base";   % "base" if tendon is pulled from notch 1; use "tip" otherwise
+P.muCapstan = 0.15;    R.muCapstan = [0 1.5];
+
 %% ------------------- ANIMATION / GIF SETTINGS -------------------
-gifFilename           = "full_curl_force_elastic.gif";
+gifFilename           = "full_curl.gif";
 gifFrames             = 140;
 gifDelay              = 0.03;
 gifLoopCount          = inf;
@@ -66,42 +48,43 @@ animFPS               = 40;
 animBaseFramesPerCurl = 140;
 
 %% ------------------- COLORS -------------------
-colLinkUndeformed     = [0.80 0.80 0.80];
-colTendonPins         = [1.00 1.00 1.00];
-colOverElastic        = [1.00 0.00 0.00]; % RED highlight
-undeformedDarkenFactor = 0.80;
+colLinkUndeformed = [0.80 0.80 0.80];   % undeformed inter-notch links
+colTendonPins     = [1.00 1.00 1.00];   % tendon + deformed pins (WHITE)
+undeformedDarkenFactor = 0.80;          % darken undeformed notch colors
 
 %% ------------------- FIGURE / AXES (transparent) -------------------
-fig = figure('Name','Tendon Pull (Force + Elastic limit): Notches + Pins', ...
+fig = figure('Name','Tendon Pull: Deformed Pins + Notches', ...
     'Position',[100 140 1200 820], ...
     'Color','none', ...
     'InvertHardcopy','off');
 
+% Move axes up a bit (more room for UI)
 ax = axes('Parent',fig, 'Position',[0.07 0.34 0.90 0.62]);
 grid(ax,'on'); axis(ax,'equal'); hold(ax,'on');
 xlabel(ax,'X (mm)'); ylabel(ax,'Y (mm)'); zlabel(ax,'Z (mm)');
-ht = title(ax,'Undeformed vs Force-Driven Deformation (red = out of elastic)');
+ht = title(ax,'Undeformed vs Deformed continuum robot');
 view(ax, 35, 20);
 set(ax,'Color','none');
 
+% Title slightly higher
 try
     set(ht,'Units','normalized');
     p = get(ht,'Position'); p(2) = p(2) + 0.04; set(ht,'Position',p);
 catch
 end
 
-%% ------------------- FORCE SLIDER + LABEL -------------------
+%% ------------------- PULL SLIDER + LABEL -------------------
 pullSld = uicontrol(fig,'Style','slider', ...
     'Units','pixels', ...
     'Position',[110 215 980 18], ...
-    'Min',0,'Max',P.Fmax_user_N,'Value',0);
+    'Min',0,'Max',1,'Value',0);
 
 pullLbl = uicontrol(fig,'Style','text', ...
     'Units','pixels', ...
     'Position',[110 235 980 18], ...
     'BackgroundColor','none', ...
     'HorizontalAlignment','left', ...
-    'String','Tendon force F = 0.000 N | predicted ΔL ≈ 0.0000 mm | over-elastic: 0');
+    'String','Pulled tendon ΔL = 0.0000 mm');
 
 %% ------------------- BUTTONS -------------------
 btnY = 150;
@@ -127,11 +110,27 @@ popSpeed = uicontrol(fig,'Style','popupmenu', ...
     'String',{'0.25x','0.5x','1x','2x','4x'}, ...
     'Value',3);
 
+% Lock view checkbox (side view = X-Z plane)
 chkLockView = uicontrol(fig,'Style','checkbox', ...
     'String','Lock side view (X-Z)', ...
     'Units','pixels','Position',[740 btnY+5 170 22], ...
     'BackgroundColor','none', ...
     'Value',0);
+
+chkCapstan = uicontrol(fig,'Style','checkbox', ...
+    'String','Use capstan friction', ...
+    'Units','pixels','Position',[740 btnY-24 170 22], ...
+    'BackgroundColor','none', ...
+    'Value',useCapstan);
+
+uicontrol(fig,'Style','text','String','Pull side:', ...
+    'Units','pixels','Position',[920 btnY-20 60 18], ...
+    'BackgroundColor','none','HorizontalAlignment','right');
+
+popPullSide = uicontrol(fig,'Style','popupmenu', ...
+    'Units','pixels','Position',[985 btnY-24 75 24], ...
+    'String',{'base','tip'}, ...
+    'Value', find(strcmp({'base','tip'}, char(pullSide)), 1));
 
 tipTxt = uicontrol(fig,'Style','text', ...
     'Units','pixels', ...
@@ -152,7 +151,7 @@ rowYs = panelY + [90 70 50 30 10];
 
 UI = struct();
 [UI.h_height, UI.t_height, UI.v_height] = makeParamSlider('height', P.height, R.height, col1x, rowYs(1));
-[UI.h_depth,  UI.t_depth,  UI.v_depth ] = makeParamSlider('depth (cut across dia)',  P.depth,  R.depth,  col1x, rowYs(2));
+[UI.h_depth,  UI.t_depth,  UI.v_depth ] = makeParamSlider('depth',  P.depth,  R.depth,  col1x, rowYs(2));
 [UI.h_offset, UI.t_offset, UI.v_offset] = makeParamSlider('offset', P.offset, R.offset, col1x, rowYs(3));
 [UI.h_sNW,    UI.t_sNW,    UI.v_sNW   ] = makeParamSlider('startNotchWidth', P.startNotchWidth, R.startNotchWidth, col1x, rowYs(4));
 [UI.h_eNW,    UI.t_eNW,    UI.v_eNW   ] = makeParamSlider('endNotchWidth',   P.endNotchWidth,   R.endNotchWidth,   col1x, rowYs(5));
@@ -161,6 +160,7 @@ UI = struct();
 [UI.h_eSp,    UI.t_eSp,    UI.v_eSp   ] = makeParamSlider('endSpacing',      P.endSpacing,      R.endSpacing,      col2x, rowYs(2));
 [UI.h_sOA,    UI.t_sOA,    UI.v_sOA   ] = makeParamSlider('startOffsetApex', P.startOffsetApex, R.startOffsetApex, col2x, rowYs(3));
 [UI.h_eOA,    UI.t_eOA,    UI.v_eOA   ] = makeParamSlider('endOffsetApex',   P.endOffsetApex,   R.endOffsetApex,   col2x, rowYs(4));
+[UI.h_muCapstan, UI.t_muCapstan, UI.v_muCapstan] = makeParamSlider('muCapstan', P.muCapstan, R.muCapstan, col2x, rowYs(5));
 
 %% ------------------- STATE -------------------
 S = struct();
@@ -170,25 +170,28 @@ S.tipTxt = tipTxt;
 
 S.btnPlay = btnPlay; S.btnStop = btnStop;
 S.popSpeed = popSpeed;
+S.chkCapstan = chkCapstan;
+S.popPullSide = popPullSide;
 
 S.chkLockView = chkLockView;
 S.lockView = false;
 S.viewFreeAzEl = get(ax,'View');
-S.viewSideDir  = [0 -1 0];
-S.viewSideUp   = [0 0 1];
+S.viewSideDir  = [0 -1 0];   % camera along +Y => screen plane is X-Z
+S.viewSideUp   = [0 0 1];   % Z up
 
 S.P = P; S.R = R;
 S.distribution = distribution;
 S.bend_dir = bend_dir;
+S.useCapstan = logical(useCapstan);
+S.pullSide = string(pullSide);
 
 S.animTimer = [];
 S.animFPS = animFPS;
 S.animBaseFramesPerCurl = animBaseFramesPerCurl;
 S.speedFactor = 1.0;
 
-S.colLinkUndeformed     = colLinkUndeformed;
-S.colTendonPins         = colTendonPins;
-S.colOverElastic        = colOverElastic;
+S.colLinkUndeformed = colLinkUndeformed;
+S.colTendonPins     = colTendonPins;
 S.undeformedDarkenFactor = undeformedDarkenFactor;
 
 S.hOrig = gobjects(0);
@@ -197,7 +200,6 @@ S.hInterLinkUndeformed = gobjects(0);
 S.hPins = gobjects(1);
 S.hTendon = gobjects(1);
 S.hLegend = gobjects(1);
-S.hLegendOverElastic = gobjects(1);
 S.notchColors = zeros(0,3);
 
 S.notches0 = {};
@@ -206,13 +208,8 @@ S.p0_list = [];
 S.p2_list = [];
 S.L_notch = [];
 S.theta0 = [];
-
-% physics caches
-S.k_theta = [];
-S.r_eff   = [];
-S.c_fiber = [];
-S.E_MPa   = 45000;
-S.F_max_model = P.Fmax_user_N;
+S.d = [];
+S.DeltaL_max = 1;
 
 set(fig,'CloseRequestFcn',@(~,~) closeAndCleanup());
 
@@ -226,9 +223,11 @@ set(btnGif,'Callback',@(~,~) saveGifFromUI());
 set(btnClose,'Callback',@(~,~) closeAndCleanup());
 set(popSpeed,'Callback',@(~,~) onSpeedChanged());
 set(chkLockView,'Callback',@(~,~) onLockViewToggled());
+set(chkCapstan,'Callback',@(~,~) onCapstanToggled());
+set(popPullSide,'Callback',@(~,~) onPullSideChanged());
 
 paramNames = {'height','depth','offset','startNotchWidth','endNotchWidth', ...
-              'startSpacing','endSpacing','startOffsetApex','endOffsetApex'};
+              'startSpacing','endSpacing','startOffsetApex','endOffsetApex','muCapstan'};
 for k = 1:numel(paramNames)
     name = paramNames{k};
     h = UI.(['h_' shortName(name)]);
@@ -273,16 +272,30 @@ rebuildGeometryAndPlots(true);
         if ~ishandle(S.fig), return; end
         newLock = logical(get(S.chkLockView,'Value'));
         if newLock && ~S.lockView
-            S.viewFreeAzEl = get(S.ax,'View');
+            S.viewFreeAzEl = get(S.ax,'View'); % store current view
         end
         S.lockView = newLock;
         applyViewLock();
     end
 
+    function onCapstanToggled()
+        if ~ishandle(S.fig), return; end
+        S.useCapstan = logical(get(S.chkCapstan,'Value'));
+        updatePlot(S, get(S.pullSld,'Value'));
+    end
+
+    function onPullSideChanged()
+        if ~ishandle(S.fig), return; end
+        strs = get(S.popPullSide,'String');
+        val = get(S.popPullSide,'Value');
+        S.pullSide = string(strs{val});
+        updatePlot(S, get(S.pullSld,'Value'));
+    end
+
     function onPull()
         if ~ishandle(S.fig), return; end
-        F = get(S.pullSld,'Value');
-        updatePlot(S, F);
+        DeltaL = get(S.pullSld,'Value');
+        updatePlot(S, DeltaL);
     end
 
     function onSpeedChanged()
@@ -311,6 +324,7 @@ rebuildGeometryAndPlots(true);
             case 'endSpacing',      hval = UI.v_eSp;
             case 'startOffsetApex', hval = UI.v_sOA;
             case 'endOffsetApex',   hval = UI.v_eOA;
+            case 'muCapstan',       hval = UI.v_muCapstan;
             otherwise, return;
         end
         set(hval,'String',sprintf('%.3f', newVal));
@@ -320,7 +334,7 @@ rebuildGeometryAndPlots(true);
         wasRunning = ~isempty(S.animTimer) && isvalid(S.animTimer) && strcmp(S.animTimer.Running,'on');
         if wasRunning, stopAnimation(); end
 
-        prevMax = S.F_max_model;
+        prevMax = S.DeltaL_max;
         prevPull = get(S.pullSld,'Value');
         pullRatio = 0;
         if prevMax > 1e-12
@@ -352,79 +366,25 @@ rebuildGeometryAndPlots(true);
             theta0(i) = angleBetween(v0, v2);
         end
 
-        % ----------- PHYSICS PRECOMPUTE -----------
-        in2mm = 25.4;
-        ro = (S.P.tubeOD_in * in2mm)/2;
-        ri = (S.P.tubeID_in * in2mm)/2;
+        d = abs(p2_list(:,1) - pins0(:,1));
+        DeltaL_max = sum(d .* theta0);
+        if DeltaL_max < 1e-9, DeltaL_max = 1.0; end
 
-        E_MPa = S.P.E_GPa * 1000; % GPa -> MPa (= N/mm^2)
-        S.E_MPa = E_MPa;
-
-        if isnan(S.P.tendon_x_mm)
-            xT = ri; % tendon rides on +x inner wall
-        else
-            xT = S.P.tendon_x_mm;
-        end
-
-        depthCut = max(S.P.depth, 0);
-        depthCut = min(depthCut, 2*ro);
-
-        k_theta = zeros(N,1);
-        r_eff   = zeros(N,1);
-        c_fiber = zeros(N,1);
-
-        for i = 1:N
-            [~, xbar, Iy] = ringNotchSectionProps(ro, ri, depthCut, 140, 360);
-
-            % Remaining material max-x boundary after cut is xMax = ro - depthCut.
-            xMax = ro - depthCut;
-            xMax = min(max(xMax, -ro), ro);
-
-            % Distance from NA to extreme fiber in bending direction (x):
-            cpos = abs(xMax - xbar);
-            cneg = abs((-ro) - xbar);
-            c    = max(cpos, cneg);
-            c    = max(c, 1e-6);
-
-            r_eff(i)   = max(xT - xbar, 1e-6);             % mm
-            k_theta(i) = (E_MPa * Iy) / max(L_notch(i),1e-6); % (MPa*mm^4)/mm = N*mm/rad
-            k_theta(i) = max(k_theta(i), 1e-9);
-
-            c_fiber(i) = c;
-        end
-
-        % Model-based force cap from theta0 caps (avoids unreachable beyond geometric limit)
-        Fcap_each = (k_theta .* max(theta0,0)) ./ max(r_eff,1e-6);
-        Fcap_model = min(Fcap_each);
-        if ~isfinite(Fcap_model) || Fcap_model <= 0
-            Fcap_model = S.P.Fmax_user_N;
-        end
-
-        Fmax_use = min(S.P.Fmax_user_N, 1.05*Fcap_model);
-        if ~isfinite(Fmax_use) || Fmax_use <= 1e-9
-            Fmax_use = S.P.Fmax_user_N;
-        end
-
-        % ----------- Store -----------
         S.notches0 = notches0;
-        S.pins0   = pins0;
+        S.pins0 = pins0;
         S.p0_list = p0_list;
         S.p2_list = p2_list;
         S.L_notch = L_notch;
-        S.theta0  = theta0;
-
-        S.k_theta = k_theta;
-        S.r_eff   = r_eff;
-        S.c_fiber = c_fiber;
-        S.F_max_model = Fmax_use;
+        S.theta0 = theta0;
+        S.d = d;
+        S.DeltaL_max = DeltaL_max;
 
         S.notchColors = lines(max(N,7));
         S.notchColors = S.notchColors(1:N,:);
 
-        % ----------- Plot rebuild -----------
         cla(S.ax); hold(S.ax,'on'); grid(S.ax,'on'); axis(S.ax,'equal');
         xlabel(S.ax,'X (mm)'); ylabel(S.ax,'Y (mm)'); zlabel(S.ax,'Z (mm)');
-        ht2 = title(S.ax,'Undeformed (thin) vs Force-Driven Deformed (thicker); red = out of elastic');
+        ht2 = title(S.ax,'Undeformed (thin) vs Deformed (thicker)');
         set(S.ax,'Color','none');
         try
             set(ht2,'Units','normalized');
@@ -453,7 +413,7 @@ rebuildGeometryAndPlots(true);
                 'LineWidth', 0.8, 'Color', S.colLinkUndeformed);
         end
 
-        % Deformed notches (created once; color updated each frame based on elastic status)
+        % Deformed notches
         S.hDef = gobjects(N,1);
         for i = 1:N
             P0 = notches0{i};
@@ -461,38 +421,34 @@ rebuildGeometryAndPlots(true);
                 'LineWidth', 1.8, 'MarkerSize', 3.8, 'Color', S.notchColors(i,:));
         end
 
-        % Pins -> scatter3 so we can per-point color
-        S.hPins = scatter3(S.ax, pins0(:,1), pins0(:,2), pins0(:,3), 34, ...
-            'Marker','s','LineWidth',0.9,'MarkerEdgeColor','flat','MarkerFaceColor','none');
-        set(S.hPins, 'CData', repmat(S.colTendonPins, N, 1));
+        % Deformed pins (thin white, smaller)
+        S.hPins = plot3(S.ax, pins0(:,1), pins0(:,2), pins0(:,3), 's', ...
+            'MarkerSize', 4.6, 'LineWidth', 0.9, ...
+            'MarkerEdgeColor', S.colTendonPins, ...
+            'MarkerFaceColor', 'none');
 
-        % Tendon (through p2)
+        % Tendon (thin white)
         S.hTendon = plot3(S.ax, p2_list(:,1), p2_list(:,2), p2_list(:,3), '-', ...
             'LineWidth', 1.0, 'Color', S.colTendonPins);
 
-        % Dummy red handle for legend (over-elastic)
-        S.hLegendOverElastic = plot3(S.ax, nan, nan, nan, '-o', ...
-            'LineWidth', 1.8, 'MarkerSize', 3.8, 'Color', S.colOverElastic);
-
-        % LEGEND
+        % LEGEND (restored)
         try
             if nLinks >= 1
                 S.hLegend = legend(S.ax, ...
-                    [S.hOrig(1) S.hDef(1) S.hLegendOverElastic S.hInterLinkUndeformed(1) S.hPins S.hTendon], ...
-                    {'Undeformed notches','Deformed (elastic)','Deformed (over-elastic)','Undeformed p2→p0 link','Pins (color-coded)','Tendon (through p2)'}, ...
+                    [S.hOrig(1) S.hDef(1) S.hInterLinkUndeformed(1) S.hPins S.hTendon], ...
+                    {'Undeformed notches','Deformed notches','Undeformed p2→p0 link','Deformed pins','Tendon (through p2)'}, ...
                     'Location','best');
             else
                 S.hLegend = legend(S.ax, ...
-                    [S.hOrig(1) S.hDef(1) S.hLegendOverElastic S.hPins S.hTendon], ...
-                    {'Undeformed notches','Deformed (elastic)','Deformed (over-elastic)','Pins (color-coded)','Tendon (through p2)'}, ...
+                    [S.hOrig(1) S.hDef(1) S.hPins S.hTendon], ...
+                    {'Undeformed notches','Deformed notches','Deformed pins','Tendon (through p2)'}, ...
                     'Location','best');
             end
         catch
         end
 
-        % Force slider scaling
-        set(S.pullSld,'Min',0,'Max',S.F_max_model);
-        newPull = pullRatio * S.F_max_model;
+        set(S.pullSld,'Min',0,'Max',DeltaL_max);
+        newPull = pullRatio * DeltaL_max;
         set(S.pullSld,'Value',newPull);
 
         updatePlot(S, newPull);
@@ -525,11 +481,11 @@ rebuildGeometryAndPlots(true);
                 stopAnimation();
                 return;
             end
-            baseStep = S.F_max_model / max(S.animBaseFramesPerCurl, 10);
+            baseStep = S.DeltaL_max / max(S.animBaseFramesPerCurl, 10);
             step = baseStep * S.speedFactor;
 
             v = get(S.pullSld,'Value') + step;
-            if v > S.F_max_model, v = 0; end
+            if v > S.DeltaL_max, v = 0; end
             set(S.pullSld,'Value',v);
             updatePlot(S, v);
         end
@@ -549,7 +505,7 @@ rebuildGeometryAndPlots(true);
         stopAnimation();
         if ishandle(S.fig)
             try, set(S.fig,'CloseRequestFcn',[]); catch, end
-            delete(S.fig);
+            delete(S.fig);  % use delete to avoid recursive close warnings
         end
     end
 
@@ -566,13 +522,12 @@ rebuildGeometryAndPlots(true);
 
         viewAzEl = get(S.ax,'View');
 
-        saveFullCurlGifForceElastic( ...
+        saveFullCurlGif( ...
             out, gifFrames, gifDelay, gifLoopCount, gifTransparentBg, ...
-            S.P, S.distribution, S.bend_dir, ...
+            S.P, S.distribution, S.bend_dir, S.useCapstan, S.pullSide, ...
             S.lockView, S.viewSideDir, S.viewSideUp, viewAzEl, ...
-            S.notches0, S.pins0, S.p0_list, S.p2_list, S.L_notch, S.theta0, ...
-            S.k_theta, S.r_eff, S.c_fiber, S.E_MPa, S.F_max_model, ...
-            S.notchColors, S.undeformedDarkenFactor, S.colLinkUndeformed, S.colTendonPins, S.colOverElastic);
+            S.notches0, S.pins0, S.p0_list, S.p2_list, S.L_notch, S.theta0, S.d, S.DeltaL_max, ...
+            S.notchColors, S.undeformedDarkenFactor, S.colLinkUndeformed, S.colTendonPins);
 
         msgbox(sprintf('Saved GIF:\n%s', out), 'GIF Saved');
 
@@ -600,19 +555,17 @@ rebuildGeometryAndPlots(true);
     end
 end
 
-%% ========================= UPDATE (FORCE + ELASTIC CHECK) =========================
-function updatePlot(S, F)
+%% ========================= UPDATE =========================
+function updatePlot(S, DeltaL)
+set(S.pullLbl, 'String', sprintf('Pulled tendon ΔL = %.4f mm (max ≈ %.4f mm)', DeltaL, S.DeltaL_max));
 
-[theta, DeltaL_geom] = solveAnglesFromForce(F, S.k_theta, S.r_eff, S.theta0);
-
-% Elastic check
-[overElastic, epsMax, sigmaMax] = elasticStatus(theta, S.L_notch, S.c_fiber, S.E_MPa, ...
-    S.P.epsElasticLimit, S.P.sigmaElasticLimit_MPa);
-
-nOver = nnz(overElastic);
-set(S.pullLbl, 'String', sprintf('Tendon force F = %.3f N | predicted ΔL ≈ %.4f mm (Fmax ≈ %.3f N) | over-elastic: %d', ...
-    F, DeltaL_geom, S.F_max_model, nOver));
-
+if S.useCapstan
+    theta = solveAnglesWithCapstanLimits( ...
+        DeltaL, S.d, S.L_notch, S.theta0, S.distribution, ...
+        S.P.muCapstan, S.pullSide);
+else
+    theta = solveAnglesWithLimits(DeltaL, S.d, S.L_notch, S.theta0, S.distribution);
+end
 [pinsDef, yawBefore, yawAfter] = deformPinsFromThetas(S.pins0, theta, S.bend_dir);
 
 N = numel(S.notches0);
@@ -635,59 +588,46 @@ for i = 1:N
 
     Pseg = [p0d; p1d; p2d];
     set(S.hDef(i), 'XData', Pseg(:,1), 'YData', Pseg(:,2), 'ZData', Pseg(:,3));
-
-    % Color the notch red if out-of-elastic
-    if overElastic(i)
-        set(S.hDef(i), 'Color', S.colOverElastic);
-    else
-        set(S.hDef(i), 'Color', S.notchColors(i,:));
-    end
-
     p2_def(i,:) = p2d;
 end
 
-% Pins: per-point color
-pinColors = repmat(S.colTendonPins, N, 1);
-pinColors(overElastic,:) = repmat(S.colOverElastic, nOver, 1);
-
-set(S.hPins,  'XData', pinsDef(:,1), 'YData', pinsDef(:,2), 'ZData', pinsDef(:,3), 'CData', pinColors);
+set(S.hPins,  'XData', pinsDef(:,1), 'YData', pinsDef(:,2), 'ZData', pinsDef(:,3));
 set(S.hTendon,'XData', p2_def(:,1), 'YData', p2_def(:,2), 'ZData', p2_def(:,3));
 
 % Tip relative to tendon base:
+% base = first tendon point shifted by -startSpacing in Z
 tipAbs  = p2_def(end,:);
 baseAbs = p2_def(1,:) + [0 0 -S.P.startSpacing];
 tipRel  = tipAbs - baseAbs;
 
+% Unwrapped attack angle: use cumulative yaw at the tip (can exceed 360°)
 attackDeg = rad2deg(abs(yawAfter(end)));
+
 degSym = char(176);
-
-% Show worst-case elastic metric at current force
-epsWorst   = max(epsMax);
-sigmaWorst = max(sigmaMax);
-
 set(S.tipTxt, 'String', sprintf(['Tip wrt base: (x,y,z) = (%.3f, %.3f, %.3f) mm\n' ...
-                                 'Notches: %d | Attack = %.2f%s | eps(max)=%.3f | sig(max)=%.0f MPa'], ...
-                                 tipRel(1), tipRel(2), tipRel(3), N, attackDeg, degSym, epsWorst, sigmaWorst));
+                                 'Notches: %d | Attack = %.2f%s'], ...
+                                 tipRel(1), tipRel(2), tipRel(3), N, attackDeg, degSym));
 
 drawnow limitrate;
 end
 
-%% ========================= GIF EXPORT (FORCE + ELASTIC) =========================
-function saveFullCurlGifForceElastic( ...
+%% ========================= GIF EXPORT =========================
+function saveFullCurlGif( ...
     filename, nFrames, delay, loopCount, makeTransparent, ...
-    P, distribution, bend_dir, ...
+    P, distribution, bend_dir, useCapstan, pullSide, ...
     lockView, viewSideDir, viewSideUp, viewAzEl, ...
-    notches0, pins0, p0_list, p2_list, L_notch, theta0, ...
-    k_theta, r_eff, c_fiber, E_MPa, F_max, ...
-    notchColors, undeformedDarkenFactor, colLinkUndeformed, colTendonPins, colOverElastic)
+    notches0, pins0, p0_list, p2_list, L_notch, theta0, d, DeltaL_max, ...
+    notchColors, undeformedDarkenFactor, colLinkUndeformed, colTendonPins)
 
 N = numel(notches0);
 
+% If transparency edges still bother you, set this true (forces black opaque background).
 forceBlackOpaque = false;
 if forceBlackOpaque
     makeTransparent = false;
 end
 
+% Use BLACK as the transparency key -> no pink halos.
 keyRGB = [0 0 0];
 
 f = figure('Visible','off', 'Position',[100 100 950 640], 'InvertHardcopy','off');
@@ -703,19 +643,22 @@ end
 ax = axes('Parent',f);
 hold(ax,'on'); grid(ax,'on'); axis(ax,'equal');
 xlabel(ax,'X (mm)'); ylabel(ax,'Y (mm)'); zlabel(ax,'Z (mm)');
-ht = title(ax,'CPR Curl Deformation (Force + Elastic limit)');
+ht = title(ax,'CPR Curl Deformation');
+% title slightly higher
 try
     set(ht,'Units','normalized');
     p = get(ht,'Position'); p(2) = p(2) + 0.06; set(ht,'Position',p);
 catch
 end
 
+% Make axis readable on black
 set(ax,'XColor',[1 1 1],'YColor',[1 1 1],'ZColor',[1 1 1]);
 set(ax,'GridColor',[0.6 0.6 0.6],'GridAlpha',0.35);
 
+% View
 if lockView
-    view(ax, viewSideDir);
-    camup(ax, viewSideUp);
+    view(ax, viewSideDir);   % should be [0 1 0]
+    camup(ax, viewSideUp);   % [0 0 1]
     camproj(ax,'orthographic');
     axis(ax,'vis3d');
 else
@@ -729,7 +672,8 @@ else
 end
 
 % --- Overlays ---
-hTip = annotation(f,'textbox',[0.0 0.90 0.92 0.08], ...
+% Tip text (top-left)
+hTip = annotation(f,'textbox',[0.0 0.90 0.86 0.08], ...
     'String','', ...
     'FitBoxToText','on', ...
     'Interpreter','none', ...
@@ -738,8 +682,9 @@ hTip = annotation(f,'textbox',[0.0 0.90 0.92 0.08], ...
     'Color',[1 1 1], ...
     'FontSize',11);
 
-paramStr = formatParamStringForceElastic(P, distribution, bend_dir, F_max);
-annotation(f,'textbox',[0.00 0.01 0.75 0.27], ...
+% Metadata (bottom-left), smaller
+paramStr = formatParamString(P, distribution, bend_dir, useCapstan, pullSide);
+annotation(f,'textbox',[0.00 0.01 0.6 0.20], ...
     'String',paramStr, ...
     'FitBoxToText','on', ...
     'Interpreter','none', ...
@@ -773,23 +718,22 @@ for i = 1:N
         'LineWidth', 1.8, 'MarkerSize', 3.8, 'Color', notchColors(i,:));
 end
 
-hPins = scatter3(ax, pins0(:,1), pins0(:,2), pins0(:,3), 34, ...
-    'Marker','s','LineWidth',0.9,'MarkerEdgeColor','flat','MarkerFaceColor','none');
-set(hPins, 'CData', repmat(colTendonPins, N, 1));
+hPins = plot3(ax, pins0(:,1), pins0(:,2), pins0(:,3), 's', ...
+    'MarkerSize', 4.6, 'LineWidth', 0.9, ...
+    'MarkerEdgeColor', colTendonPins, 'MarkerFaceColor', 'none');
 
 hTendon = plot3(ax, p2_list(:,1), p2_list(:,2), p2_list(:,3), '-', ...
     'LineWidth', 1.0, 'Color', colTendonPins);
 
-hOver = plot3(ax, nan, nan, nan, '-o', 'LineWidth',1.8,'MarkerSize',3.8,'Color',colOverElastic);
-
+% Legend (restored) — place it away from top-left overlays
 try
     if nLinks >= 1
-        lgd = legend(ax, [hOrig(1) hDef(1) hOver hLink(1) hPins hTendon], ...
-            {'Undeformed notches','Deformed (elastic)','Deformed (over-elastic)','Undeformed p2→p0 link','Pins (color-coded)','Tendon (through p2)'}, ...
+        lgd = legend(ax, [hOrig(1) hDef(1) hLink(1) hPins hTendon], ...
+            {'Undeformed notches','Deformed notches','Undeformed p2→p0 link','Deformed pins','Tendon (through p2)'}, ...
             'Location','northeast');
     else
-        lgd = legend(ax, [hOrig(1) hDef(1) hOver hPins hTendon], ...
-            {'Undeformed notches','Deformed (elastic)','Deformed (over-elastic)','Pins (color-coded)','Tendon (through p2)'}, ...
+        lgd = legend(ax, [hOrig(1) hDef(1) hPins hTendon], ...
+            {'Undeformed notches','Deformed notches','Deformed pins','Tendon (through p2)'}, ...
             'Location','northeast');
     end
     set(lgd,'TextColor',[1 1 1],'Color','none','Box','off');
@@ -798,17 +742,24 @@ end
 
 degSym = char(176);
 
+% --- GIF anti-trail strategy ---
+% - Fixed colormap from frame 1
+% - DisposalMethod='restorebg' for every frame
+% - Stable TransparentColor index
 baseMap = [];
 keyIdx0 = 0; % 0-based
 
 for k = 1:nFrames
     t = (k-1) / max(nFrames-1,1);
-    F = t * F_max;
+    DeltaL = t * DeltaL_max;
 
-    [theta, DeltaL_geom] = solveAnglesFromForce(F, k_theta, r_eff, theta0);
-    [overElastic, epsMax, sigmaMax] = elasticStatus(theta, L_notch, c_fiber, E_MPa, ...
-        P.epsElasticLimit, P.sigmaElasticLimit_MPa);
-
+    if useCapstan
+        theta = solveAnglesWithCapstanLimits( ...
+            DeltaL, d, L_notch, theta0, distribution, ...
+            P.muCapstan, pullSide);
+    else
+        theta = solveAnglesWithLimits(DeltaL, d, L_notch, theta0, distribution);
+    end
     [pinsDef, yawBefore, yawAfter] = deformPinsFromThetas(pins0, theta, bend_dir);
 
     p2_def = zeros(N,3);
@@ -826,30 +777,23 @@ for k = 1:nFrames
 
         Pseg = [p0d; p1d; p2d];
         set(hDef(i), 'XData', Pseg(:,1), 'YData', Pseg(:,2), 'ZData', Pseg(:,3));
-
-        if overElastic(i)
-            set(hDef(i), 'Color', colOverElastic);
-        else
-            set(hDef(i), 'Color', notchColors(i,:));
-        end
-
         p2_def(i,:) = p2d;
     end
 
-    pinColors = repmat(colTendonPins, N, 1);
-    pinColors(overElastic,:) = repmat(colOverElastic, nnz(overElastic), 1);
-    set(hPins,'XData',pinsDef(:,1),'YData',pinsDef(:,2),'ZData',pinsDef(:,3),'CData',pinColors);
+    set(hPins,'XData',pinsDef(:,1),'YData',pinsDef(:,2),'ZData',pinsDef(:,3));
     set(hTendon,'XData',p2_def(:,1),'YData',p2_def(:,2),'ZData',p2_def(:,3));
 
+    % Tip relative to base with -startSpacing in Z
     tipAbs  = p2_def(end,:);
     baseAbs = p2_def(1,:) + [0 0 -P.startSpacing];
     tipRel  = tipAbs - baseAbs;
 
+    % Unwrapped attack angle (can exceed 360°)
     attackDeg = rad2deg(abs(yawAfter(end)));
 
-    set(hTip,'String',sprintf(['Tip: (%.3f, %.3f, %.3f) mm | F: %.3f N | ΔL≈%.3f mm | ' ...
-                              'Over-elastic: %d | eps(max)=%.3f | sig(max)=%.0f MPa | Attack: %.2f%s'], ...
-        tipRel(1), tipRel(2), tipRel(3), F, DeltaL_geom, nnz(overElastic), max(epsMax), max(sigmaMax), attackDeg, degSym));
+    set(hTip,'String',sprintf(['Tip wrt base: (%.3f, %.3f, %.3f) mm   |   ' ...
+                              'ΔL: %.3f mm   |   Notches: %d   |   Attack: %.2f%s'], ...
+        tipRel(1), tipRel(2), tipRel(3), DeltaL, N, attackDeg, degSym));
 
     drawnow;
     fr = getframe(f);
@@ -860,7 +804,7 @@ for k = 1:nFrames
 
         if makeTransparent
             [~, idx] = min(sum((baseMap - keyRGB).^2, 2));
-            keyIdx0 = idx - 1;
+            keyIdx0 = idx - 1; % 0-based
             imwrite(im, baseMap, filename, 'gif', ...
                 'LoopCount', loopCount, ...
                 'DelayTime', delay, ...
@@ -892,21 +836,11 @@ end
 delete(f);
 end
 
-function s = formatParamStringForceElastic(P, distribution, bend_dir, Fmax)
-in2mm = 25.4;
-IDmm = P.tubeID_in * in2mm;
-ODmm = P.tubeOD_in * in2mm;
-
-if isnan(P.tendon_x_mm)
-    tendonStr = 'tendon_x_mm = NaN (assume +ri)';
-else
-    tendonStr = sprintf('tendon_x_mm = %.4f', P.tendon_x_mm);
-end
-
+function s = formatParamString(P, distribution, bend_dir, useCapstan, pullSide)
 s = sprintf([ ...
     'Settings used:\n' ...
     'height = %.3f\n' ...
-    'depthCut = %.3f\n' ...
+    'depth = %.3f\n' ...
     'offset = %.3f\n' ...
     'startNotchWidth = %.3f\n' ...
     'endNotchWidth   = %.3f\n' ...
@@ -914,22 +848,16 @@ s = sprintf([ ...
     'endSpacing      = %.3f\n' ...
     'startOffsetApex = %.3f\n' ...
     'endOffsetApex   = %.3f\n' ...
-    'tube ID/OD = %.4f / %.4f mm\n' ...
-    'E = %.2f GPa\n' ...
-    '%s\n' ...
-    'elastic limits: eps<=%.4f, sigma<=%.0f MPa\n' ...
-    'model = %s\n' ...
-    'bend_dir = %+d\n' ...
-    'Fmax(model/slider) = %.3f N' ], ...
+    'muCapstan       = %.3f\n' ...
+    'capstan         = %d\n' ...
+    'pullSide        = %s\n' ...
+    'distribution    = %s\n' ...
+    'bend_dir        = %+d' ], ...
     P.height, P.depth, P.offset, ...
     P.startNotchWidth, P.endNotchWidth, ...
     P.startSpacing, P.endSpacing, ...
-    P.startOffsetApex, P.endOffsetApex, ...
-    IDmm, ODmm, ...
-    P.E_GPa, ...
-    tendonStr, ...
-    P.epsElasticLimit, P.sigmaElasticLimit_MPa, ...
-    char(distribution), bend_dir, Fmax);
+    P.startOffsetApex, P.endOffsetApex, P.muCapstan, ...
+    logical(useCapstan), char(pullSide), char(distribution), bend_dir);
 end
 
 %% ========================= GEOMETRY BUILD =========================
@@ -961,8 +889,6 @@ while start_z < height
 
     apex_z_offset = lerp(startOffsetApex, endOffsetApex, t);
 
-    % NOTE: These are still your demo kinematic points. The stiffness model
-    % uses tube ID/OD and "depth" as cut depth across diameter for section props.
     p0 = [ depth, 0.0, start_z ];
     p1 = [ -offset, 0.0, start_z + 0.5*L + apex_z_offset ];
     p2 = [ depth, 0.0, end_z ];
@@ -1016,64 +942,171 @@ for i = 1:N
 end
 end
 
-%% ========================= FORCE-BASED ANGLES =========================
-function [theta, DeltaL_geom] = solveAnglesFromForce(F, k_theta, r_eff, thetaCap)
-if isempty(k_theta) || isempty(r_eff) || F <= 0
-    theta = zeros(size(thetaCap));
-    DeltaL_geom = 0;
+%% ========================= ANGLES FROM PULL (WITH LIMITS) =========================
+function theta = solveAnglesWithLimits(DeltaL, d, L_notch, theta0, distribution)
+N = numel(d);
+theta = zeros(N,1);
+if N == 0 || DeltaL <= 0
     return;
 end
 
-theta = (F .* r_eff) ./ max(k_theta,1e-12);
-theta = min(max(theta,0), max(thetaCap,0));
-
-DeltaL_geom = sum(r_eff .* theta);  % mm (geometric tendon shortening estimate)
+switch string(distribution)
+    case "uniform"
+        w = ones(N,1);
+    otherwise
+        w = max(L_notch(:), 1e-12);
 end
 
-%% ========================= ELASTIC STATUS (NEW) =========================
-function [overElastic, epsMax, sigmaMax] = elasticStatus(theta, L_notch, c_fiber, E_MPa, epsLim, sigmaLim_MPa)
-Lsafe = max(L_notch, 1e-9);
-kappa = theta ./ Lsafe;              % 1/mm
-epsMax = abs(kappa) .* c_fiber;      % unitless
-sigmaMax = E_MPa .* epsMax;          % MPa (since E in MPa)
-
-% if either limit exceeded -> mark as out-of-elastic
-overElastic = (epsMax > epsLim + 1e-12) | (sigmaMax > sigmaLim_MPa + 1e-9);
+theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, w);
 end
 
-%% ========================= SECTION PROPS (NOTCHED RING) =========================
-function [A, xbar, Iy_centroid] = ringNotchSectionProps(ro, ri, depthCut, nR, nTh)
-% Remaining section = ring (ri..ro) MINUS region with x > (ro - depthCut)
-% depthCut in mm, measured from +x outer surface inward.
+function theta = solveAnglesWithCapstanLimits( ...
+    DeltaL, d, L_notch, theta0, distribution, mu, pullSide)
+% Kinematic capstan approximation for a tendon routed through notch tips.
+%
+% Capstan law:
+%   T_out = T_in * exp(-mu * beta)
+%
+% Here beta is approximated as the local notch closing angle. The resulting
+% relative tension distribution is used as an effective weighting for how
+% much of the commanded tendon shortening is assigned to each notch.
 
-if nargin < 4, nR = 140; end
-if nargin < 5, nTh = 360; end
+N = numel(d);
+theta = zeros(N,1);
 
-depthCut = max(depthCut, 0);
-depthCut = min(depthCut, 2*ro);
-xCut = ro - depthCut;   % remove x > xCut
-
-dr  = (ro - ri) / nR;
-dth = 2*pi / nTh;
-
-r  = ri + (0.5:1:nR-0.5)*dr;
-th = (0.5:1:nTh-0.5)*dth;
-[R,TH] = ndgrid(r, th);
-
-X = R .* cos(TH);
-dA = R * dr * dth;
-
-keep = (X <= xCut);
-
-A = sum(dA(keep));
-if A < 1e-12
-    xbar = 0;
-    Iy_centroid = 1e-12;
+if N == 0 || DeltaL <= 0
     return;
 end
 
-xbar = sum(X(keep).*dA(keep)) / A;
-Iy_centroid = sum( (X(keep) - xbar).^2 .* dA(keep) );
+switch string(distribution)
+    case "uniform"
+        baseW = ones(N,1);
+    otherwise
+        baseW = max(L_notch(:), 1e-12);
+end
+
+if mu <= 0
+    theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, baseW);
+    return;
+end
+
+% Start from the frictionless solution, then iterate because the frictional
+% tension decay depends on wrap angle, which depends on theta.
+theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, baseW);
+
+maxIter = 40;
+tol     = 1e-6;
+relax   = 0.5;
+
+for it = 1:maxIter %#ok<NASGU>
+    thetaOld = theta;
+
+    % Local tendon wrap angle approximation at each notch.
+    beta = abs(thetaOld);
+
+    % Relative local tendon tension according to pull direction.
+    Trel = capstanRelativeTension(beta, mu, pullSide);
+
+    % Less tension means that notch gets a smaller share of the global pull.
+    wEff = baseW .* Trel;
+
+    thetaNew = solveAnglesWeightedWithLimits(DeltaL, d, theta0, wEff);
+
+    % Under-relaxation improves numerical stability when mu is high.
+    theta = (1 - relax)*thetaOld + relax*thetaNew;
+
+    if norm(theta - thetaOld, inf) < tol
+        break;
+    end
+end
+
+thetaCap = max(theta0(:), 0);
+theta = min(theta, thetaCap);
+theta = max(theta, 0);
+end
+
+function Trel = capstanRelativeTension(beta, mu, pullSide)
+beta = beta(:);
+N = numel(beta);
+Trel = ones(N,1);
+
+switch string(pullSide)
+    case "base"
+        % Tendon is pulled from notch 1 toward notch N.
+        % Notch 1 sees the highest tension; distal notches see reduced tension.
+        accumulatedWrap = 0;
+        for i = 1:N
+            Trel(i) = exp(-mu * accumulatedWrap);
+            accumulatedWrap = accumulatedWrap + beta(i);
+        end
+
+    case "tip"
+        % Tendon is pulled from notch N toward notch 1.
+        % Tip notch sees the highest tension; proximal notches see reduced tension.
+        accumulatedWrap = 0;
+        for i = N:-1:1
+            Trel(i) = exp(-mu * accumulatedWrap);
+            accumulatedWrap = accumulatedWrap + beta(i);
+        end
+
+    otherwise
+        error('pullSide must be "base" or "tip".');
+end
+
+% Avoid fully starving a section numerically.
+Trel = max(Trel, 1e-6);
+end
+
+function theta = solveAnglesWeightedWithLimits(DeltaL, d, theta0, w)
+N = numel(d);
+theta = zeros(N,1);
+
+if N == 0 || DeltaL <= 0
+    return;
+end
+
+d_safe = max(d(:), 1e-12);
+thetaCap = max(theta0(:), 0);
+
+w = max(w(:), 0);
+if sum(w) < 1e-12
+    return;
+end
+
+free = true(N,1);
+remaining = DeltaL;
+
+while remaining > 1e-12 && any(free)
+    wf = w .* free;
+    wf_sum = sum(wf);
+
+    if wf_sum < 1e-12
+        break;
+    end
+
+    DeltaL_i = remaining * (wf / wf_sum);
+    theta_proposed = DeltaL_i ./ d_safe;
+
+    saturate = free & (theta + theta_proposed > thetaCap + 1e-12);
+
+    if ~any(saturate)
+        theta(free) = theta(free) + theta_proposed(free);
+        remaining = 0;
+        break;
+    end
+
+    for i = find(saturate).'
+        theta_to_cap = max(thetaCap(i) - theta(i), 0);
+        used = d_safe(i) * theta_to_cap;
+
+        theta(i) = thetaCap(i);
+        remaining = max(remaining - used, 0);
+        free(i) = false;
+    end
+end
+
+theta = min(theta, thetaCap);
+theta = max(theta, 0);
 end
 
 %% ========================= MATH HELPERS =========================
@@ -1082,7 +1115,8 @@ function y = lerp(a,b,t), y = a + t*(b-a); end
 function ang = angleBetween(a,b)
 na = norm(a); nb = norm(b);
 if na < 1e-12 || nb < 1e-12
-    ang = 0; return;
+    ang = 0;
+    return;
 end
 c = dot(a,b) / (na*nb);
 c = max(min(c,1),-1);
